@@ -1,0 +1,35 @@
+{
+  "llama_server": "E:/xox/Tools/llama-c/llama-server.exe",
+  "models_dir": "E:/model",
+  "model_choices": {
+    "HY": {
+      "name": "huiyuan/HunyuanOCR.BF16.gguf",
+      "mmproj": "huiyuan/HunyuanOCR.mmproj-bf16.gguf"
+    },
+    "QWEN.8": {
+      "name": "qwen3.5/Qwen3.5-0.8B-Q8_0.gguf",
+      "mmproj": "qwen3.5/0.8b_mmproj-F16.gguf"
+    },
+    "QWEN2": {
+      "name": "qwen3.5/Qwen3.5-2B-Q8_0.gguf",
+      "mmproj": "qwen3.5/2b_mmproj-F16.gguf"
+    },
+    "QWEN4": {
+      "name": "qwen3.5/Qwen3.5-4B-Q8_0.gguf",
+      "mmproj": "qwen3.5/4b_mmproj-F16.gguf"
+    },
+    "PD": {
+      "name": "paddleocr/PaddleOCR-VL-1.6-GGUF.gguf",
+      "mmproj": "paddleocr/PaddleOCR-VL-1.6-GGUF-mmproj.gguf"
+    },
+    "ULQ8": {
+      "name": "Unlimited/Unlimited-OCR-Q8_0.gguf",
+      "mmproj": "Unlimited/mmproj-Unlimited-OCR-F16.gguf"
+    },
+    "ULQ4": {
+      "name": "Unlimited/Unlimited-OCR-Q4_K_S.gguf",
+      "mmproj": "Unlimited/mmproj-Unlimited-OCR-F16.gguf"
+    }
+  },
+  "selected_model": "HY"
+}

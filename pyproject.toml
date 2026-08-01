@@ -1,0 +1,15 @@
+[project]
+name = "ptoe"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "pymupdf>=1.28.0",
+    "requests>=2.34.2",
+    "zhconv>=1.4.3",
+]
+
+[tool.pyrefly]
+project-includes = [
+    "**/*.py*",
+    "**/*.ipynb",
+]

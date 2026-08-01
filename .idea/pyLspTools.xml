@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PyToolsState">
+    <option name="tools">
+      <map>
+        <entry key="black">
+          <value>
+            <ToolEntry>
+              <option name="enabled" value="true" />
+              <option name="customPathToExecutable" value="E:\xox\Tools\pypy3.11-v7.3.23-win64\Scripts\black.exe" />
+            </ToolEntry>
+          </value>
+        </entry>
+        <entry key="pyrefly">
+          <value>
+            <ToolEntry>
+              <option name="enabled" value="true" />
+            </ToolEntry>
+          </value>
+        </entry>
+        <entry key="ruff">
+          <value>
+            <ToolEntry>
+              <option name="enabled" value="true" />
+            </ToolEntry>
+          </value>
+        </entry>
+      </map>
+    </option>
+  </component>
+  <component name="PyreflyConfiguration2">
+    <option name="documentation" value="true" />
+    <option name="inlayHints" value="true" />
+  </component>
+</project>
