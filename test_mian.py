@@ -5,6 +5,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
+import llamamanage
 import mian
 import pdfmanage
 from epubmanage import _natural_key
@@ -45,9 +46,9 @@ class TestPdfToEpub(unittest.TestCase):
                 on_progress(len(out), len(out))
             return out
 
-        original = mian.batch_infer
+        original = llamamanage.batch_infer
         original_ensure = mian._ensure_server
-        mian.batch_infer = fake_batch_infer
+        llamamanage.batch_infer = fake_batch_infer
         mian._ensure_server = lambda model_key: None
         try:
             epub_out = self._tmp / "out.epub"
@@ -59,7 +60,7 @@ class TestPdfToEpub(unittest.TestCase):
                 author="tester",
             )
         finally:
-            mian.batch_infer = original
+            llamamanage.batch_infer = original
             mian._ensure_server = original_ensure
 
         self.assertTrue(epub_out.is_file(), f"epub not created: {result}")

@@ -1,5 +1,5 @@
 {
-  "llama_server": "E:/xox/Tools/llama-c/llama-server.exe",
+  "llama_server": "E:/xox/Tools/llama13/llama-server.exe",
   "models_dir": "E:/model",
   "model_choices": {
     "HY": {
@@ -31,5 +31,5 @@
       "mmproj": "Unlimited/mmproj-Unlimited-OCR-F16.gguf"
     }
   },
-  "selected_model": "HY"
+  "selected_model": "QWEN2"
 }

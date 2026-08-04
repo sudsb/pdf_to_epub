@@ -20,6 +20,27 @@ import re
 import html
 from typing import Dict, List, Any, Optional, Tuple
 
+# 手动矫正（correctmanage.sanitize_html）白名单标签：出现任一即走标记渲染路径
+_MARKUP_RE = re.compile(r"</?(?:p|h[1-6]|strong|em|br|span)([^>]*)>", flags=re.I)
+
+# 块级保留 class：注释（ptoe-note）+ 对齐类（ptoe-align-*）+ 换页（ptoe-page-break）
+_NOTE_CLASS = "ptoe-note"
+_ALIGN_CLASSES = ("ptoe-align-left", "ptoe-align-center", "ptoe-align-right")
+_PAGE_BREAK_CLASS = "ptoe-page-break"
+
+
+def _block_class_html(attrs: str) -> str:
+    """从块标签属性中提取应保留的 class（ptoe-note + 对齐类 + 换页），返回 class 属性。"""
+    m = re.search(r'class="([^"]*)"', attrs)
+    if not m:
+        return ""
+    keep = [
+        c
+        for c in m.group(1).split()
+        if c == _NOTE_CLASS or c in _ALIGN_CLASSES or c == _PAGE_BREAK_CLASS
+    ]
+    return f' class="{" ".join(keep)}"' if keep else ""
+
 
 class CSSManager:
     def __init__(self, css_template: Optional[str] = None, font_family: str = "serif", line_height: float = 1.6):
@@ -46,14 +67,35 @@ class CSSManager:
           color: #111;
           background: #fff;
         }}
-        h1, h2, h3, h4 {{
+        h1, h2, h3, h4, h5, h6 {{
           font-weight: bold;
           margin: 1em 0 0.5em 0;
+          text-align: center;
         }}
         p {{
           text-indent: 1.5em;
           margin: 0.5em 0;
           orphans: 2; widows: 2;
+        }}
+        .ptoe-note {{
+          font-size: 0.85em;
+        }}
+        .ptoe-align-center {{
+          text-align: center;
+        }}
+        .ptoe-align-left {{
+          text-align: left;
+        }}
+        .ptoe-align-right {{
+          text-align: right;
+        }}
+        .ptoe-page-break {{
+          page-break-before: always;
+          break-before: page;
+          margin: 0;
+          padding: 0;
+          height: 0;
+          overflow: hidden;
         }}
         img {{
           display: block;
@@ -192,16 +234,25 @@ class HTMLConverter:
 
     def render_toc_page(self, toc_items: List[Dict[str, Any]]) -> str:
         """Generate a nav.xhtml-like page (HTML5) for table of contents.
-        toc_items: list of {'title': str, 'href': str, 'level': int}
+        toc_items: list of {'title': str, 'href': str, 'level': int}，按 level 嵌套 <ol>。
         """
-        nav_lines = []
+        out: List[str] = []
+        depth = 0
         for it in toc_items:
             t = self._escape_text(it.get('title', ''))
             href = self._escape_text(it.get('href', '#'))
-            level = int(it.get('level', 1))
-            indent = '  ' * (level - 1)
-            nav_lines.append(f"{indent}<li><a href=\"{href}\">{t}</a></li>")
-        nav_html = '<nav class="toc"><ol>\n' + '\n'.join(nav_lines) + '\n</ol></nav>'
+            level = max(1, int(it.get('level', 1)))
+            while depth < level:
+                out.append('<ol>')
+                depth += 1
+            while depth > level:
+                out.append('</ol>')
+                depth -= 1
+            out.append(f'<li><a href="{href}">{t}</a></li>')
+        while depth > 0:
+            out.append('</ol>')
+            depth -= 1
+        nav_html = '<nav class="toc">' + ''.join(out) + '</nav>'
         html_doc = f"""<?xml version='1.0' encoding='{self.encoding}'?>
 <!DOCTYPE html>
 <html lang='en'>
@@ -217,49 +268,129 @@ class HTMLConverter:
 """
         return html_doc
 
-    def _render_fragment(self, text: str) -> str:
-        # text is already escaped where needed by caller; assume plain paragraphs
-        parts = []
-        for p in [ln.strip() for ln in text.split('\n') if ln.strip()]:
-            parts.append(f"<p>{self._escape_text(p)}</p>")
-        return '\n'.join(parts)
+    def _render_fragment(self, text: str, toc_out: Optional[List[Dict[str, Any]]] = None) -> str:
+        """把矫正后的 HTML 片段渲染为 XHTML 正文片段。
 
-    def render_content_pages(self, chapters: List[Dict[str, Any]], split_by_chars: int = 5000) -> List[Tuple[str, str]]:
-        """Render chapters into a list of (filename, html_content).
+        toc_out 不为 None 时，收集正文中的标题（h1-h6）为目录项
+        {'title', 'level', 'id'}；标题元素带 id="hN" 锚点供目录跳转。
+        注释块/注释 span（class="ptoe-note"）原样放行（CSS 控制小字号）。
+        """
+        # 无校正标记时保持原逻辑（逐行转义为 <p>），保证默认流水线输出不变。
+        if not _MARKUP_RE.search(text):
+            parts = []
+            for p in [ln.strip() for ln in text.split('\n') if ln.strip()]:
+                parts.append(f"<p>{self._escape_text(p)}</p>")
+            return '\n'.join(parts)
+        # 手动矫正路径：text 已经 correctmanage.sanitize_html 白名单清洗
+        # （仅含 <p>/<h1-6>/<strong>/<em>/<br/>、ptoe-note span 与转义文本），
+        # 按块级标签重排，块内文本直接放行（避免二次转义）。
+        blocks: List[str] = []
+        cur: List[str] = []
+        kind: Optional[str] = None  # 当前块类型：'p' | 'h1'..'h6' | None
+        open_tag: Optional[str] = None  # 当前块的开标签（含 id/class）
+        hcount = 0  # 标题锚点计数（每片段内 h1..hN）
+        heading: Optional[Tuple[int, List[str]]] = None  # 当前标题 (级别, 文本缓冲)
+
+        def _flush_block() -> None:
+            nonlocal cur, kind, open_tag, heading
+            if kind is None:
+                return
+            blocks.append(f"{open_tag or f'<{kind}>'}{''.join(cur)}</{kind}>")
+            if kind != 'p' and heading is not None and toc_out is not None:
+                title = html.unescape(re.sub(r"<[^>]+>", "", "".join(heading[1]))).strip()
+                if title:
+                    toc_out.append({'title': title, 'level': heading[0], 'id': f'h{hcount}'})
+            cur = []
+            kind = None
+            open_tag = None
+            heading = None
+
+        for tok in re.split(r"(<[^>]+>)", text):
+            if not tok:
+                continue
+            # 防御：标记 span 已由 apply_markers 提取，此处兜底剔除
+            if "data-ptoe-marker" in tok:
+                continue
+            m = re.fullmatch(r"</?(p|h[1-6])([^>]*)>", tok, flags=re.I)
+            if m:
+                tag = m.group(1).lower()
+                if tok.startswith('</'):
+                    if kind == tag:
+                        _flush_block()
+                    continue
+                # 开标签：先收掉上一块；开标签本身不进 cur（flush 时合成包裹）
+                if kind:
+                    _flush_block()
+                cls = _block_class_html(m.group(2) or "")
+                if tag.startswith('h'):
+                    hcount += 1
+                    kind = tag
+                    heading = (int(tag[1]), [])
+                    open_tag = f'<{tag} id="h{hcount}"{cls}>'
+                else:
+                    kind = 'p'
+                    open_tag = f'<p{cls}>'
+                continue
+            cur.append(tok)
+            if heading is not None:
+                heading[1].append(tok)
+        if kind or cur:
+            if kind is None:
+                kind = 'p'
+                open_tag = '<p>'
+            blocks.append(f"{open_tag}{''.join(cur)}</{kind}>")
+            if kind != 'p' and heading is not None and toc_out is not None:
+                title = html.unescape(re.sub(r"<[^>]+>", "", "".join(heading[1]))).strip()
+                if title:
+                    toc_out.append({'title': title, 'level': heading[0], 'id': f'h{hcount}'})
+        return '\n'.join(blocks)
+
+    def render_content_pages(self, chapters: List[Dict[str, Any]], split_by_chars: int = 5000) -> Tuple[List[Tuple[str, str]], List[Dict[str, Any]]]:
+        """Render chapters into a list of (filename, html_content) plus heading-based TOC items.
+
         chapters: [{'title':..., 'page':..., 'text':...}, ...] or higher-level grouped chapters.
         split_by_chars: soft limit to split large chapters into multiple HTML files.
-        Returns list of (relpath, content) where relpath is filename relative to output_dir.
+        Returns (outputs, toc_items)：outputs 为 (relpath, content) 列表；
+        toc_items 为 {'title','href','level'} 列表，href 形如 content_1.xhtml#h1。
+        正文含标题时用标题作为该页的 h1/目录项（不再重复插入书名一级标题）；
+        正文无标题时才补 h1（首个分卷用书名，后续分卷用「书名（第N部分）」）。
+        已作为正文标题出现过的文本不再重复补 h1 —— 否则当书名等于第一章大标题
+        （单章 PDF、--title 用了章节名等）时，同一标题会在后续每页重复出现。
         """
         outputs: List[Tuple[str, str]] = []
-        file_index = 1
         toc_items: List[Dict[str, Any]] = []
+        file_index = 1
+        used_titles: set = set()  # 已作为正文标题（含补充 h1）出现过的文本
         for ch in chapters:
             title = ch.get('title') or f"Chapter {ch.get('page', file_index)}"
             text = ch.get('text', '')
-            # split by chars if needed
+            # split by chars if needed（后续分卷标题带「（第N部分）」）
             if len(text) <= split_by_chars:
-                fname = f"content_{file_index}.xhtml"
-                body = self._render_fragment(text)
-                html_doc = f"<?xml version='1.0' encoding='{self.encoding}'?>\n<!DOCTYPE html>\n<html lang='en'>\n<head>\n<meta charset='{self.encoding}'/>\n<title>{self._escape_text(title)}</title>\n</head>\n<body>\n<h1>{self._escape_text(title)}</h1>\n{body}\n</body>\n</html>"
-                outputs.append((fname, html_doc))
-                toc_items.append({'title': title, 'href': fname, 'level': 1})
-                file_index += 1
+                chunks = [(title, text)]
             else:
-                # chunk
-                start = 0
-                part = 1
-                while start < len(text):
-                    chunk = text[start:start + split_by_chars]
-                    fname = f"content_{file_index}.xhtml"
-                    body = self._render_fragment(chunk)
-                    subtitle = f"{title} (Part {part})"
-                    html_doc = f"<?xml version='1.0' encoding='{self.encoding}'?>\n<!DOCTYPE html>\n<html lang='en'>\n<head>\n<meta charset='{self.encoding}'/>\n<title>{self._escape_text(subtitle)}</title>\n</head>\n<body>\n<h1>{self._escape_text(subtitle)}</h1>\n{body}\n</body>\n</html>"
-                    outputs.append((fname, html_doc))
-                    toc_items.append({'title': subtitle, 'href': fname, 'level': 1})
-                    start += split_by_chars
-                    file_index += 1
-                    part += 1
-        return outputs
+                chunks = [
+                    (title if i == 0 else f"{title}（第{i + 1}部分）", text[start:start + split_by_chars])
+                    for i, start in enumerate(range(0, len(text), split_by_chars))
+                ]
+            for sub_title, chunk in chunks:
+                fname = f"content_{file_index}.xhtml"
+                toc = []  # 本页标题（含锚点 id）
+                body = self._render_fragment(chunk, toc_out=toc)
+                if not toc:
+                    # 无标题：仅当该标题此前从未作为正文标题出现过才补 h1
+                    # （避免「书名=第一章大标题」时标题在后续每页重复）
+                    if sub_title.strip() not in used_titles:
+                        toc.append({'title': sub_title, 'level': 1, 'id': None})
+                        body = f"<h1>{self._escape_text(sub_title)}</h1>\n" + body
+                for it in toc:
+                    used_titles.add(it['title'])
+                html_doc = f"<?xml version='1.0' encoding='{self.encoding}'?>\n<!DOCTYPE html>\n<html lang='en'>\n<head>\n<meta charset='{self.encoding}'/>\n<title>{self._escape_text(sub_title)}</title>\n</head>\n<body>\n{body}\n</body>\n</html>"
+                outputs.append((fname, html_doc))
+                for it in toc:
+                    href = fname if not it['id'] else f"{fname}#{it['id']}"
+                    toc_items.append({'title': it['title'], 'href': href, 'level': it['level']})
+                file_index += 1
+        return outputs, toc_items
 
     def convert_document(self, structured_doc: Dict[str, Any], merge_pages: bool = True) -> Dict[str, Any]:
         """Main entry: takes structured_doc from stringmanage and writes files to disk.
@@ -310,7 +441,12 @@ class HTMLConverter:
         # content pages
         pages = structured_doc.get('pages', [])
         chapters = []
-        if merge_pages:
+        # 手动矫正的标记结构：每篇文章 = 一个 EPUB 内容页（全文标记处开新页）
+        articles = structured_doc.get('articles')
+        if articles:
+            for a in articles:
+                chapters.append({'title': title, 'text': a.get('text', '')})
+        elif merge_pages:
             # 合并模式：全部页面正文按页序合并为单一正文（跳过空白页）
             merged = "\n\n".join(
                 p.get('text', '').strip() for p in pages if (p.get('text') or '').strip()
@@ -343,7 +479,7 @@ class HTMLConverter:
                             # ignore copy errors; leave original src
                             pass
 
-        content_outputs = self.render_content_pages(chapters, split_by_chars=200_000 if merge_pages else 5000)
+        content_outputs, toc_items = self.render_content_pages(chapters, split_by_chars=200_000 if merge_pages else 5000)
         content_files = []
         for fname, content in content_outputs:
             path = os.path.join(oebps, fname)
@@ -353,8 +489,8 @@ class HTMLConverter:
                 f.write(doc)
             content_files.append(os.path.join('OEBPS', fname))
 
-        # toc
-        toc_html = self.render_toc_page([{'title': os.path.splitext(os.path.basename(p[0]))[0], 'href': p[0], 'level': 1} for p in content_outputs])
+        # toc（与正文标题一一对应，带锚点跳转）
+        toc_html = self.render_toc_page(toc_items)
         toc_fname = 'nav.xhtml'
         with open(os.path.join(oebps, toc_fname), 'w', encoding=self.encoding) as f:
             f.write(self.cssm.inject_styles(toc_html))
@@ -366,7 +502,7 @@ class HTMLConverter:
                 from epubmanage import pack_from_oebps, EPUBMetadata
                 epub_path = meta.get('epub_path') or os.path.join(self.output_dir, f"{self._escape_text(title)}.epub")
                 md = EPUBMetadata(title=title, author=author, language=meta.get('language', 'en'))
-                pack_from_oebps(self.output_dir, epub_path, md, epub_version=meta.get('epub_version', '3.0'))
+                pack_from_oebps(self.output_dir, epub_path, md, epub_version=meta.get('epub_version', '3.0'), toc_items=toc_items)
                 result['epub'] = epub_path
         except Exception as e:
             result['epub_error'] = str(e)

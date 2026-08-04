@@ -1,6 +1,8 @@
 from pathlib import Path
 from typing import List, Tuple
 import base64
+import hashlib
+import json
 import tempfile
 import threading
 import os
@@ -64,6 +66,91 @@ def is_pdf_file(path: Path | str) -> bool:
         return False
 
 
+# 分割目录内的标记文件：记录 PDF 内容哈希 + 分割参数，用于相同输入时复用图片
+_SPLIT_MARKER = ".ptoe_split.json"
+
+
+def _pdf_sha256(pdf_path: Path | str) -> str:
+    """PDF 文件内容哈希（流式，避免整读大文件）。"""
+    h = hashlib.sha256()
+    with open(pdf_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _find_existing_split(
+    pdf_path: Path | str,
+    dpi: int,
+    fmt: str,
+    pdf_hash: Optional[str] = None,
+) -> Optional[Tuple[Path, List[Path]]]:
+    """查找同一 PDF（内容哈希一致）且同一 dpi/fmt 的已分割图片目录。
+
+    命中条件：目录内有 .ptoe_split.json 标记，pdf_hash/dpi/fmt 全部一致，
+    且 1..pages 的页图都完整存在（防止半途中断/手动删图后的残缺目录被复用）。
+    返回 (out_dir, out_paths)；未命中返回 None（需要重新分割）。
+    """
+    p = Path(pdf_path)
+    base = Path(__file__).resolve().parent
+    data_dir = base / "data"
+    if not data_dir.is_dir():
+        return None
+    if pdf_hash is None:
+        try:
+            pdf_hash = _pdf_sha256(p)
+        except Exception:
+            return None
+    for d in sorted(data_dir.glob(f"{p.stem}*")):
+        if not d.is_dir():
+            continue
+        mf = d / _SPLIT_MARKER
+        if not mf.is_file():
+            continue
+        try:
+            meta = json.loads(mf.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if (
+            meta.get("pdf_hash") != pdf_hash
+            or meta.get("dpi") != dpi
+            or meta.get("fmt") != fmt
+            or not isinstance(meta.get("pages"), int)
+        ):
+            continue
+        pages = meta["pages"]
+        if pages <= 0:
+            continue
+        if any(not (d / f"{n}.{fmt}").is_file() for n in range(1, pages + 1)):
+            continue
+        out_paths = [d / f"{n}.{fmt}" for n in range(1, pages + 1)]
+        return d, out_paths
+    return None
+
+
+def _write_split_marker(
+    out_dir: Path,
+    pdf_path: Path | str,
+    dpi: int,
+    fmt: str,
+    pages: int,
+    pdf_hash: Optional[str] = None,
+) -> None:
+    """在分割目录写标记（下次相同输入直接复用）。写入失败不影响主流程。"""
+    try:
+        meta = {
+            "pdf_hash": pdf_hash or _pdf_sha256(pdf_path),
+            "dpi": dpi,
+            "fmt": fmt,
+            "pages": pages,
+        }
+        (out_dir / _SPLIT_MARKER).write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
 def split_pdf_to_images(
     pdf_path: Path | str, *, dpi: int = 200, fmt: str = "png"
 ) -> Tuple[Path, List[Path]]:
@@ -79,17 +166,30 @@ def split_pdf_to_images(
 
     Raises:
       RuntimeError when required backend (PyMuPDF) is missing or the file cannot be read.
+
+    相同 PDF（内容哈希一致）+ 相同 dpi/fmt 时直接复用已有分割图片，不重新切图：
+    分割目录内有 .ptoe_split.json 标记记录（pdf_hash/dpi/fmt/pages），命中且
+    页图齐全即返回已有 (out_dir, out_paths)。PDF 内容或参数变化时重新分割
+    （createdic 自动生成新目录），并写入新标记。
     """
+    p = Path(pdf_path)
+    if not p.exists() or not p.is_file():
+        raise RuntimeError(f"PDF path does not exist or is not a file: {p}")
+
+    # 复用已有分割：相同内容 + 相同参数时不重新切图，直接返回既有图片
+    pdf_hash = _pdf_sha256(p)
+    reused = _find_existing_split(p, dpi, fmt, pdf_hash=pdf_hash)
+    if reused is not None:
+        out_dir, out_paths = reused
+        print(f"      reusing {len(out_paths)} existing page image(s) in {out_dir}")
+        return out_dir, out_paths
+
     from importlib import import_module
 
     try:
         fitz = import_module("fitz")  # PyMuPDF
     except Exception as exc:  # pragma: no cover - runtime dependency
         raise RuntimeError("PyMuPDF is required (pip install PyMuPDF)") from exc
-
-    p = Path(pdf_path)
-    if not p.exists() or not p.is_file():
-        raise RuntimeError(f"PDF path does not exist or is not a file: {p}")
 
     try:
         doc = fitz.open(str(p))
@@ -118,6 +218,7 @@ def split_pdf_to_images(
                 pix.save(str(out_path))
             out_paths.append(out_path)
 
+        _write_split_marker(out_dir, p, dpi, fmt, len(out_paths), pdf_hash=pdf_hash)
         return out_dir, out_paths
     finally:
         doc.close()

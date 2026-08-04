@@ -187,11 +187,27 @@ def get_config():
 
 
 def update_config(key, value):
-    """更新单个配置字段，并持久化（线程安全）."""
+    """更新单个配置字段，并持久化（线程安全）。
+
+    注意：不要在持有 _CFG_LOCK 时调用 get_config()，因为 get_config
+    本身会尝试获取同一锁（导致死锁）。直接读取/写入配置文件并
+    使用 validate_and_patch_config 做校验。
+    """
     with _CFG_LOCK:
-        cfg = get_config()
-        cfg[key] = value
-        cfg = validate_and_patch_config(cfg)
-        with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-        return cfg
+        try:
+            if os.path.exists(_CONFIG_PATH):
+                with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            else:
+                cfg = DEFAULT_CONFIG.copy()
+            cfg[key] = value
+            cfg = validate_and_patch_config(cfg)
+            with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            return cfg
+        except Exception as e:
+            print(f"[config] Error updating config, fallback to default: {e}")
+            cfg = DEFAULT_CONFIG.copy()
+            with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            return cfg

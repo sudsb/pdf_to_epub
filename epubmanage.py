@@ -289,12 +289,13 @@ class EPUBPacker:
             mapped_toc = []
             for it in toc_items:
                 href = it.get('href', '')
-                base = os.path.basename(href)
+                file_part, _, frag = href.partition('#')
+                base = os.path.basename(file_part)
                 mapped = next(
                     (e.replace('\\', '/') for _s, e in manifest_sources if os.path.basename(e) == base),
-                    href,
+                    file_part,
                 )
-                mapped_toc.append({'title': it.get('title'), 'href': mapped})
+                mapped_toc.append({'title': it.get('title'), 'href': mapped + (f'#{frag}' if frag else '')})
             ncx_content = self.generate_toc_ncx(metadata, mapped_toc)
 
         # write into epub zip: mimetype (stored), then rest
@@ -323,9 +324,11 @@ class EPUBPacker:
                 zf.writestr('OEBPS/toc.ncx', ncx_content)
         return self.epub_path
 
-def pack_from_oebps(root_dir: str, epub_path: str, metadata: EPUBMetadata, epub_version: str = '2.0') -> str:
+def pack_from_oebps(root_dir: str, epub_path: str, metadata: EPUBMetadata, epub_version: str = '2.0', toc_items: Optional[List[Dict[str, str]]] = None) -> str:
     """Convenience wrapper: discover OEBPS contents and package into epub_path.
     Order: cover.xhtml (if present), nav.xhtml (if present), then content_*.xhtml sorted.
+    toc_items 为 htmlmanage 生成的标题目录（{'title','href','level'}，href 可带 #锚点）；
+    缺省时退化为按文件名的目录（旧行为）。
     """
     oebps = os.path.join(root_dir, 'OEBPS')
     if not os.path.isdir(oebps):
@@ -341,7 +344,8 @@ def pack_from_oebps(root_dir: str, epub_path: str, metadata: EPUBMetadata, epub_
         spine.append(os.path.join('OEBPS', nav))
     for c in contents:
         spine.append(os.path.join('OEBPS', c))
-    toc_items = [{'title': os.path.splitext(os.path.basename(p))[0], 'href': os.path.relpath(p, 'OEBPS')} for p in spine]
+    if toc_items is None:
+        toc_items = [{'title': os.path.splitext(os.path.basename(p))[0], 'href': os.path.relpath(p, 'OEBPS')} for p in spine]
     packer = EPUBPacker(epub_path, root_dir, epub_version=epub_version)
     return packer.pack(metadata, [os.path.relpath(s, 'OEBPS') for s in spine], toc_items)
 

@@ -136,5 +136,71 @@ class TestSplitPdfToImages(unittest.TestCase):
             self.assertGreater(img.stat().st_size, 0)
 
 
+class TestSplitReuse(unittest.TestCase):
+    """相同 PDF + 相同参数复用已有分割图片；内容/参数变化时重新分割。"""
+
+    def setUp(self):
+        try:
+            import fitz  # noqa: F401
+        except Exception:
+            self.skipTest("PyMuPDF (fitz) is not installed")
+        self._work_dir = Path(tempfile.mkdtemp(prefix="test_reuse_"))
+        self.pdf_name = "reuse_test"
+        self.pdf_path = self._work_dir / f"{self.pdf_name}.pdf"
+
+        import fitz
+
+        doc = fitz.open()
+        for _ in range(3):
+            page = doc.new_page()
+            page.insert_text((72, 72), "Reuse page")
+        doc.save(str(self.pdf_path))
+        doc.close()
+        for d in Path("data").glob(f"{self.pdf_name}*"):
+            shutil.rmtree(d, ignore_errors=True)
+
+    def tearDown(self):
+        for d in Path("data").glob(f"{self.pdf_name}*"):
+            shutil.rmtree(d, ignore_errors=True)
+        shutil.rmtree(self._work_dir, ignore_errors=True)
+
+    def test_same_params_reuses_existing_split(self):
+        d1, imgs1 = pdfmanage.split_pdf_to_images(self.pdf_path, dpi=200, fmt="png")
+        self.assertTrue((d1 / pdfmanage._SPLIT_MARKER).is_file(), "分割后应写入标记")
+        # 相同参数再次分割 → 同一目录、同一批图片，不生成 _1 新目录
+        d2, imgs2 = pdfmanage.split_pdf_to_images(self.pdf_path, dpi=200, fmt="png")
+        self.assertEqual(d1, d2)
+        self.assertEqual([p.name for p in imgs1], [p.name for p in imgs2])
+        self.assertFalse((d1.parent / f"{self.pdf_name}_1").exists())
+
+    def test_param_change_triggers_resplit(self):
+        d1, _ = pdfmanage.split_pdf_to_images(self.pdf_path, dpi=200, fmt="png")
+        d2, _ = pdfmanage.split_pdf_to_images(self.pdf_path, dpi=300, fmt="png")
+        self.assertNotEqual(d1, d2)
+        self.assertEqual(d2.name, f"{self.pdf_name}_1")
+        # 参数改回后仍复用原目录
+        d3, _ = pdfmanage.split_pdf_to_images(self.pdf_path, dpi=200, fmt="png")
+        self.assertEqual(d1, d3)
+
+    def test_pdf_change_triggers_resplit(self):
+        import json as _json
+
+        d1, _ = pdfmanage.split_pdf_to_images(self.pdf_path, dpi=200, fmt="png")
+        # 伪造旧标记为不同哈希（等价于 PDF 内容变化）→ 必须重新分割
+        marker = d1 / pdfmanage._SPLIT_MARKER
+        meta = _json.loads(marker.read_text(encoding="utf-8"))
+        meta["pdf_hash"] = "0" * 64
+        marker.write_text(_json.dumps(meta), encoding="utf-8")
+        d2, _ = pdfmanage.split_pdf_to_images(self.pdf_path, dpi=200, fmt="png")
+        self.assertNotEqual(d1, d2)
+
+    def test_missing_page_triggers_resplit(self):
+        d1, _ = pdfmanage.split_pdf_to_images(self.pdf_path, dpi=200, fmt="png")
+        (d1 / "1.png").unlink()  # 残缺目录（缺页图）不得复用
+        d2, imgs = pdfmanage.split_pdf_to_images(self.pdf_path, dpi=200, fmt="png")
+        self.assertNotEqual(d1, d2)
+        self.assertEqual(len(imgs), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -18,10 +18,9 @@ item = q.add(img, encode=True)
 b64 = item.get_base64()
 assert b64 is not None
 
-# monkeypatch requests.post to inspect payload
-import requests
-from types import SimpleNamespace
-orig_post = requests.post
+# monkeypatch the shared session post to inspect payload
+# （llamamanage 现在复用 _SESSION 连接，不再直接 requests.post）
+orig_post = llm._SESSION.post
 
 def fake_post(url, json=None, headers=None, timeout=None):
     class Resp:
@@ -37,11 +36,11 @@ def fake_post(url, json=None, headers=None, timeout=None):
     assert image_url.endswith(b64)
     return Resp()
 
-requests.post = fake_post
+llm._SESSION.post = fake_post
 res = llm.request_image('please output original', b64, 'HY', False, True)
 assert isinstance(res, dict)
 assert res['result'] == 'ok'
 
 # cleanup
-requests.post = orig_post
+llm._SESSION.post = orig_post
 print('test passed')
