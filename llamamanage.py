@@ -65,6 +65,34 @@ def _detect_gpu(exe: str):
     return None, None
 
 
+def _probe_server(model_name: str) -> str:
+    """探测 127.0.0.1:8080 上是否已有 llama-server，并比对模型。
+
+    返回 'none'（端口空闲/不可达）| 'match'（已在运行且模型一致）|
+    'mismatch'（端口被占用但模型不符或无法确认）。
+    防止旧实例存活时新 Popen 绑定失败、health 却打到旧服务返回 ok，
+    导致用错模型静默 OCR（S1）。
+    """
+    try:
+        resp = _SESSION.get("http://127.0.0.1:8080/health", timeout=2)
+        if resp.status_code != 200:
+            return "none"
+    except requests.ConnectionError:
+        return "none"
+    except requests.RequestException:
+        return "none"
+    # 端口上有服务：通过 OpenAI 兼容 /v1/models 比对已加载模型
+    try:
+        r2 = _SESSION.get("http://127.0.0.1:8080/v1/models", timeout=2)
+        if r2.status_code == 200:
+            ids = [m.get("id") for m in r2.json().get("data", [])]
+            if model_name in ids:
+                return "match"
+    except Exception:
+        pass
+    return "mismatch"
+
+
 # 全部全局配置通过 configmanage 统一获取
 
 
@@ -131,6 +159,35 @@ def runserver(model_key: str = "HY"):
         print(f"Model file not found: {model_path}")
         return False
     exe = llama_server_cfg
+    model_name = model_info.get("name", model_key)
+
+    # S1：启动前探测端口。旧 llama-server 存活时若直接 Popen，绑定 8080 会失败，
+    # 而后续 health 检查会打到旧服务返回 ok —— 用错模型静默 OCR 且不报错。
+    probe = _probe_server(model_name)
+    if probe == "match":
+        print(f"llama-server already running with model '{model_name}' — reusing")
+        return True
+    if probe == "mismatch":
+        print(
+            f"Port 8080 is occupied by a llama-server with a different model "
+            f"(need '{model_name}'); stopping stale instance ..."
+        )
+        if _server_process is not None and _server_process.poll() is None:
+            # 旧实例是本进程启动的：停掉后重启（避免静默用错模型）
+            stopserver()
+            time.sleep(0.5)
+            if _probe_server(model_name) != "none":
+                print(
+                    "Port 8080 still occupied by an external process — abort to avoid "
+                    "silent model mismatch; close it manually and retry"
+                )
+                return False
+        else:
+            print(
+                "Port 8080 is held by an external process that ptoe cannot verify — "
+                "abort to avoid silent model mismatch; close it manually and retry"
+            )
+            return False
 
     args = [
         exe,
@@ -138,38 +195,42 @@ def runserver(model_key: str = "HY"):
         model_path,
         "--mmproj",
         mmproj_path,
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "8080",
-        "--temperature",
-        "0",
-        "--repeat-penalty",
-        "1.1",
-        "--parallel",
-        "12",
-        # KV 缓存量化：8GB 显存装下 BF16 模型后仅剩约 600MB，
-        # 4 slot 的 f16 KV cache 会溢出到 CPU，导致生成阶段跌到 1-5 t/s。
-        # q8_0 量化后 KV 体积减半，可留在显存，生成速度恢复 50+ t/s。
-        "--cache-type-k",
-        "q8_0",
-        "--cache-type-v",
-        "q8_0",
-        # 只输出 ERROR 级日志：屏蔽 find_slot/print_timing 等刷屏信息
-        # （进度与耗时由 ptoe 侧打印，服务器日志无需展示）
-        "--log-verbosity",
-        "0",
     ]
 
-    # 检测 GPU 后端：若可用则默认把全部层加载入显存（--n-gpu-layers 999）
-    backend, device = _detect_gpu(exe)
-    if backend:
-        args += ["--n-gpu-layers", "999"]
-        print(
-            f"GPU acceleration: {backend} detected ({device}) - loading all layers to VRAM (--n-gpu-layers 999)"
-        )
+    # 启动参数从 config.json 的 llama_server_args 读取（值以字符串存储，原样传给
+    # subprocess）。缺失/空值跳过该参数，回退到 llama-server 内置默认。
+    # 服务器启动是一次性操作，此处多读一次 get_config() 无性能顾虑。
+    cfg = get_config()
+    sargs = cfg.get("llama_server_args", {}) or {}
+    for key, flag in (
+        ("host", "--host"),
+        ("port", "--port"),
+        ("temperature", "--temperature"),
+        ("repeat_penalty", "--repeat-penalty"),
+        ("parallel", "--parallel"),
+        ("cache_type_k", "--cache-type-k"),
+        ("cache_type_v", "--cache-type-v"),
+        ("log_verbosity", "--log-verbosity"),
+    ):
+        v = sargs.get(key)
+        if v not in (None, ""):
+            args += [flag, str(v)]
+
+    # GPU 后端：默认自动检测，可用则把全部层加载入显存（--n-gpu-layers 999）。
+    # 若配置里显式给出 n_gpu_layers 键，则以其覆盖自动探测（跳过检测）。
+    ngl = sargs.get("n_gpu_layers")
+    if ngl not in (None, ""):
+        args += ["--n-gpu-layers", str(ngl)]
+        print(f"GPU acceleration: n_gpu_layers override from config (--n-gpu-layers {ngl})")
     else:
-        print("GPU acceleration: no GPU backend detected - running on CPU")
+        backend, device = _detect_gpu(exe)
+        if backend:
+            args += ["--n-gpu-layers", "999"]
+            print(
+                f"GPU acceleration: {backend} detected ({device}) - loading all layers to VRAM (--n-gpu-layers 999)"
+            )
+        else:
+            print("GPU acceleration: no GPU backend detected - running on CPU")
 
     print(f"Starting server: {' '.join(args)}")
 
@@ -364,14 +425,24 @@ def batch_infer(
 
     def infer_one(img, prompt):
         t0 = time.perf_counter()
-        r = _request_image_new(
-            prompt,
-            img,
-            model_key,
-            thinking=thinking,
-            timeout=timeout,
-            model_name=model_name,
-        )
+        try:
+            r = _request_image_new(
+                prompt,
+                img,
+                model_key,
+                thinking=thinking,
+                timeout=timeout,
+                model_name=model_name,
+            )
+        finally:
+            # P5：请求结束后清理 ImageItem 的 base64 临时文件/内存缓存，
+            # 避免整批图片的 base64 全量驻留磁盘/内存。路径模式下无副作用。
+            cleaner = getattr(img, "clear", None)
+            if callable(cleaner):
+                try:
+                    cleaner()
+                except Exception:
+                    pass
         dt = time.perf_counter() - t0
         name = getattr(img, "path", img)
         if r.get("error"):
@@ -394,8 +465,12 @@ def batch_infer(
             if isinstance(_model_cfg, dict)
             else model_key
         )
-    except Exception:
-        model_name = None  # 交给 _request_image_new 兜底解析
+    except Exception as e:
+        # S3：配置解析失败时整批返回明确错误，而不是每页都重新解析
+        # （逐页兜底会导致每页都可能弹 tkinter 对话框、重复读文件）。
+        msg = f"config resolution failed: {e}"
+        print(f"[batch_infer] {msg}")
+        return [{"img": img, "result": None, "error": msg} for img in images]
     # prompts 可为单值/同长序列
     if isinstance(prompts, str):
         prompts = [prompts] * len(images)

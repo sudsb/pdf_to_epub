@@ -69,10 +69,33 @@ def getdicpath():
 
 
 # ---- 集中式统一配置 ----
+import tempfile
 import threading
 
 _CFG_LOCK = threading.Lock()  # 避免并发写
 _CONFIG_PATH = "config.json"
+
+
+def _atomic_write_json(path: str, obj: dict) -> None:
+    """原子写 JSON：先写临时文件再 os.replace，避免中途崩溃/被杀留下半截文件。
+
+    兼作性能优化：写入只在确有变更时发生（调用方负责判断），配合
+    临时文件 + 原子替换，任何时刻磁盘上的 config.json 都是完整可读的。
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".config-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
 DEFAULT_CONFIG = {
     "llama_server": "E:/xox/Tools/llama-c/llama-server.exe",
     "models_dir": "E:/xox/Tools/llama-c/models",
@@ -95,6 +118,22 @@ DEFAULT_CONFIG = {
         },
     },
     "selected_model": "HY",
+    # OCR 提示词：与 llamamanage.OCR_PROMPT 保持一致，作为 config.json 缺失时的
+    # 兜底种子（首次加载会写入 config.json，之后以配置值为准）。
+    "ocr_prompt": "请逐行完整识别图片中的全部文字，逐字输出，不得遗漏任何内容、不得省略、不得总结、不得翻译",
+    # llama-server 启动参数：镜像 runserver() 当前硬编码参数（值以字符串存储，
+    # 原样传给 subprocess）。n_gpu_layers 不在此默认值中（保持自动检测）；
+    # 若用户配置里显式给出 n_gpu_layers 键，则覆盖自动探测。
+    "llama_server_args": {
+        "host": "127.0.0.1",
+        "port": "8080",
+        "temperature": "0",
+        "repeat_penalty": "1.1",
+        "parallel": "11",
+        "cache_type_k": "q8_0",
+        "cache_type_v": "q8_0",
+        "log_verbosity": "0",
+    },
     # 可拓展其余各manage/key conf
 }
 
@@ -127,13 +166,19 @@ def validate_and_patch_config(cfg):
     return out
 
 
-def get_config():
+def get_config(*, show_dialogs: bool = True):
     """统一入口，返回健壮配置(dict)，丢失/坏则自动生成/修复。线程安全。
+
+    show_dialogs=True 时，若 llama_server/models_dir 缺失或指向不存在的路径，
+    弹出文件/目录选择框让用户定位（默认行为）。CLI/headless 读取传
+    show_dialogs=False 可跳过交互弹窗（校验与回填默认值仍照常执行）。
 
     If llama_server or models_dir are missing or point to non-existent paths,
     prompt the user with a file/directory chooser to locate them. This keeps
     the configuration interactive instead of relying on hardcoded paths.
     """
+    # 锁内只做「读/校验/确有变更才写盘」；tkinter 对话框移出锁外（S2），
+    # 否则对话框期间其他线程的 get_config 会卡死在锁上。
     with _CFG_LOCK:
         try:
             if os.path.exists(_CONFIG_PATH):
@@ -141,49 +186,43 @@ def get_config():
                     cfg = json.load(f)
             else:
                 cfg = DEFAULT_CONFIG.copy()
-                with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
-                    json.dump(cfg, f, ensure_ascii=False, indent=2)
+                _atomic_write_json(_CONFIG_PATH, cfg)
             newcfg = validate_and_patch_config(cfg)
-            # 回填新字段
+            # 只在确有字段变更时写盘（避免每次调用都无条件全量重写）
             if newcfg != cfg:
-                with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
-                    json.dump(newcfg, f, ensure_ascii=False, indent=2)
-
-            # Interactive prompts for missing/invalid paths
-            # Only prompt when running in a GUI-capable environment; tkinter will raise otherwise.
-            try:
-                llama_path = newcfg.get("llama_server")
-                if not llama_path or not os.path.isfile(llama_path):
-                    chosen = getfilepath()
-                    if chosen:
-                        newcfg["llama_server"] = chosen
-                models_path = newcfg.get("models_dir")
-                if not models_path or not os.path.isdir(models_path):
-                    chosen = getdicpath()
-                    if chosen:
-                        newcfg["models_dir"] = chosen
-                # persist any interactive choices
-                with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
-                    json.dump(newcfg, f, ensure_ascii=False, indent=2)
-            except Exception:
-                # headless or tkinter unavailable — skip interactive prompts
-                pass
-
-            return newcfg
+                _atomic_write_json(_CONFIG_PATH, newcfg)
         except Exception as e:
-            # 配置文件被损坏，回退
+            # 配置文件被损坏，回退默认并重建
             print(f"[config] Error reading config, fallback to default: {e}")
-            cfg = DEFAULT_CONFIG.copy()
-            with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
-            return cfg
-        except Exception as e:
-            # 配置文件被损坏，回退
-            print(f"[config] Error reading config, fallback to default: {e}")
-            cfg = DEFAULT_CONFIG.copy()
-            with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
-            return cfg
+            newcfg = DEFAULT_CONFIG.copy()
+            _atomic_write_json(_CONFIG_PATH, newcfg)
+
+    # Interactive prompts for missing/invalid paths（锁外：弹窗期间不阻塞其他线程）
+    # Only prompt when running in a GUI-capable environment; tkinter will raise otherwise.
+    # show_dialogs=False 时跳过弹窗（CLI/headless 读取），校验与回填仍照常执行。
+    changed = False
+    if show_dialogs:
+        try:
+            llama_path = newcfg.get("llama_server")
+            if not llama_path or not os.path.isfile(llama_path):
+                chosen = getfilepath()
+                if chosen:
+                    newcfg["llama_server"] = chosen
+                    changed = True
+            models_path = newcfg.get("models_dir")
+            if not models_path or not os.path.isdir(models_path):
+                chosen = getdicpath()
+                if chosen:
+                    newcfg["models_dir"] = chosen
+                    changed = True
+        except Exception:
+            # headless or tkinter unavailable — skip interactive prompts
+            pass
+    if changed:
+        # persist any interactive choices（锁内写回，保证并发安全）
+        with _CFG_LOCK:
+            _atomic_write_json(_CONFIG_PATH, newcfg)
+    return newcfg
 
 
 def update_config(key, value):
@@ -202,11 +241,48 @@ def update_config(key, value):
                 cfg = DEFAULT_CONFIG.copy()
             cfg[key] = value
             cfg = validate_and_patch_config(cfg)
-            with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            _atomic_write_json(_CONFIG_PATH, cfg)
             return cfg
         except Exception as e:
             print(f"[config] Error updating config, fallback to default: {e}")
+            cfg = DEFAULT_CONFIG.copy()
+            with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            return cfg
+
+
+def set_ocr_prompt(prompt: str) -> dict:
+    """设置 OCR 提示词（顶层键 ocr_prompt）并持久化，返回新配置。线程安全。
+
+    空串/None 时回退到 DEFAULT_CONFIG 的默认提示词（validate_and_patch_config
+    会补齐缺失键，但显式写空串也会被校验逻辑保留，故此处直接透传）。
+    """
+    return update_config("ocr_prompt", prompt)
+
+
+def set_llama_server_arg(name: str, value) -> dict:
+    """设置 llama-server 启动参数（嵌套键 llama_server_args.<name>）并持久化。
+
+    注意：update_config 只处理顶层键，嵌套参数需在此直接实现——锁内读配置、
+    确保 llama_server_args 存在、改值、校验、原子写回，返回新配置。线程安全。
+    """
+    with _CFG_LOCK:
+        try:
+            if os.path.exists(_CONFIG_PATH):
+                with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            else:
+                cfg = DEFAULT_CONFIG.copy()
+            if not isinstance(cfg.get("llama_server_args"), dict):
+                cfg["llama_server_args"] = dict(
+                    DEFAULT_CONFIG.get("llama_server_args", {})
+                )
+            cfg["llama_server_args"][name] = value
+            cfg = validate_and_patch_config(cfg)
+            _atomic_write_json(_CONFIG_PATH, cfg)
+            return cfg
+        except Exception as e:
+            print(f"[config] Error updating llama_server_args, fallback to default: {e}")
             cfg = DEFAULT_CONFIG.copy()
             with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)

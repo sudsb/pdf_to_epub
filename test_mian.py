@@ -1,5 +1,6 @@
 import re
 import shutil
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -40,7 +41,7 @@ class TestPdfToEpub(unittest.TestCase):
             # return results shuffled to prove the pipeline sorts by page number
             out = []
             for i, img in enumerate(images):
-                item = {"img": img, "result": f"OCR text for page {i + 1}", "error": None}
+                item = {"img": img, "result": f"这是第 {i + 1} 页的正文内容：OCR text for page {i + 1}。本句足够长，超过三十个字符，不会被标题启发式误判为标题行。", "error": None}
                 out.append(item) if i % 2 == 0 else out.insert(0, item)
             if on_progress is not None:
                 on_progress(len(out), len(out))
@@ -94,6 +95,66 @@ class TestPdfToEpub(unittest.TestCase):
     def test_content_filename_natural_sort(self):
         # 字典序会把 content_10 排在 content_2 前；自然排序必须相反
         self.assertLess(_natural_key("content_2.xhtml"), _natural_key("content_10.xhtml"))
+
+    def test_no_args_piped_still_nothing_to_do(self):
+        # 无参数 + 非交互 stdin（管道/重定向）：保持原 "nothing to do" 行为
+        import contextlib
+        import io
+
+        old_stdin = sys.stdin
+        sys.stdin = io.StringIO("")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                rc = mian.main([])
+            self.assertEqual(rc, 0)
+            self.assertIn("nothing to do", buf.getvalue())
+        finally:
+            sys.stdin = old_stdin
+
+    def test_no_args_interactive_menu(self):
+        # 无参数 + 交互终端（含打包 exe 双击启动）：进入终端菜单，输入 0 退出
+        import contextlib
+        import io
+
+        class _TTY(io.StringIO):
+            def isatty(self):
+                return True
+
+        old_stdin = sys.stdin
+        sys.stdin = _TTY("0\n")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                rc = mian.main([])
+            out = buf.getvalue()
+            self.assertEqual(rc, 0)
+            self.assertIn("请选择操作", out, "无参数交互模式应显示终端菜单")
+            self.assertIn("PDF → EPUB 转换", out)
+            self.assertIn("手动矫正", out)
+            self.assertNotIn("nothing to do", out)
+        finally:
+            sys.stdin = old_stdin
+
+
+    def test_no_args_interactive_menu_eof_exits(self):
+        # 菜单读 stdin 遇 EOF（管道关闭/控制台关闭）必须安全退出，不能死循环
+        import contextlib
+        import io
+
+        class _TTY(io.StringIO):
+            def isatty(self):
+                return True
+
+        old_stdin = sys.stdin
+        sys.stdin = _TTY("")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                rc = mian.main([])
+            out = buf.getvalue()
+            self.assertEqual(rc, 0)
+            self.assertIn("请选择操作", out, "EOF 前应显示菜单")
+            self.assertIn("已退出", out)
+        finally:
+            sys.stdin = old_stdin
 
 
 if __name__ == "__main__":

@@ -29,7 +29,26 @@
     "ULQ4": {
       "name": "Unlimited/Unlimited-OCR-Q4_K_S.gguf",
       "mmproj": "Unlimited/mmproj-Unlimited-OCR-F16.gguf"
+    },
+    "DOTS4": {
+      "name": "dots/dots.ocr.IQ4_XS.gguf",
+      "mmproj": "dots/dots.ocr.mmproj-Q8_0.gguf"
+    },
+    "DOTS8": {
+      "name": "dots/dots.ocr.Q8_0.gguf",
+      "mmproj": "dots/dots.ocr.mmproj-Q8_0.gguf"
     }
   },
-  "selected_model": "QWEN2"
+  "selected_model": "DOTS4",
+  "ocr_prompt": "请逐行完整识别图片中的全部文字，逐字输出，不得遗漏任何内容、不得省略、不得总结、不得翻译",
+  "llama_server_args": {
+    "host": "127.0.0.1",
+    "port": "8080",
+    "temperature": "0",
+    "repeat_penalty": "1.1",
+    "parallel": "11",
+    "cache_type_k": "q8_0",
+    "cache_type_v": "q8_0",
+    "log_verbosity": "0"
+  }
 }

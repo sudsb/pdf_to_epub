@@ -90,6 +90,42 @@ def strip_page_numbers(text: str) -> str:
     return "\n".join(lines) if changed else text
 
 
+# 纯文本行级标题启发式（普通 OCR 模型无结构输出时，用行形态识别标题行）：
+# 候选 = 去空白后 1..30 字符、不含句末/引出行标点（。！？!?…，、；：）、
+# 含 CJK/字母、非纯数字。命中行 → <h1>（htmlmanage 按 h1 换页 = 每篇文章一个
+# EPUB 新页 + 标题进目录）。
+_CJK_RE = re.compile(r"[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]")
+_HEADING_TERMINAL_RE = re.compile(r"[。！？!?…，、；：]$")
+_DIGITS_ONLY_RE = re.compile(r"^[\d\s\u3000·\-—–]+$")
+
+
+def detect_headings(text: str) -> str:
+    """启发式把纯文本页转成 `<h1>`/`<p>` 混合 HTML：短行（≤30 字、非句末标点
+    结尾、含文字）判为标题 → `<h1>`，其余行 → `<p>`。仅当整页至少命中 1 个
+    标题才转换（否则原样返回，不影响无标题页面与其他路径）。已含 HTML 标签的
+    行（bbox 输出等）原样保留——转换由 htmlmanage 的 h1-split 自动分页。
+    """
+    lines = text.split("\n")
+    hit = 0
+    out = []
+    for line in lines:
+        s = line.strip()
+        if "<" in s or not s:
+            out.append(line)
+            continue
+        if (
+            1 <= len(s) <= 30
+            and not _HEADING_TERMINAL_RE.search(s)
+            and (_CJK_RE.search(s) or any(c.isalpha() for c in s))
+            and not _DIGITS_ONLY_RE.match(s)
+        ):
+            out.append(f"<h1>{html.escape(s, quote=False)}</h1>")
+            hit += 1
+        else:
+            out.append(f"<p>{html.escape(s, quote=False)}</p>")
+    return "\n".join(out) if hit else text
+
+
 def clean_and_structure_text(
     pages: List[Dict[str, Any]],
     remove_thoughts: bool = True,
@@ -119,6 +155,10 @@ def clean_and_structure_text(
         t = convert_bbox_text(t)
         # -- 删除页面首/末行的独立页码（普通文本模型也适用） --
         t = strip_page_numbers(t)
+        # -- 纯文本标题启发式识别（普通 OCR 无结构输出） --
+        # 命中标题的页面整页转 <h1>/<p>，供 htmlmanage 按 h1 分页（每篇新页）
+        # + 标题进 EPUB 目录；未命中（无标题页）原样返回，不影响其他路径。
+        t = detect_headings(t)
         # -- 空白规范 --
         if normalize_spaces:
             t = re.sub(r"[ \u3000\t]+", " ", t)

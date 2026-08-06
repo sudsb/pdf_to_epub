@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import re
 import html
+import base64
 from typing import Dict, List, Any, Optional, Tuple
 
 # 手动矫正（correctmanage.sanitize_html）白名单标签：出现任一即走标记渲染路径
@@ -27,17 +28,19 @@ _MARKUP_RE = re.compile(r"</?(?:p|h[1-6]|strong|em|br|span)([^>]*)>", flags=re.I
 _NOTE_CLASS = "ptoe-note"
 _ALIGN_CLASSES = ("ptoe-align-left", "ptoe-align-center", "ptoe-align-right")
 _PAGE_BREAK_CLASS = "ptoe-page-break"
+# 插入图片的显示模式 class（全画幅 / 局部），随 <p> 块与 <img> 一起保留
+_IMG_CLASSES = ("ptoe-img-full", "ptoe-img-fit")
 
 
 def _block_class_html(attrs: str) -> str:
-    """从块标签属性中提取应保留的 class（ptoe-note + 对齐类 + 换页），返回 class 属性。"""
+    """从块标签属性中提取应保留的 class（ptoe-note + 对齐类 + 换页 + 图片模式），返回 class 属性。"""
     m = re.search(r'class="([^"]*)"', attrs)
     if not m:
         return ""
     keep = [
         c
         for c in m.group(1).split()
-        if c == _NOTE_CLASS or c in _ALIGN_CLASSES or c == _PAGE_BREAK_CLASS
+        if c == _NOTE_CLASS or c in _ALIGN_CLASSES or c == _PAGE_BREAK_CLASS or c in _IMG_CLASSES
     ]
     return f' class="{" ".join(keep)}"' if keep else ""
 
@@ -101,6 +104,23 @@ class CSSManager:
           display: block;
           max-width: 100%;
           height: auto;
+        }}
+        /* 插入图片：全画幅（占满行宽）与局部（按原尺寸居中） */
+        p.ptoe-img-full, p.ptoe-img-fit {{
+          text-align: center;
+          text-indent: 0;
+          margin: 0.8em 0;
+        }}
+        p.ptoe-img-full img {{
+          width: 100%;
+          max-width: 100%;
+          height: auto;
+          margin: 0 auto;
+        }}
+        p.ptoe-img-fit img {{
+          max-width: 100%;
+          height: auto;
+          margin: 0 auto;
         }}
         .cover {{
           text-align: center;
@@ -426,7 +446,9 @@ class HTMLConverter:
                     # copy binary
                     with open(cover_src, 'rb') as rf, open(dst, 'wb') as wf:
                         wf.write(rf.read())
-                    cover_rel = os.path.join('Images', os.path.basename(cover_src))
+                    # EPUB 内相对路径必须用正斜杠：os.path.join 在 Windows 会产出
+                    # 反斜杠，阅读器按 URI 解析失败导致图片/封面不显示（2026-08 修复）
+                    cover_rel = 'Images/' + os.path.basename(cover_src)
                 else:
                     cover_rel = cover_src  # maybe already relative
             except Exception:
@@ -452,17 +474,59 @@ class HTMLConverter:
                 p.get('text', '').strip() for p in pages if (p.get('text') or '').strip()
             )
             if merged:
-                chapters.append({'title': title, 'text': merged})
+                # B1：正文含 <h1> 时按标题切分为多篇文章，每篇一个 EPUB 内容页（新页开始）
+                if '<h1' in merged:
+                    chunks = [c for c in re.split(r'(?=<h1(?:\s|>))', merged) if c.strip()]
+                    for chunk in chunks:
+                        m = re.search(r'<h1[^>]*>(.*?)</h1>', chunk, flags=re.S)
+                        if m:
+                            # 提取章节标题：去标签、反转义、折叠空白
+                            ch_title = html.unescape(re.sub(r'<[^>]+>', '', m.group(1))).strip()
+                            ch_title = re.sub(r'\s+', ' ', ch_title)
+                            chapters.append({'title': ch_title or title, 'text': chunk})
+                        else:
+                            # 首个 h1 之前的序言块：沿用书名标题（与 articles 分支一致）
+                            chapters.append({'title': title, 'text': chunk})
+                else:
+                    chapters.append({'title': title, 'text': merged})
         else:
             for p in pages:
                 chapters.append({'title': f"Page {p.get('page')}", 'page': p.get('page'), 'text': p.get('text', '')})
 
         # Before rendering, detect <img src='...'> occurrences in page texts and copy referenced images
         img_pattern = re.compile(r"<img[^>]+src=[\"']([^\"']+)[\"']", flags=re.I)
+        data_img_map: Dict[str, str] = {}  # data URI → Images/ 相对路径（同一图只写一次）
+        img_seq = 0
         for p in pages:
             txt = p.get('text', '')
             for m in img_pattern.findall(txt):
                 src = m
+                # data URI（矫正界面插入的图片）：解码写入 Images/ 并替换为相对路径
+                if src.startswith('data:') and ';base64,' in src:
+                    try:
+                        if src in data_img_map:
+                            rel = data_img_map[src]
+                        else:
+                            head, b64 = src.split(';base64,', 1)
+                            mime = head.split(':', 1)[-1] if ':' in head else ''
+                            ext = 'png'
+                            for key, val in (('png', 'png'), ('jpeg', 'jpg'), ('jpg', 'jpg'), ('gif', 'gif'), ('webp', 'webp')):
+                                if mime.endswith(key):
+                                    ext = val
+                                    break
+                            img_seq += 1
+                            fname = f"img_{img_seq}.{ext}"
+                            dst = os.path.join(images_dir, fname)
+                            with open(dst, 'wb') as wf:
+                                wf.write(base64.b64decode(b64))
+                            rel = 'Images/' + fname  # EPUB 路径必须正斜杠（Windows os.path.join 会产出反斜杠）
+                            data_img_map[src] = rel
+                        for ch in chapters:
+                            ch['text'] = ch['text'].replace(src, rel)
+                    except Exception:
+                        # 解码/写盘失败则保留原样（不阻断打包）
+                        pass
+                    continue
                 # only handle local file paths (not http)
                 if src and not src.lower().startswith(('http://', 'https://')):
                     src_path = os.path.abspath(src)
@@ -472,7 +536,7 @@ class HTMLConverter:
                             with open(src_path, 'rb') as rf, open(dst, 'wb') as wf:
                                 wf.write(rf.read())
                             # replace occurrences in chapters text to relative Images/ path
-                            rel = os.path.join('Images', os.path.basename(src_path))
+                            rel = 'Images/' + os.path.basename(src_path)  # EPUB 路径必须正斜杠
                             for ch in chapters:
                                 ch['text'] = ch['text'].replace(src, rel)
                         except Exception:

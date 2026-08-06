@@ -9,6 +9,10 @@ CLI:
 
 --dpi 为档位（0-4）而非原始数值：0=100, 1=150, 2=200, 3=300, 4=600（默认 0）。
 --correct 开启手动矫正：在浏览器中逐页对照原图与识别文字（默认关闭）。
+
+无参数 + 交互终端（含打包 exe 双击启动）进入终端菜单 _run_menu：
+PDF→EPUB 转换 / 手动矫正 / 配置 / 模型管理 / 退出。
+非交互 stdin（管道/重定向）保持打印 "nothing to do"。
 """
 
 from __future__ import annotations
@@ -36,8 +40,16 @@ _BAR_WIDTH = 24
 
 
 def _read_meta() -> tuple[str, str]:
-    """Return (name, version) from pyproject.toml or sensible defaults."""
-    path = Path(__file__).with_name("pyproject.toml")
+    """Return (name, version) from pyproject.toml or sensible defaults.
+
+    PyInstaller 打包后 pyproject.toml 通过 --add-data 放入 sys._MEIPASS；
+    __file__ 指向解包目录，直接 with_name() 找不到，需走 _MEIPASS。
+    """
+    if getattr(sys, "frozen", False):
+        base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    else:
+        base = Path(__file__).parent
+    path = base / "pyproject.toml"
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
         proj = data.get("project", {})
@@ -278,8 +290,12 @@ def pdf_to_epub(
 
     # Lazy imports used only when running the OCR pipeline — keep CLI (non-OCR)
     # commands working without optional deps like requests/zhconv.
+    from configmanage import get_config
     from llamamanage import batch_infer, OCR_PROMPT
-    prompts = [OCR_PROMPT] * len(img_paths)
+    # OCR 提示词优先取 config.json 的 ocr_prompt（用户可自定义），
+    # 缺失/为空时回退到 llamamanage.OCR_PROMPT 默认值。
+    prompt = get_config(show_dialogs=False).get("ocr_prompt") or OCR_PROMPT
+    prompts = [prompt] * len(img_paths)
     from stringmanage import clean_and_structure_text
     from htmlmanage import HTMLConverter
 
@@ -373,13 +389,185 @@ def pdf_to_epub(
     return result
 
 
+def _ask(prompt: str) -> str:
+    """打印提示并从 stdin 读一行；EOF/读取失败返回空串。"""
+    try:
+        print(prompt, end="", flush=True)
+        line = sys.stdin.readline()
+        return line.strip() if line else ""
+    except Exception:
+        return ""
+
+
+def _pause() -> None:
+    """交互模式下等待回车（打包 exe 双击启动时窗口不会立刻消失）。"""
+    try:
+        if getattr(sys.stdin, "isatty", lambda: False)():
+            input("按回车键继续...")
+    except Exception:
+        pass
+
+
+def _menu_epub(cfg: dict) -> None:
+    """菜单项 1：交互式 PDF → EPUB 转换。"""
+    pdf = _ask("PDF 路径：")
+    if not pdf:
+        print("已取消（未输入路径）。")
+        return
+    if not Path(pdf).is_file():
+        print(f"错误：文件不存在 {pdf}")
+        return
+    model = _ask(f"模型键（默认 {cfg.get('selected_model', 'HY')}，回车用默认）：")
+    if not model:
+        model = cfg.get("selected_model", "HY")
+    dpi = 0
+    dpi_in = _ask("DPI 档位 0-4（默认 0=100，回车用默认）：")
+    if dpi_in.isdigit() and int(dpi_in) in DPI_LEVELS:
+        dpi = int(dpi_in)
+    workers = 3
+    workers_in = _ask("OCR 并发数（默认 3，回车用默认）：")
+    if workers_in.isdigit():
+        workers = int(workers_in)
+    correct = _ask("开启手动矫正（浏览器对照原图修字）？(y/N)：").lower() == "y"
+    print(f"\n开始转换：{pdf}\n  模型={model}，dpi={DPI_LEVELS[dpi]}，并发={workers}，矫正={'开' if correct else '关'}")
+    try:
+        result = pdf_to_epub(
+            pdf,
+            dpi=DPI_LEVELS[dpi],
+            model_key=model,
+            max_workers=workers,
+            correct=correct,
+        )
+        if result.get("epub_error"):
+            print(f"错误：{result['epub_error']}")
+        else:
+            print(f"完成：{result.get('epub')}")
+    except Exception as e:
+        print(f"错误：{e}")
+    _pause()
+
+
+def _menu_correct() -> None:
+    """菜单项 2：直接启动手动矫正界面（不跑 OCR）。"""
+    pdf = _ask("PDF 路径（留空=无文件启动，用于历史记录管理）：")
+    try:
+        result = correct_pdf(pdf or None)
+        if result.get("epub_error"):
+            print(f"错误：{result['epub_error']}")
+        else:
+            print(f"完成：{result.get('epub')}")
+    except Exception as e:
+        print(f"错误：{e}")
+    _pause()
+
+
+def _menu_config() -> None:
+    """菜单项 3：查看/修改配置（llama_server / models_dir / selected_model）。"""
+    from configmanage import get_config, update_config
+
+    cfg = get_config()
+    for k in ("llama_server", "models_dir", "selected_model"):
+        print(f"  {k}: {cfg.get(k, '')}")
+    key = _ask("要修改的键（llama_server/models_dir/selected_model，留空跳过）：")
+    if key not in ("llama_server", "models_dir", "selected_model"):
+        print("已跳过（键名无效或为空）。")
+        return
+    if key == "selected_model":
+        value = _ask(f"{key} 的新值（可选：{', '.join(cfg.get('model_choices', {}).keys())}）：")
+    else:
+        value = _ask(f"{key} 的新值：")
+    if not value:
+        print("已跳过（未输入新值）。")
+        return
+    if key == "selected_model" and value not in cfg.get("model_choices", {}):
+        print(f"错误：未知模型键 {value}；可用：{', '.join(cfg.get('model_choices', {}).keys())}")
+        return
+    update_config(key, value)
+    print(f"{key} = {value}")
+    _pause()
+
+
+def _menu_model() -> None:
+    """菜单项 4：模型管理（列出并切换默认模型）。"""
+    from configmanage import get_config, update_config
+
+    cfg = get_config()
+    choices = cfg.get("model_choices", {})
+    sel = cfg.get("selected_model")
+    for k, v in choices.items():
+        mark = "*" if k == sel else " "
+        print(f"{mark} {k}: name={v.get('name')}, mmproj={v.get('mmproj')}")
+    key = _ask("要切换的模型键（留空跳过）：")
+    if not key:
+        print("已跳过。")
+        return
+    if key not in choices:
+        print(f"错误：未知模型键 {key}")
+        return
+    update_config("selected_model", key)
+    print(f"selected_model 已切换为 {key}")
+    _pause()
+
+
+def _run_menu(name: str, version: str) -> int:
+    """无参数 + 交互终端时的终端菜单（打包 exe 双击启动即进入此界面）。"""
+    print(f"\n{name} {version} — PDF → OCR → EPUB 工具")
+    from configmanage import get_config
+
+    while True:
+        print("\n请选择操作：")
+        print("  1) PDF → EPUB 转换（OCR 全流程）")
+        print("  2) 手动矫正（correct，不跑 OCR）")
+        print("  3) 查看/修改配置（config）")
+        print("  4) 模型管理（model）")
+        print("  5) 帮助（CLI 用法）")
+        print("  0) 退出")
+        choice = _ask("请输入序号 [0-5]：")
+        if not choice:
+            # EOF（管道关闭/控制台关闭）或空输入：安全退出，避免死循环
+            print("已退出。")
+            break
+        if choice == "0":
+            break
+        if choice == "1":
+            _menu_epub(get_config())
+        elif choice == "2":
+            _menu_correct()
+        elif choice == "3":
+            _menu_config()
+        elif choice == "4":
+            _menu_model()
+        elif choice == "5":
+            print("  命令行用法（功能与菜单相同）：")
+            print("    mian.py epub <pdf> [--dpi 0-4] [--model KEY] [--workers N] [--thinking] [--correct]")
+            print("    mian.py correct [<pdf>]")
+            print("    mian.py config show|set <key> <value>")
+            print("    mian.py model list|show|set|add|remove")
+            print("  详见 USAGE.md 或 mian.py <子命令> --help")
+        else:
+            print("无效输入，请输入 0-5。")
+    if getattr(sys, "frozen", False):
+        # 打包后的 exe 双击启动：退出前暂停，避免控制台窗口一闪而过
+        _pause()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    # S6：打包 exe 在非交互管道下 stdout/stderr 可能是 GBK 编码，
+    # 遇到无法编码的字符（如 emoji、特殊符号）会抛 UnicodeEncodeError 直接崩溃；
+    # errors="replace" 保证任何输出都不会因编码问题中断。
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(errors="replace")
+        except Exception:
+            pass
+
     name, version = _read_meta()
     # Load persistent config early so the CLI default for --model follows the
     # user's selected_model in config.json. get_config() is robust and will
     # auto-create/repair config.json if necessary (interactive prompts are
     # suppressed in headless environments).
-    from configmanage import get_config, update_config
+    from configmanage import get_config, update_config, set_llama_server_arg
     cfg = get_config()
     default_model = cfg.get("selected_model", "HY")
 
@@ -507,7 +695,7 @@ def main(argv: list[str] | None = None) -> int:
 
     config_show_p = config_sub.add_parser("show", help="显示当前配置")
     config_set_p = config_sub.add_parser("set", help="修改配置项（key=value）")
-    config_set_p.add_argument("key", help="配置键名（如 llama_server, models_dir, selected_model）")
+    config_set_p.add_argument("key", help="配置键名（llama_server / models_dir / selected_model / ocr_prompt / llama_server_args.<参数>）")
     config_set_p.add_argument("value", help="新的值")
 
     args = parser.parse_args(argv)
@@ -583,12 +771,28 @@ def main(argv: list[str] | None = None) -> int:
         if cmd == "show":
             for k in ("llama_server", "models_dir", "selected_model"):
                 print(f"  {k}: {cfg.get(k, '')}")
+            sel = cfg.get("selected_model")
+            print("  model_choices:")
+            for mk, mv in (cfg.get("model_choices", {}) or {}).items():
+                mark = "*" if mk == sel else " "
+                print(f"    {mark}{mk}: name={mv.get('name')}, mmproj={mv.get('mmproj')}")
+            print(f"  ocr_prompt: {cfg.get('ocr_prompt', '')}")
+            sargs = cfg.get("llama_server_args", {}) or {}
+            print("  llama_server_args:")
+            for ak, av in sargs.items():
+                print(f"    {ak}: {av}")
             return 0
         if cmd == "set":
-            key = getattr(args, "key", None)
+            key = getattr(args, "key", None) or ""
             value = getattr(args, "value", None)
-            if key not in ("llama_server", "models_dir", "selected_model"):
-                print(f"Error: 可修改的键名仅限 llama_server / models_dir / selected_model", file=sys.stderr)
+            if key.startswith("llama_server_args."):
+                # 嵌套参数（如 llama_server_args.parallel）走 set_llama_server_arg
+                nested = key.split(".", 1)[1]
+                set_llama_server_arg(nested, value)
+                print(f"{key} = {value}")
+                return 0
+            if key not in ("llama_server", "models_dir", "selected_model", "ocr_prompt"):
+                print(f"Error: 可修改的键名仅限 llama_server / models_dir / selected_model / ocr_prompt / llama_server_args.<参数名>", file=sys.stderr)
                 return 1
             if key == "selected_model" and value not in cfg.get("model_choices", {}):
                 print(f"Error: 未知的 model key: {value}（可用: {', '.join(cfg.get('model_choices', {}).keys())}）", file=sys.stderr)
@@ -643,6 +847,9 @@ def main(argv: list[str] | None = None) -> int:
         print(args.echo)
         return 0
 
+    # 无参数：交互终端（含打包 exe 双击启动）进入终端菜单；非交互保持原行为
+    if getattr(sys.stdin, "isatty", lambda: False)():
+        return _run_menu(name, version)
     print(f"{name} {version} — nothing to do")
     return 0
 
