@@ -4,51 +4,346 @@
   "model_choices": {
     "HY": {
       "name": "huiyuan/HunyuanOCR.BF16.gguf",
-      "mmproj": "huiyuan/HunyuanOCR.mmproj-bf16.gguf"
+      "mmproj": "huiyuan/HunyuanOCR.mmproj-bf16.gguf",
+      "workers": 2
     },
     "QWEN.8": {
       "name": "qwen3.5/Qwen3.5-0.8B-Q8_0.gguf",
-      "mmproj": "qwen3.5/0.8b_mmproj-F16.gguf"
+      "mmproj": "qwen3.5/0.8b_mmproj-F16.gguf",
+      "workers": 6
     },
     "QWEN2": {
       "name": "qwen3.5/Qwen3.5-2B-Q8_0.gguf",
-      "mmproj": "qwen3.5/2b_mmproj-F16.gguf"
+      "mmproj": "qwen3.5/2b_mmproj-F16.gguf",
+      "workers": 4
     },
     "QWEN4": {
       "name": "qwen3.5/Qwen3.5-4B-Q8_0.gguf",
-      "mmproj": "qwen3.5/4b_mmproj-F16.gguf"
+      "mmproj": "qwen3.5/4b_mmproj-F16.gguf",
+      "workers": 3
     },
     "PD": {
       "name": "paddleocr/PaddleOCR-VL-1.6-GGUF.gguf",
-      "mmproj": "paddleocr/PaddleOCR-VL-1.6-GGUF-mmproj.gguf"
+      "mmproj": "paddleocr/PaddleOCR-VL-1.6-GGUF-mmproj.gguf",
+      "workers": 4
     },
     "ULQ8": {
       "name": "Unlimited/Unlimited-OCR-Q8_0.gguf",
-      "mmproj": "Unlimited/mmproj-Unlimited-OCR-F16.gguf"
+      "mmproj": "Unlimited/mmproj-Unlimited-OCR-F16.gguf",
+      "workers": 3
     },
     "ULQ4": {
       "name": "Unlimited/Unlimited-OCR-Q4_K_S.gguf",
-      "mmproj": "Unlimited/mmproj-Unlimited-OCR-F16.gguf"
+      "mmproj": "Unlimited/mmproj-Unlimited-OCR-F16.gguf",
+      "workers": 5
     },
     "DOTS4": {
       "name": "dots/dots.ocr.IQ4_XS.gguf",
-      "mmproj": "dots/dots.ocr.mmproj-Q8_0.gguf"
+      "mmproj": "dots/dots.ocr.mmproj-Q8_0.gguf",
+      "workers": 5
     },
     "DOTS8": {
       "name": "dots/dots.ocr.Q8_0.gguf",
-      "mmproj": "dots/dots.ocr.mmproj-Q8_0.gguf"
+      "mmproj": "dots/dots.ocr.mmproj-Q8_0.gguf",
+      "workers": 4
     }
   },
   "selected_model": "DOTS4",
-  "ocr_prompt": "请逐行完整识别图片中的全部文字，逐字输出，不得遗漏任何内容、不得省略、不得总结、不得翻译",
+  "ocr_prompt": "OCR this image,Output the original text in its original format without any missing or omitted characters. Reply in Simplified Chinese",
   "llama_server_args": {
     "host": "127.0.0.1",
     "port": "8080",
     "temperature": "0",
     "repeat_penalty": "1.1",
-    "parallel": "11",
+    "parallel": "6",
     "cache_type_k": "q8_0",
     "cache_type_v": "q8_0",
-    "log_verbosity": "0"
+    "log_verbosity": "0",
+    "max_tokens": "8192"
+  },
+  "proofread": {
+    "similarity_min": 0.67,
+    "score_min": 0.4,
+    "max_cand_cache": 2000,
+    "max_replacement_combinations": 20,
+    "auto_fix_score": 0.85,
+    "enable_llm": false,
+    "enable_legacy_rules": false,
+    "llm_model": "QWEN.8",
+    "llm_timeout": 3
+  },
+  "engine": "llama",
+  "vllm_server": "",
+  "vllm_server_args": {
+    "host": "127.0.0.1",
+    "port": "8000",
+    "omni": "1",
+    "trust_remote_code": "1",
+    "served_model_name": "",
+    "max_model_len": "",
+    "gpu_memory_utilization": "",
+    "limit_mm_per_prompt": "",
+    "chat_template": "",
+    "mm_proj_config": "",
+    "mm_processor_config": "",
+    "deploy_config": "",
+    "extra_args": ""
+  },
+  "shortcuts": {
+    "bold": "Ctrl+B",
+    "italic": "Ctrl+I",
+    "heading": "Ctrl+1",
+    "p": "Ctrl+2",
+    "note": "Ctrl+Shift+N",
+    "align_left": "Ctrl+ArrowLeft",
+    "align_center": "Ctrl+ArrowUp",
+    "align_right": "Ctrl+ArrowRight",
+    "marker_full": "Ctrl+Shift+F",
+    "marker_note": "Ctrl+Shift+M",
+    "marker_join": "Ctrl+Shift+J",
+    "marker_page": "Ctrl+Shift+P",
+    "search": "Ctrl+F",
+    "clean": "Ctrl+Shift+C",
+    "convert_t2s": "Ctrl+Shift+T",
+    "convert_s2t": "Ctrl+Shift+Y",
+    "toggle_md": "Ctrl+Shift+D",
+    "undo": "Ctrl+Z",
+    "redo": "Ctrl+Y",
+    "history": "Ctrl+H",
+    "export": "Ctrl+E",
+    "save": "Ctrl+S",
+    "stage": "Ctrl+Shift+S",
+    "finish": "Ctrl+Enter",
+    "jump": "Ctrl+G",
+    "help": "F1",
+    "settings": "Ctrl+Shift+O",
+    "proofread_correct": "Ctrl+K",
+    "proofread_reocr": "Ctrl+Shift+R",
+    "proofread_apply": "Ctrl+Shift+A",
+    "proofread_clear": "Ctrl+Shift+X",
+    "proofread_revert": "Ctrl+Shift+Z",
+    "proofread_accept": "Shift+ArrowUp",
+    "proofread_ignore": "Shift+ArrowDown"
+  },
+  "format_rules": [
+    {
+      "id": "7305745e793b4233b216be614aa1a779",
+      "name": "合段",
+      "mode": "first",
+      "conditions": [
+        {
+          "type": "contains",
+          "pattern": "",
+          "scope": "selection",
+          "formats": [
+            "merge"
+          ],
+          "target": "match"
+        }
+      ]
+    },
+    {
+      "id": "b25f9eb73beb450b8edfe9c14d389772",
+      "name": "中粗",
+      "mode": "first",
+      "conditions": [
+        {
+          "type": "regex",
+          "pattern": "[\\s\\S]*",
+          "scope": "paragraph",
+          "formats": [
+            "bold",
+            "align_center",
+            "p"
+          ],
+          "target": "match"
+        }
+      ]
+    },
+    {
+      "id": "5b2211ac296541919e7d7ddd76537982",
+      "name": "模板：标-注2",
+      "mode": "first",
+      "conditions": [
+        {
+          "type": "regex",
+          "pattern": "([\\s\\S]*)([\\(（]\\s*.+\\s*年\\s*.+\\s*月[\\s\\S]*?[\\）)])([\\s\\S]*?)(毛\\s*泽\\s*东[\\s\\S]*刊\\s*印[\\s\\S]*?)?(注[\\s]*释)([\\s\\S]*)",
+          "scope": "page",
+          "formats": [],
+          "target": "match",
+          "group_formats": [
+            [
+              "heading1",
+              "merge"
+            ],
+            [
+              "align_center",
+              "p"
+            ],
+            [
+              "p"
+            ],
+            [
+              "align_right",
+              "p"
+            ],
+            [
+              "bold",
+              "align_left",
+              "p"
+            ],
+            [
+              "note"
+            ],
+            [
+              "note"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "6dfb153a44aa4d90875c2683fd4795c0",
+      "name": "模板：标",
+      "mode": "first",
+      "conditions": [
+        {
+          "type": "regex",
+          "pattern": "([\\s\\S]*)([\\(（]\\s*.+\\s*年\\s*.+\\s*月[\\s\\S]*?[\\）)])([\\s\\S]*)",
+          "scope": "page",
+          "formats": [],
+          "target": "match",
+          "group_formats": [
+            [
+              "heading1"
+            ],
+            [
+              "no_bold",
+              "align_center",
+              "p"
+            ],
+            [
+              "no_bold",
+              "p"
+            ],
+            [
+              "no_bold",
+              "align_right",
+              "p"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "288e2a3d0eb84c8da54fcac200610585",
+      "name": "模板：注",
+      "mode": "first",
+      "conditions": [
+        {
+          "type": "regex",
+          "pattern": "(毛\\s*泽\\s*东[\\s\\S]*刊\\s*印[\\s\\S]*?)?(注[\\s]*释)([\\s\\S]*)",
+          "scope": "page",
+          "formats": [],
+          "target": "match",
+          "group_formats": [
+            [
+              "no_bold",
+              "align_right",
+              "p"
+            ],
+            [
+              "bold",
+              "align_left",
+              "p"
+            ],
+            [
+              "no_bold",
+              "note"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "27f5fd2ccab2466dbdb9063d0a3ce117",
+      "name": "正文",
+      "mode": "first",
+      "conditions": [
+        {
+          "type": "contains",
+          "pattern": "",
+          "scope": "page",
+          "formats": [
+            "no_bold",
+            "p"
+          ],
+          "target": "match"
+        }
+      ]
+    },
+    {
+      "id": "cb9a2f170f17426fb6d694c04c7d1fca",
+      "name": "注释",
+      "mode": "first",
+      "conditions": [
+        {
+          "type": "regex",
+          "pattern": "[\\s\\S]*",
+          "scope": "page",
+          "formats": [
+            "no_bold",
+            "note"
+          ],
+          "target": "match"
+        }
+      ]
+    },
+    {
+      "id": "bbbf3e31f1e5478795b9a1f03068d078",
+      "name": "模板：标-注",
+      "mode": "first",
+      "conditions": [
+        {
+          "type": "regex",
+          "pattern": "([\\s\\S]*)([\\(（]\\s*.+\\s*年\\s*.+\\s*月\\s*(?:.+\\s*日)?\\s*[\\）)])([\\s\\S]*?)(注[\\s]*释)([\\s\\S]*)",
+          "scope": "page",
+          "formats": [],
+          "target": "match",
+          "group_formats": [
+            [
+              "heading1",
+              "merge"
+            ],
+            [
+              "no_bold",
+              "align_center",
+              "p"
+            ],
+            [
+              "no_bold",
+              "p"
+            ],
+            [
+              "bold",
+              "p"
+            ],
+            [
+              "no_bold",
+              "note"
+            ],
+            [
+              "note"
+            ]
+          ]
+        }
+      ]
+    }
+  ],
+  "fonts": {
+    "body": "serif",
+    "heading": "sans-serif",
+    "note": "serif",
+    "citation": "cursive"
   }
 }

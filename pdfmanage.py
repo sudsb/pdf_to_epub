@@ -1,14 +1,12 @@
-from pathlib import Path
-from typing import List, Tuple
 import base64
 import hashlib
 import json
+import os
 import tempfile
 import threading
-import os
-from typing import Optional, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from multiprocessing import Pool, cpu_count
+from pathlib import Path
 
 
 # 检测路径的文件夹是否存在
@@ -83,8 +81,8 @@ def _find_existing_split(
     pdf_path: Path | str,
     dpi: int,
     fmt: str,
-    pdf_hash: Optional[str] = None,
-) -> Optional[Tuple[Path, List[Path]]]:
+    pdf_hash: str | None = None,
+) -> tuple[Path, list[Path]] | None:
     """查找同一 PDF（内容哈希一致）且同一 dpi/fmt 的已分割图片目录。
 
     命中条件：目录内有 .ptoe_split.json 标记，pdf_hash/dpi/fmt 全部一致，
@@ -134,7 +132,7 @@ def _write_split_marker(
     dpi: int,
     fmt: str,
     pages: int,
-    pdf_hash: Optional[str] = None,
+    pdf_hash: str | None = None,
 ) -> None:
     """在分割目录写标记（下次相同输入直接复用）。写入失败不影响主流程。"""
     try:
@@ -151,9 +149,55 @@ def _write_split_marker(
         pass
 
 
+# 多进程渲染阈值：页数低于此值直接顺序渲染（spawn 开销 > 并行收益）
+# 调低阈值以更早启用并行渲染，提升中小型 PDF 的分割速度
+_PARALLEL_PAGE_THRESHOLD = 8
+# 最大并行 worker 数（Windows spawn 开销约 0.1s/worker，不宜过多）
+# 根据 CPU 核心数动态调整，至少保留 4 个 worker 保证并发度
+_MAX_WORKERS = max(4, (os.cpu_count() or 1) - 1)
+
+
+def _render_page_range(args: tuple) -> list[dict]:
+    """多进程 worker：渲染指定页范围，返回 [{page, path, error}, ...]。
+
+    每个 worker 独立 fitz.open() 打开 PDF（PyMuPDF 非线程安全，
+    不同进程必须各自持有独立 Document 对象）。
+    """
+    pdf_path, start, end, out_dir, dpi, fmt, mat_scale = args
+    import fitz  # 每个子进程延迟导入
+
+    results: list[dict] = []
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as exc:
+        for i in range(start, end):
+            results.append({"page": i, "path": None, "error": str(exc)})
+        return results
+
+    try:
+        mat = fitz.Matrix(mat_scale, mat_scale)
+        for i in range(start, end):
+            page_num = i + 1  # 1-based
+            try:
+                pix = doc[i].get_pixmap(matrix=mat, alpha=False)
+                filename = f"{page_num}.{fmt}"
+                out_path = os.path.join(out_dir, filename)
+                if fmt.lower() in ("jpg", "jpeg"):
+                    pix.save(out_path, jpg_quality=100)
+                else:
+                    pix.save(out_path)
+                results.append({"page": page_num, "path": out_path, "error": None})
+            except Exception as exc:
+                results.append({"page": page_num, "path": None, "error": str(exc)})
+    finally:
+        doc.close()
+
+    return results
+
+
 def split_pdf_to_images(
     pdf_path: Path | str, *, dpi: int = 200, fmt: str = "png"
-) -> Tuple[Path, List[Path]]:
+) -> tuple[Path, list[Path]]:
     """Split a PDF into per-page images.
 
     Args:
@@ -205,23 +249,86 @@ def split_pdf_to_images(
                     "PDF is encrypted and cannot be opened without a password"
                 )
 
+        total_pages = doc.page_count
         out_dir = createdic(p.stem)
-        mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
-        out_paths: List[Path] = []
-        for i, page in enumerate(doc, start=1):
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            filename = f"{i}.{fmt}"
-            out_path = out_dir / filename
-            if fmt.lower() in ("jpg", "jpeg"):
-                pix.save(str(out_path), jpg_quality=100)
-            else:
-                pix.save(str(out_path))
-            out_paths.append(out_path)
+        mat_scale = dpi / 72.0
+
+        # 多进程渲染：页数足够时按页范围分片并行（PyMuPDF 非线程安全，
+        # 必须用多进程，每个子进程独立 fitz.open()）
+        if total_pages >= _PARALLEL_PAGE_THRESHOLD:
+            n_workers = min(cpu_count(), _MAX_WORKERS, total_pages)
+            seg_size = (total_pages + n_workers - 1) // n_workers
+            chunks = []
+            for w in range(n_workers):
+                seg_start = w * seg_size
+                seg_end = min(seg_start + seg_size, total_pages)
+                if seg_start >= seg_end:
+                    break
+                chunks.append((str(p), seg_start, seg_end, str(out_dir), dpi, fmt, mat_scale))
+            # 先关闭父进程 doc，子进程各自打开
+            doc.close()
+            doc = None
+            print(f"      多进程渲染：{total_pages} 页 / {len(chunks)} worker")
+
+            with Pool(processes=len(chunks)) as pool:
+                chunk_results = pool.map(_render_page_range, chunks)
+
+            # 按页码排序合并结果
+            all_results = []
+            for chunk in chunk_results:
+                all_results.extend(chunk)
+            all_results.sort(key=lambda r: r["page"])
+
+            errors = []
+            out_paths = []
+            for r in all_results:
+                if r["error"]:
+                    errors.append(f"页 {r['page']}: {r['error']}")
+                else:
+                    out_paths.append(Path(r["path"]))
+            if errors:
+                print(f"      {len(errors)} 页渲染失败：{'; '.join(errors[:5])}")
+        else:
+            # 少量页使用 ThreadPoolExecutor 并行渲染（PyMuPDF 在 get_pixmap 时释放 GIL，
+            # 线程可提供真正的并行性，避免多进程 spawn 开销）
+            mat = fitz.Matrix(mat_scale, mat_scale)
+            out_paths = [None] * total_pages
+
+            def _render_one(i_page):
+                i, page = i_page
+                try:
+                    pix = page.get_pixmap(matrix=mat, alpha=False)
+                    filename = f"{i}.{fmt}"
+                    out_path = out_dir / filename
+                    if fmt.lower() in ("jpg", "jpeg"):
+                        pix.save(str(out_path), jpg_quality=100)
+                    else:
+                        pix.save(str(out_path))
+                    return i, out_path, None
+                except Exception as exc:
+                    return i, None, str(exc)
+
+            # 使用线程池，worker 数不超过页面数和 CPU 核心数
+            max_workers = min(total_pages, max(2, (os.cpu_count() or 1) - 1))
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = [ex.submit(_render_one, (i, page)) for i, page in enumerate(doc, start=1)]
+                for fut in as_completed(futures):
+                    i, out_path, err = fut.result()
+                    if err:
+                        print(f"      页 {i} 渲染失败：{err}")
+                    else:
+                        out_paths[i - 1] = out_path
+
+            # 过滤掉失败的页
+            out_paths = [p for p in out_paths if p is not None]
 
         _write_split_marker(out_dir, p, dpi, fmt, len(out_paths), pdf_hash=pdf_hash)
         return out_dir, out_paths
     finally:
-        doc.close()
+        if doc is not None:
+            doc.close()
+
+
 class ImageItem:
     """Represents an image file and its base64 representation.
 
@@ -229,15 +336,21 @@ class ImageItem:
     keeping very large strings in memory. Set store_in_memory=True to keep the
     base64 string in RAM (faster, higher memory usage).
     """
-    def __init__(self, path: Path | str, store_in_memory: bool = False, temp_dir: Optional[str] = None):
+
+    def __init__(
+        self,
+        path: Path | str,
+        store_in_memory: bool = False,
+        temp_dir: str | None = None,
+    ):
         self.path = Path(path)
         self.store_in_memory = store_in_memory
-        self.base64_str: Optional[str] = None
-        self.base64_file: Optional[Path] = None
-        self.error: Optional[str] = None
+        self.base64_str: str | None = None
+        self.base64_file: Path | None = None
+        self.error: str | None = None
         self._temp_dir = temp_dir
 
-    def encode_base64(self) -> Optional[str]:
+    def encode_base64(self) -> str | None:
         """Encode the image file to base64 and store result according to configuration.
         Returns the base64 string on success, or None on error.
         """
@@ -249,22 +362,24 @@ class ImageItem:
             if self.base64_file is not None and self.base64_file.exists():
                 if self.base64_str is not None:
                     return self.base64_str
-                with open(self.base64_file, 'r', encoding='utf-8') as f:
+                with open(self.base64_file, "r", encoding="utf-8") as f:
                     b64 = f.read()
                 if self.store_in_memory:
                     self.base64_str = b64
                 return b64
 
             # read raw bytes and encode
-            with open(self.path, 'rb') as f:
+            with open(self.path, "rb") as f:
                 data = f.read()
-            b64 = base64.b64encode(data).decode('ascii')
+            b64 = base64.b64encode(data).decode("ascii")
             if self.store_in_memory:
                 self.base64_str = b64
             else:
-                fd, tmp = tempfile.mkstemp(prefix='img_b64_', suffix='.b64', dir=self._temp_dir)
+                fd, tmp = tempfile.mkstemp(
+                    prefix="img_b64_", suffix=".b64", dir=self._temp_dir
+                )
                 try:
-                    with os.fdopen(fd, 'w', encoding='utf-8') as tf:
+                    with os.fdopen(fd, "w", encoding="utf-8") as tf:
                         tf.write(b64)
                     self.base64_file = Path(tmp)
                 except Exception:
@@ -278,12 +393,12 @@ class ImageItem:
             self.error = str(e)
             return None
 
-    def get_base64(self) -> Optional[str]:
+    def get_base64(self) -> str | None:
         """Return the base64 string, encoding it if necessary."""
         if self.base64_str is not None:
             return self.base64_str
         if self.base64_file is not None and self.base64_file.exists():
-            with open(self.base64_file, 'r', encoding='utf-8') as f:
+            with open(self.base64_file, "r", encoding="utf-8") as f:
                 self.base64_str = f.read()
             return self.base64_str
         return self.encode_base64()
@@ -305,22 +420,27 @@ class ImageQueue:
     The queue supports preloading (encoding) all images ahead of time so
     downstream consumers don't need to perform conversion during requests.
     """
-    def __init__(self, store_in_memory: bool = False, temp_dir: Optional[str] = None):
-        self._queue: List[ImageItem] = []
+
+    def __init__(self, store_in_memory: bool = False, temp_dir: str | None = None):
+        self._queue: list[ImageItem] = []
         self._lock = threading.Lock()
         self.store_in_memory = store_in_memory
         self.temp_dir = temp_dir
 
     def add(self, image_path: Path | str, encode: bool = False) -> ImageItem:
-        item = ImageItem(image_path, store_in_memory=self.store_in_memory, temp_dir=self.temp_dir)
+        item = ImageItem(
+            image_path, store_in_memory=self.store_in_memory, temp_dir=self.temp_dir
+        )
         if encode:
             item.encode_base64()
         with self._lock:
             self._queue.append(item)
         return item
 
-    def add_many(self, paths: List[Path | str], encode: bool = False, max_workers: int = 4) -> List[ImageItem]:
-        items: List[ImageItem] = []
+    def add_many(
+        self, paths: list[Path | str], encode: bool = False, max_workers: int = 4
+    ) -> list[ImageItem]:
+        items: list[ImageItem] = []
         for p in paths:
             items.append(self.add(p, encode=False))
         if encode:
@@ -330,7 +450,12 @@ class ImageQueue:
     def preload_all(self, max_workers: int = 4) -> None:
         """Encode all queued images concurrently. Errors are recorded on items."""
         with self._lock:
-            items = [it for it in self._queue if it.base64_str is None and (it.base64_file is None or not it.base64_file.exists())]
+            items = [
+                it
+                for it in self._queue
+                if it.base64_str is None
+                and (it.base64_file is None or not it.base64_file.exists())
+            ]
         if not items:
             return
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -342,7 +467,7 @@ class ImageQueue:
                     # individual item records error
                     pass
 
-    def get_next(self, as_base64: bool = True) -> Optional[object]:
+    def get_next(self, as_base64: bool = True) -> object | None:
         """Pop next image. If as_base64 True return base64 string, else ImageItem."""
         with self._lock:
             if not self._queue:
@@ -352,7 +477,7 @@ class ImageQueue:
             return item.get_base64()
         return item
 
-    def peek(self) -> Optional[ImageItem]:
+    def peek(self) -> ImageItem | None:
         with self._lock:
             return self._queue[0] if self._queue else None
 
@@ -369,5 +494,11 @@ class ImageQueue:
                 it.clear()
 
 
-
-__all__ = ["cpath", "createdic", "is_pdf_file", "split_pdf_to_images", "ImageItem", "ImageQueue"]
+__all__ = [
+    "ImageItem",
+    "ImageQueue",
+    "cpath",
+    "createdic",
+    "is_pdf_file",
+    "split_pdf_to_images",
+]

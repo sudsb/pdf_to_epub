@@ -1,4 +1,4 @@
-# pack.ps1 — 用 PyInstaller 把 mian.py 打包成单个独立 exe（dist\ptoe.exe）。
+﻿# pack.ps1 — 用 PyInstaller 把 mian.py 打包成单个独立 exe（dist\ptoe.exe）。
 #
 # 产物特点：
 #   - onefile：单文件 exe，无需 Python 环境即可运行
@@ -18,11 +18,13 @@ Set-Location -LiteralPath $PSScriptRoot
 
 Write-Host "==> 构建 dist\ptoe.exe（PyInstaller onefile / console）..." -ForegroundColor Cyan
 
+# 2026-08 词典数据（形近/同音/通用词表）随 --add-data "dicts;dicts" 打包
 uv run --with pyinstaller pyinstaller --noconfirm --clean `
   --onefile --console `
   --noupx `
   --name ptoe `
   --add-data "pyproject.toml;." `
+  --add-data "dicts;dicts" `
   --collect-all pymupdf `
   mian.py
 

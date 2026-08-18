@@ -99,44 +99,120 @@ def _atomic_write_json(path: str, obj: dict) -> None:
 DEFAULT_CONFIG = {
     "llama_server": "E:/xox/Tools/llama-c/llama-server.exe",
     "models_dir": "E:/xox/Tools/llama-c/models",
+    # 各模型推荐 OCR 并发（workers，可选）：batch_infer 未显式指定并发时按此
+    # 值运行（--workers 或 GUI 转换页显式指定则覆盖）。依据模型大小/量化选择：
+    # 大模型（HY BF16）显存压力大，并发过高会让多槽位 KV 缓存溢出到 CPU、
+    # 单张耗时反而大涨，宜 2-3；小模型（0.8B）显存占用小，可 6+。设置页
+    # 「模型管理」表格可逐模型调整。
     "model_choices": {
-        "HY": {"name": "HunyuanOCR.BF16.gguf", "mmproj": "HunyuanOCR.mmproj-bf16.gguf"},
-        "QWEN.8": {"name": "Qwen3.5-0.8B-Q8_0.gguf", "mmproj": "0.8b_mmproj-F16.gguf"},
-        "QWEN2": {"name": "Qwen3.5-2B-Q8_0.gguf", "mmproj": "2b_mmproj-F16.gguf"},
-        "QWEN4": {"name": "Qwen3.5-4B-Q8_0.gguf", "mmproj": "4b_mmproj-F16.gguf"},
+        "HY": {
+            "name": "HunyuanOCR.BF16.gguf",
+            "mmproj": "HunyuanOCR.mmproj-bf16.gguf",
+            "workers": 2,
+        },
+        "QWEN.8": {
+            "name": "Qwen3.5-0.8B-Q8_0.gguf",
+            "mmproj": "0.8b_mmproj-F16.gguf",
+            "workers": 6,
+        },
+        "QWEN2": {
+            "name": "Qwen3.5-2B-Q8_0.gguf",
+            "mmproj": "2b_mmproj-F16.gguf",
+            "workers": 4,
+        },
+        "QWEN4": {
+            "name": "Qwen3.5-4B-Q8_0.gguf",
+            "mmproj": "4b_mmproj-F16.gguf",
+            "workers": 3,
+        },
         "PD": {
             "name": "PaddleOCR-VL-1.6-GGUF.gguf",
             "mmproj": "PaddleOCR-VL-1.6-GGUF-mmproj.gguf",
+            "workers": 4,
         },
         "ULQ8": {
             "name": "Unlimited-OCR-Q8_0.gguf",
             "mmproj": "mmproj-Unlimited-OCR-F16.gguf",
+            "workers": 3,
         },
         "ULQ4": {
             "name": "Unlimited-OCR-Q4_K_S.gguf",
             "mmproj": "mmproj-Unlimited-OCR-F16.gguf",
+            "workers": 5,
         },
     },
-    "selected_model": "HY",
-    # OCR 提示词：与 llamamanage.OCR_PROMPT 保持一致，作为 config.json 缺失时的
-    # 兜底种子（首次加载会写入 config.json，之后以配置值为准）。
-    "ocr_prompt": "请逐行完整识别图片中的全部文字，逐字输出，不得遗漏任何内容、不得省略、不得总结、不得翻译",
-    # llama-server 启动参数：镜像 runserver() 当前硬编码参数（值以字符串存储，
-    # 原样传给 subprocess）。n_gpu_layers 不在此默认值中（保持自动检测）；
+        "proofread": {
+            "similarity_min": 0.6,
+            "score_min": 0.4,
+            "max_cand_cache": 2000,
+            # LLM-assisted proofreading (disabled by default). UI toggle stored in browser localStorage;
+            # when enabled the client sends use_llm=true and optional llm_model override.
+            "enable_llm": False,
+            # 原有规则开关（2026-08-09）：False（默认）时「校正」只跑三条新规则
+            # （连续重复 / 连续标点 / 中文中的连续字母）；True 时额外跑半角转全角、
+            # 引号配对、混淆表、词典滑窗四条原有规则。经 /api/proofread_settings 读写。
+            "enable_legacy_rules": False,
+            "llm_model": "qwen2b",
+            "llm_timeout": 3
+        },
     # 若用户配置里显式给出 n_gpu_layers 键，则覆盖自动探测。
     "llama_server_args": {
         "host": "127.0.0.1",
         "port": "8080",
         "temperature": "0",
         "repeat_penalty": "1.1",
-        "parallel": "11",
+        # parallel（槽位数）：KV cache 总量 ≈ ctx × parallel，槽位多于实际并发
+        # 只会浪费显存（溢出到 CPU 时单页反而变慢）。默认 4 匹配常见并发；
+        # 流程运行时 runserver 还会按实际 workers 取 min 自适应（见 llamamanage）。
+        "parallel": "4",
         "cache_type_k": "q8_0",
         "cache_type_v": "q8_0",
         "log_verbosity": "0",
+        # max_tokens 保留：请求级 MAX_TOKENS 上限（OCR 单页输出远小于此值）。
+        # ngram_size/window_size 已移除：纯启动参数，部分 llama-server 构建不支持
+        # （如 llama13 会因 --ngram-size/--window-size 直接退出），且对 OCR 无增益。
+        # flash_attn 可选："0"/false 禁用、空/缺省自动、非 0（如 "1"/"on"）强制开启
+        # GPU 下的 Flash Attention（新构建默认 auto：CUDA 支持时自动开启；
+        # 老构建自动附加裸 --flash-attn）。
+        "max_tokens": "8192",   # per-request max token cap (also passed to llama-server via --max-tokens)
+    },
+    # 推理引擎选择：'llama'（llama.cpp，默认）| 'vllm'（vLLM-Omni）
+    "engine": "llama",
+    # vLLM-Omni 可执行文件路径（如 "vllm" 或绝对路径）；空 = 仅连接模式
+    # （vLLM-Omni 官方仅支持 Linux，Windows 用户可在 WSL2/远程手动启动后连接）
+    "vllm_server": "",
+    # vllm serve 启动参数（键 → --kebab-case 标志；"1"/"true"/"yes" → 裸标志；
+    # extra_args 为原始字符串，shlex 切分后原样追加）
+    "vllm_server_args": {
+        "host": "127.0.0.1",
+        "port": "8000",
+        "omni": "1",
+        "trust_remote_code": "1",
+        "served_model_name": "",
+        "max_model_len": "",
+        "gpu_memory_utilization": "",
+        "limit_mm_per_prompt": "",
+        "chat_template": "",
+        "mm_proj_config": "",
+        "mm_processor_config": "",
+        "deploy_config": "",
+        "extra_args": "",
+    },
+    # 矫正界面快捷键绑定（op -> 组合键字符串）。随机端口下 localStorage 每次运行失效，
+    # 故持久化到 config.json（经 /api/shortcuts GET/POST 读写）。
+    "shortcuts": {},
+    # 矫正界面格式规则（弹窗管理）：新模型每条 {id, name, mode(first|all), conditions:[{type, pattern, scope, formats}]}；
+    # 旧模型 {id, name, formats, condition, else_formats} 读取时由 correctmanage._validate_format_rules 迁移
+    "format_rules": [],
+    # 字体设置（2026-08）：正文/标题/注释/引用 独立字体，供 CSS 变量使用
+    "fonts": {
+        "body": "serif",
+        "heading": "sans-serif",
+        "note": "serif",
+        "citation": "cursive"
     },
     # 可拓展其余各manage/key conf
 }
-
 
 def validate_and_patch_config(cfg):
     """确保返回的配置dict所有字段完整，无则回补DEFAULT_CONFIG."""
@@ -283,6 +359,179 @@ def set_llama_server_arg(name: str, value) -> dict:
             return cfg
         except Exception as e:
             print(f"[config] Error updating llama_server_args, fallback to default: {e}")
+            cfg = DEFAULT_CONFIG.copy()
+            with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            return cfg
+
+
+def set_vllm_server_arg(name: str, value) -> dict:
+    """设置 vLLM-Omni 启动参数（嵌套键 vllm_server_args.<name>）并持久化。
+
+    与 set_llama_server_arg 同构：锁内读配置、确保 vllm_server_args 存在、
+    改值、校验、原子写回，返回新配置。线程安全。
+    """
+    with _CFG_LOCK:
+        try:
+            if os.path.exists(_CONFIG_PATH):
+                with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            else:
+                cfg = DEFAULT_CONFIG.copy()
+            if not isinstance(cfg.get("vllm_server_args"), dict):
+                cfg["vllm_server_args"] = dict(
+                    DEFAULT_CONFIG.get("vllm_server_args", {})
+                )
+            cfg["vllm_server_args"][name] = value
+            cfg = validate_and_patch_config(cfg)
+            _atomic_write_json(_CONFIG_PATH, cfg)
+            return cfg
+        except Exception as e:
+            print(f"[config] Error updating vllm_server_args, fallback to default: {e}")
+            cfg = DEFAULT_CONFIG.copy()
+            with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            return cfg
+
+
+def set_proofread_param(name: str, value) -> dict:
+    """设置 proofread 嵌套配置（proofread.<name>），并持久化。
+
+    支持数值自动转换（整型/浮点），其余以字符串保存。
+    """
+    # try to coerce numeric values to int/float
+    v: object = value
+    try:
+        if isinstance(value, str) and value.isdigit():
+            v = int(value)
+        else:
+            if isinstance(value, str) and ("." in value or "e" in value.lower()):
+                v = float(value)
+    except Exception:
+        v = value
+
+    with _CFG_LOCK:
+        try:
+            if os.path.exists(_CONFIG_PATH):
+                with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            else:
+                cfg = DEFAULT_CONFIG.copy()
+            if not isinstance(cfg.get("proofread"), dict):
+                cfg["proofread"] = dict(DEFAULT_CONFIG.get("proofread", {}))
+            cfg["proofread"][name] = v
+            cfg = validate_and_patch_config(cfg)
+            _atomic_write_json(_CONFIG_PATH, cfg)
+            return cfg
+        except Exception as e:
+            print(f"[config] Error updating proofread param, fallback to default: {e}")
+            cfg = DEFAULT_CONFIG.copy()
+            with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            return cfg
+
+
+def set_format_rules(rules: list) -> dict:
+    """设置矫正界面格式规则（顶层键 format_rules）并持久化。
+
+    与 set_shortcuts 同构：锁内读配置、改值、校验、原子写回，返回新配置。
+    rules 必须是 list。新模型每项含 name / mode / conditions（conditions 为有序
+    条件列表，每项 {type, pattern, scope, formats}）；旧模型（formats /
+    condition / else_formats）原样保留，读取时由 correctmanage 迁移。
+    线程安全。
+    """
+    if not isinstance(rules, list):
+        raise ValueError("format_rules 必须是数组")
+    clean = []
+    for r in rules:
+        if not isinstance(r, dict):
+            continue
+        item = {
+            "id": str(r.get("id") or ""),
+            "name": str(r.get("name") or ""),
+        }
+        if "conditions" in r:
+            # 新模型：保留 mode + conditions（已由 correctmanage._validate_format_rules 清洗）
+            item["mode"] = str(r.get("mode") or "first")
+            item["conditions"] = []
+            for c in r.get("conditions"):
+                if not isinstance(c, dict):
+                    continue
+                cond_out: dict = {
+                    "type": str(c.get("type") or "contains"),
+                    "pattern": str(c.get("pattern") or ""),
+                    "scope": str(c.get("scope") or "selection"),
+                    "formats": [str(x) for x in (c.get("formats") or [])],
+                }
+                # target: 匹配对象/条件之前/条件之后/两条件之间
+                target = str(c.get("target") or "match")
+                if target not in ("match", "before", "after", "between"):
+                    target = "match"
+                cond_out["target"] = target
+                if target == "between":
+                    cond_out["between_end_pattern"] = str(c.get("between_end_pattern") or "")
+                # 正则条件可携带 group_formats：每个捕获组独立格式列表
+                gf = c.get("group_formats")
+                if isinstance(gf, list) and gf:
+                    cond_out["group_formats"] = [
+                        [str(x) for x in (sub if isinstance(sub, list) else [])]
+                        for sub in gf
+                    ]
+                item["conditions"].append(cond_out)
+        else:
+            # 旧模型：原样保留（读取时迁移）
+            item["formats"] = [str(x) for x in (r.get("formats") or [])]
+            item["condition"] = (
+                r.get("condition")
+                if isinstance(r.get("condition"), dict)
+                else {"enabled": False}
+            )
+            item["else_formats"] = [str(x) for x in (r.get("else_formats") or [])]
+        clean.append(item)
+    with _CFG_LOCK:
+        try:
+            if os.path.exists(_CONFIG_PATH):
+                with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            else:
+                cfg = DEFAULT_CONFIG.copy()
+            cfg["format_rules"] = clean
+            cfg = validate_and_patch_config(cfg)
+            _atomic_write_json(_CONFIG_PATH, cfg)
+            return cfg
+        except Exception as e:
+            print(f"[config] Error updating format_rules, fallback to default: {e}")
+            cfg = DEFAULT_CONFIG.copy()
+            with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            return cfg
+
+
+def set_shortcuts(shortcuts: dict) -> dict:
+    """设置矫正界面快捷键绑定（顶层键 shortcuts）并持久化。
+
+    与 set_proofread_param 同构：锁内读配置、改值、校验、原子写回，返回新配置。
+    仅在确有变更时写盘（快捷键设置页每次录制都会 POST，避免无谓磁盘写）。
+    线程安全。
+    """
+    if not isinstance(shortcuts, dict):
+        raise ValueError("shortcuts 必须是对象（op -> 组合键）")
+    clean = {str(k): ("" if v is None else str(v)) for k, v in shortcuts.items()}
+    with _CFG_LOCK:
+        try:
+            if os.path.exists(_CONFIG_PATH):
+                with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            else:
+                cfg = DEFAULT_CONFIG.copy()
+            before = cfg.get("shortcuts")
+            cfg["shortcuts"] = clean
+            cfg = validate_and_patch_config(cfg)
+            if before != clean:  # 无变更不写盘
+                _atomic_write_json(_CONFIG_PATH, cfg)
+            return cfg
+        except Exception as e:
+            print(f"[config] Error updating shortcuts, fallback to default: {e}")
             cfg = DEFAULT_CONFIG.copy()
             with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)

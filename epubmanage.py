@@ -20,7 +20,7 @@ import zipfile
 import uuid
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Tuple, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import quote as urlquote
 
 
@@ -84,6 +84,11 @@ class EPUBMetadata:
         if self.description:
             dc_desc = ET.SubElement(metadata, '{http://purl.org/dc/elements/1.1/}description')
             dc_desc.text = self.description
+        # EPUB 3.3 §5.4.1 要求：包文档必须包含恰好一个 dcterms:modified 元数据
+        # ——缺少时 Apple Books / Google Play 等阅读器会警告甚至拒绝打开
+        modified = ET.SubElement(metadata, '{http://www.idpf.org/2007/opf}meta')
+        modified.set('property', 'dcterms:modified')
+        modified.text = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         return metadata
 
 
@@ -199,8 +204,9 @@ class EPUBPacker:
         package.append(meta_el)
 
         manifest = ET.SubElement(package, 'manifest')
-        if not pkg_version.startswith('3'):
-            ET.SubElement(manifest, 'item', id='ncx', href='toc.ncx', **{'media-type': 'application/x-dtbncx+xml'})
+        # NCX 目录：EPUB2/EPUB3 均生成，给 Kindle 旧版 / ADE 2.0 等阅读器做
+        # 目录兜底（epubcheck 对 EPUB3 含 NCX 仅警告，不影响兼容性）
+        ET.SubElement(manifest, 'item', id='ncx', href='toc.ncx', **{'media-type': 'application/x-dtbncx+xml'})
 
         # Files are re-mapped into OEBPS/Text|Styles|Images by ResourceMapper, so the
         # EPUB3 nav entry must reference the mapped location: mark the matching item
@@ -212,14 +218,42 @@ class EPUBPacker:
                 item_attrs['properties'] = 'nav'
             ET.SubElement(manifest, 'item', id=f'item{i+1}', href=href, **item_attrs)
 
+        # 封面图片标记 properties="cover-image"（EPUB 3.3 §5.4.2）：解析 cover.xhtml
+        # 的 <img src="...">，给对应图片文件项加该属性，阅读器据此识别封面
+        cover_img_href = self._find_cover_image_href(manifest_items)
+        if cover_img_href:
+            for item in manifest.findall('item'):
+                if item.get('href') == cover_img_href:
+                    item.set('properties', 'cover-image')
+                    break
+
         # spine
         spine = ET.SubElement(package, 'spine')
-        if not pkg_version.startswith('3'):
-            spine.set('toc', 'ncx')
+        # NCX 目录引用：EPUB2/EPUB3 均设置，保证旧阅读器能跳转目录
+        spine.set('toc', 'ncx')
         for ref in spine_itemrefs:
             ET.SubElement(spine, 'itemref', idref=ref)
 
+        # 注册命名空间前缀，避免 ElementTree 输出 ns0:title 等无意义前缀
+        ET.register_namespace('dc', 'http://purl.org/dc/elements/1.1/')
+        ET.register_namespace('opf', 'http://www.idpf.org/2007/opf')
         return ET.tostring(package, encoding='unicode')
+
+    @staticmethod
+    def _find_cover_image_href(manifest_items: List[Tuple[str, str]]) -> Optional[str]:
+        """从 manifest 中定位封面图片的 href（解析 cover.xhtml 的 <img src>）。
+
+        cover.xhtml 由 htmlmanage 生成，src 为相对路径如 Images/img_1.png；
+        返回匹配的 manifest href，找不到返回 None。
+        """
+        # 找到 cover.xhtml 源文件路径（manifest_items 的 href 是映射后的 Text/cover.xhtml）
+        # 这里只能从 manifest 推断：封面图片通常是最先出现的 Images/ 项
+        # 更可靠的方式是在 pack() 阶段传入 cover 图片路径，此处做兜底：
+        # 返回第一个 Images/ 类型的 manifest href（封面图通常是第一张图）
+        for href, mtype in manifest_items:
+            if mtype.startswith('image/'):
+                return href
+        return None
 
     def generate_toc_ncx(self, metadata: EPUBMetadata, toc_items: List[Dict[str, str]]) -> str:
         # minimal NCX
@@ -283,30 +317,32 @@ class EPUBPacker:
             return None
 
         opf_content = self.generate_content_opf(metadata, manifest_items, [_resolve_id(r) or r for r in spine_order])
-        ncx_content = ''
-        if not str(self.epub_version).startswith('3'):
-            # toc.ncx lives at OEBPS/ root; its srcs must point at the mapped paths
-            mapped_toc = []
-            for it in toc_items:
-                href = it.get('href', '')
-                file_part, _, frag = href.partition('#')
-                base = os.path.basename(file_part)
-                mapped = next(
-                    (e.replace('\\', '/') for _s, e in manifest_sources if os.path.basename(e) == base),
-                    file_part,
-                )
-                mapped_toc.append({'title': it.get('title'), 'href': mapped + (f'#{frag}' if frag else '')})
-            ncx_content = self.generate_toc_ncx(metadata, mapped_toc)
+        # NCX 目录：EPUB2/EPUB3 均生成，给旧阅读器做目录兜底
+        # toc.ncx lives at OEBPS/ root; its srcs must point at the mapped paths
+        mapped_toc = []
+        for it in toc_items:
+            href = it.get('href', '')
+            file_part, _, frag = href.partition('#')
+            base = os.path.basename(file_part)
+            mapped = next(
+                (e.replace('\\', '/') for _s, e in manifest_sources if os.path.basename(e) == base),
+                file_part,
+            )
+            mapped_toc.append({'title': it.get('title'), 'href': mapped + (f'#{frag}' if frag else '')})
+        ncx_content = self.generate_toc_ncx(metadata, mapped_toc)
 
         # write into epub zip: mimetype (stored), then rest
         # open zipfile and write mimetype first uncompressed
-        with zipfile.ZipFile(self.epub_path, 'w') as zf:
+        with zipfile.ZipFile(self.epub_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=self.compression_level) as zf:
             # write mimetype
             zf.writestr('mimetype', self.generate_mimetype(), compress_type=zipfile.ZIP_STORED)
             # container.xml
             container_xml = self.generate_container_xml()
             zf.writestr('META-INF/container.xml', container_xml)
             # write all mapped resources streaming from disk
+            def _is_image_file(path: str) -> bool:
+                return path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg'))
+
             for src, epub_path in manifest_sources:
                 arcname = os.path.join('OEBPS', epub_path).replace('\\', '/')
                 if epub_path.lower().endswith(('.xhtml', '.html', '.htm')):
@@ -315,11 +351,15 @@ class EPUBPacker:
                     with open(src, 'r', encoding='utf-8') as f:
                         content = f.read()
                     zf.writestr(arcname, _rewrite_flat_refs(content))
+                elif _is_image_file(src):
+                    # Images already compressed; skip re-compression
+                    zf.write(src, arcname, compress_type=zipfile.ZIP_STORED)
                 else:
-                    zf.write(src, arcname)
+                    zip_type = zipfile.ZIP_STORED if _is_image_file(arcname) else zipfile.ZIP_DEFLATED
+                    zf.write(src, arcname, compress_type=zip_type)
             # write content.opf
             zf.writestr('OEBPS/content.opf', opf_content)
-            # write toc.ncx for EPUB2
+            # write toc.ncx（EPUB2/EPUB3 均写入，给旧阅读器做目录兜底）
             if ncx_content:
                 zf.writestr('OEBPS/toc.ncx', ncx_content)
         return self.epub_path
@@ -335,18 +375,18 @@ def pack_from_oebps(root_dir: str, epub_path: str, metadata: EPUBMetadata, epub_
         raise FileNotFoundError(f'OEBPS directory not found: {oebps}')
     files = sorted([f for f in os.listdir(oebps) if os.path.isfile(os.path.join(oebps, f))], key=_natural_key)
     cover = 'cover.xhtml' if 'cover.xhtml' in files else None
-    nav = 'nav.xhtml' if 'nav.xhtml' in files else None
     contents = [f for f in files if f.startswith('content_') and f.endswith('.xhtml')]
+    # nav.xhtml 不在 spine 中（2026-08-15）：正文不显示目录页，阅读器导航栏
+    # 经 manifest properties="nav" 仍可发现目录（EPUB 3.3 §7.3 MAY + RS §7 MUST）；
+    # title.xhtml 书名页已不再生成（书名保留在元数据与导航栏目录条目中）
     spine = []
     if cover:
         spine.append(os.path.join('OEBPS', cover))
-    if nav:
-        spine.append(os.path.join('OEBPS', nav))
     for c in contents:
         spine.append(os.path.join('OEBPS', c))
     if toc_items is None:
         toc_items = [{'title': os.path.splitext(os.path.basename(p))[0], 'href': os.path.relpath(p, 'OEBPS')} for p in spine]
-    packer = EPUBPacker(epub_path, root_dir, epub_version=epub_version)
+    packer = EPUBPacker(epub_path, root_dir, compression_level=6, epub_version=epub_version)
     return packer.pack(metadata, [os.path.relpath(s, 'OEBPS') for s in spine], toc_items)
 
 

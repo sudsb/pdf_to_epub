@@ -3,9 +3,10 @@
 CLI:
   python mian.py [--version]
   python mian.py -e TEXT
-  python mian.py epub <pdf> [--dpi 0] [--model HY] [--workers 3] [--thinking]
+  python mian.py epub <pdf> [--dpi 0] [--model HY] [--workers N] [--thinking]
                     [--title TITLE] [--author AUTHOR] [--lang zh-CN]
                     [--out-dir DIR] [--epub-path PATH] [--correct]
+  python mian.py stop [--engine llama|vllm]   # 停止推理服务（llama-server / vLLM-Omni，释放端口）
 
 --dpi 为档位（0-4）而非原始数值：0=100, 1=150, 2=200, 3=300, 4=600（默认 0）。
 --correct 开启手动矫正：在浏览器中逐页对照原图与识别文字（默认关闭）。
@@ -76,24 +77,29 @@ def _pdf_title(pdf: Path) -> str:
         return ""
 
 
-def _ensure_server(model_key: str) -> None:
-    """Start llama-server if it is not already answering on 127.0.0.1:8080."""
-    import requests
+def _ensure_server(model_key: str, workers: int | None = None) -> None:
+    """Start the configured inference engine if it is not already serving the model.
 
-    try:
-        resp = requests.get("http://127.0.0.1:8080/health", timeout=3)
-        if resp.status_code == 200:
-            print("      llama-server already running")
-            return
-    except Exception:
-        pass
-    print(f"      starting llama-server (model='{model_key}') ...")
+    workers：调用方已知的并发数，传给 runserver 用于 --parallel 自适应
+    （槽位不多于实际并发，避免 KV cache 浪费显存，见 llamamanage.runserver）。
+    """
+    from configmanage import get_config
+    from llamamanage import _probe_server, runserver
+
+    cfg = get_config(show_dialogs=False)
+    model_name = (
+        (cfg.get("model_choices") or {}).get(model_key, {}).get("name", model_key)
+        if isinstance(cfg.get("model_choices"), dict)
+        else model_key
+    )
+    if _probe_server(model_name) == "match":
+        print("      server already running with the requested model")
+        return
+    print(f"      starting server (model='{model_key}') ...")
     # import runserver lazily to avoid pull-in of requests when not needed
-    from llamamanage import runserver
-
-    if not runserver(model_key):
+    if not runserver(model_key, parallel=workers):
         raise RuntimeError(
-            "llama-server failed to start; check llama_server/models_dir in config.json"
+            "server failed to start; check engine/llama_server/vllm_server in config.json"
         )
 
 
@@ -233,12 +239,43 @@ def correct_pdf(
     return result
 
 
+# 各流程阶段的中文名（输出顺序 = 流水线顺序）；未执行的阶段不输出
+_STAGE_LABELS: List[tuple[str, str]] = [
+    ("split", "分割图片（含图片处理）"),
+    ("model", "模型启动"),
+    ("ocr", "文字识别"),
+    ("structure", "文字整理"),
+    ("correct", "矫正界面"),
+    ("render", "EPUB 生成"),
+    ("history", "历史记录保存"),
+]
+
+
+def _print_timing_summary(timings: Dict[str, float], *, ocr_pages: int) -> None:
+    """流程结束时输出各阶段总用时与总流程用时，并单独给出平均每页识别用时。
+
+    timings 键 = _STAGE_LABELS 各阶段 + "total"（总流程）；ocr_pages 为本次
+    实际识别的页数（断点续传时可能小于总页数，用于计算平均每页用时）。
+    """
+    print("\n—— 用时统计 ——")
+    for key, label in _STAGE_LABELS:
+        v = timings.get(key)
+        if v is not None:
+            print(f"  {label}：{v:.1f} 秒")
+    total = timings.get("total")
+    if total is not None:
+        print(f"  总流程：{total:.1f} 秒")
+    ocr = timings.get("ocr")
+    if ocr is not None and ocr_pages > 0:
+        print(f"  平均每页识别：{ocr / ocr_pages:.2f} 秒/页（本次共识别 {ocr_pages} 页）")
+
+
 def pdf_to_epub(
     pdf_path: str | Path,
     *,
     dpi: int = 100,
     model_key: str = "HY",
-    max_workers: int = 3,
+    max_workers: int | None = None,
     thinking: bool = False,
     timeout: int = REQUEST_TIMEOUT,
     title: str | None = None,
@@ -248,6 +285,7 @@ def pdf_to_epub(
     epub_path: str | Path | None = None,
     correct: bool = False,
     correct_idle_timeout: int = 600,
+    resume: str | None = None,
 ) -> dict:
     """Convert a PDF to EPUB by chaining the pipeline modules.
 
@@ -264,18 +302,98 @@ def pdf_to_epub(
 
     pdf_title = _pdf_title(pdf)
     t_start = time.perf_counter()
+    timings: Dict[str, float] = {}  # 各流程阶段用时（结束时统一输出）
 
     print(f"[1/4] Splitting PDF to images (dpi={dpi}) ...", end="", flush=True)
     t0 = time.perf_counter()
     img_dir, img_paths = split_pdf_to_images(pdf, dpi=dpi, fmt="png")
-    print(f" done in {time.perf_counter() - t0:.1f}s")
+    timings["split"] = time.perf_counter() - t0
+    print(f" done in {timings['split']:.1f}s")
     print(f"      {len(img_paths)} page(s) -> {img_dir}")
 
-    print(f"[2/4] OCR via llama-server (model='{model_key}', workers={max_workers}) ...", end="", flush=True)
+    print(f"[2/4] OCR via llama-server (model='{model_key}', workers={max_workers if max_workers else 'auto'}) ...", end="", flush=True)
     t0 = time.perf_counter()
-    _ensure_server(model_key)
     total_pages = len(img_paths)
     t_ocr = time.perf_counter()
+
+    # --- OCR 断点续传：检查上次进度，决定 全新/继续/直接转换/重来 ------------------
+    progress = _load_ocr_progress(img_dir)
+    resume_mode = "new"  # new | resume | convert | restart | abort
+    if (
+        progress
+        and str(progress.get("pdf") or "") == str(pdf.resolve())
+        and int(progress.get("total") or -1) == total_pages
+    ):
+        if resume == "restart":
+            resume_mode = "restart"
+        elif resume == "resume":
+            resume_mode = (
+                "convert" if progress.get("status") == "ocr_done" else "resume"
+            )
+        else:
+            resume_mode = _ask_ocr_resume(progress)
+    elif resume == "resume":
+        # resume 子命令但找不到进度：询问是否从头完整转换
+        ans = _ask("未找到可恢复的 OCR 进度，是否从头完整转换？(y/N)：")
+        if ans.lower() != "y":
+            print("已取消。")
+            return {"ok": False, "message": "cancelled", "epub_error": None}
+        resume_mode = "new"
+
+    if resume_mode == "abort":
+        print("已取消。")
+        return {"ok": False, "message": "cancelled", "epub_error": None}
+
+    cached: Dict[int, str] = {}  # 页码 -> 已识别文本（继续/转换时复用，不再请求）
+    if resume_mode == "restart":
+        _clear_ocr_progress(img_dir)
+        progress = None
+        resume_mode = "new"
+    elif resume_mode in ("resume", "convert"):
+        for k, v in (progress.get("pages") or {}).items():
+            try:
+                page_no = int(k)
+            except (TypeError, ValueError):
+                continue
+            if v.get("status") == "done" and v.get("result"):
+                cached[page_no] = v["result"]
+        if resume_mode == "convert" and len(cached) < total_pages:
+            print(
+                f"      ! 有 {total_pages - len(cached)} 页无缓存结果，将一并重新识别"
+            )
+
+    todo_images = [p for p in img_paths if _page_of(p) not in cached]
+
+    # 进度文件初始化：每页完成后写盘，中断不丢已完成页
+    if progress is None:
+        progress = {
+            "pdf": str(pdf.resolve()),
+            "dpi": dpi,
+            "model_key": model_key,
+            "total": total_pages,
+            "status": "running",
+            "pages": {},
+        }
+        _save_ocr_progress(img_dir, progress)
+    elif progress.get("status") == "ocr_done":
+        # 继续模式下有页需重识别（如失败页重试）→ 回到运行中状态
+        progress["status"] = "running"
+
+    # 并发数：--workers 未显式指定时按模型推荐（model_choices.<key>.workers，
+    # 设置页可调；未配置则 3）。一次解析，_ensure_server（--parallel 自适应）
+    # 与 batch_infer 共用同一值。
+    from llamamanage import default_workers
+
+    eff_workers = (
+        max_workers if (max_workers or 0) >= 1 else default_workers(model_key)
+    )
+    if max_workers is None:
+        print(f"      workers={eff_workers}（模型推荐）")
+
+    if todo_images:
+        t_model = time.perf_counter()
+        _ensure_server(model_key, workers=eff_workers)
+        timings["model"] = time.perf_counter() - t_model
 
     def _on_progress(done: int, total: int) -> None:
         """每完成一页 OCR 输出一行进度：已完成页数 + 百分比 + 已用时间（总 + 本步骤）。"""
@@ -288,6 +406,30 @@ def pdf_to_epub(
             f"elapsed {elapsed:6.1f}s | step {time.perf_counter() - t_ocr:6.1f}s"
         )
 
+    # 进度写盘节流（2026-08-17 性能调优）：每页完成都整文件原子写，文件随页数
+    # 增长（含全部已识别文本），快模型下磁盘写会成为批次瓶颈。改为最多每 2 秒
+    # 写一次，最后一页必写；中断最多丢失最近 2 秒内完成的页（续传时重新识别，
+    # 正确性不受影响）。批次结束后 status=ocr_done 的那次写盘始终执行。
+    _last_save_ts = 0.0
+    _saved_count = 0
+
+    def _on_ocr_result(res: dict) -> None:
+        """每页 OCR 完成即写进度文件（断点续传核心：中断后已完成页不丢）。"""
+        nonlocal _last_save_ts, _saved_count
+        page_no = _page_of(res.get("img"))
+        ok = not res.get("error")
+        progress["pages"][str(page_no)] = {
+            "status": "done" if ok else "error",
+            "result": (res.get("result") or "") if ok else None,
+            "error": res.get("error") if not ok else None,
+        }
+        _saved_count += 1
+        now = time.monotonic()
+        if _saved_count >= len(todo_images) or now - _last_save_ts >= 2.0:
+            _save_ocr_progress(img_dir, progress)
+            _last_save_ts = now
+            _saved_count = 0
+
     # Lazy imports used only when running the OCR pipeline — keep CLI (non-OCR)
     # commands working without optional deps like requests/zhconv.
     from configmanage import get_config
@@ -295,25 +437,40 @@ def pdf_to_epub(
     # OCR 提示词优先取 config.json 的 ocr_prompt（用户可自定义），
     # 缺失/为空时回退到 llamamanage.OCR_PROMPT 默认值。
     prompt = get_config(show_dialogs=False).get("ocr_prompt") or OCR_PROMPT
-    prompts = [prompt] * len(img_paths)
     from stringmanage import clean_and_structure_text
     from htmlmanage import HTMLConverter
 
-    results = batch_infer(
-        img_paths,
-        prompts,
-        model_key=model_key,
-        max_workers=max_workers,
-        thinking=thinking,
-        timeout=timeout,
-        on_progress=_on_progress,
-    )
+    if todo_images:
+        t_batch = time.perf_counter()
+        results = batch_infer(
+            todo_images,
+            [prompt] * len(todo_images),
+            model_key=model_key,
+            max_workers=eff_workers,
+            thinking=thinking,
+            timeout=timeout,
+            on_progress=_on_progress,
+            on_result=_on_ocr_result,
+        )
+        timings["ocr"] = time.perf_counter() - t_batch
+    else:
+        results = []
     if total_pages == 0:
         print()
+
+    # 合并缓存结果 + 本次识别结果（按页排序）
+    merged: Dict[int, dict] = {
+        k: {"result": v, "error": None} for k, v in cached.items()
+    }
+    for r in results:
+        merged[_page_of(r.get("img"))] = r
     print(f" done in {time.perf_counter() - t0:.1f}s")
+    # OCR 全部完成：进度标记为 ocr_done 并保留文件（EPUB 生成成功后才删除）
+    progress["status"] = "ocr_done"
+    _save_ocr_progress(img_dir, progress)
     pages = []
-    for r in sorted(results, key=lambda r: _page_of(r.get("img"))):
-        page_no = _page_of(r.get("img"))
+    for page_no in sorted(merged):
+        r = merged[page_no]
         if r.get("error"):
             print(f"      ! page {page_no} OCR failed: {r['error']}")
         pages.append({"page": page_no, "text": r.get("result") or ""})
@@ -329,14 +486,18 @@ def pdf_to_epub(
         "package_epub": True,
         "epub_path": str(Path(epub_path).resolve()) if epub_path else None,
     }
-    print(f" done in {time.perf_counter() - t0:.1f}s")
+    timings["structure"] = time.perf_counter() - t0
+    print(f" done in {timings['structure']:.1f}s")
 
     root = Path(out_dir) if out_dir else img_dir
 
     def _post_correct(corrected, *, strict_markers: bool) -> dict:
         """矫正后的 pages → 结构化 → XHTML/EPUB；返回 convert_document 结果。"""
         _apply_correction(structured, corrected, strict_markers=strict_markers)
-        return HTMLConverter(output_dir=str(root), epub_version="3.0").convert_document(structured)
+        t0 = time.perf_counter()
+        result = HTMLConverter(output_dir=str(root), epub_version="3.0").convert_document(structured)
+        timings["render"] = time.perf_counter() - t0
+        return result
 
     if correct:
         print("      矫正（OCR 文字与原文对照；默认关闭，仅 --correct 时启用）")
@@ -367,7 +528,8 @@ def pdf_to_epub(
             # 重新识别后的新文本优先：不能用上一次暂存/保存的历史内容覆盖
             preload_history=False,
         )
-        print(f"      矫正完成 in {time.perf_counter() - t0:.1f}s")
+        timings["correct"] = time.perf_counter() - t0
+        print(f"      矫正完成 in {timings['correct']:.1f}s")
         if last_convert.get("result") is not None:
             # 浏览器端已「完成并转换」过（可多次），直接用最近一次转换结果
             result = last_convert["result"]
@@ -375,18 +537,213 @@ def pdf_to_epub(
             # 浏览器被关闭且未点过完成并转换：按已保存内容转换一次
             result = _post_correct(corrected, strict_markers=False)
     else:
+        # 无矫正流程：把本次 OCR/结构化结果自动保存到历史记录（data/correction_history/）。
+        # 之后可随时用 `mian.py correct [<pdf>]` 或矫正界面的「历史记录」打开该书矫正
+        # （correct 命令默认 preload_history=True，自动加载同一 PDF 的最新版本）。
+        t_hist = time.perf_counter()
+        _save_ocr_history(pdf, structured)
+        timings["history"] = time.perf_counter() - t_hist
         print(f"[4/4] Rendering XHTML and packing EPUB ...", end="", flush=True)
         t0 = time.perf_counter()
         result = HTMLConverter(output_dir=str(root), epub_version="3.0").convert_document(structured)
-        print(f" done in {time.perf_counter() - t0:.1f}s")
+        timings["render"] = time.perf_counter() - t0
+        print(f" done in {timings['render']:.1f}s")
 
-    print(f"Total: {time.perf_counter() - t_start:.1f}s")
+    timings["total"] = time.perf_counter() - t_start
+    _print_timing_summary(timings, ocr_pages=len(todo_images))
+
+    # OCR 进度文件使命完成：EPUB 已生成，删除进度（避免下次误判为「未完成」）
+    if result.get("epub") and not result.get("epub_error"):
+        _clear_ocr_progress(img_dir)
 
     if result.get("epub"):
         print(f"Done: {result['epub']}")
     elif result.get("epub_error"):
         print(f"EPUB packaging failed: {result['epub_error']}", file=sys.stderr)
     return result
+
+
+# ---------------------------------------------------------------------------
+# OCR 断点续传：进度文件读写 + 交互询问（继续识别 / 重新识别 / 直接转换）
+# ---------------------------------------------------------------------------
+
+
+def _ocr_progress_path(img_dir) -> Path:
+    """OCR 进度文件位置：与分割图片同目录（data/<pdf_stem>/.ocr_progress.json）。"""
+    return Path(img_dir) / ".ocr_progress.json"
+
+
+def _load_ocr_progress(img_dir) -> dict | None:
+    """读取 OCR 进度；文件不存在/损坏返回 None。"""
+    import json
+
+    fp = _ocr_progress_path(img_dir)
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _save_ocr_progress(img_dir, progress: dict) -> None:
+    """原子写入 OCR 进度文件（tempfile + os.replace，中断不损坏文件）。"""
+    import json
+    import os
+    import tempfile
+
+    progress["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    fp = _ocr_progress_path(img_dir)
+    fd, tmp = tempfile.mkstemp(dir=str(fp.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(progress, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, fp)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _clear_ocr_progress(img_dir) -> None:
+    """删除 OCR 进度文件（重新识别 / 转换成功时调用）。"""
+    import os
+
+    try:
+        _ocr_progress_path(img_dir).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _save_ocr_history(pdf: Path, structured: dict) -> None:
+    """无矫正流程：把结构化后的页面文本写入历史记录（失败不阻断转换）。
+
+    复用 correctmanage 的历史写入函数（同文件名/载荷格式），使后续
+    correct 命令/矫正界面能通过历史记录打开并矫正这本书。
+    """
+    import threading
+
+    try:
+        from correctmanage import (
+            _history_prefix,
+            _write_history_version,
+            _page_text,
+        )
+
+        state = {
+            "pdf_path": str(pdf),
+            "pages": {
+                # 与矫正界面 /api/pages 一致（2026-08-15）：所有传入矫正界面的文本
+                # 一律为正文——结构化产生的 <h1>-<h6> 标题经 _page_text 归一为 <p>
+                # （标题由用户在矫正界面手动标记）；纯文本才按行转 <div>（initial_html）。
+                p["page"]: _page_text(p.get("text") or "")
+                for p in (structured.get("pages") or [])
+            },
+            "history_prefix": _history_prefix(str(pdf)),
+            "history_lock": threading.Lock(),
+            "history_name": pdf.name,
+            "proofread": {"errors": {}, "original": {}, "dismissed": {}},
+            "last_proofread_page": None,
+        }
+        if _write_history_version(state):
+            print("      已保存到历史记录（可随时用 correct 命令打开矫正）")
+        else:
+            print("      ! 历史记录写入失败（不影响本次转换）")
+    except Exception as e:  # noqa: BLE001
+        print(f"      ! 历史记录保存失败: {e}（不影响本次转换）")
+
+
+def _ask_ocr_resume(progress: dict) -> str:
+    """询问用户如何继续上次 OCR 进度。
+
+    返回 'resume'（继续识别未完成页）| 'convert'（直接转换）|
+    'restart'（重新识别全部）| 'abort'（取消）。
+    GUI 转换子进程（PTOE_UI_PROMPT=1）下改走浏览器弹窗（_ask_ui_choice），
+    不再依赖不可见的 stdin——此前子进程无控制台时该提示会卡死/取消，
+    llama-server 无法启动（2026-08-17 修复）。
+    """
+    total = int(progress.get("total") or 0)
+    pages = progress.get("pages") or {}
+    done = sum(1 for v in pages.values() if v.get("status") == "done")
+    failed = sum(1 for v in pages.values() if v.get("status") == "error")
+    if progress.get("status") == "ocr_done":
+        if _gui_prompt_mode():
+            return _ask_ui_choice(
+                f"检测到上次 OCR 已全部完成（{done}/{total} 页），尚未生成 EPUB。",
+                [("convert", "直接继续转换"), ("restart", "重新识别全部"), ("abort", "取消")],
+                default="convert",
+            )
+        print(f"\n检测到上次 OCR 已全部完成（{done}/{total} 页），尚未生成 EPUB。")
+        choice = _ask("选择操作：1) 直接继续转换  2) 重新识别全部  3) 取消 [1]：") or "1"
+        if choice == "2":
+            return "restart"
+        if choice == "3":
+            return "abort"
+        return "convert"
+    extra = f"，{failed} 页失败" if failed else ""
+    if _gui_prompt_mode():
+        return _ask_ui_choice(
+            f"检测到上次未完成的 OCR 进度（{done}/{total} 页完成{extra}）。",
+            [("resume", "继续识别（只处理未完成页）"), ("restart", "重新识别全部"), ("abort", "取消")],
+            default="resume",
+        )
+    print(f"\n检测到上次未完成的 OCR 进度（{done}/{total} 页完成{extra}）。")
+    choice = _ask("选择操作：1) 继续识别（只处理未完成页）  2) 重新识别全部  3) 取消 [1]：") or "1"
+    if choice == "2":
+        return "restart"
+    if choice == "3":
+        return "abort"
+    return "resume"
+
+
+# GUI 转换子进程的弹窗询问协议（2026-08-17）：guimanage 以 Popen + stdin=PIPE
+# 启动 `mian.py epub` 并置 PTOE_UI_PROMPT=1。流程中需要用户决策（如 OCR 断点
+# 续传选择）时打印 __PTOE_PROMPT__ 标记行（JSON 载荷）并读 stdin 一行；
+# guimanage 监控线程截获标记后在浏览器弹窗，用户选择后写回子进程 stdin。
+# EOF/非法选择回退 default，保证任何情况下不卡死。
+_PROMPT_MARKER = "__PTOE_PROMPT__"
+_UI_PROMPT_ENV = "PTOE_UI_PROMPT"
+
+
+def _gui_prompt_mode() -> bool:
+    """是否 GUI 转换子进程模式（guimanage 启动时置 PTOE_UI_PROMPT=1）。"""
+    import os
+
+    return os.environ.get(_UI_PROMPT_ENV) == "1"
+
+
+def _ask_ui_choice(question: str, options: list, default: str) -> str:
+    """询问用户选择：GUI 子进程模式经浏览器弹窗，终端模式走 stdin。
+
+    options: [(value, label), ...]；default 为默认 value。
+    GUI 模式：打印 __PTOE_PROMPT__ 标记行（单行 JSON，guimanage 据此弹窗），
+    阻塞读 stdin 一行（GUI 写回选择）；EOF/非法选择回退 default。
+    终端模式：等价原 _ask 交互（序号 1..n 对应 options，回车用默认）。
+    """
+    values = [v for v, _ in options]
+    if not _gui_prompt_mode():
+        choices = "  ".join(f"{i + 1}) {label}" for i, (_, label) in enumerate(options))
+        idx = _ask(f"{question} 选择操作：{choices} [{values.index(default) + 1}]：")
+        if idx.isdigit() and 1 <= int(idx) <= len(values):
+            return values[int(idx) - 1]
+        return default
+    import json
+    import sys as _sys
+
+    payload = {
+        "id": "ocr_resume",
+        "question": question,
+        "options": [{"value": v, "label": label} for v, label in options],
+        "default": default,
+    }
+    print(f"\n{_PROMPT_MARKER} {json.dumps(payload, ensure_ascii=False)}", flush=True)
+    try:
+        line = _sys.stdin.readline()
+    except Exception:
+        line = ""
+    choice = line.strip() if line else ""
+    return choice if choice in values else default
 
 
 def _ask(prompt: str) -> str:
@@ -424,8 +781,9 @@ def _menu_epub(cfg: dict) -> None:
     dpi_in = _ask("DPI 档位 0-4（默认 0=100，回车用默认）：")
     if dpi_in.isdigit() and int(dpi_in) in DPI_LEVELS:
         dpi = int(dpi_in)
-    workers = 3
-    workers_in = _ask("OCR 并发数（默认 3，回车用默认）：")
+    rec_workers = int((cfg.get("model_choices") or {}).get(model, {}).get("workers") or 3)
+    workers = rec_workers
+    workers_in = _ask(f"OCR 并发数（默认 {rec_workers}（模型推荐），回车用默认）：")
     if workers_in.isdigit():
         workers = int(workers_in)
     correct = _ask("开启手动矫正（浏览器对照原图修字）？(y/N)：").lower() == "y"
@@ -447,6 +805,50 @@ def _menu_epub(cfg: dict) -> None:
     _pause()
 
 
+def _menu_resume() -> None:
+    """菜单项 5：继续上次中断的 OCR 转换（断点续传）。"""
+    pdf = _ask("PDF 路径：")
+    if not pdf:
+        print("已取消（未输入路径）。")
+        return
+    if not Path(pdf).is_file():
+        print(f"错误：文件不存在 {pdf}")
+        return
+    try:
+        result = pdf_to_epub(pdf, resume="resume")
+        if result.get("epub_error"):
+            print(f"错误：{result['epub_error']}")
+        elif result.get("ok") is False:
+            print(f"已取消：{result.get('message') or '未转换'}")
+        else:
+            print(f"完成：{result.get('epub')}")
+    except Exception as e:
+        print(f"错误：{e}")
+    _pause()
+
+
+def _menu_stop() -> None:
+    """菜单项 7：停止推理服务（llama-server / vLLM）。"""
+    from llamamanage import _active_engine, stopserver
+
+    eng = _active_engine()
+    eng_label = "vLLM-Omni" if eng == "vllm" else "llama-server"
+    stopserver()
+    print(f"{eng_label} 已停止")
+    _pause()
+
+
+def _menu_gui() -> None:
+    """菜单项 8：启动 HTML 配置操作界面（GUI）。"""
+    try:
+        from guimanage import gui_serve
+
+        gui_serve()
+    except Exception as e:
+        print(f"错误：{e}")
+    _pause()
+
+
 def _menu_correct() -> None:
     """菜单项 2：直接启动手动矫正界面（不跑 OCR）。"""
     pdf = _ask("PDF 路径（留空=无文件启动，用于历史记录管理）：")
@@ -462,18 +864,20 @@ def _menu_correct() -> None:
 
 
 def _menu_config() -> None:
-    """菜单项 3：查看/修改配置（llama_server / models_dir / selected_model）。"""
+    """菜单项 3：查看/修改配置（engine / llama_server / models_dir / selected_model）。"""
     from configmanage import get_config, update_config
 
     cfg = get_config()
-    for k in ("llama_server", "models_dir", "selected_model"):
+    for k in ("engine", "llama_server", "models_dir", "selected_model"):
         print(f"  {k}: {cfg.get(k, '')}")
-    key = _ask("要修改的键（llama_server/models_dir/selected_model，留空跳过）：")
-    if key not in ("llama_server", "models_dir", "selected_model"):
+    key = _ask("要修改的键（engine/llama_server/models_dir/selected_model，留空跳过）：")
+    if key not in ("engine", "llama_server", "models_dir", "selected_model"):
         print("已跳过（键名无效或为空）。")
         return
     if key == "selected_model":
         value = _ask(f"{key} 的新值（可选：{', '.join(cfg.get('model_choices', {}).keys())}）：")
+    elif key == "engine":
+        value = _ask(f"{key} 的新值（llama / vllm）：")
     else:
         value = _ask(f"{key} 的新值：")
     if not value:
@@ -481,6 +885,9 @@ def _menu_config() -> None:
         return
     if key == "selected_model" and value not in cfg.get("model_choices", {}):
         print(f"错误：未知模型键 {value}；可用：{', '.join(cfg.get('model_choices', {}).keys())}")
+        return
+    if key == "engine" and value not in ("llama", "vllm"):
+        print("错误：engine 仅支持 llama / vllm")
         return
     update_config(key, value)
     print(f"{key} = {value}")
@@ -520,9 +927,12 @@ def _run_menu(name: str, version: str) -> int:
         print("  2) 手动矫正（correct，不跑 OCR）")
         print("  3) 查看/修改配置（config）")
         print("  4) 模型管理（model）")
-        print("  5) 帮助（CLI 用法）")
+        print("  5) 继续识别上次中断的转换（resume）")
+        print("  6) 帮助（CLI 用法）")
+        print("  7) 停止推理服务（llama-server / vLLM）")
+        print("  8) 配置界面（GUI）")
         print("  0) 退出")
-        choice = _ask("请输入序号 [0-5]：")
+        choice = _ask("请输入序号 [0-8]：")
         if not choice:
             # EOF（管道关闭/控制台关闭）或空输入：安全退出，避免死循环
             print("已退出。")
@@ -538,14 +948,22 @@ def _run_menu(name: str, version: str) -> int:
         elif choice == "4":
             _menu_model()
         elif choice == "5":
+            _menu_resume()
+        elif choice == "6":
             print("  命令行用法（功能与菜单相同）：")
-            print("    mian.py epub <pdf> [--dpi 0-4] [--model KEY] [--workers N] [--thinking] [--correct]")
+            print("    mian.py epub <pdf> [--dpi 0-4] [--model KEY] [--workers N] [--thinking] [--correct] [--resume|--restart]")
+            print("    mian.py resume <pdf> [--restart]")
             print("    mian.py correct [<pdf>]")
             print("    mian.py config show|set <key> <value>")
             print("    mian.py model list|show|set|add|remove")
+            print("    mian.py stop [--engine llama|vllm]")
             print("  详见 USAGE.md 或 mian.py <子命令> --help")
+        elif choice == "7":
+            _menu_stop()
+        elif choice == "8":
+            _menu_gui()
         else:
-            print("无效输入，请输入 0-5。")
+            print("无效输入，请输入 0-8。")
     if getattr(sys, "frozen", False):
         # 打包后的 exe 双击启动：退出前暂停，避免控制台窗口一闪而过
         _pause()
@@ -595,10 +1013,16 @@ def main(argv: list[str] | None = None) -> int:
         help="DPI level 0-4: 0=100, 1=150, 2=200, 3=300, 4=600 (default: 0=100)",
     )
     epub_p.add_argument("--model", default=default_model, help="Model key in config.json model_choices (default: from config.json)")
+    epub_p.add_argument(
+        "--engine",
+        choices=("llama", "vllm"),
+        default=None,
+        help="推理引擎：llama（llama.cpp，默认）或 vllm（vLLM-Omni）；缺省用 config.json 的 engine 键",
+    )
 
     epub_p.add_argument(
-        "--workers", type=int, default=3,
-        help="OCR worker threads (default: 3；视觉模型每张数千图像 token，并发过高会让 KV 缓存溢出到 CPU 反而变慢；显存充足可调大如 6)",
+        "--workers", type=int, default=None,
+        help="OCR worker threads (default: 模型推荐并发 model_choices.<key>.workers，未配置时 3；视觉模型每张数千图像 token，并发过高会让 KV 缓存溢出到 CPU 反而变慢；显存充足可调大如 6)",
     )
     epub_p.add_argument(
         "--timeout",
@@ -631,6 +1055,17 @@ def main(argv: list[str] | None = None) -> int:
         default=600,
         help="浏览器被关闭后自动继续后续流程的等待秒数（仅 --correct 生效；默认 600=10 分钟）",
     )
+    _resume_group = epub_p.add_mutually_exclusive_group()
+    _resume_group.add_argument(
+        "--resume",
+        action="store_true",
+        help="继续上次中断的 OCR（跳过询问：只识别未完成页；OCR 已完成则直接转换）",
+    )
+    _resume_group.add_argument(
+        "--restart",
+        action="store_true",
+        help="忽略已有 OCR 进度，重新识别全部页面（跳过询问）",
+    )
 
     correct_p = sub.add_parser(
         "correct",
@@ -643,6 +1078,12 @@ def main(argv: list[str] | None = None) -> int:
     correct_p.add_argument(
         "pdf", nargs="?", default=None,
         help="Path to the source PDF（可省略：无文件直接启动，用于历史记录管理）",
+    )
+    correct_p.add_argument(
+        "--engine",
+        choices=("llama", "vllm"),
+        default=None,
+        help="推理引擎：llama（llama.cpp，默认）或 vllm（vLLM-Omni）；缺省用 config.json 的 engine 键",
     )
     correct_p.add_argument("--title", default=None, help="EPUB title (default: auto from PDF metadata)")
     correct_p.add_argument("--author", default=None, help="EPUB author")
@@ -658,6 +1099,82 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=600,
         help="浏览器被关闭后自动继续后续流程的等待秒数（默认 600=10 分钟）",
+    )
+
+    resume_p = sub.add_parser(
+        "resume",
+        help="继续/管理上次中断的 OCR 转换（断点续传）",
+        description="针对上次 OCR 中断/未完成的 PDF 继续处理：只识别未完成页"
+        "（OCR 已全部完成则直接进入转换），交互询问或 --restart 强制重来。"
+        "无进度时询问是否从头完整转换。",
+    )
+    resume_p.add_argument("pdf", help="Path to the source PDF")
+    resume_p.add_argument(
+        "--dpi",
+        type=int,
+        choices=sorted(DPI_LEVELS),
+        default=0,
+        help="DPI level 0-4: 0=100, 1=150, 2=200, 3=300, 4=600 (default: 0=100)",
+    )
+    resume_p.add_argument("--model", default=default_model, help="Model key in config.json model_choices (default: from config.json)")
+    resume_p.add_argument(
+        "--engine",
+        choices=("llama", "vllm"),
+        default=None,
+        help="推理引擎：llama（llama.cpp，默认）或 vllm（vLLM-Omni）；缺省用 config.json 的 engine 键",
+    )
+    resume_p.add_argument(
+        "--workers", type=int, default=None,
+        help="OCR worker threads (default: 模型推荐并发 model_choices.<key>.workers，未配置时 3；显存充足可调大如 6)",
+    )
+    resume_p.add_argument(
+        "--timeout",
+        type=int,
+        default=REQUEST_TIMEOUT,
+        help="Per-request read timeout in seconds (default: 600)",
+    )
+    resume_p.add_argument(
+        "--thinking",
+        action="store_true",
+        help="Pass the prompt through without appending the '按原文原格式输出' suffix",
+    )
+    resume_p.add_argument("--title", default=None, help="EPUB title (default: auto from PDF metadata)")
+    resume_p.add_argument("--author", default=None, help="EPUB author")
+    resume_p.add_argument("--lang", default="zh-CN", help="EPUB language code (default: zh-CN)")
+    resume_p.add_argument(
+        "--out-dir",
+        default=None,
+        help="Output directory for OEBPS/ and the EPUB (default: data/<pdf stem>/)",
+    )
+    resume_p.add_argument("--epub-path", default=None, help="Explicit output path for the .epub file")
+    resume_p.add_argument(
+        "--correct",
+        action="store_true",
+        help="开启手动矫正（默认关闭；同 epub --correct）",
+    )
+    resume_p.add_argument(
+        "--correct-timeout",
+        type=int,
+        default=600,
+        help="浏览器被关闭后自动继续后续流程的等待秒数（仅 --correct 生效；默认 600=10 分钟）",
+    )
+    resume_p.add_argument(
+        "--restart",
+        action="store_true",
+        help="忽略已有进度，重新识别全部页面（跳过询问）",
+    )
+
+    stop_p = sub.add_parser(
+        "stop",
+        help="停止推理服务（llama-server / vLLM-Omni）",
+        description="关闭正在运行的推理服务进程并释放端口：本进程启动的实例直接终止，"
+        "上次运行遗留/外部启动的实例按配置端口兜底关闭（Windows netstat+taskkill）。",
+    )
+    stop_p.add_argument(
+        "--engine",
+        choices=("llama", "vllm"),
+        default=None,
+        help="推理引擎：llama（llama.cpp，默认）或 vllm（vLLM-Omni）；缺省用 config.json 的 engine 键",
     )
 
     # Model registry management: list / show / set the configured default model
@@ -693,16 +1210,27 @@ def main(argv: list[str] | None = None) -> int:
     )
     config_sub = config_p.add_subparsers(dest="config_cmd", metavar="action")
 
-    config_show_p = config_sub.add_parser("show", help="显示当前配置")
     config_set_p = config_sub.add_parser("set", help="修改配置项（key=value）")
-    config_set_p.add_argument("key", help="配置键名（llama_server / models_dir / selected_model / ocr_prompt / llama_server_args.<参数>）")
-    config_set_p.add_argument("value", help="新的值")
+    config_set_p.add_argument("key", help="配置键名（llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / llama_server_args.<参数> / vllm_server_args.<参数> / proofread.<param>）")
+    config_set_p.add_argument("value", help="配置值")
 
+    gui_p = sub.add_parser(
+        "gui",
+        help="启动 HTML 配置操作界面（浏览器）",
+        description="启动本地 HTTP 服务并在浏览器中打开配置操作界面：查看/修改配置、"
+        "启动/停止推理服务、选择文件路径等。浏览器关闭超过 idle-timeout 秒后自动退出。",
+    )
+    gui_p.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
+    gui_p.add_argument("--port", type=int, default=0, help="监听端口（默认 0=自动分配）")
+    gui_p.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    gui_p.add_argument(
+        "--idle-timeout",
+        type=int,
+        default=120,
+        help="浏览器关闭后自动退出的等待秒数（默认 120）",
+    )
     args = parser.parse_args(argv)
 
-    if args.version:
-        print(f"{name} {version}")
-    # Handle model management commands (list/show/set)
     if args.command == "model":
         cmd = getattr(args, "model_cmd", None)
         # read fresh config for each model action so changes are immediately visible
@@ -769,8 +1297,9 @@ def main(argv: list[str] | None = None) -> int:
         cmd = getattr(args, "config_cmd", None)
         cfg = get_config()
         if cmd == "show":
-            for k in ("llama_server", "models_dir", "selected_model"):
+            for k in ("engine", "llama_server", "models_dir", "selected_model"):
                 print(f"  {k}: {cfg.get(k, '')}")
+            print(f"  vllm_server: {cfg.get('vllm_server', '')}")
             sel = cfg.get("selected_model")
             print("  model_choices:")
             for mk, mv in (cfg.get("model_choices", {}) or {}).items():
@@ -780,6 +1309,10 @@ def main(argv: list[str] | None = None) -> int:
             sargs = cfg.get("llama_server_args", {}) or {}
             print("  llama_server_args:")
             for ak, av in sargs.items():
+                print(f"    {ak}: {av}")
+            vsargs = cfg.get("vllm_server_args", {}) or {}
+            print("  vllm_server_args:")
+            for ak, av in vsargs.items():
                 print(f"    {ak}: {av}")
             return 0
         if cmd == "set":
@@ -791,11 +1324,30 @@ def main(argv: list[str] | None = None) -> int:
                 set_llama_server_arg(nested, value)
                 print(f"{key} = {value}")
                 return 0
-            if key not in ("llama_server", "models_dir", "selected_model", "ocr_prompt"):
-                print(f"Error: 可修改的键名仅限 llama_server / models_dir / selected_model / ocr_prompt / llama_server_args.<参数名>", file=sys.stderr)
+            if key.startswith("vllm_server_args."):
+                # vllm 启动参数（如 vllm_server_args.port）走 set_vllm_server_arg
+                nested = key.split(".", 1)[1]
+                from configmanage import set_vllm_server_arg
+
+                set_vllm_server_arg(nested, value)
+                print(f"{key} = {value}")
+                return 0
+            if key.startswith("proofread."):
+                # proofread.<param> 专门路由到 set_proofread_param
+                sub = key.split(".", 1)[1]
+                from configmanage import set_proofread_param
+
+                set_proofread_param(sub, value)
+                print(f"{key} = {value}")
+                return 0
+            if key not in ("llama_server", "models_dir", "selected_model", "ocr_prompt", "engine", "vllm_server"):
+                print(f"Error: 可修改的键名仅限 llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / llama_server_args.<参数名> / vllm_server_args.<参数名> / proofread.<param>", file=sys.stderr)
                 return 1
             if key == "selected_model" and value not in cfg.get("model_choices", {}):
                 print(f"Error: 未知的 model key: {value}（可用: {', '.join(cfg.get('model_choices', {}).keys())}）", file=sys.stderr)
+                return 1
+            if key == "engine" and value not in ("llama", "vllm"):
+                print("Error: engine 仅支持 llama / vllm", file=sys.stderr)
                 return 1
             update_config(key, value)
             print(f"{key} = {value}")
@@ -803,8 +1355,39 @@ def main(argv: list[str] | None = None) -> int:
         print("Unknown config action; use 'config show|set <key> <value>'")
         return 1
 
+    if args.command == "gui":
+        # 惰性导入：guimanage 仅在本命令用到时加载（不引入额外依赖）
+        from guimanage import gui_serve
+
+        gui_serve(
+            host=args.host,
+            port=args.port,
+            open_browser=not args.no_browser,
+            idle_timeout=args.idle_timeout,
+        )
+        return 0
+
+    if args.command == "stop":
+        try:
+            from llamamanage import _active_engine, set_engine, stopserver
+
+            if args.engine:
+                set_engine(args.engine)
+            eng = _active_engine()
+            eng_label = "vLLM-Omni" if eng == "vllm" else "llama-server"
+            stopserver()
+            print(f"{eng_label} 已停止")
+            return 0
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
     if args.command == "epub":
         try:
+            if args.engine:
+                from llamamanage import set_engine
+
+                set_engine(args.engine)
             result = pdf_to_epub(
                 args.pdf,
                 dpi=DPI_LEVELS[args.dpi],
@@ -819,6 +1402,39 @@ def main(argv: list[str] | None = None) -> int:
                 epub_path=args.epub_path,
                 correct=args.correct,
                 correct_idle_timeout=args.correct_timeout,
+                resume=(
+                    "resume"
+                    if args.resume
+                    else ("restart" if args.restart else None)
+                ),
+            )
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+        if result.get("epub_error"):
+            return 1
+        return 0
+    if args.command == "resume":
+        try:
+            if args.engine:
+                from llamamanage import set_engine
+
+                set_engine(args.engine)
+            result = pdf_to_epub(
+                args.pdf,
+                dpi=DPI_LEVELS[args.dpi],
+                model_key=args.model,
+                max_workers=args.workers,
+                thinking=args.thinking,
+                timeout=args.timeout,
+                title=args.title,
+                author=args.author,
+                language=args.lang,
+                out_dir=args.out_dir,
+                epub_path=args.epub_path,
+                correct=args.correct,
+                correct_idle_timeout=args.correct_timeout,
+                resume="restart" if args.restart else "resume",
             )
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)
@@ -828,6 +1444,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "correct":
         try:
+            if args.engine:
+                from llamamanage import set_engine
+
+                set_engine(args.engine)
             result = correct_pdf(
                 args.pdf,
                 title=args.title,
@@ -855,4 +1475,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     raise SystemExit(main())

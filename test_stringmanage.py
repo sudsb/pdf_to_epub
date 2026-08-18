@@ -6,9 +6,11 @@ import unittest
 
 from stringmanage import (
     clean_and_structure_text,
+    clean_bbox_text,
     convert_bbox_text,
     detect_headings,
     strip_page_numbers,
+    strip_think_blocks,
 )
 
 
@@ -68,6 +70,65 @@ class TestConvertBboxText(unittest.TestCase):
         self.assertEqual(
             convert_bbox_text(text), "<p>a &lt; b &amp; c \"d\"</p>"
         )
+
+
+class TestCleanBboxText(unittest.TestCase):
+    """clean_bbox_text：纯文本版 bbox 清理（/api/reocr 用，ULQ4/ULQ8 输出）。"""
+
+    def test_strip_prefix_keeps_content(self):
+        text = "text [21, 152, 327, 170]列位工人来听我们说几句白话："
+        self.assertEqual(clean_bbox_text(text), "列位工人来听我们说几句白话：")
+
+    def test_title_label_kept_as_text(self):
+        text = "title [337, 99, 611, 123]工人夜校招生广告"
+        self.assertEqual(clean_bbox_text(text), "工人夜校招生广告")
+
+    def test_skip_labels_dropped(self):
+        text = (
+            "text [1, 2, 3, 4]正文内容\n"
+            "page_number [78, 904, 94, 918]2\n"
+            "figure [10, 10, 50, 20]图注\n"
+            "image [10, 10, 50, 20]图片"
+        )
+        self.assertEqual(clean_bbox_text(text), "正文内容")
+
+    def test_non_bbox_lines_kept(self):
+        text = "某模型的前言说明\n\ntitle [1, 2, 3, 4]夜学日记"
+        self.assertEqual(clean_bbox_text(text), "某模型的前言说明\n\n夜学日记")
+
+    def test_no_bbox_match_unchanged(self):
+        text = "普通文本输出，没有任何坐标格式\n第二行"
+        self.assertEqual(clean_bbox_text(text), text)
+
+    def test_empty_content_line_dropped(self):
+        text = "title [1, 2, 3, 4]   \ntext [1, 2, 3, 4]正文"
+        self.assertEqual(clean_bbox_text(text), "正文")
+
+    def test_empty_text(self):
+        self.assertEqual(clean_bbox_text(""), "")
+
+
+class TestStripThinkBlocks(unittest.TestCase):
+    """strip_think_blocks：剥离模型输出的 <thinking> 思考块。"""
+
+    def test_tag_block_removed(self):
+        text = "<thinking>让我先分析一下这张图片。</thinking>正文内容"
+        self.assertEqual(strip_think_blocks(text), "正文内容")
+
+    def test_multiple_blocks_removed(self):
+        text = "<thinking>第一段思考</thinking>正文一<thinking>第二段思考</thinking>正文二"
+        self.assertEqual(strip_think_blocks(text), "正文一正文二")
+
+    def test_no_tag_untouched(self):
+        text = "普通文本没有思考块"
+        self.assertEqual(strip_think_blocks(text), text)
+
+    def test_multiline_block_removed(self):
+        text = "<thinking>\n第一行思考\n第二行思考\n</thinking>正文"
+        self.assertEqual(strip_think_blocks(text), "正文")
+
+    def test_empty_text(self):
+        self.assertEqual(strip_think_blocks(""), "")
 
 
 class TestStripPageNumbers(unittest.TestCase):

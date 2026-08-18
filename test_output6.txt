@@ -1,0 +1,236 @@
+...............................................C:\Users\Administrator\AppData\Local\Programs\Python\Python314\Lib\site-packages\zhconv\zhconv.py:76: ResourceWarning: unclosed file <_io.BufferedReader name='C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python314\\Lib\\site-packages\\zhconv\\zhcdict.json'>
+  zhcdicts = json.loads(get_module_res(filename).read().decode('utf-8'))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+.....D:\code-project\python\PToEA\epubmanage.py:48: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  self.date = date or datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+test passed
+      矫正（直接启动：不跑 OCR；历史缓存优先，空白页可手动录入）
+Done: C:\Users\Administrator\AppData\Local\Temp\test_no_file_conv_vmlejvb8\某书.epub
+      矫正（直接启动：不跑 OCR；历史缓存优先，空白页可手动录入）
+      未产生转换（没有可转换的内容）
+[correctmanage] 内嵌预览图缓存写入失败: [WinError 5] 拒绝访问。: 'C:\\Users\\Administrator\\AppData\\Local\\Temp\\test_imgsink_znvufn41\\.testprefix.images.8cf1c1.tmp' -> 'C:\\Users\\Administrator\\AppData\\Local\\Temp\\test_imgsink_znvufn41\\testprefix.images.json'
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+[1/4] Splitting PDF to images (dpi=100) ... done in 0.1s
+      3 page(s) -> D:\code-project\python\PToEA\data\sample
+[2/4] OCR via llama-server (model='HY', workers=auto) ...      workers=2（模型推荐）
+ done in 0.0s
+[3/4] Structuring text (3 page(s)) ... done in 0.0s
+      矫正（OCR 文字与原文对照；默认关闭，仅 --correct 时启用）
+      矫正完成 in 0.0s
+
+—— 用时统计 ——
+  分割图片（含图片处理）：0.1 秒
+  模型启动：0.0 秒
+  文字识别：0.0 秒
+  文字整理：0.0 秒
+  矫正界面：0.0 秒
+  EPUB 生成：0.0 秒
+  总流程：0.1 秒
+  平均每页识别：0.00 秒/页（本次共识别 3 页）
+Done: C:\Users\Administrator\AppData\Local\Temp\test_correct_mian_qqitllte\out.epub
+usage: ptoe gui [-h] [--host HOST] [--port PORT] [--no-browser]
+                [--idle-timeout IDLE_TIMEOUT]
+
+启动本地 HTTP 服务并在浏览器中打开配置操作界面：查看/修改配置、启动/停止推理服务、选择文件路径等。浏览器关闭超过 idle-timeout
+秒后自动退出。
+
+options:
+  -h, --help            show this help message and exit
+  --host HOST           监听地址（默认 127.0.0.1）
+  --port PORT           监听端口（默认 0=自动分配）
+  --no-browser          不自动打开浏览器
+  --idle-timeout IDLE_TIMEOUT
+                        浏览器关闭后自动退出的等待秒数（默认 120）
+[OCR] /tmp/fake_0.png done in 0.0s (4 chars)
+[OCR] /tmp/fake_1.png done in 0.0s (4 chars)
+[OCR] /tmp/fake_2.png done in 0.0s (4 chars)
+[OCR] /tmp/fake_3.png done in 0.0s (4 chars)
+[OCR] /tmp/fake_4.png done in 0.0s (4 chars)
+[OCR] /tmp/a.png done in 0.0s (2 chars)
+[OCR] /tmp/b.png FAILED after 0.0s: boom
+[OCR] /tmp/c.png done in 0.0s (2 chars)
+[OCR] /tmp/a.png done in 0.0s (2 chars)
+[OCR] /tmp/b.png done in 0.0s (2 chars)
+GPU acceleration: CUDA detected (NVIDIA GeForce RTX 3060) - loading all layers to VRAM (--n-gpu-layers 999)
+Flash Attention: enabled (--flash-attn)
+Starting server: exe -m mdir\HY.gguf --mmproj mdir\ --parallel 4 --n-gpu-layers 999 --flash-attn
+Server loaded successfully
+GPU acceleration: CUDA detected (NVIDIA) - loading all layers to VRAM (--n-gpu-layers 999)
+Starting server: exe -m mdir\HY.gguf --mmproj mdir\ --parallel 4 --n-gpu-layers 999
+Server loaded successfully
+GPU acceleration: CUDA detected (NVIDIA) - loading all layers to VRAM (--n-gpu-layers 999)
+Flash Attention: enabled (--flash-attn on)
+Starting server: exe -m mdir\HY.gguf --mmproj mdir\ --parallel 4 --n-gpu-layers 999 --flash-attn on
+Server loaded successfully
+GPU acceleration: no GPU backend detected - running on CPU
+Starting server: exe -m mdir\HY.gguf --mmproj mdir\ --parallel 4
+Server loaded successfully
+GPU acceleration: CUDA detected (NVIDIA) - loading all layers to VRAM (--n-gpu-layers 999)
+Starting server: exe -m mdir\HY.gguf --mmproj mdir\ --parallel 4 --n-gpu-layers 999
+Server loaded successfully
+GPU acceleration: CUDA detected (NVIDIA) - loading all layers to VRAM (--n-gpu-layers 999)
+Flash Attention: auto（构建默认，CUDA 支持时自动启用；llama_server_args.flash_attn=0 可禁用，=1 强制开启）
+Starting server: exe -m mdir\HY.gguf --mmproj mdir\ --parallel 4 --n-gpu-layers 999
+Server loaded successfully
+GPU acceleration: no GPU backend detected - running on CPU
+Starting server: exe -m mdir\HY.gguf --mmproj mdir\ --parallel 4
+Server loaded successfully
+GPU acceleration: no GPU backend detected - running on CPU
+Starting server: exe -m mdir\HY.gguf --mmproj mdir\ --parallel 8
+Server loaded successfully
+GPU acceleration: no GPU backend detected - running on CPU
+Starting server: exe -m mdir\HY.gguf --mmproj mdir\ --parallel 3
+Server loaded successfully
+Using max_tokens from config: 4096
+Using ngram_size from config: 30
+Using window_size from config: 90
+GPU acceleration: no GPU backend detected - running on CPU
+Starting server: exe -m mdir\HY.gguf --mmproj mdir\ --parallel 4 --max-tokens 4096 --ngram-size 30 --window-size 90
+Server loaded successfully
+llama-server 构建不支持 --max-tokens 启动参数，已跳过（请求级 max_tokens 仍生效）
+llama-server 构建不支持 --ngram-size 启动参数，已跳过
+llama-server 构建不支持 --window-size 启动参数，已跳过
+GPU acceleration: no GPU backend detected - running on CPU
+Starting server: exe -m mdir\HY.gguf --mmproj mdir\ --parallel 4
+Server loaded successfully
+Server stopped successfully (port 8080)
+[1/4] Splitting PDF to images (dpi=100) ...      reusing 3 existing page image(s) in D:\code-project\python\PToEA\data\sample
+ done in 0.0s
+      3 page(s) -> D:\code-project\python\PToEA\data\sample
+[2/4] OCR via llama-server (model='HY', workers=auto) ...      workers=2（模型推荐）
+ done in 0.0s
+[3/4] Structuring text (3 page(s)) ... done in 0.0s
+      已保存到历史记录（可随时用 correct 命令打开矫正）
+[4/4] Rendering XHTML and packing EPUB ... done in 0.0s
+
+—— 用时统计 ——
+  分割图片（含图片处理）：0.0 秒
+  模型启动：0.0 秒
+  文字识别：0.0 秒
+  文字整理：0.0 秒
+  EPUB 生成：0.0 秒
+  历史记录保存：0.0 秒
+  总流程：0.0 秒
+  平均每页识别：0.00 秒/页（本次共识别 3 页）
+Done: C:\Users\Administrator\AppData\Local\Temp\test_mian_hist_1u7l47xx\out.epub
+[1/4] Splitting PDF to images (dpi=100) ...      reusing 3 existing page image(s) in D:\code-project\python\PToEA\data\sample
+ done in 0.0s
+      3 page(s) -> D:\code-project\python\PToEA\data\sample
+[2/4] OCR via llama-server (model='HY', workers=auto) ...      workers=2（模型推荐）
+      OCR 3/3 [########################] 100.0% | elapsed    0.0s | step    0.0s
+ done in 0.0s
+[3/4] Structuring text (3 page(s)) ... done in 0.0s
+      已保存到历史记录（可随时用 correct 命令打开矫正）
+[4/4] Rendering XHTML and packing EPUB ... done in 0.0s
+
+—— 用时统计 ——
+  分割图片（含图片处理）：0.0 秒
+  模型启动：0.0 秒
+  文字识别：0.0 秒
+  文字整理：0.0 秒
+  EPUB 生成：0.0 秒
+  历史记录保存：0.0 秒
+  总流程：0.0 秒
+  平均每页识别：0.00 秒/页（本次共识别 3 页）
+Done: C:\Users\Administrator\AppData\Local\Temp\test_mian_resume_wfxkzl_0\out.epub
+[1/4] Splitting PDF to images (dpi=100) ...      reusing 3 existing page image(s) in D:\code-project\python\PToEA\data\sample
+ done in 0.0s
+      3 page(s) -> D:\code-project\python\PToEA\data\sample
+[2/4] OCR via llama-server (model='HY', workers=auto) ...      workers=2（模型推荐）
+ done in 0.0s
+[3/4] Structuring text (3 page(s)) ... done in 0.0s
+      已保存到历史记录（可随时用 correct 命令打开矫正）
+[4/4] Rendering XHTML and packing EPUB ... done in 0.0s
+
+—— 用时统计 ——
+  分割图片（含图片处理）：0.0 秒
+  模型启动：0.0 秒
+  文字识别：0.0 秒
+  文字整理：0.0 秒
+  EPUB 生成：0.0 秒
+  历史记录保存：0.0 秒
+  总流程：0.0 秒
+  平均每页识别：0.00 秒/页（本次共识别 3 页）
+Done: C:\Users\Administrator\AppData\Local\Temp\test_mian_resume_kmltnvn6\out.epub
+[1/4] Splitting PDF to images (dpi=100) ...      reusing 3 existing page image(s) in D:\code-project\python\PToEA\data\sample
+ done in 0.0s
+      3 page(s) -> D:\code-project\python\PToEA\data\sample
+[2/4] OCR via llama-server (model='HY', workers=auto) ...已取消。
+[1/4] Splitting PDF to images (dpi=100) ...      reusing 3 existing page image(s) in D:\code-project\python\PToEA\data\sample
+ done in 0.0s
+      3 page(s) -> D:\code-project\python\PToEA\data\sample
+[2/4] OCR via llama-server (model='HY', workers=auto) ...      workers=2（模型推荐）
+ done in 0.0s
+[3/4] Structuring text (3 page(s)) ... done in 0.0s
+      已保存到历史记录（可随时用 correct 命令打开矫正）
+[4/4] Rendering XHTML and packing EPUB ... done in 0.0s
+
+—— 用时统计 ——
+  分割图片（含图片处理）：0.0 秒
+  模型启动：0.0 秒
+  文字识别：0.0 秒
+  文字整理：0.0 秒
+  EPUB 生成：0.0 秒
+  历史记录保存：0.0 秒
+  总流程：0.0 秒
+  平均每页识别：0.00 秒/页（本次共识别 1 页）
+Done: C:\Users\Administrator\AppData\Local\Temp\test_mian_resume_c10_8_5h\out.epub
+[1/4] Splitting PDF to images (dpi=100) ... done in 0.1s
+      3 page(s) -> D:\code-project\python\PToEA\data\sample
+[2/4] OCR via llama-server (model='HY', workers=auto) ...      workers=2（模型推荐）
+      OCR 3/3 [########################] 100.0% | elapsed    0.1s | step    0.0s
+ done in 0.0s
+[3/4] Structuring text (3 page(s)) ... done in 0.0s
+      已保存到历史记录（可随时用 correct 命令打开矫正）
+[4/4] Rendering XHTML and packing EPUB ...warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+................................................................................................................................................................................................................................................................................................................................................................................................................................
+----------------------------------------------------------------------
+Ran 468 tests in 66.510s
+
+OK
+ done in 0.0s
+
+—— 用时统计 ——
+  分割图片（含图片处理）：0.1 秒
+  模型启动：0.0 秒
+  文字识别：0.0 秒
+  文字整理：0.0 秒
+  EPUB 生成：0.0 秒
+  历史记录保存：0.0 秒
+  总流程：0.1 秒
+  平均每页识别：0.00 秒/页（本次共识别 3 页）
+Done: C:\Users\Administrator\AppData\Local\Temp\test_mian_vw6jvjss\out.epub
+      多进程渲染：12 页 / 12 worker
+      多进程渲染：12 页 / 12 worker
+      reusing 3 existing page image(s) in D:\code-project\python\PToEA\data\reuse_test
+      reusing 3 existing page image(s) in D:\code-project\python\PToEA\data\reuse_test
+[OCR] /tmp/a.png done in 0.0s (2 chars)
+[OCR] /tmp/b.png done in 0.0s (2 chars)
+llama-server already running with model 'HY.gguf' — reusing
+vllm_server 未配置（config.json vllm_server 为空）——仅连接模式：请先在 WSL2/远程主机手动启动 vllm serve，再重试
+Starting vLLM server: C:/fake/vllm-server.exe serve HY --host 127.0.0.1 --port 8000
+Server loaded successfully
+vLLM server already running with model 'HY' — reusing

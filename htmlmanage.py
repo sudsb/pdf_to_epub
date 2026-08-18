@@ -29,7 +29,33 @@ _NOTE_CLASS = "ptoe-note"
 _ALIGN_CLASSES = ("ptoe-align-left", "ptoe-align-center", "ptoe-align-right")
 _PAGE_BREAK_CLASS = "ptoe-page-break"
 # 插入图片的显示模式 class（全画幅 / 局部），随 <p> 块与 <img> 一起保留
-_IMG_CLASSES = ("ptoe-img-full", "ptoe-img-fit")
+# 尺寸 class（ptoe-img-w25/50/75/100）控制图片宽度百分比
+# 位置 class（ptoe-img-left/center/right）控制图片对齐
+_IMG_CLASSES = ("ptoe-img-full", "ptoe-img-fit", "ptoe-img-inline",
+               "ptoe-img-w25", "ptoe-img-w50", "ptoe-img-w75", "ptoe-img-w100",
+               "ptoe-img-left", "ptoe-img-center", "ptoe-img-right",
+               "ptoe-img-vtop", "ptoe-img-vmid", "ptoe-img-vbot")
+
+
+def _is_img_page(text: str) -> bool:
+    """整页图片判定：含 <img> 且剥标签后无文字（或仅剩 OCR 噪声如 #、标点等非文字字符）。"""
+    if '<img' not in text:
+        return False
+    stripped = re.sub(r'<[^>]+>', '', text).strip()
+    if not stripped:
+        return True
+    return not re.search(r'[\u4e00-\u9fffA-Za-z0-9]', stripped)
+
+
+# 防御性自闭合 <img> 标签（XHTML 规范要求空元素必须自闭合）。
+# sanitize_html 已确保 img 自闭合，但阅读器对未自闭合的 <img> 容错不一，
+# 此处做最终兜底：把 <img ...> 转为 <img .../>，已自闭合的不重复处理。
+_SELF_CLOSE_IMG_RE = re.compile(r'<img\b([^>]*?)(?<!/)>', flags=re.I)
+
+
+def _self_close_img(html: str) -> str:
+    """确保所有 <img> 标签自闭合（XHTML 兼容）。"""
+    return _SELF_CLOSE_IMG_RE.sub(r'<img\1/>', html)
 
 
 def _block_class_html(attrs: str) -> str:
@@ -67,13 +93,18 @@ class CSSManager:
           font-family: {self.font_family};
           line-height: {self.line_height};
           font-size: 1em;
-          color: #111;
-          background: #fff;
+          /* 不硬编码背景/文字颜色（2026-08-13）：交阅读器自身的阅读背景/夜间模式等主题设置，
+             否则 epub 内固定白底黑字会覆盖阅读器内的背景/主题设置 */
         }}
         h1, h2, h3, h4, h5, h6 {{
           font-weight: bold;
           margin: 1em 0 0.5em 0;
           text-align: center;
+        }}
+        h1 {{
+          /* 一级标题下方分隔线（2026-08）：全宽自适应（随版面宽度伸展） */
+          border-bottom: 1px solid #999;
+          padding-bottom: 0.35em;
         }}
         p {{
           text-indent: 1.5em;
@@ -92,6 +123,11 @@ class CSSManager:
         .ptoe-align-right {{
           text-align: right;
         }}
+        /* 对齐段落取消首行缩进（2026-08-15）：p 默认 text-indent 1.5em 会让
+           居中/居右段落首行偏移，与矫正界面（无缩进）显示不一致 */
+        p.ptoe-align-center, p.ptoe-align-left, p.ptoe-align-right {{
+          text-indent: 0;
+        }}
         .ptoe-page-break {{
           page-break-before: always;
           break-before: page;
@@ -105,29 +141,77 @@ class CSSManager:
           max-width: 100%;
           height: auto;
         }}
-        /* 插入图片：全画幅（占满行宽）与局部（按原尺寸居中） */
+        /* 插入图片：全画幅（独立占页 + 占满整页）与局部（按原尺寸居中）
+           全画幅（2026-08-15 用户要求）：page-break 保证图片单独一页不与文字
+           同页；width:100% + max-height:100vh + object-fit:contain 让图片按
+           比例缩放填满页面（不裁切）。局部保持原尺寸居中。 */
         p.ptoe-img-full, p.ptoe-img-fit {{
-          text-align: center;
           text-indent: 0;
           margin: 0.8em 0;
         }}
+        p.ptoe-img-full {{
+          page-break-before: always;
+          page-break-after: always;
+          margin: 0;
+          padding: 0;
+          text-align: center;
+        }}
+        p.ptoe-img-full img, p.ptoe-img-fit img {{
+          display: inline-block;
+          max-width: 100%;
+          vertical-align: middle;
+        }}
         p.ptoe-img-full img {{
           width: 100%;
-          max-width: 100%;
-          height: auto;
-          margin: 0 auto;
+          max-height: 100vh;
+          object-fit: contain;
         }}
         p.ptoe-img-fit img {{
+          height: auto;
+        }}
+        /* 尺寸 class：唯一宽度控制（全画幅默认 w100，局部默认无尺寸=原图） */
+        .ptoe-img-w25 {{ width: 25%; }}
+        .ptoe-img-w50 {{ width: 50%; }}
+        .ptoe-img-w75 {{ width: 75%; }}
+        .ptoe-img-w100 {{ width: 100%; }}
+        /* 位置 class：p 上 text-align 控制 img 对齐 */
+        p.ptoe-img-left {{ text-align: left; }}
+        p.ptoe-img-center {{ text-align: center; }}
+        p.ptoe-img-right {{ text-align: right; }}
+        /* 行内图片（2026-08-10）：直接嵌在文字流中（无 <p> 包裹），
+           vertical-align 控制上下对齐；尺寸 class 同样生效。
+           img.ptoe-img-inline 特异性(0,1,1)高于通用 img(0,0,1)，覆盖 display:block */
+        img.ptoe-img-inline {{
+          display: inline-block;
           max-width: 100%;
           height: auto;
-          margin: 0 auto;
+          vertical-align: middle;
         }}
+        img.ptoe-img-vtop {{ vertical-align: top; }}
+        img.ptoe-img-vmid {{ vertical-align: middle; }}
+        img.ptoe-img-vbot {{ vertical-align: bottom; }}
         .cover {{
           text-align: center;
           margin-top: 2em;
         }}
         nav.toc {{
           margin: 1em 0;
+        }}
+        /* 目录编号与文字不重叠：序号以文本显式输出（.toc-num），关闭列表 marker——
+           部分阅读器对多位数字（>9）的 list-style marker 渲染会截断/数字叠加（2026-08） */
+        nav.toc ol {{
+          list-style: none;
+          padding-left: 1.8em;
+          margin: 0.2em 0;
+        }}
+        nav.toc li {{
+          margin: 0.2em 0;
+        }}
+        nav.toc .toc-num {{
+          display: inline-block;
+          min-width: 2.2em;
+          text-align: right;
+          margin-right: 0.4em;
         }}
         """
         return css
@@ -229,24 +313,30 @@ class HTMLConverter:
     def _escape_text(self, text: str) -> str:
         return html.escape(text, quote=False)
 
-    def render_cover_page(self, cover_info: Dict[str, Any]) -> str:
+    def render_cover_page(self, cover_info: Dict[str, Any], image_only: bool = False) -> str:
+        """封面页。image_only=True 时整页仅图片（无标题无其他内容，2026-08）——
+        第一页为整页图片时图片独立一页（书名保留在元数据与导航栏目录条目中）。
+        2026-08-15 起 convert_document 一律以 image_only=True 调用（用户不要书名页）；
+        非 image_only 分支保留供其他调用方使用。"""
         title = self._escape_text(cover_info.get('title', ''))
         author = self._escape_text(cover_info.get('author', ''))
         cover_img = cover_info.get('cover_image')  # relative path expected
         img_html = ''
         if cover_img:
             img_html = f"<div class='cover'><img alt='{title} cover' src='{self._escape_text(cover_img)}'/></div>"
+        if image_only:
+            body = img_html
+        else:
+            body = f"<h1>{title}</h1>\n<h2>{author}</h2>\n{img_html}"
         html_doc = f"""<?xml version='1.0' encoding='{self.encoding}'?>
 <!DOCTYPE html>
-<html lang='en'>
+<html lang='zh-CN' xmlns="http://www.w3.org/1999/xhtml">
 <head>
 <meta charset='{self.encoding}' />
 <title>{title}</title>
 </head>
 <body>
-<h1>{title}</h1>
-<h2>{author}</h2>
-{img_html}
+{body}
 </body>
 </html>
 """
@@ -255,9 +345,12 @@ class HTMLConverter:
     def render_toc_page(self, toc_items: List[Dict[str, Any]]) -> str:
         """Generate a nav.xhtml-like page (HTML5) for table of contents.
         toc_items: list of {'title': str, 'href': str, 'level': int}，按 level 嵌套 <ol>。
+        序号以文本显式输出（<span class="toc-num">N.</span>），不依赖阅读器
+        list-style marker 渲染——多位数字（>9）在部分阅读器中被截断/数字叠加（2026-08）。
         """
         out: List[str] = []
         depth = 0
+        counters: Dict[int, int] = {}  # 每级列表独立计数，新开一级从 1 重计
         for it in toc_items:
             t = self._escape_text(it.get('title', ''))
             href = self._escape_text(it.get('href', '#'))
@@ -265,24 +358,43 @@ class HTMLConverter:
             while depth < level:
                 out.append('<ol>')
                 depth += 1
+                counters[depth] = 0
             while depth > level:
                 out.append('</ol>')
                 depth -= 1
-            out.append(f'<li><a href="{href}">{t}</a></li>')
+            counters[level] = counters.get(level, 0) + 1
+            out.append(f'<li><a href="{href}"><span class="toc-num">{counters[level]}.</span>{t}</a></li>')
         while depth > 0:
             out.append('</ol>')
             depth -= 1
-        nav_html = '<nav class="toc">' + ''.join(out) + '</nav>'
+        # EPUB 3.3 §11 导航文档规范：目录 <nav> 必须带 epub:type="toc"，
+        # 且 <html> 需声明 xmlns:epub 命名空间——否则严格阅读器（Apple Books、
+        # Google Play 等）不识别为目录，TOC 面板空白或链接无法跳转（2026-08）。
+        # role="doc-toc" 为 ARIA 角色，辅助阅读器识别目录导航区域。
+        nav_html = '<nav class="toc" epub:type="toc" role="doc-toc">' + ''.join(out) + '</nav>'
+        # Landmarks nav：为阅读器提供目录/正文的语义入口（EPUB 3.3 §11.3）。
+        # nav.xhtml 不在 spine 中（正文不显示目录页，导航栏经 manifest properties="nav"
+        # 仍可用）：landmarks 链接必须指向 spine 内资源，否则 epubcheck RSC-011 报错
+        # （2026-08-15）
+        first_content_href = toc_items[0]['href'] if toc_items else 'content_1.xhtml'
+        # 取纯文件路径（去掉 #fragment），landmarks 链接指向文件即可
+        first_content_file = first_content_href.split('#', 1)[0]
+        landmarks_html = (
+            '<nav epub:type="landmarks" hidden="hidden">'
+            f'<ol><li><a epub:type="toc" href="{first_content_file}">目录</a></li>'
+            f'<li><a epub:type="bodymatter" href="{first_content_file}">正文</a></li></ol></nav>'
+        )
         html_doc = f"""<?xml version='1.0' encoding='{self.encoding}'?>
 <!DOCTYPE html>
-<html lang='en'>
+<html lang='zh-CN' xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
 <head>
 <meta charset='{self.encoding}' />
-<title>Table of Contents</title>
+<title>目录</title>
 </head>
 <body>
-<h1>Contents</h1>
+<h1>目录</h1>
 {nav_html}
+{landmarks_html}
 </body>
 </html>
 """
@@ -397,14 +509,16 @@ class HTMLConverter:
                 toc = []  # 本页标题（含锚点 id）
                 body = self._render_fragment(chunk, toc_out=toc)
                 if not toc:
-                    # 无标题：仅当该标题此前从未作为正文标题出现过才补 h1
-                    # （避免「书名=第一章大标题」时标题在后续每页重复）
-                    if sub_title.strip() not in used_titles:
+                    # 无标题：目录项保留（导航栏可跳转到该页），但不再向正文补
+                    # <h1>书名</h1>——「自动添加的图书名」从正文移除（2026-08-15），
+                    # 书名仅保留在导航栏目录条目与 EPUB 元数据中。
+                    # 全幅图片页（整页仅图片，无文字内容）不列目录项——整页即图片（2026-08）
+                    is_full_img_page = _is_img_page(text)
+                    if not is_full_img_page and sub_title.strip() not in used_titles:
                         toc.append({'title': sub_title, 'level': 1, 'id': None})
-                        body = f"<h1>{self._escape_text(sub_title)}</h1>\n" + body
                 for it in toc:
                     used_titles.add(it['title'])
-                html_doc = f"<?xml version='1.0' encoding='{self.encoding}'?>\n<!DOCTYPE html>\n<html lang='en'>\n<head>\n<meta charset='{self.encoding}'/>\n<title>{self._escape_text(sub_title)}</title>\n</head>\n<body>\n{body}\n</body>\n</html>"
+                html_doc = f"<?xml version='1.0' encoding='{self.encoding}'?>\n<!DOCTYPE html>\n<html lang='zh-CN' xmlns=\"http://www.w3.org/1999/xhtml\">\n<head>\n<meta charset='{self.encoding}'/>\n<title>{self._escape_text(sub_title)}</title>\n</head>\n<body>\n{body}\n</body>\n</html>"
                 outputs.append((fname, html_doc))
                 for it in toc:
                     href = fname if not it['id'] else f"{fname}#{it['id']}"
@@ -456,49 +570,54 @@ class HTMLConverter:
         else:
             cover_rel = None
 
-        cover_html = self.render_cover_page({'title': title, 'author': author, 'cover_image': cover_rel})
-        with open(os.path.join(oebps, cover_fname), 'w', encoding=self.encoding) as f:
-            f.write(self.cssm.inject_styles(cover_html))
+        cover_html = None  # cover 在图片提取之后构建（需解析后的图片路径），见下方
 
         # content pages
+        def split_h1_chapters(text: str, fallback_title: str) -> List[Dict[str, str]]:
+            """正文含 <h1> 时按一级标题切分为多篇文章（每篇 = 一个 EPUB 内容页，新页开始）。
+            merged 与 articles 分支共用（2026-08）：标题取首个 h1 内文（剥标签/unescape/压空白，
+            空回退 fallback_title），首个 h1 前的序言块沿用 fallback_title；无 <h1 单篇原样返回。"""
+            if '<h1' not in text:
+                return [{'title': fallback_title, 'text': text}]
+            out = []
+            for chunk in (c for c in re.split(r'(?=<h1(?:\s|>))', text) if c.strip()):
+                m = re.search(r'<h1[^>]*>(.*?)</h1>', chunk, flags=re.S)
+                if m:
+                    ch_title = html.unescape(re.sub(r'<[^>]+>', '', m.group(1))).strip()
+                    ch_title = re.sub(r'\s+', ' ', ch_title)
+                    out.append({'title': ch_title or fallback_title, 'text': chunk})
+                else:
+                    # 首个 h1 之前的序言块：沿用书名标题
+                    out.append({'title': fallback_title, 'text': chunk})
+            return out
+
         pages = structured_doc.get('pages', [])
         chapters = []
-        # 手动矫正的标记结构：每篇文章 = 一个 EPUB 内容页（全文标记处开新页）
+        # 手动矫正的标记结构：每篇文章 = 一个 EPUB 内容页（全文标记处开新页）；
+        # 文章正文含 <h1> 时同样按一级标题分页（与 merged 分支一致，2026-08）
         articles = structured_doc.get('articles')
         if articles:
             for a in articles:
-                chapters.append({'title': title, 'text': a.get('text', '')})
+                chapters.extend(split_h1_chapters(a.get('text', ''), title))
         elif merge_pages:
             # 合并模式：全部页面正文按页序合并为单一正文（跳过空白页）
             merged = "\n\n".join(
                 p.get('text', '').strip() for p in pages if (p.get('text') or '').strip()
             )
             if merged:
-                # B1：正文含 <h1> 时按标题切分为多篇文章，每篇一个 EPUB 内容页（新页开始）
-                if '<h1' in merged:
-                    chunks = [c for c in re.split(r'(?=<h1(?:\s|>))', merged) if c.strip()]
-                    for chunk in chunks:
-                        m = re.search(r'<h1[^>]*>(.*?)</h1>', chunk, flags=re.S)
-                        if m:
-                            # 提取章节标题：去标签、反转义、折叠空白
-                            ch_title = html.unescape(re.sub(r'<[^>]+>', '', m.group(1))).strip()
-                            ch_title = re.sub(r'\s+', ' ', ch_title)
-                            chapters.append({'title': ch_title or title, 'text': chunk})
-                        else:
-                            # 首个 h1 之前的序言块：沿用书名标题（与 articles 分支一致）
-                            chapters.append({'title': title, 'text': chunk})
-                else:
-                    chapters.append({'title': title, 'text': merged})
+                chapters.extend(split_h1_chapters(merged, title))
         else:
             for p in pages:
                 chapters.append({'title': f"Page {p.get('page')}", 'page': p.get('page'), 'text': p.get('text', '')})
 
-        # Before rendering, detect <img src='...'> occurrences in page texts and copy referenced images
+        # Before rendering, detect <img src='...'> occurrences and copy referenced images.
+        # 同时扫描原始页面文本与章节文本：矫正 markers/articles 流下两者可能不一致
+        # （历史载入、页面替换、文章重组等），保证图片不会漏提取（2026-08）
         img_pattern = re.compile(r"<img[^>]+src=[\"']([^\"']+)[\"']", flags=re.I)
         data_img_map: Dict[str, str] = {}  # data URI → Images/ 相对路径（同一图只写一次）
         img_seq = 0
-        for p in pages:
-            txt = p.get('text', '')
+        scan_texts = [p.get('text', '') for p in pages] + [ch.get('text', '') for ch in chapters]
+        for txt in scan_texts:
             for m in img_pattern.findall(txt):
                 src = m
                 # data URI（矫正界面插入的图片）：解码写入 Images/ 并替换为相对路径
@@ -543,12 +662,31 @@ class HTMLConverter:
                             # ignore copy errors; leave original src
                             pass
 
-        content_outputs, toc_items = self.render_content_pages(chapters, split_by_chars=200_000 if merge_pages else 5000)
+        # cover：整页图片页独立为封面（cover.xhtml，仅图片无书名页——2026-08-15
+        # 用户明确不要书名页，书名保留在 EPUB 元数据与导航栏目录条目中）；
+        # 无封面图（meta 未提供且首章非整页图片）时不生成 cover.xhtml
+        first_is_img_page = bool(chapters) and _is_img_page(chapters[0]['text'])
+        cover_img = cover_rel
+        if first_is_img_page:
+            m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', chapters[0]['text'])
+            if m:
+                cover_img = m.group(1)
+        cover_title = chapters[0]['title'] if chapters else title
+        if cover_img:
+            cover_html = self.render_cover_page({'title': cover_title, 'author': author, 'cover_image': cover_img}, image_only=True)
+            with open(os.path.join(oebps, cover_fname), 'w', encoding=self.encoding) as f:
+                f.write(self.cssm.inject_styles(cover_html))
+
+        # 第一页为整页图片且已生成封面页（cover.xhtml）时，该章不再重复出现在正文（2026-08）
+        render_chapters = chapters[1:] if (first_is_img_page and cover_img) else chapters
+        content_outputs, toc_items = self.render_content_pages(render_chapters, split_by_chars=200_000 if merge_pages else 5000)
         content_files = []
         for fname, content in content_outputs:
             path = os.path.join(oebps, fname)
             # inject stylesheet link
             doc = content.replace('</head>', '<link rel="stylesheet" type="text/css" href="style.css"/>\n</head>')
+            # 防御性自闭合：确保所有 <img ...> 都是 <img .../>（XHTML 规范要求）
+            doc = _self_close_img(doc)
             with open(path, 'w', encoding=self.encoding) as f:
                 f.write(doc)
             content_files.append(os.path.join('OEBPS', fname))
