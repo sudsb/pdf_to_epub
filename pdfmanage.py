@@ -82,11 +82,14 @@ def _find_existing_split(
     dpi: int,
     fmt: str,
     pdf_hash: str | None = None,
+    preprocess: dict | None = None,
 ) -> tuple[Path, list[Path]] | None:
-    """查找同一 PDF（内容哈希一致）且同一 dpi/fmt 的已分割图片目录。
+    """查找同一 PDF（内容哈希一致）且同一 dpi/fmt/预处理配置 的已分割图片目录。
 
-    命中条件：目录内有 .ptoe_split.json 标记，pdf_hash/dpi/fmt 全部一致，
+    命中条件：目录内有 .ptoe_split.json 标记，pdf_hash/dpi/fmt/preprocess 全部一致，
     且 1..pages 的页图都完整存在（防止半途中断/手动删图后的残缺目录被复用）。
+    preprocess 为归一化后的预处理配置（None=未启用）；旧标记无该键视为 None，
+    与「未启用预处理」兼容——开关变化时缓存自动失效重新分割。
     返回 (out_dir, out_paths)；未命中返回 None（需要重新分割）。
     """
     p = Path(pdf_path)
@@ -113,6 +116,7 @@ def _find_existing_split(
             meta.get("pdf_hash") != pdf_hash
             or meta.get("dpi") != dpi
             or meta.get("fmt") != fmt
+            or meta.get("preprocess") != (preprocess or None)
             or not isinstance(meta.get("pages"), int)
         ):
             continue
@@ -133,20 +137,104 @@ def _write_split_marker(
     fmt: str,
     pages: int,
     pdf_hash: str | None = None,
+    preprocess: dict | None = None,
 ) -> None:
-    """在分割目录写标记（下次相同输入直接复用）。写入失败不影响主流程。"""
+    """在分割目录写标记（下次相同输入直接复用）。写入失败不影响主流程。
+
+    preprocess 记录归一化预处理配置（None=未启用），供 _find_existing_split
+    比对——开关/参数变化时缓存自动失效。
+    """
     try:
         meta = {
             "pdf_hash": pdf_hash or _pdf_sha256(pdf_path),
             "dpi": dpi,
             "fmt": fmt,
             "pages": pages,
+            "preprocess": preprocess or None,
         }
         (out_dir / _SPLIT_MARKER).write_text(
             json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
         )
     except Exception:
         pass
+
+
+def _normalize_prep_cfg(cfg) -> dict | None:
+    """归一化图片预处理配置；未启用返回 None。
+
+    cfg 为 config.json 的 image_preprocess 键（dict）或 None。
+    返回 {gray, denoise, sharpen, binarize}（enabled 已剥离）或 None。
+    """
+    if not isinstance(cfg, dict) or not cfg.get("enabled"):
+        return None
+    return {
+        "gray": bool(cfg.get("gray", True)),
+        "denoise": bool(cfg.get("denoise", True)),
+        "sharpen": bool(cfg.get("sharpen", True)),
+        "binarize": bool(cfg.get("binarize", False)),
+    }
+
+
+_PREP_WARNED = False
+
+
+def _apply_preprocess_array(arr, prep: dict):
+    """对图像 ndarray 应用 OpenCV 预处理：灰度→中值去噪→锐化→可选二值化。
+
+    cv2/numpy 未安装时打印一次中文提示并原样返回（绝不因缺依赖中断分割）；
+    单步处理失败也只跳过该步/整体回退，不影响主流程。
+    """
+    global _PREP_WARNED
+    try:
+        import cv2
+    except Exception:
+        if not _PREP_WARNED:
+            _PREP_WARNED = True
+            print("      未安装 opencv-python，已跳过图片预处理（pip install opencv-python）")
+        return arr
+    try:
+        # OCR 场景颜色无意义：统一在灰度域处理
+        gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY) if getattr(arr, "ndim", 2) == 3 else arr
+        if prep.get("denoise"):
+            gray = cv2.medianBlur(gray, 3)
+        if prep.get("sharpen"):
+            blur = cv2.GaussianBlur(gray, (0, 0), 3)
+            gray = cv2.addWeighted(gray, 1.5, blur, -0.5, 0)
+        if prep.get("binarize"):
+            gray = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15
+            )
+        return gray
+    except Exception as exc:
+        print(f"      图片预处理失败，已使用原图：{exc}")
+        return arr
+
+
+def _write_preprocessed(pix, out_path: str, fmt: str, prep: dict) -> None:
+    """把 Pixmap 经 OpenCV 预处理后写盘；任何失败都回退 pix.save 原图。"""
+    try:
+        import cv2
+        import numpy as np
+
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+            pix.height, pix.width, pix.n
+        )
+        if pix.n == 4:
+            arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+        else:
+            arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        processed = _apply_preprocess_array(arr, prep)
+        ext = ".jpg" if fmt.lower() in ("jpg", "jpeg") else ".png"
+        ok, buf = cv2.imencode(ext, processed)
+        if not ok:
+            raise RuntimeError("cv2.imencode 失败")
+        buf.tofile(out_path)
+    except Exception:
+        # 兜底：预处理/编码任何环节失败都退回原始渲染结果
+        if fmt.lower() in ("jpg", "jpeg"):
+            pix.save(out_path, jpg_quality=100)
+        else:
+            pix.save(out_path)
 
 
 # 多进程渲染阈值：页数低于此值直接顺序渲染（spawn 开销 > 并行收益）
@@ -162,8 +250,10 @@ def _render_page_range(args: tuple) -> list[dict]:
 
     每个 worker 独立 fitz.open() 打开 PDF（PyMuPDF 非线程安全，
     不同进程必须各自持有独立 Document 对象）。
+    args = (pdf_path, start, end, out_dir, dpi, fmt, mat_scale, prep)
+    prep 为归一化预处理配置（None=不预处理，走 pix.save 原路径）。
     """
-    pdf_path, start, end, out_dir, dpi, fmt, mat_scale = args
+    pdf_path, start, end, out_dir, dpi, fmt, mat_scale, prep = args
     import fitz  # 每个子进程延迟导入
 
     results: list[dict] = []
@@ -182,7 +272,9 @@ def _render_page_range(args: tuple) -> list[dict]:
                 pix = doc[i].get_pixmap(matrix=mat, alpha=False)
                 filename = f"{page_num}.{fmt}"
                 out_path = os.path.join(out_dir, filename)
-                if fmt.lower() in ("jpg", "jpeg"):
+                if prep:
+                    _write_preprocessed(pix, out_path, fmt, prep)
+                elif fmt.lower() in ("jpg", "jpeg"):
                     pix.save(out_path, jpg_quality=100)
                 else:
                     pix.save(out_path)
@@ -196,7 +288,11 @@ def _render_page_range(args: tuple) -> list[dict]:
 
 
 def split_pdf_to_images(
-    pdf_path: Path | str, *, dpi: int = 200, fmt: str = "png"
+    pdf_path: Path | str,
+    *,
+    dpi: int = 200,
+    fmt: str = "png",
+    preprocess=None,
 ) -> tuple[Path, list[Path]]:
     """Split a PDF into per-page images.
 
@@ -204,6 +300,9 @@ def split_pdf_to_images(
       pdf_path: path to the PDF file
       dpi: output dpi for rasterization (default 200)
       fmt: image format ("png" or "jpg").
+      preprocess: OpenCV 预处理配置（config.json image_preprocess 形状）；
+        None 时从 configmanage.get_config(show_dialogs=False) 懒读取，
+        显式传 dict 可覆盖（测试钩子）。enabled=false/None 均不预处理。
 
     Returns:
       (output_folder, list_of_image_paths)
@@ -211,18 +310,30 @@ def split_pdf_to_images(
     Raises:
       RuntimeError when required backend (PyMuPDF) is missing or the file cannot be read.
 
-    相同 PDF（内容哈希一致）+ 相同 dpi/fmt 时直接复用已有分割图片，不重新切图：
-    分割目录内有 .ptoe_split.json 标记记录（pdf_hash/dpi/fmt/pages），命中且
-    页图齐全即返回已有 (out_dir, out_paths)。PDF 内容或参数变化时重新分割
-    （createdic 自动生成新目录），并写入新标记。
+    相同 PDF（内容哈希一致）+ 相同 dpi/fmt/预处理配置 时直接复用已有分割图片，
+    不重新切图：分割目录内有 .ptoe_split.json 标记记录（pdf_hash/dpi/fmt/pages/
+    preprocess），命中且页图齐全即返回已有 (out_dir, out_paths)。PDF 内容或
+    参数（含预处理开关）变化时重新分割（createdic 自动生成新目录），并写入新标记。
     """
     p = Path(pdf_path)
     if not p.exists() or not p.is_file():
         raise RuntimeError(f"PDF path does not exist or is not a file: {p}")
 
+    # 解析预处理配置：显式参数优先，否则懒读 config.json（headless 安全）
+    if preprocess is None:
+        try:
+            from configmanage import get_config
+
+            preprocess = get_config(show_dialogs=False).get("image_preprocess")
+        except Exception:
+            preprocess = None
+    prep = _normalize_prep_cfg(preprocess)
+    if prep:
+        print("      图片预处理已启用（OpenCV：灰度/去噪/锐化）")
+
     # 复用已有分割：相同内容 + 相同参数时不重新切图，直接返回既有图片
     pdf_hash = _pdf_sha256(p)
-    reused = _find_existing_split(p, dpi, fmt, pdf_hash=pdf_hash)
+    reused = _find_existing_split(p, dpi, fmt, pdf_hash=pdf_hash, preprocess=prep)
     if reused is not None:
         out_dir, out_paths = reused
         print(f"      reusing {len(out_paths)} existing page image(s) in {out_dir}")
@@ -264,7 +375,7 @@ def split_pdf_to_images(
                 seg_end = min(seg_start + seg_size, total_pages)
                 if seg_start >= seg_end:
                     break
-                chunks.append((str(p), seg_start, seg_end, str(out_dir), dpi, fmt, mat_scale))
+                chunks.append((str(p), seg_start, seg_end, str(out_dir), dpi, fmt, mat_scale, prep))
             # 先关闭父进程 doc，子进程各自打开
             doc.close()
             doc = None
@@ -300,7 +411,9 @@ def split_pdf_to_images(
                     pix = page.get_pixmap(matrix=mat, alpha=False)
                     filename = f"{i}.{fmt}"
                     out_path = out_dir / filename
-                    if fmt.lower() in ("jpg", "jpeg"):
+                    if prep:
+                        _write_preprocessed(pix, str(out_path), fmt, prep)
+                    elif fmt.lower() in ("jpg", "jpeg"):
                         pix.save(str(out_path), jpg_quality=100)
                     else:
                         pix.save(str(out_path))
@@ -322,7 +435,9 @@ def split_pdf_to_images(
             # 过滤掉失败的页
             out_paths = [p for p in out_paths if p is not None]
 
-        _write_split_marker(out_dir, p, dpi, fmt, len(out_paths), pdf_hash=pdf_hash)
+        _write_split_marker(
+            out_dir, p, dpi, fmt, len(out_paths), pdf_hash=pdf_hash, preprocess=prep
+        )
         return out_dir, out_paths
     finally:
         if doc is not None:

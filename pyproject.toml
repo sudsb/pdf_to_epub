@@ -6,6 +6,14 @@ dependencies = [
     "pymupdf>=1.28.0",
     "requests>=2.34.2",
     "zhconv>=1.4.3",
+    "opencv-python>=4.8",
+]
+
+[project.optional-dependencies]
+# PaddleOCR 识别引擎（可选，--engine paddle 时才需要；体积大故不入默认依赖）
+paddle = [
+    "paddleocr>=3.7",
+    "paddlepaddle>=3.2",
 ]
 
 [tool.pyrefly]

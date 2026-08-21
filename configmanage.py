@@ -211,6 +211,17 @@ DEFAULT_CONFIG = {
         "note": "serif",
         "citation": "cursive"
     },
+    # 图片预处理（2026-08，OpenCV）：PDF 分割图片时启用，提高 OCR 识别率。
+    # enabled 开关；gray 灰度 / denoise 中值去噪 / sharpen 锐化 / binarize 自适应二值化；
+    # workers 0=自动按 CPU 核数（>0 时限制渲染进程数）。设置变更会使 .ptoe_split.json 缓存失效。
+    "image_preprocess": {
+        "enabled": False,
+        "gray": True,
+        "denoise": True,
+        "sharpen": True,
+        "binarize": False,
+        "workers": 0
+    },
     # 可拓展其余各manage/key conf
 }
 

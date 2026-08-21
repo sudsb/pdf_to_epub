@@ -26,6 +26,7 @@ uv run --with pyinstaller pyinstaller --noconfirm --clean `
   --add-data "pyproject.toml;." `
   --add-data "dicts;dicts" `
   --collect-all pymupdf `
+  --collect-all cv2 `
   mian.py
 
 if ($LASTEXITCODE -ne 0) {

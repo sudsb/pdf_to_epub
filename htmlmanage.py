@@ -100,6 +100,8 @@ class CSSManager:
           font-weight: bold;
           margin: 1em 0 0.5em 0;
           text-align: center;
+          /* 标题默认金光红（2026-08）：R255 G0 B0 */
+          color: #ff0000;
         }}
         h1 {{
           /* 一级标题下方分隔线（2026-08）：全宽自适应（随版面宽度伸展） */

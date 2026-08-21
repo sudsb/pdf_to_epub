@@ -345,5 +345,13 @@
     "heading": "sans-serif",
     "note": "serif",
     "citation": "cursive"
+  },
+  "image_preprocess": {
+    "enabled": false,
+    "gray": true,
+    "denoise": true,
+    "sharpen": true,
+    "binarize": false,
+    "workers": 0
   }
 }

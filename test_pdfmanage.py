@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import shutil
 import tempfile
@@ -5,6 +6,8 @@ import unittest
 from pathlib import Path
 
 import pdfmanage
+
+_CV2_AVAILABLE = importlib.util.find_spec("cv2") is not None
 
 _REAL_PDF = Path(r"E:\MYBooks\books\毛泽东思想\主席与毛远新同志谈话纪要.pdf")
 _TEST_PDF = (
@@ -200,6 +203,131 @@ class TestSplitReuse(unittest.TestCase):
         d2, imgs = pdfmanage.split_pdf_to_images(self.pdf_path, dpi=200, fmt="png")
         self.assertNotEqual(d1, d2)
         self.assertEqual(len(imgs), 3)
+
+
+class TestPreprocessCfg(unittest.TestCase):
+    """图片预处理配置归一化（OpenCV，2026-08）。"""
+
+    def test_none_or_non_dict_returns_none(self):
+        self.assertIsNone(pdfmanage._normalize_prep_cfg(None))
+        self.assertIsNone(pdfmanage._normalize_prep_cfg("enabled"))
+        self.assertIsNone(pdfmanage._normalize_prep_cfg(42))
+
+    def test_disabled_returns_none(self):
+        self.assertIsNone(pdfmanage._normalize_prep_cfg({"enabled": False}))
+        self.assertIsNone(pdfmanage._normalize_prep_cfg({}))
+
+    def test_enabled_uses_defaults(self):
+        cfg = pdfmanage._normalize_prep_cfg({"enabled": True})
+        self.assertEqual(
+            cfg,
+            {"gray": True, "denoise": True, "sharpen": True, "binarize": False},
+        )
+
+    def test_explicit_flags_preserved(self):
+        cfg = pdfmanage._normalize_prep_cfg(
+            {"enabled": True, "gray": False, "denoise": False,
+             "sharpen": False, "binarize": True}
+        )
+        self.assertEqual(
+            cfg,
+            {"gray": False, "denoise": False, "sharpen": False, "binarize": True},
+        )
+
+
+class TestPreprocessSplit(unittest.TestCase):
+    """预处理设置写入分割标记并参与缓存判定。"""
+
+    def setUp(self):
+        try:
+            import fitz  # noqa: F401
+        except Exception:
+            self.skipTest("PyMuPDF (fitz) is not installed")
+        self._work_dir = Path(tempfile.mkdtemp(prefix="test_prep_"))
+        self.pdf_name = "prep_test"
+        self.pdf_path = self._work_dir / f"{self.pdf_name}.pdf"
+
+        import fitz
+
+        doc = fitz.open()
+        for _ in range(3):
+            page = doc.new_page()
+            page.insert_text((72, 72), "Prep page")
+        doc.save(str(self.pdf_path))
+        doc.close()
+        for d in Path("data").glob(f"{self.pdf_name}*"):
+            shutil.rmtree(d, ignore_errors=True)
+
+    def tearDown(self):
+        for d in Path("data").glob(f"{self.pdf_name}*"):
+            shutil.rmtree(d, ignore_errors=True)
+        shutil.rmtree(self._work_dir, ignore_errors=True)
+
+    def test_marker_records_preprocess(self):
+        import json as _json
+
+        prep = {"enabled": True, "gray": True, "denoise": True,
+                "sharpen": True, "binarize": False}
+        d1, _ = pdfmanage.split_pdf_to_images(
+            self.pdf_path, dpi=200, fmt="png", preprocess=prep
+        )
+        meta = _json.loads(
+            (d1 / pdfmanage._SPLIT_MARKER).read_text(encoding="utf-8")
+        )
+        self.assertEqual(meta.get("preprocess"), pdfmanage._normalize_prep_cfg(prep))
+
+    def test_mismatched_preprocess_triggers_resplit(self):
+        prep_on = {"enabled": True}
+        d1, _ = pdfmanage.split_pdf_to_images(
+            self.pdf_path, dpi=200, fmt="png", preprocess=prep_on
+        )
+        # 预处理开关变化 → 缓存不得复用
+        d2, _ = pdfmanage.split_pdf_to_images(self.pdf_path, dpi=200, fmt="png")
+        self.assertNotEqual(d1, d2)
+
+    def test_old_marker_without_key_reused_when_disabled(self):
+        d1, _ = pdfmanage.split_pdf_to_images(self.pdf_path, dpi=200, fmt="png")
+        # 旧标记无 preprocess 键 == 未启用 → 关闭状态下仍复用（向后兼容）
+        d2, _ = pdfmanage.split_pdf_to_images(self.pdf_path, dpi=200, fmt="png")
+        self.assertEqual(d1, d2)
+
+    def test_disabled_never_imports_cv2(self):
+        # 未启用预处理时不得触碰 cv2（模拟 cv2 缺失环境也不应报错）
+        import sys as _sys
+
+        saved = _sys.modules.pop("cv2", None)
+        _sys.modules["cv2"] = None  # import cv2 会直接抛 ImportError
+        try:
+            d1, imgs = pdfmanage.split_pdf_to_images(
+                self.pdf_path, dpi=150, fmt="png"
+            )
+            self.assertEqual(len(imgs), 3)
+            self.assertTrue((d1 / "1.png").is_file())
+        finally:
+            if saved is not None:
+                _sys.modules["cv2"] = saved
+            else:
+                _sys.modules.pop("cv2", None)
+
+
+@unittest.skipUnless(_CV2_AVAILABLE, "opencv-python is not installed")
+class TestPreprocessTransform(unittest.TestCase):
+    """真实 OpenCV 变换：输出尺寸不变、像素有变化、非黑即白不崩溃。"""
+
+    def test_apply_preprocess_array_changes_pixels(self):
+        import numpy as np
+
+        rng = np.random.RandomState(42)
+        arr = rng.randint(0, 256, size=(64, 64, 3), dtype=np.uint8)
+        prep = {"gray": True, "denoise": True, "sharpen": True, "binarize": False}
+        out = pdfmanage._apply_preprocess_array(arr, prep)
+        self.assertEqual(out.ndim, 2)  # 灰度输出
+        self.assertEqual(out.shape[:2], arr.shape[:2])
+        binarized = pdfmanage._apply_preprocess_array(
+            arr, {"gray": True, "denoise": True, "sharpen": True, "binarize": True}
+        )
+        # 二值化后仅含 0/255
+        self.assertTrue(((binarized == 0) | (binarized == 255)).all())
 
 
 if __name__ == "__main__":

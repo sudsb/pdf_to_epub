@@ -103,6 +103,32 @@ def _ensure_server(model_key: str, workers: int | None = None) -> None:
         )
 
 
+# ---- PaddleOCR 引擎覆盖（2026-08）：--engine paddle 仅作用于 PDF OCR 阶段 ----
+_ENGINE_OVERRIDE: str | None = None
+
+
+def _apply_engine_arg(engine: str | None) -> None:
+    """应用 CLI --engine：paddle 走模块级覆盖（不进 llamamanage/config），llama/vllm 走 set_engine。"""
+    global _ENGINE_OVERRIDE
+    if not engine:
+        return
+    if engine == "paddle":
+        _ENGINE_OVERRIDE = "paddle"
+        return
+    from llamamanage import set_engine
+
+    set_engine(engine)
+
+
+def _active_ocr_engine() -> str:
+    """PDF OCR 阶段实际使用的引擎（paddle 覆盖优先于 config/llamamanage）。"""
+    if _ENGINE_OVERRIDE == "paddle":
+        return "paddle"
+    from llamamanage import _active_engine
+
+    return _active_engine()
+
+
 def _apply_correction(structured: dict, corrected: List[Dict[str, Any]], *, strict_markers: bool) -> None:
     """把矫正后的 pages 写入 structured（body/paragraphs/articles）。
 
@@ -390,7 +416,10 @@ def pdf_to_epub(
     if max_workers is None:
         print(f"      workers={eff_workers}（模型推荐）")
 
-    if todo_images:
+    # PaddleOCR 引擎（--engine paddle）：本地推理，无需启动 llama/vllm 服务
+    use_paddle = _active_ocr_engine() == "paddle"
+
+    if todo_images and not use_paddle:
         t_model = time.perf_counter()
         _ensure_server(model_key, workers=eff_workers)
         timings["model"] = time.perf_counter() - t_model
@@ -442,16 +471,31 @@ def pdf_to_epub(
 
     if todo_images:
         t_batch = time.perf_counter()
-        results = batch_infer(
-            todo_images,
-            [prompt] * len(todo_images),
-            model_key=model_key,
-            max_workers=eff_workers,
-            thinking=thinking,
-            timeout=timeout,
-            on_progress=_on_progress,
-            on_result=_on_ocr_result,
-        )
+        if use_paddle:
+            # PaddleOCR 本地识别：无提示词/服务进程，接口形状与 llamamanage.batch_infer 一致
+            import paddleocrmanage as _paddle
+
+            results = _paddle.batch_infer(
+                todo_images,
+                [prompt] * len(todo_images),
+                model_key=model_key,
+                max_workers=eff_workers,
+                thinking=thinking,
+                timeout=timeout,
+                on_progress=_on_progress,
+                on_result=_on_ocr_result,
+            )
+        else:
+            results = batch_infer(
+                todo_images,
+                [prompt] * len(todo_images),
+                model_key=model_key,
+                max_workers=eff_workers,
+                thinking=thinking,
+                timeout=timeout,
+                on_progress=_on_progress,
+                on_result=_on_ocr_result,
+            )
         timings["ocr"] = time.perf_counter() - t_batch
     else:
         results = []
@@ -1015,7 +1059,7 @@ def main(argv: list[str] | None = None) -> int:
     epub_p.add_argument("--model", default=default_model, help="Model key in config.json model_choices (default: from config.json)")
     epub_p.add_argument(
         "--engine",
-        choices=("llama", "vllm"),
+        choices=("llama", "vllm", "paddle"),
         default=None,
         help="推理引擎：llama（llama.cpp，默认）或 vllm（vLLM-Omni）；缺省用 config.json 的 engine 键",
     )
@@ -1081,7 +1125,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     correct_p.add_argument(
         "--engine",
-        choices=("llama", "vllm"),
+        choices=("llama", "vllm", "paddle"),
         default=None,
         help="推理引擎：llama（llama.cpp，默认）或 vllm（vLLM-Omni）；缺省用 config.json 的 engine 键",
     )
@@ -1119,7 +1163,7 @@ def main(argv: list[str] | None = None) -> int:
     resume_p.add_argument("--model", default=default_model, help="Model key in config.json model_choices (default: from config.json)")
     resume_p.add_argument(
         "--engine",
-        choices=("llama", "vllm"),
+        choices=("llama", "vllm", "paddle"),
         default=None,
         help="推理引擎：llama（llama.cpp，默认）或 vllm（vLLM-Omni）；缺省用 config.json 的 engine 键",
     )
@@ -1172,7 +1216,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     stop_p.add_argument(
         "--engine",
-        choices=("llama", "vllm"),
+        choices=("llama", "vllm", "paddle"),
         default=None,
         help="推理引擎：llama（llama.cpp，默认）或 vllm（vLLM-Omni）；缺省用 config.json 的 engine 键",
     )
@@ -1368,6 +1412,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "stop":
+        if args.engine == "paddle":
+            # PaddleOCR 为本地推理引擎（无外部服务进程），无需停止
+            print("PaddleOCR 为本地推理引擎，无需停止服务")
+            return 0
         try:
             from llamamanage import _active_engine, set_engine, stopserver
 
@@ -1384,10 +1432,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "epub":
         try:
-            if args.engine:
-                from llamamanage import set_engine
-
-                set_engine(args.engine)
+            _apply_engine_arg(args.engine)
             result = pdf_to_epub(
                 args.pdf,
                 dpi=DPI_LEVELS[args.dpi],
@@ -1416,10 +1461,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "resume":
         try:
-            if args.engine:
-                from llamamanage import set_engine
-
-                set_engine(args.engine)
+            _apply_engine_arg(args.engine)
             result = pdf_to_epub(
                 args.pdf,
                 dpi=DPI_LEVELS[args.dpi],
@@ -1443,11 +1485,12 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
     if args.command == "correct":
+        if args.engine == "paddle":
+            # PaddleOCR 仅用于 PDF 识别流程；文本矫正仍使用大模型引擎
+            print("PaddleOCR 仅用于 PDF 识别流程；文本矫正仍使用大模型引擎，已忽略 --engine paddle")
+        else:
+            _apply_engine_arg(args.engine)
         try:
-            if args.engine:
-                from llamamanage import set_engine
-
-                set_engine(args.engine)
             result = correct_pdf(
                 args.pdf,
                 title=args.title,
