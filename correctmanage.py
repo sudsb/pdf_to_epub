@@ -2451,6 +2451,27 @@ def _preview_doc(state: dict[str, Any]):
         return doc
 
 
+def _page_dims(state: dict[str, Any]) -> dict[int, tuple[int, int]]:
+    """读取各页原始宽高（PDF 页面矩形，pt；宽高比与 DPI 无关）。
+
+    供 /api/pages 下发给前端：按「图片宽度为基准」预计算每行高度，
+    虚拟列表未挂载行的前缀和也能精确计算（跳转定位不再依赖估算）。
+    PDF 不可用时返回空 dict（前端回退到图片 onload 后逐行测量收敛）。
+    """
+    doc = _preview_doc(state)
+    if doc is None:
+        return {}
+    lock = state.get("preview_doc_lock")
+    try:
+        with lock if lock is not None else nullcontext():
+            return {
+                i + 1: (round(doc[i].rect.width), round(doc[i].rect.height))
+                for i in range(len(doc))
+            }
+    except Exception:
+        return {}
+
+
 def _render_jpeg(
     state: dict[str, Any], page_no: int, dpi: float
 ) -> tuple[str, bytes] | None:
@@ -3784,6 +3805,8 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
             else:
                 pages_snapshot = dict(state["pages"])
             pages_list = []
+            # 各页原始宽高（PDF 不可用时为空 dict，前端回退 onload 测量）
+            dims = _page_dims(state)
             for n in sorted(pages_snapshot):
                 raw_html = pages_snapshot[n]
                 # Add ptoe-marker class for marker spans so saved pages render
@@ -3792,12 +3815,13 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 # 2026-08-15 修复：已保存/历史内容按原样 serve（normalize_headings=False）
                 # ——其中可能含用户手动设置的标题，不能再归一为 <p>（否则「保存后重开，
                 # 已设置的标题格式丢失」）；OCR 自动标题的归一只在写入历史时做一次。
-                pages_list.append(
-                    {
-                        "page": n,
-                        "text": _page_text(served_html, normalize_headings=False),
-                    }
-                )
+                item = {
+                    "page": n,
+                    "text": _page_text(served_html, normalize_headings=False),
+                }
+                if n in dims:
+                    item["w"], item["h"] = dims[n]
+                pages_list.append(item)
             payload = {"pages": pages_list}
             self._send(200, self._json(payload), "application/json; charset=utf-8")
             return
@@ -5209,12 +5233,16 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
 #hintClose:hover{background:#dfe7f3;color:#1c2733;border:none;}
 #hintbar.hidden{display:none;}
 #pages{position:relative;overflow-anchor:none;}
+/* 宽度基准动态行高（2026-08）：行高由左侧图片按栏宽等比撑出（服务端 /api/pages
+   下发各页原始宽高，前端预计算 heights[]，未挂载行前缀和也精确 → 跳转瞬时定位）。
+   每页用各自真实宽高比，个别异常大小页面只影响自身行高，不干扰其他页。
+   文字窗内容超出图片高度时在行内滚动（height:0+min-height:100% 不参与撑行）。 */
 .page-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:stretch;background:#fff;border:1px solid var(--border);border-radius:8px;padding:12px;}
 .page-head{grid-column:1 / -1;font-size:12px;color:#5a6b7c;border-bottom:1px dashed var(--border);padding-bottom:6px;}
-.img-panel{position:relative;min-width:0;background:#fff;border:1px solid var(--border);border-radius:4px;padding:4px;}
+.img-panel{position:relative;min-width:0;overflow:hidden;background:#fff;border:1px solid var(--border);border-radius:4px;padding:4px;}
 .img-panel img{width:100%;height:auto;display:block;background:#fff;cursor:zoom-in;}
 .badge{position:absolute;top:8px;left:8px;background:rgba(0,0,0,.55);color:#fff;font-size:11px;padding:2px 8px;border-radius:10px;pointer-events:none;}
-.editable{min-height:220px;padding:10px 14px;border:1px solid var(--border);border-radius:4px;line-height:1.7;font-size:var(--editor-font-size);outline:none;}
+.editable{height:0;min-height:100%;overflow-y:auto;padding:10px 14px;border:1px solid var(--border);border-radius:4px;line-height:1.7;font-size:var(--editor-font-size);outline:none;}
 .editable:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(47,111,237,.15);}
 .editable h1{font-size:1.45em;} .editable h2{font-size:1.28em;} .editable h3{font-size:1.12em;}
 .editable h4,.editable h5,.editable h6{font-size:1.02em;}
@@ -5386,8 +5414,10 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
 .fr-tag-none{background:#f0f2f4;color:#5a6b7c;border-color:#d5dbe1;}
 .fr-tags-empty{color:#9aa7b4;font-size:12px;}
 @media (max-width:900px){
+  /* 窄屏单列布局：回退自然高度（图上文下纵向堆叠），文字窗不裁剪 */
   .page-row{grid-template-columns:1fr;}
-  .editable{font-size:calc(var(--editor-font-size) + 2px);}
+  .img-panel img{width:100%;}
+  .editable{font-size:calc(var(--editor-font-size) + 2px);height:auto;min-height:160px;overflow-y:visible;}
 }
 </style>
 </head>
@@ -6123,6 +6153,7 @@ function pageRow(p, i) {
   const v = loadNonce;
   // 已知宽高比时先占位：重挂载/预览↔原图切换不再改变行高（避免视口内行突然长高 → 下方内容下移 → 跳页）
   if (imgAspect[p.page]) img.style.aspectRatio = imgAspect[p.page];
+  else if (p.w && p.h) img.style.aspectRatio = p.w + ' / ' + p.h; // 服务端下发的原始宽高（加载前即占位）
   img.onload = () => {
     // 首帧加载后缓存宽高比并占位；随后批量测量（行高变化即时补偿 scrollY，视口保持贴附）
     if (img.naturalWidth > 0 && img.naturalHeight > 0) {
@@ -6602,6 +6633,10 @@ function updateViewport() {
     if (!keep.has(i)) {
       const ed = row.querySelector('.editable');
       if (ed) syncContent(ed);
+      // 卸载前中止在途预览图请求：row.remove() 不会取消已发出的图片下载，
+      // 快速滚动/跳页时中间页的请求会继续排队占用服务端串行渲染
+      const img = row.querySelector('img');
+      if (img) { img.onerror = null; img.onload = null; img.src = ''; }
       row.remove();
     }
   }
@@ -6914,7 +6949,15 @@ function jumpToPage() {
   for (let i = 0; i < pages.length; i++) { if (pages[i].page === v) { idx = i; break; } }
   if (idx < 0) { setStatus('未找到第 ' + v + ' 页'); return; }
   const hostTop = host.getBoundingClientRect().top + window.scrollY;
-  window.scrollTo({ top: Math.max(0, hostTop + prefixTop(idx) - 60), behavior: 'smooth' });
+  // 瞬时跳转（behavior:'auto'）：smooth 会逐页滚过中间所有页，每页都触发
+  // updateViewport 挂载行并发出 /preview 图片请求，且行卸载不取消已发出的
+  // 请求——跨几百页跳转时会积压成百上千个串行渲染请求，加载近分钟级。
+  window.scrollTo({ top: Math.max(0, hostTop + prefixTop(idx) - 60), behavior: 'auto' });
+  // 固定行高下同步挂载目标行（scroll 事件异步触发，这里显式调用保证行已存在），
+  // 并把页内文字滚动复位到顶部，避免沿用上一页的内部滚动位置
+  updateViewport();
+  const row = host.querySelector('.page-row[data-i="' + idx + '"]');
+  if (row) { const ed = row.querySelector('.editable'); if (ed) ed.scrollTop = 0; }
   hidePopup();
   setStatus('已跳转到第 ' + v + ' 页');
 }
@@ -7180,7 +7223,21 @@ function replaceCurrent() {
 
 function scrollToIndex(idx) {
   const hostTop = host.getBoundingClientRect().top + window.scrollY;
-  window.scrollTo({ top: Math.max(0, hostTop + prefixTop(idx) - 60), behavior: 'smooth' });
+  // 瞬时跳转（同 jumpToPage）：smooth 滚动会逐页挂载中间行、积压图片请求
+  window.scrollTo({ top: Math.max(0, hostTop + prefixTop(idx) - 60), behavior: 'auto' });
+  // 固定行高下同步挂载目标行，并把页内文字滚动复位到顶部
+  updateViewport();
+  const row = host.querySelector('.page-row[data-i="' + idx + '"]');
+  if (row) {
+    const ed = row.querySelector('.editable');
+    if (ed) ed.scrollTop = 0;
+    // 搜索跳转：若目标行内有高亮标记，把标记滚到文字窗上三分之一处
+    const mark = row.querySelector('.ptoe-search');
+    if (mark && ed) {
+      const dy = mark.getBoundingClientRect().top - ed.getBoundingClientRect().top;
+      ed.scrollTop = Math.max(0, dy - ed.clientHeight / 3);
+    }
+  }
   hidePopup();
 }
 
@@ -10607,6 +10664,47 @@ function _flushPendingOps() { while (window._pendingOps.length) { const f = wind
 document.addEventListener('compositionstart', () => { window.isComposing = true; });
 document.addEventListener('compositionend', () => { window.isComposing = false; _flushPrPending(); setTimeout(_flushPendingOps, 0); });
 
+// ---------- 宽度基准动态行高 ----------
+// 行高由左侧图片按栏宽等比撑出（服务端 /api/pages 下发各页原始宽高 w/h）。
+// 每页用各自真实比例：个别异常大小页面只影响自身行高，不进入任何统计。
+// 预计算全部 heights[] 后，未挂载行的 prefixTop 也精确 → 跳转瞬时定位。
+let _rowChrome = 0; // 每行固定开销（page-head/边框/内边距，与栏宽无关），首次实测后校准
+function applyAspectHeights() {
+  if (!pages.length) return;
+  const probe = host.querySelector('.page-row .img-panel');
+  if (!probe) return;
+  const imgW = probe.clientWidth - 10; // 减 img-panel padding 4*2 + border 1*2
+  if (imgW <= 0) return;
+  // 校准固定开销：取任一已挂载且已实测高度的行反推（图片有 aspect-ratio 占位，
+  // 挂载即可测得最终高度；与下方公式同源，差值即纯 chrome）
+  if (!_rowChrome) {
+    for (const row of host.children) {
+      const i = Number(row.dataset.i);
+      const p = pages[i];
+      if (p && p.w && p.h && heights[i] > 0) {
+        _rowChrome = heights[i] - GAP - Math.round(imgW * p.h / p.w);
+        break;
+      }
+    }
+    if (!_rowChrome) _rowChrome = 60; // 尚无可校准行时的兜底值
+  }
+  let sum = 0, cnt = 0, changed = false;
+  for (let i = 0; i < pages.length; i++) {
+    const p = pages[i];
+    if (!p || !p.w || !p.h) continue;
+    // 极端长宽比钳制：图片高度限制在 [160, imgW*3]，防超长条页把行撑到离谱
+    let ih = Math.round(imgW * p.h / p.w);
+    ih = Math.max(160, Math.min(ih, imgW * 3));
+    const h = ih + _rowChrome + GAP;
+    if (!heights[i] || Math.abs(heights[i] - h) > 1) { heights[i] = h; changed = true; }
+    sum += h; cnt++;
+  }
+  if (!cnt) return;
+  est = Math.round(sum / cnt); // 全局估算同步为真实均值（viewRows 计算更准）
+  if (changed) { rebuildPrefix(); reposition(); }
+}
+window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport(); });
+
 // ---------- 初始化 ----------
 (async function init() {
   try {
@@ -10625,7 +10723,8 @@ document.addEventListener('compositionend', () => { window.isComposing = false; 
   const fs = loadInt('ptoe_font_size', 14);
   document.getElementById('fontSizeSel').value = fs;
   document.documentElement.style.setProperty('--editor-font-size', fs + 'px');
-  updateViewport();
+  updateViewport();   // 先挂载首屏（提供测量探针行）
+  applyAspectHeights();   // 按各页真实宽高比预计算全部行高，未挂载行前缀和即精确
   setStatus('已加载 ' + pages.length + ' 页');
 })();
 </script>
