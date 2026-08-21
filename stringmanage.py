@@ -27,6 +27,38 @@ _BBOX_LINE_RE = re.compile(
 _BBOX_SKIP_LABELS = {"page_number", "figure", "image"}
 
 
+# -- ULQ 杂符引注清理 + 括号对统一（与 correctmanage._normalize_brackets 同实现；
+# 不能反向导入 correctmanage（会循环导入），故在此复制一份小实现） --
+# 策略：数字两侧只要出现垃圾符号（\ ^ ~ ` | · { }）即视为引注包裹，允许任意
+# 括号汤（各类中英括号任意混排）垫在周围——比逐个枚举包裹形状稳健得多。
+_ULQ_JUNK_BRACKET_RE = re.compile(
+    r"[\[\]{}()（）【】［］〔〕〈〉《》「」『』\\^~`|·\s]{0,8}"
+    r"[\\^~`|·{}]+"
+    r"[\[\]{}()（）【】［］〔〕〈〉《》「」『』\\^~`|·\s]{0,8}"
+    r"(\d{1,3})"
+    r"[\[\]{}()（）【】［］〔〕〈〉《》「」『』\\^~`|·\s]{0,8}"
+    r"[\\^~`|·{}]+"
+    r"[\[\]{}()（）【】［］〔〕〈〉《》「」『』\\^~`|·\s]{0,8}"
+)
+_BRACKET_PAIR_RES = (
+    re.compile(r"【([^【】]*)】"),
+    re.compile(r"\[([^\[\]\n]{1,32})\]"),
+    re.compile(r"［([^［］]*)］"),
+)
+
+
+def normalize_brackets(text: str) -> str:
+    """ULQ 模型杂符引注清理 + 括号对统一。
+
+    ① ``（^{[1]】}`` 等垃圾包裹的数字引注 → ``〔1〕``；
+    ② 【x】/[x]/［x］（可能混用）→ 统一为 〔x〕。
+    """
+    text = _ULQ_JUNK_BRACKET_RE.sub(r"〔\1〕", text)
+    for pat in _BRACKET_PAIR_RES:
+        text = pat.sub(r"〔\1〕", text)
+    return text
+
+
 def convert_bbox_text(text: str) -> str:
     """把 PaddleOCR 风格 `label [x1,y1,x2,y2] 文本` 行转换为正文 HTML。
 
@@ -188,6 +220,8 @@ def clean_and_structure_text(
         t = convert_bbox_text(t)
         # -- 删除页面首/末行的独立页码（普通文本模型也适用） --
         t = strip_page_numbers(t)
+        # -- ULQ 杂符引注清理 + 括号对统一：【x】/[x]/［x］→〔x〕，混用归一 --
+        t = normalize_brackets(t)
         # -- 纯文本标题启发式识别（普通 OCR 无结构输出） --
         # 命中标题的页面整页转 <h1>/<p>，供 htmlmanage 按 h1 分页（每篇新页）
         # + 标题进 EPUB 目录；未命中（无标题页）原样返回，不影响其他路径。

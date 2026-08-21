@@ -145,8 +145,8 @@ class CSSManager:
         }}
         /* 插入图片：全画幅（独立占页 + 占满整页）与局部（按原尺寸居中）
            全画幅（2026-08-15 用户要求）：page-break 保证图片单独一页不与文字
-           同页；width:100% + max-height:100vh + object-fit:contain 让图片按
-           比例缩放填满页面（不裁切）。局部保持原尺寸居中。 */
+           同页；width/height 100% + object-fit:contain 让图片按比例填满
+           整个页面（不裁切）。局部保持原尺寸居中。 */
         p.ptoe-img-full, p.ptoe-img-fit {{
           text-indent: 0;
           margin: 0.8em 0;
@@ -157,6 +157,11 @@ class CSSManager:
           margin: 0;
           padding: 0;
           text-align: center;
+          height: 100%;
+        }}
+        /* 全画幅图片位于内容文件首位时不再强制前置分页（否则封面后出现空白页，2026-08 修复） */
+        p.ptoe-img-full:first-child {{
+          page-break-before: auto;
         }}
         p.ptoe-img-full img, p.ptoe-img-fit img {{
           display: inline-block;
@@ -165,7 +170,7 @@ class CSSManager:
         }}
         p.ptoe-img-full img {{
           width: 100%;
-          max-height: 100vh;
+          height: 100%;
           object-fit: contain;
         }}
         p.ptoe-img-fit img {{

@@ -5,7 +5,7 @@
     "HY": {
       "name": "huiyuan/HunyuanOCR.BF16.gguf",
       "mmproj": "huiyuan/HunyuanOCR.mmproj-bf16.gguf",
-      "workers": 2
+      "workers": 4
     },
     "QWEN.8": {
       "name": "qwen3.5/Qwen3.5-0.8B-Q8_0.gguf",
@@ -67,9 +67,9 @@
     "max_cand_cache": 2000,
     "max_replacement_combinations": 20,
     "auto_fix_score": 0.85,
-    "enable_llm": false,
+    "enable_llm": true,
     "enable_legacy_rules": false,
-    "llm_model": "QWEN.8",
+    "llm_model": "ULQ4",
     "llm_timeout": 3
   },
   "engine": "llama",
@@ -167,7 +167,7 @@
       "conditions": [
         {
           "type": "regex",
-          "pattern": "([\\s\\S]*)([\\(（]\\s*.+\\s*年\\s*.+\\s*月[\\s\\S]*?[\\）)])([\\s\\S]*?)(毛\\s*泽\\s*东[\\s\\S]*刊\\s*印[\\s\\S]*?)?(注[\\s]*释)([\\s\\S]*)",
+          "pattern": "([\\s\\S]*)([\\(（]\\s*.+\\s*年\\s*.*?[日月]\\s*[\\）)])([\\s\\S]*?)(毛\\s*泽\\s*东[\\s\\S]*刊\\s*印[\\s\\S]*?)?(注[\\s]*释)([\\s\\S]*)",
           "scope": "page",
           "formats": [],
           "target": "match",
@@ -181,6 +181,7 @@
               "p"
             ],
             [
+              "align_left",
               "p"
             ],
             [
@@ -209,7 +210,7 @@
       "conditions": [
         {
           "type": "regex",
-          "pattern": "([\\s\\S]*)([\\(（]\\s*.+\\s*年\\s*.+\\s*月[\\s\\S]*?[\\）)])([\\s\\S]*)",
+          "pattern": "([\\s\\S]*)([\\(（]\\s*.+\\s*年\\s*.*?[日月]\\s*[\\）)])([\\s\\S]*?)",
           "scope": "page",
           "formats": [],
           "target": "match",
@@ -218,12 +219,11 @@
               "heading1"
             ],
             [
-              "no_bold",
               "align_center",
               "p"
             ],
             [
-              "no_bold",
+              "align_left",
               "p"
             ],
             [
@@ -242,14 +242,12 @@
       "conditions": [
         {
           "type": "regex",
-          "pattern": "(毛\\s*泽\\s*东[\\s\\S]*刊\\s*印[\\s\\S]*?)?(注[\\s]*释)([\\s\\S]*)",
+          "pattern": "([\\s\\S]*)(注\\s*释)([\\s\\S]*)",
           "scope": "page",
           "formats": [],
           "target": "match",
           "group_formats": [
             [
-              "no_bold",
-              "align_right",
               "p"
             ],
             [
@@ -258,7 +256,7 @@
               "p"
             ],
             [
-              "no_bold",
+              "align_left",
               "note"
             ]
           ]

@@ -156,6 +156,12 @@ class TestSanitize(unittest.TestCase):
         out3 = sanitize_html('<p class="evil ptoe-align-left">x</p>')
         self.assertEqual(out3, '<p class="ptoe-align-left">x</p>')
 
+    def test_search_mark_stripped(self):
+        # 搜索高亮 <mark class="ptoe-search"> 不在白名单内，sanitize 会剥掉标签保留文字
+        out = sanitize_html('<p>a<mark class="ptoe-search">b</mark>c</p>')
+        self.assertNotIn('<mark', out)
+        self.assertIn('abc', out)
+
 
 class TestCleanPageHtml(unittest.TestCase):
     """clean_page_html：段落合并 / 段首符号 / 中英文标点 / 残留 HTML 标签清理。"""
@@ -819,12 +825,15 @@ class TestRenderFragment(unittest.TestCase):
             shutil.rmtree(outdir, ignore_errors=True)
 
     def test_full_img_css_page_break_and_fill(self):
-        # 全画幅图片独立占页（page-break 前后）+ 占满整页（width/max-height/object-fit，2026-08-15）
+        # 全画幅图片独立占页（page-break 前后）+ 占满整页（width/height 100% +
+        # object-fit，2026-08-15；2026-08 修复：max-height:100vh 改 height:100%
+        # 真正占满页面 + :first-child 不强制前置分页消除封面后空白页）
         css = self.conv.cssm.generate_stylesheet()
         self.assertIn("page-break-before: always", css)
         self.assertIn("page-break-after: always", css)
-        self.assertIn("max-height: 100vh", css)
+        self.assertIn("height: 100%", css)
         self.assertIn("object-fit: contain", css)
+        self.assertIn("p.ptoe-img-full:first-child", css)
 
     def test_landmarks_toc_links_content_not_nav(self):
         # nav.xhtml 移出 spine 后，landmarks 链接必须指向 spine 内资源
@@ -5155,6 +5164,46 @@ class TestEmbeddedImages(unittest.TestCase):
         self.assertEqual(doc._pages[2].rendered, 1)
         # 第 1 页保留原缓存值
         self.assertEqual(st["embedded_images"]["1"], _b64(b"jpg-0"))
+
+    def test_prerender_respects_cap(self):
+        # 预渲染上限：达到 prerender_max_pages 后停止（大书内存有界，
+        # 实测 4000 页全量驻留 ≈ 800MB，故默认上限 _PRERENDER_MAX_PAGES）
+        doc = _FakeDoc(5)
+        st = self._state(doc, prerender_max_pages=2)
+        _prerender_embedded_images(st)  # 同步跑完
+        self.assertEqual(set(st["embedded_images"].keys()), {"1", "2"})
+        self.assertEqual(sum(p.rendered for p in doc._pages), 2)
+
+    def test_prerender_cap_writes_sidecar(self):
+        # 达上限停止时把已渲染页写入共享 sidecar（跨电脑兜底覆盖前段页面）
+        import correctmanage as _cm
+
+        hist_dir = Path(tempfile.mkdtemp(prefix="test_scc_"))
+        self.addCleanup(shutil.rmtree, hist_dir, ignore_errors=True)
+        orig = _cm._history_dir
+        _cm._history_dir = lambda: hist_dir
+        self.addCleanup(lambda: setattr(_cm, "_history_dir", orig))
+        doc = _FakeDoc(3)
+        st = self._state(doc, prerender_max_pages=1, history_prefix="precap")
+        _prerender_embedded_images(st)
+        loaded = _cm._load_images_cache("precap")
+        self.assertEqual(set(loaded.keys()), {"1"})
+
+    def test_resolve_prerender_max(self):
+        # config.json 顶层键 prerender_max_pages 覆盖默认；非法值回退默认
+        import configmanage as _cfg
+        import correctmanage as _cm
+
+        orig = _cfg.get_config
+        self.addCleanup(setattr, _cfg, "get_config", orig)
+        _cfg.get_config = lambda show_dialogs=False: {}
+        self.assertEqual(_cm._resolve_prerender_max(), _cm._PRERENDER_MAX_PAGES)
+        _cfg.get_config = lambda show_dialogs=False: {"prerender_max_pages": "7"}
+        self.assertEqual(_cm._resolve_prerender_max(), 7)
+        _cfg.get_config = lambda show_dialogs=False: {"prerender_max_pages": "abc"}
+        self.assertEqual(_cm._resolve_prerender_max(), _cm._PRERENDER_MAX_PAGES)
+        _cfg.get_config = lambda show_dialogs=False: {"prerender_max_pages": "0"}
+        self.assertEqual(_cm._resolve_prerender_max(), _cm._PRERENDER_MAX_PAGES)
 
 
 class TestImagesSidecar(unittest.TestCase):

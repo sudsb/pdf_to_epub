@@ -182,6 +182,10 @@ _VALID_FORMAT_OPS = {
     "citation",     # 引用：斜体 + 独立字体设置
 }
 
+# 预渲染上限——embedded_images 仅作跨电脑打开历史时 PDF 缺失的兜底，
+# 全量驻留内存对大书不可接受（实测 4000 页 ≈ 800MB）。
+_PRERENDER_MAX_PAGES = 300
+
 
 def _clean_format_ops(value) -> list:
     """过滤出合法的格式操作列表（去重、保序）。"""
@@ -654,17 +658,77 @@ def diff_reocr_texts(current: str, new_text: str) -> list:
             # 防御性检查：去空白后理论上不会相等，但以防万一
             if cur_norm[i1:i2] == new_norm[j1:j2]:
                 continue
-            start = cur_pos[i1]
-            end = cur_pos[i2 - 1] + 1
-            out.append(
-                {
-                    "start": start,
-                    "end": end,
-                    "wrong": current[start:end],
-                    "candidates": [new_norm[j1:j2]],
-                    "line": 1 + current.count("\n", 0, start),
-                }
-            )
+            # 收窄替换区间：剥掉两端相同的字符，只标注真正差异的核心。
+            # 否则 SequenceMatcher 的粗粒度 replace 会把大段相同文字一并划线，
+            # 视觉上像「文字错位/整段被标红」（2026-08 用户反馈修复）。
+            a_seg = cur_norm[i1:i2]
+            b_seg = new_norm[j1:j2]
+            p = 0
+            while p < len(a_seg) and p < len(b_seg) and a_seg[p] == b_seg[p]:
+                p += 1
+            s = 0
+            while (
+                s < len(a_seg) - p
+                and s < len(b_seg) - p
+                and a_seg[len(a_seg) - 1 - s] == b_seg[len(b_seg) - 1 - s]
+            ):
+                s += 1
+            ni1, ni2 = i1 + p, i2 - s
+            nj1, nj2 = j1 + p, j2 - s
+            if ni1 >= ni2:
+                # 收窄后原文本侧为空 → 纯增字：锚定相邻现有字符使前端可渲染
+                if not cur_norm:
+                    continue
+                if ni1 > 0:
+                    anchor = ni1 - 1
+                    start = cur_pos[anchor]
+                    end = start + 1
+                    out.append(
+                        {
+                            "start": start,
+                            "end": end,
+                            "wrong": current[start:end],
+                            "candidates": [cur_norm[anchor] + new_norm[nj1:nj2]],
+                            "line": 1 + current.count("\n", 0, start),
+                        }
+                    )
+                else:
+                    start = cur_pos[0]
+                    end = start + 1
+                    out.append(
+                        {
+                            "start": start,
+                            "end": end,
+                            "wrong": current[start:end],
+                            "candidates": [new_norm[nj1:nj2] + cur_norm[0]],
+                            "line": 1 + current.count("\n", 0, start),
+                        }
+                    )
+            elif nj1 >= nj2:
+                # 收窄后新文本侧为空 → 原文本增字：纯划线无候选
+                start = cur_pos[ni1]
+                end = cur_pos[ni2 - 1] + 1
+                out.append(
+                    {
+                        "start": start,
+                        "end": end,
+                        "wrong": current[start:end],
+                        "candidates": [],
+                        "line": 1 + current.count("\n", 0, start),
+                    }
+                )
+            else:
+                start = cur_pos[ni1]
+                end = cur_pos[ni2 - 1] + 1
+                out.append(
+                    {
+                        "start": start,
+                        "end": end,
+                        "wrong": current[start:end],
+                        "candidates": [new_norm[nj1:nj2]],
+                        "line": 1 + current.count("\n", 0, start),
+                    }
+                )
         elif tag == "delete":
             # 原文本增字：新文本没有这些字符 → 纯划线无候选
             start = cur_pos[i1]
@@ -1531,6 +1595,43 @@ def _normalize_punctuation(text: str) -> str:
             rf"(?<=[{_LATIN_RANGE}]){re.escape(full)}(?=[{_LATIN_RANGE}])", half, s
         )
     return s
+
+
+# 括号归一（2026-08）：ULQ/PD 系模型输出的引注标记常带杂符包裹（如 （^{[1]】}、
+# [\（^{〔1]〕}\）），实际内容只是 [1]；且全角/半角/方头括号混用。统一清理为〔n〕。
+# 策略：数字两侧只要出现垃圾符号（\ ^ ~ ` | · { }）即视为引注包裹，允许任意
+# 括号汤（各类中英括号任意混排）垫在周围——比逐个枚举包裹形状稳健得多。
+_ULQ_JUNK_BRACKET_RE = re.compile(
+    r"[\[\]{}()（）【】［］〔〕〈〉《》「」『』\\^~`|·\s]{0,8}"
+    r"[\\^~`|·{}]+"
+    r"[\[\]{}()（）【】［］〔〕〈〉《》「」『』\\^~`|·\s]{0,8}"
+    r"(\d{1,3})"
+    r"[\[\]{}()（）【】［］〔〕〈〉《》「」『』\\^~`|·\s]{0,8}"
+    r"[\\^~`|·{}]+"
+    r"[\[\]{}()（）【】［］〔〕〈〉《》「」『』\\^~`|·\s]{0,8}"
+)
+_BRACKET_PAIR_RES = (
+    re.compile(r"【([^【】]*)】"),
+    re.compile(r"\[([^\[\]\n]{1,32})\]"),
+    re.compile(r"［([^［］]*)］"),
+)
+
+
+def _clean_ulq_bracket_junk(text: str) -> str:
+    """把 ULQ 输出的杂符包裹引注（如 （^{[1]】}、^{[2]}）折叠为〔n〕。"""
+    return _ULQ_JUNK_BRACKET_RE.sub(r"〔\1〕", text)
+
+
+def _normalize_bracket_pairs(text: str) -> str:
+    """把成对的 【x】/[x]/［x］ 统一替换为 〔x〕（允许符号混用）。"""
+    for pat in _BRACKET_PAIR_RES:
+        text = pat.sub(r"〔\1〕", text)
+    return text
+
+
+def _normalize_brackets(text: str) -> str:
+    """先清 ULQ 杂符包裹，再统一括号对。"""
+    return _normalize_bracket_pairs(_clean_ulq_bracket_junk(text))
 
 
 def _full_punct(text: str) -> str:
@@ -2483,6 +2584,10 @@ def _render_jpeg(
     doc = _preview_doc(state)
     if doc is None:
         return None
+    # 防 use-after-close：文档已被关闭（会话结束/历史载入换档）时直接放弃渲染，
+    # 避免 fitz C 层崩溃拖垮整个进程（前端表现为持续 NetworkError）
+    if getattr(doc, "is_closed", False):
+        return None
     try:
         import fitz
 
@@ -2616,6 +2721,23 @@ def _build_embedded_images(state: dict[str, Any]) -> dict[str, str]:
     return images
 
 
+def _resolve_prerender_max() -> int:
+    """预渲染上限：默认 _PRERENDER_MAX_PAGES；config.json 顶层键
+    prerender_max_pages 可覆盖（非法值回退默认）。"""
+    try:
+        from configmanage import get_config
+
+        v = (get_config(show_dialogs=False) or {}).get("prerender_max_pages")
+        if v is None:
+            return _PRERENDER_MAX_PAGES
+        n = int(v)
+        if n > 0:
+            return n
+    except Exception:
+        pass
+    return _PRERENDER_MAX_PAGES
+
+
 def _prerender_embedded_images(state: dict[str, Any]) -> None:
     """后台线程：渐进式渲染预览图填充 state["embedded_images"]。
 
@@ -2643,6 +2765,7 @@ def _prerender_embedded_images(state: dict[str, Any]) -> None:
     dpi = float(state.get("preview_dpi", 110))
     quality = int(state.get("preview_quality", 82))
     finished = state.get("finished")
+    max_pages = int(state.get("prerender_max_pages") or _PRERENDER_MAX_PAGES)
     while True:
         if finished is not None and finished.is_set():
             return
@@ -2669,8 +2792,17 @@ def _prerender_embedded_images(state: dict[str, Any]) -> None:
             prefix = state.get("history_prefix")
             if prefix and embedded:
                 _write_images_cache(prefix, dict(embedded))
+            mb = sum(len(v) for v in embedded.values()) / 1048576
+            print(f"      预览图预渲染完成：{len(embedded)} 页，约 {mb:.0f} MB")
             return  # 全部页已缓存
         i, key = target
+        if len(embedded) >= max_pages:
+            mb = sum(len(v) for v in embedded.values()) / 1048576
+            prefix = state.get("history_prefix")
+            if prefix and embedded:
+                _write_images_cache(prefix, dict(embedded))
+            print(f"      预览图预渲染达上限 {max_pages} 页，已停止（已缓存约 {mb:.0f} MB；跨电脑兜底仅覆盖前段页面）")
+            return
         lock = state.get("preview_doc_lock")
         try:
             with lock if lock is not None else nullcontext():
@@ -2790,6 +2922,7 @@ def _write_images_cache(prefix: str, images: dict[str, str]) -> bool:
 
     预览图是可再生成的缓存：失败仅打印原因返回 False，不影响保存主流程。
     优先使用 msgpack（更快、更小），回退到 gzip+JSON，再回退到纯 JSON。
+    gzip 压缩级别用 1（实测 level 9 对 JPEG 派生数据压缩比几乎无增益但耗时 ~10 倍）。
     """
     if not prefix:
         return True
@@ -2802,8 +2935,8 @@ def _write_images_cache(prefix: str, images: dict[str, str]) -> bool:
             with open(tmp, "wb") as f:
                 msgpack.pack(images, f)
         else:
-            # 回退：gzip 压缩 JSON
-            with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=9) as gz:
+            # 回退：gzip 压缩 JSON（level 1 对 JPEG 已足够，速度远高于 level 9）
+            with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=1) as gz:
                 json.dump(images, gz, ensure_ascii=False)
         tmp.replace(_images_cache_path(prefix))
         return True
@@ -2812,40 +2945,53 @@ def _write_images_cache(prefix: str, images: dict[str, str]) -> bool:
         return False
 
 
+def _log_images_loaded(data: dict[str, str]) -> None:
+    """载入 sidecar 后打印规模（页数 + base64 总量），让大书内存占用可见。"""
+    mb = sum(len(v) for v in data.values()) / 1048576
+    print(f"[correctmanage] 已载入预览图缓存 {len(data)} 页（约 {mb:.0f} MB）")
+
+
 def _load_images_cache(prefix: str) -> dict[str, str]:
     """读取内嵌预览图 sidecar；缺失/损坏返回空 dict（调用方回退其它预览来源）。
 
     支持三种格式（按优先级）：msgpack（新）、gzip+JSON（中）、纯 JSON（旧）。
+    成功载入时打印规模（_log_images_loaded）。
     """
     if not prefix:
         return {}
+    data: dict[str, str] | None = None
     try:
         fp = _images_cache_path(prefix)
         if fp.is_file():
             # 1. 尝试 msgpack（新格式，二进制）
-            if msgpack is not None:
+            if msgpack is not None and data is None:
                 try:
                     with open(fp, "rb") as f:
-                        data = msgpack.unpackb(f.read(), raw=False)
-                    if isinstance(data, dict):
-                        return {str(k): str(v) for k, v in data.items()}
+                        parsed = msgpack.unpackb(f.read(), raw=False)
+                    if isinstance(parsed, dict):
+                        data = {str(k): str(v) for k, v in parsed.items()}
                 except Exception:
                     pass  # 回退到 gzip/JSON
             # 2. 尝试 gzip 解压（中格式）
-            try:
-                with gzip.open(fp, "rt", encoding="utf-8") as gz:
-                    content = gz.read()
-                data = json.loads(content)
-                if isinstance(data, dict):
-                    return {str(k): str(v) for k, v in data.items()}
-            except Exception:
-                pass  # 回退到纯 JSON
+            if data is None:
+                try:
+                    with gzip.open(fp, "rt", encoding="utf-8") as gz:
+                        content = gz.read()
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict):
+                        data = {str(k): str(v) for k, v in parsed.items()}
+                except Exception:
+                    pass  # 回退到纯 JSON
             # 3. 回退：旧格式未压缩 JSON
-            data = json.loads(fp.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return {str(k): str(v) for k, v in data.items()}
+            if data is None:
+                parsed = json.loads(fp.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    data = {str(k): str(v) for k, v in parsed.items()}
     except Exception:
-        pass
+        return {}
+    if data is not None:
+        _log_images_loaded(data)
+        return data
     return {}
 
 
@@ -4393,6 +4539,30 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     if eng == "vllm"
                     else (cfg.get("llama_server_args") or {}).get("port") or "8080"
                 )
+                # 快速切换支持（2026-08 修复）：若端口上运行的是其他模型，先停掉
+                # 本进程管理的旧实例再启动新模型；仍被占用（外部进程）则给出明确提示，
+                # 避免直接调 runserver 撞端口报出难懂的占用错误。
+                from llamamanage import _probe_server as _probe_pre, stopserver
+
+                pre_name = str(model_info.get("name") or model_key)
+                if _probe_pre(pre_name) == "mismatch":
+                    stopserver()  # 仅能停掉本进程启动的实例
+                    time.sleep(1.0)
+                    if _probe_pre(pre_name) == "mismatch":
+                        self._send(
+                            200,
+                            self._json(
+                                {
+                                    "ok": False,
+                                    "error": (
+                                        f"端口 {eng_port} 被外部 {eng_label} 占用"
+                                        "（非本程序启动），请手动关闭后重试"
+                                    ),
+                                }
+                            ),
+                            "application/json; charset=utf-8",
+                        )
+                        return
                 running = bool(runserver(model_key, with_mmproj=has_mmproj))
                 if running:
                     message = f"{eng_label} 已就绪"
@@ -4665,7 +4835,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     ocr_prompt,
                     "",
                     model_key=model_key,
-                    thinking=True,
+                    # 重识别为纯 OCR 任务：thinking=True 会触发 Qwen 隐藏思考链长生成，
+                    # KV 缓存暴涨占满显存且拖慢识别 ~7 倍（2026-08 修复）
+                    thinking=False,
                     timeout=llamamanage.REQUEST_TIMEOUT,
                     img_bytes=img_bytes,
                 )
@@ -4689,11 +4861,16 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
 
                     new_text = strip_think_blocks(new_text)
                     new_text = clean_bbox_text(new_text)
+                    # ULQ 杂符引注清理 + 括号对统一（【x】/[x]/［x］→〔x〕）
+                    new_text = _normalize_brackets(new_text)
                     # 2026-08-08：重识别结果先繁转简再与当前文本对比（与 /api/proofread 的 ⑫b 一致）
                     new_text = ttos(new_text)
                 # 2026-08-09：再将英文标点归一为中文标点，避免半角/全角差异被当成纠错项
                 new_text = _full_punct(new_text)
                 current_text = _proofread_plain_text(str(body.get("html") or ""))
+                # 与 new_text 同样做半角→全角标点归一：否则相同内容因标点宽度差异
+                # 被逐字判为差异，产生大量非预期位置的纠错标注（2026-08 修复）
+                current_text = _full_punct(current_text)
                 diff = diff_reocr_texts(current_text, new_text)
                 self._send(
                     200,
@@ -5103,6 +5280,8 @@ def correct_pages(
         # 文字纠错状态（保存/暂存/完成时随历史缓存落盘，加载时恢复）
         "proofread": {"errors": {}, "original": {}, "dismissed": {}},
         "last_proofread_page": None,
+        # 预渲染页数上限：可经 config.json 顶层键 prerender_max_pages 覆盖
+        "prerender_max_pages": _resolve_prerender_max(),
         "embedded_images": {},
     }
     server = ThreadingHTTPServer((host, port), _CorrectionHandler)
@@ -5459,7 +5638,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
     <button type="button" id="redoBtn" class="ic-btn" onmousedown="event.preventDefault()" disabled title="前进下一步（Ctrl+Y / Ctrl+Shift+Z）" aria-label="前进（Ctrl+Y）">↷</button>
   </div>
   <div class="tb-group" role="group" aria-label="图片">
-    <select id="imgModeSel" title="插入图片的显示模式：全画幅=占满文字宽度，局部=按原尺寸居中，行内=嵌在文字中间（50% 宽度）">
+    <select id="imgModeSel" hidden title="插入图片的显示模式：全画幅=占满文字宽度，局部=按原尺寸居中，行内=嵌在文字中间（50% 宽度）">
       <option value="full">全画幅</option>
       <option value="fit">局部</option>
       <option value="inline">行内</option>
@@ -5541,6 +5720,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
     <div style="display:flex;gap:6px;margin-top:8px;">
       <button type="button" id="prLlmStart" style="flex:1;">启动服务</button>
       <button type="button" id="prLlmStop" style="flex:1;">停止服务</button>
+      <button type="button" id="prLlmSwitch" style="flex:1;" title="用当前所选模型重启服务：自动停止旧模型并加载新模型（无需先手动停止）">切换模型</button>
     </div>
     <small id="prLlmStatus" style="color:#666;display:block;margin-top:4px;"></small>
   </div>
@@ -5709,6 +5889,12 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
 <!-- 图片设置弹窗：点击编辑区内的图片弹出，可调整大小/位置/删除 -->
 <div id="imgPopup" style="display:none;position:fixed;z-index:65;flex-direction:column;gap:6px;padding:10px;background:#fff;border:1px solid #ccc;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.2);min-width:140px;">
   <div style="font-weight:600;font-size:13px;margin-bottom:2px;">图片设置</div>
+  <div style="display:flex;flex-wrap:wrap;gap:4px;">
+    <span style="width:100%;font-size:12px;color:#666;">布局</span>
+    <button type="button" class="img-pop-btn" data-img-op="layout" data-img-val="full" title="全画幅：导出 EPUB 时独占一页，前后内容另起一页；大小设置不影响导出">全画幅</button>
+    <button type="button" class="img-pop-btn" data-img-op="layout" data-img-val="fit" title="局部：与前后内容共占一页（不强制分页）；大小设置在导出中生效">局部</button>
+    <button type="button" class="img-pop-btn" data-img-op="layout" data-img-val="inline" title="行内：嵌在文字中间（默认 50% 宽度）">行内</button>
+  </div>
   <div style="display:flex;flex-wrap:wrap;gap:4px;">
     <span style="width:100%;font-size:12px;color:#666;">大小</span>
     <button type="button" class="img-pop-btn" data-img-op="size" data-img-val="original">原尺寸</button>
@@ -6018,11 +6204,43 @@ function stripProofreadMarkup(html) {
   d.normalize();
   return d.innerHTML;
 }
+// 剥离搜索高亮标记：解包 <mark class="ptoe-search"> 保留内部文字（不触碰其他节点）
+function _stripSearchMarks(html) {
+  const s = String(html == null ? '' : html);
+  if (s.indexOf('ptoe-search') < 0) return s;
+  const d = document.createElement('div');
+  d.innerHTML = s;
+  var found = true;
+  while (found) {  // 循环解包，兼容历史版本可能存在的嵌套 mark
+    found = false;
+    d.querySelectorAll('mark.ptoe-search').forEach(function (el) {
+      found = true;
+      el.parentNode.replaceChild(document.createTextNode(el.textContent), el);
+    });
+    if (found) d.normalize();
+  }
+  return d.innerHTML;
+}
+// 在 live DOM 上外科解包搜索标记（保留纠错标注/标记），返回是否发现标记
+function _unwrapSearchMarks(root) {
+  var changed = false;
+  var found = true;
+  while (found) {
+    found = false;
+    root.querySelectorAll('mark.ptoe-search').forEach(function (el) {
+      found = true;
+      changed = true;
+      el.parentNode.replaceChild(document.createTextNode(el.textContent), el);
+    });
+    if (found) root.normalize();
+  }
+  return changed;
+}
 function collect() {
   const out = [];
   for (let i = 0; i < pages.length; i++) {
     const src = pageSource(i);
-    const html = mdMode ? mdToHtml(src) : stripProofreadMarkup(src);
+    const html = mdMode ? mdToHtml(src) : stripProofreadMarkup(_stripSearchMarks(src));
     out.push({ page: pages[i].page, html: html });
   }
   return out;
@@ -6099,7 +6317,7 @@ function syncContent(ed) {
   if (!row) return;
   const i = Number(row.dataset.i);
   if (mdMode) mdSourceMap.set(i, editableSource(ed));
-  else contentMap.set(i, ed.innerHTML);
+  else contentMap.set(i, _stripSearchMarks(ed.innerHTML));
 }
 function currentEditable() {
   const a = document.activeElement;
@@ -7107,18 +7325,20 @@ function _highlightInHtmlSource(html, re) {
 
 function applySearchHighlights() {
   const q = (document.getElementById('searchInput').value || '').trim();
-  if (!q) { clearSearchHighlights(); return; } // query 已在 clearSearchHighlights 内置空
-  if (q === _searchHighlightQuery) return; // avoid redundant work
+  if (!q) { clearSearchHighlights(); return; }
   let re;
   try { re = searchRegexFor(q); } catch (e) { return; }
-  _searchHighlightQuery = q;
-  // Only process attached rows (virtual list) for performance
+  // 先清空 query，避免 displayHtml 在取 base 时回注旧标记导致双重包裹
+  const prevQuery = _searchHighlightQuery;
+  _searchHighlightQuery = '';
   for (const row of host.children) {
     const idx = Number(row.dataset.i);
     const ed = row.querySelector('.editable');
     if (!ed) continue;
-    // avoid replacing while user is editing to preserve caret
-    if (ed === document.activeElement || ed.contains(document.activeElement)) continue;
+    const isFocused = ed === document.activeElement || ed.contains(document.activeElement);
+    // 先解包既有标记，避免嵌套
+    _unwrapSearchMarks(ed);
+    if (isFocused) continue; // 聚焦行跳过替换，等 blur 时刷新
     const src = displayHtml(idx);
     const highlighted = _highlightInHtmlSource(src, re);
     if (highlighted !== ed.innerHTML) {
@@ -7126,20 +7346,25 @@ function applySearchHighlights() {
       scheduleRemeasure(idx);
     }
   }
+  _searchHighlightQuery = q;
+  // 聚焦行若仍残留标记，blur 时一次性刷新
+  const focused = currentEditable();
+  if (focused && focused.innerHTML.indexOf('ptoe-search') >= 0) {
+    focused.addEventListener('blur', function onBlur() {
+      focused.removeEventListener('blur', onBlur);
+      applySearchHighlights();
+    }, { once: true });
+  }
 }
 
 function clearSearchHighlights() {
-  _searchHighlightQuery = '';   // 先置空，否则 displayHtml 还原时会用旧 query 回注标记
+  _searchHighlightQuery = '';   // 先置空，避免 displayHtml 回注
   for (const row of host.children) {
     const idx = Number(row.dataset.i);
     const ed = row.querySelector('.editable');
     if (!ed) continue;
-    if (ed === document.activeElement || ed.contains(document.activeElement)) continue;
-    const src = displayHtml(idx);
-    if (ed.innerHTML.indexOf('ptoe-search') !== -1) {
-      ed.innerHTML = src;
-      scheduleRemeasure(idx);
-    }
+    // 聚焦行也执行外科解包（保留纠错标注/标记）
+    if (_unwrapSearchMarks(ed)) scheduleRemeasure(idx);
   }
 }
 
@@ -7649,6 +7874,9 @@ async function loadHistoryVersion(id, name, ver) {
     rebuildPrefix(); // heights 已重置，prefixH 需按 est 重建（旧累计值不可复用）
     host.style.height = totalHeight() + 'px';
     updateViewport();
+    // 载入历史后按各页真实宽高比重算全部行高：否则跳转按 est(420) 估算定位，
+    // 落点偏差巨大 → 视口空白需反复点击等待测量收敛（2026-08 修复）
+    applyAspectHeights();
     // 重注已挂载行的纠错标注
     for (const k in proofreadErrors) {
       if (proofreadErrors[k] && proofreadErrors[k].length) {
@@ -8578,8 +8806,25 @@ function showImgPopup(rect) {
   left = Math.max(8, Math.min(left, window.innerWidth - r.width - 8));
   let top = rect.top - r.height - 8;
   if (top < 8) top = rect.bottom + 8;
+  // 防底部溢出被遮盖：翻转后仍超出视口下缘时钳回（2026-08 图片设置弹窗显示不全修复）
+  if (top + r.height > window.innerHeight - 8) top = Math.max(8, window.innerHeight - r.height - 8);
   pop.style.left = left + 'px';
   pop.style.top = top + 'px';
+  _updateImgLayoutActive();
+}
+// 布局按钮高亮：按当前图片实际布局（全画幅/局部/行内）同步 .active 状态
+function _updateImgLayoutActive() {
+  const pop = document.getElementById('imgPopup');
+  if (!pop || !_imgKey || !_imgKey.imgEl) return;
+  const imgEl = _imgKey.imgEl;
+  const pEl = _imgKey.pEl || imgEl.closest('p');
+  let cur = '';
+  if (pEl && pEl.classList && pEl.classList.contains('ptoe-img-full')) cur = 'full';
+  else if (pEl && pEl.classList && pEl.classList.contains('ptoe-img-fit')) cur = 'fit';
+  else if (imgEl.classList.contains('ptoe-img-inline')) cur = 'inline';
+  pop.querySelectorAll('button[data-img-op="layout"]').forEach(function (b) {
+    b.classList.toggle('active', b.dataset.imgVal === cur);
+  });
 }
 function hideImgPopup() {
   document.getElementById('imgPopup').style.display = 'none';
@@ -8641,8 +8886,10 @@ function proofreadCorrect() {
 }
 
 // 子项2 重识别：对当前页重新 OCR，差异以纠错标注叠加显示
+let _reocrBusy = false; // 防并发：上一次请求未完成前忽略再次点击
 async function runReocr() {
   closeProofreadMenu();
+  if (_reocrBusy) { showToast('正在重识别，请稍候…', 'warn'); return; }
   const ed = ctxTargetEditable(); // 右键菜单目标页优先（与光标位置解耦）
   if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
   const row = ed.closest('.page-row');
@@ -8652,6 +8899,7 @@ async function runReocr() {
   const model = proofreadLlmModel || '';
   const btn = document.getElementById('prMenuReocr');
   if (btn) btn.disabled = true;
+  _reocrBusy = true;
   try {
     const res = await fetchJSON('/api/reocr', {
       method: 'POST',
@@ -8672,8 +8920,15 @@ async function runReocr() {
       showToast('第 ' + page + ' 页重识别完成，未发现差异', 'ok');
     }
   } catch (e) {
-    showToast('重识别失败: ' + e.message, 'fail');
+    // 网络层失败（TypeError/NetworkError）= 本地矫正服务已不可达（进程退出/端口关闭），
+    // 给出可行动的中文提示而非原始错误
+    if (e instanceof TypeError || /NetworkError|Failed to fetch/i.test(e.message || '')) {
+      showToast('与服务器的连接已断开，请重启矫正界面', 'fail');
+    } else {
+      showToast('重识别失败: ' + e.message, 'fail');
+    }
   } finally {
+    _reocrBusy = false;
     if (btn) btn.disabled = false;
   }
 }
@@ -8709,12 +8964,21 @@ function proofreadApplyCurrent() {
     let applied = 0;
     const acceptItems = []; // 收集批量 accept 反馈
     const appliedShifts = []; // 收集 {start, delta, origStart} 用于 rebase 剩余标注
+    const appliedRanges = []; // 已应用原始区间：跳过与其重叠的条目
     // 倒序处理，避免 DOM 修改影响后续 data-err-i 索引
     for (let idx = errors.length - 1; idx >= 0; idx--) {
       const err = errors[idx];
       if (err._gone) continue; // F5: 已标记消失的条目跳过
+      // 与已应用区间重叠：直接跳过（两条建议改同一段文字时只应用一条，
+      // 否则重叠删除/替换会产生交错重复的文字错乱——2026-08 修复）
+      if (appliedRanges.some(function (r) { return err.start < r.end && r.start < err.end; })) continue;
       const sEls = ed.querySelectorAll('.ptoe-err[data-err-i="' + idx + '"]');
       if (!sEls.length) continue;
+      // 严格校验：标注段文本必须与 wrong 完全一致，否则该条偏移已失效，
+      // 放弃而不替换（把候选写进错误位置正是「文字错位+内容缺失」的根源）
+      let segText = '';
+      sEls.forEach(function (s) { segText += s.textContent; });
+      if (err.wrong && segText !== err.wrong) continue;
       const fixEl = ed.querySelector('.ptoe-fix[data-err-i="' + idx + '"]');
       if (fixEl) fixEl.parentNode.removeChild(fixEl);
       const delta = (err.candidates && err.candidates.length ? err.candidates[0].length : 0) - (err.wrong ? err.wrong.length : 0);
@@ -8729,6 +8993,7 @@ function proofreadApplyCurrent() {
       }
       // D8: 收集原始坐标用于 rebase
       appliedShifts.push({ start: err.start, delta: delta });
+      appliedRanges.push({ start: err.start, end: err.end });
       errors.splice(idx, 1);
       applied++;
     }
@@ -8935,6 +9200,44 @@ document.getElementById('imgPopup').addEventListener('click', function (e) {
     });
     scheduleRemeasure(i);
     // 位置操作保持弹窗打开
+  } else if (op === 'layout') {
+    // 设置图片布局：全画幅=导出时独占一页（前后内容另起一页，大小设置不影响导出）；
+    // 局部=与前后内容共占一页（导出保留大小设置）；行内=嵌在文字中间
+    const isInline = imgEl.classList.contains('ptoe-img-inline');
+    histRun('设置图片布局', [i], function () {
+      if (val === 'inline') {
+        // 行内：从 <p> 包裹中解出裸 <img>（空包裹一并移除）
+        if (!isInline && pEl && pEl !== ed && pEl.parentNode) {
+          pEl.parentNode.insertBefore(imgEl, pEl.nextSibling);
+          if (!pEl.textContent.trim() && !pEl.querySelector('img')) pEl.parentNode.removeChild(pEl);
+        }
+        imgEl.classList.remove('ptoe-img-full', 'ptoe-img-fit');
+        imgEl.classList.add('ptoe-img-inline');
+        if (!_imgSizeClasses.some(function (c) { return imgEl.classList.contains(c); })) imgEl.classList.add('ptoe-img-w50');
+      } else {
+        // 全画幅/局部：确保有块级 <p> 包裹（行内裸图先包一层）
+        let wrap = (!isInline && pEl && pEl.tagName === 'P') ? pEl : null;
+        if (!wrap) {
+          wrap = document.createElement('p');
+          const par = imgEl.parentNode;
+          if (par && par !== ed && par.tagName === 'P') par.insertAdjacentElement('afterend', wrap);
+          else if (par) par.insertBefore(wrap, imgEl);
+          else ed.appendChild(wrap);
+          wrap.appendChild(imgEl);
+        }
+        wrap.className = val === 'full' ? 'ptoe-img-full ptoe-img-center' : 'ptoe-img-fit ptoe-img-center';
+        imgEl.classList.remove('ptoe-img-inline');
+        _imgVAlignClasses.forEach(function (c) { imgEl.classList.remove(c); });
+        if (val === 'full') {
+          // 全画幅独占整页：清除尺寸 class，保证「大小的改变不影响导出图片效果」
+          _imgSizeClasses.forEach(function (c) { imgEl.classList.remove(c); });
+        }
+      }
+      syncContent(ed);
+    });
+    scheduleRemeasure(i);
+    _updateImgLayoutActive();
+    // 布局操作保持弹窗打开并同步高亮
   } else if (op === 'delete') {
     // 删除图片：行内图片只移除 <img> 本身（保留周围文字）；块级图片移除整个 <p> 包裹
     const isInline = imgEl.classList.contains('ptoe-img-inline');
@@ -9050,11 +9353,19 @@ function condSummary(rule) {
     const tgtMap = { before: '之前', after: '之后' };
     const tgtLabel = c.target === 'between' ? '之间「' + (c.between_end_pattern || '?') + '」' : (tgtMap[c.target] || '');
     const cond = c.pattern ? t + '「' + c.pattern + '」/' + scope + (tgtLabel ? '→' + tgtLabel : '') : '无条件';
-    if (c.type === 'regex' && c.group_formats && c.group_formats.length) {
+    if (c.type === 'regex') {
       var parts = [];
-      for (var gi = 0; gi < c.group_formats.length; gi++) {
-        var gf = c.group_formats[gi] || [];
-        if (gf.length) parts.push('组' + (gi + 1) + ':' + fmtSummary(gf));
+      if (c.group_formats && c.group_formats.length) {
+        for (var gi = 0; gi < c.group_formats.length; gi++) {
+          var gf = c.group_formats[gi] || [];
+          if (gf.length) parts.push('组' + (gi + 1) + ':' + fmtSummary(gf));
+        }
+      }
+      if (c.match_formats && c.match_formats.length) {
+        for (var mi = 0; mi < c.match_formats.length; mi++) {
+          var mf = c.match_formats[mi] || [];
+          if (mf.length) parts.push('匹配' + (mi + 1) + ':' + fmtSummary(mf));
+        }
       }
       return cond + (parts.length ? ' → ' + parts.join('，') : ' → ' + fmtSummary(c.formats));
     }
@@ -9157,6 +9468,7 @@ function collectFmtChecks(containerId) {
 let _frConds = []; // 编辑中的条件列表（镜像 DOM；select/input 实时值经 syncCondsFromDom 读回）
 let _frFmtIdx = -1; // 当前打开格式弹窗的条件下标
 let _frFmtGroupIdx = -1; // 当前打开格式弹窗的 group_formats 下标（-1=条件级）
+let _frFmtMatchIdx = -1; // 当前打开格式弹窗的 match_formats 下标（-1=非匹配模式）
 const _FR_COND_TYPES = [
   ['regex','正则匹配'], ['contains','包含文字'], ['prefix','以…开头'], ['suffix','以…结尾'],
 ];
@@ -9176,6 +9488,7 @@ function syncCondsFromDom() {
       scope: row.querySelector('.frCondScope').value,
       formats: (base.formats || []).slice(),
       group_formats: (base.group_formats || []).map(function (g) { return (g || []).slice(); }),
+      match_formats: (base.match_formats || []).map(function (m) { return (m || []).slice(); }),
       target: tgtEl ? tgtEl.value : (base.target || 'match'),
       between_end_pattern: endEl ? endEl.value : (base.between_end_pattern || ''),
     };
@@ -9318,12 +9631,70 @@ function renderConditions(conds) {
           box.appendChild(grow);
         }
       }
+      // regex 条件：显示 per-match 格式编辑行
+      var mf = c.match_formats || [];
+      for (var mi = 0; mi < mf.length; mi++) {
+        var mrow = document.createElement('div');
+        mrow.className = 'fr-cond-row fr-group-row';
+        mrow.style.cssText = 'padding-left:2em;font-size:12px;opacity:.85;min-height:0;';
+        var mLabel = document.createElement('span');
+        mLabel.style.cssText = 'margin-right:4px;white-space:nowrap;';
+        mLabel.textContent = '匹配' + (mi + 1) + '：';
+        mrow.appendChild(mLabel);
+        var mFmtBtn = document.createElement('button');
+        mFmtBtn.type = 'button'; mFmtBtn.className = 'frFmtBtn';
+        mFmtBtn.textContent = '格式';
+        mFmtBtn.title = '设置第 ' + (mi + 1) + ' 次匹配的独立格式';
+        (function(mIdx) {
+          mFmtBtn.addEventListener('click', function () { openFmtPopup(idx, -1, mIdx); });
+        })(mi);
+        mrow.appendChild(mFmtBtn);
+        var mTags = document.createElement('span');
+        mTags.className = 'fr-tags';
+        var mFmtList = mf[mi] || [];
+        if (mFmtList.length) {
+          mFmtList.forEach(function (op) {
+            var tag = document.createElement('span');
+            tag.className = 'fr-tag' + (op === 'none' ? ' fr-tag-none' : '');
+            tag.textContent = names[op] || op;
+            mTags.appendChild(tag);
+          });
+        } else {
+          var mEmpty = document.createElement('span');
+          mEmpty.className = 'fr-tags-empty';
+          mEmpty.textContent = '未设置格式';
+          mTags.appendChild(mEmpty);
+        }
+        mrow.appendChild(mTags);
+        var mDel = document.createElement('button');
+        mDel.type = 'button'; mDel.className = 'frCondDel'; mDel.textContent = '✕';
+        mDel.title = '删除该匹配格式';
+        (function(mIdx) {
+          mDel.addEventListener('click', function () {
+            _frConds[idx].match_formats.splice(mIdx, 1);
+            renderConditions(_frConds);
+          });
+        })(mi);
+        mrow.appendChild(mDel);
+        box.appendChild(mrow);
+      }
+      var matchAdd = document.createElement('button');
+      matchAdd.type = 'button'; matchAdd.className = 'frMatchAdd';
+      matchAdd.textContent = '添加匹配';
+      matchAdd.style.cssText = 'margin-left:2em;font-size:12px;';
+      matchAdd.addEventListener('click', function () {
+        if (!_frConds[idx]) return;
+        _frConds[idx].match_formats = _frConds[idx].match_formats || [];
+        _frConds[idx].match_formats.push([]);
+        renderConditions(_frConds);
+      });
+      box.appendChild(matchAdd);
     }
   });
 }
 function addCondition() {
   syncCondsFromDom();
-  _frConds.push({ type: 'contains', pattern: '', scope: 'page', formats: [], group_formats: [], target: 'match', between_end_pattern: '' });
+  _frConds.push({ type: 'contains', pattern: '', scope: 'page', formats: [], group_formats: [], match_formats: [], target: 'match', between_end_pattern: '' });
   renderConditions(_frConds);
 }
 function removeCondition(idx) {
@@ -9341,12 +9712,16 @@ function moveCondition(idx, dir) {
   renderConditions(_frConds);
 }
 // 格式弹窗：勾选该条件的格式（含「无」= 不处理文本）；groupIdx>=0 时编辑分组格式
-function openFmtPopup(idx, groupIdx) {
+function openFmtPopup(idx, groupIdx, matchIdx) {
   syncCondsFromDom();
   _frFmtIdx = idx;
   _frFmtGroupIdx = (typeof groupIdx === 'number') ? groupIdx : -1;
+  _frFmtMatchIdx = (typeof matchIdx === 'number') ? matchIdx : -1;
   renderFmtOptions('frFmtOpts');
-  if (_frFmtGroupIdx >= 0) {
+  if (_frFmtMatchIdx >= 0) {
+    var mf = _frConds[idx].match_formats || [];
+    setFmtChecks('frFmtOpts', mf[_frFmtMatchIdx] || []);
+  } else if (_frFmtGroupIdx >= 0) {
     var gf = _frConds[idx].group_formats || [];
     setFmtChecks('frFmtOpts', gf[_frFmtGroupIdx] || []);
   } else {
@@ -9358,7 +9733,12 @@ function confirmFmtPopup() {
   syncCondsFromDom();
   if (_frFmtIdx < 0 || _frFmtIdx >= _frConds.length) { closeFmtPopup(); return; }
   var newFmt = collectFmtChecks('frFmtOpts');
-  if (_frFmtGroupIdx >= 0) {
+  if (_frFmtMatchIdx >= 0) {
+    var mf = _frConds[_frFmtIdx].match_formats || [];
+    while (mf.length <= _frFmtMatchIdx) mf.push([]);
+    mf[_frFmtMatchIdx] = newFmt;
+    _frConds[_frFmtIdx].match_formats = mf;
+  } else if (_frFmtGroupIdx >= 0) {
     var gf = _frConds[_frFmtIdx].group_formats || [];
     while (gf.length <= _frFmtGroupIdx) gf.push([]);
     gf[_frFmtGroupIdx] = newFmt;
@@ -9373,6 +9753,7 @@ function closeFmtPopup() {
   document.getElementById('frFmtPopupBg').style.display = 'none';
   _frFmtIdx = -1;
   _frFmtGroupIdx = -1;
+  _frFmtMatchIdx = -1;
 }
 function editFormatRule(rule) {
   formatRuleEditingId = rule.id || null;
@@ -9381,6 +9762,7 @@ function editFormatRule(rule) {
   renderConditions((rule.conditions || []).map(function (c) {
     return { type: c.type, pattern: c.pattern, scope: c.scope, formats: (c.formats || []).slice(),
       group_formats: (c.group_formats || []).map(function (g) { return (g || []).slice(); }),
+      match_formats: (c.match_formats || []).map(function (m) { return (m || []).slice(); }),
       target: c.target || 'match', between_end_pattern: c.between_end_pattern || '',
     };
   }));
@@ -9390,7 +9772,7 @@ function newFormatRule() {
   formatRuleEditingId = null;
   document.getElementById('frName').value = '';
   document.getElementById('frMode').value = 'first';
-  renderConditions([{ type: 'contains', pattern: '', scope: 'page', formats: [], target: 'match', between_end_pattern: '' }]);
+  renderConditions([{ type: 'contains', pattern: '', scope: 'page', formats: [], group_formats: [], match_formats: [], target: 'match', between_end_pattern: '' }]);
   document.getElementById('frRuleModalBg').style.display = 'flex';
 }
 function closeRuleModal() {
@@ -9426,6 +9808,9 @@ async function saveFormatRule() {
       var cond = { type: c.type, pattern: c.pattern, scope: c.scope, formats: (c.formats || []).slice() };
       if (c.type === 'regex' && c.group_formats && c.group_formats.length) {
         cond.group_formats = c.group_formats.map(function (g) { return (g || []).slice(); });
+      }
+      if (c.type === 'regex' && c.match_formats && c.match_formats.length) {
+        cond.match_formats = c.match_formats.map(function (m) { return (m || []).slice(); });
       }
       if (c.target && c.target !== 'match') cond.target = c.target;
       if (c.target === 'between' && c.between_end_pattern) cond.between_end_pattern = c.between_end_pattern;
@@ -10547,9 +10932,35 @@ document.addEventListener('keydown', (e) => {
     } catch (e) { showToast('停止服务失败: ' + e.message, 'fail'); }
     refreshLlmStatus();
   }
+  async function switchLlm() {
+    // 快速切换模型：服务运行中也可直接调用——后端 runserver 检测到模型不符时
+    // 会自动停止旧实例并加载新模型（无需先手动「停止服务」）
+    const statusEl = document.getElementById('prLlmStatus');
+    const btn = document.getElementById('prLlmSwitch');
+    const modelEl = document.getElementById('prLlmModel');
+    const model = (modelEl && modelEl.value) || proofreadLlmModel || '';
+    if (!model) { showToast('请先在下拉框选择要切换到的模型', 'warn'); return; }
+    if (btn) { btn.disabled = true; btn.textContent = '切换中…'; }
+    if (statusEl) statusEl.textContent = '服务状态: 切换模型中（' + model + '）…';
+    try {
+      const res = await fetchJSON('/api/llm_start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: model }),
+      });
+      if (!res.ok) { showToast('切换模型失败: ' + (res.error || ''), 'fail'); return; }
+      showToast(res.message || ('正在切换到 ' + model), res.running ? 'ok' : 'fail');
+    } catch (e) { showToast('切换模型失败: ' + e.message, 'fail'); }
+    finally {
+      // 无论成功/失败/提前 return 都恢复按钮，避免卡在「切换中…」不可点击
+      if (btn) { btn.disabled = false; btn.textContent = '切换模型'; }
+    }
+    refreshLlmStatus();
+  }
   refreshLlmStatus();
   document.getElementById('prLlmStart').addEventListener('click', startLlm);
   document.getElementById('prLlmStop').addEventListener('click', stopLlm);
+  document.getElementById('prLlmSwitch').addEventListener('click', switchLlm);
 
 document.getElementById('cleanBtn').addEventListener('click', cleanAll);
 document.getElementById('proofreadBtn').addEventListener('click', toggleProofreadMenu);
