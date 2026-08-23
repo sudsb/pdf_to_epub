@@ -1,0 +1,32 @@
+<summary>
+Implemented bounded CSS + whitelist changes in htmlmanage.py:
+1. Added h1 rule with color #FF6A00 and border-bottom styling
+2. Added default p { text-indent: 2em; } with safety guards for nav.toc p and .cover p
+3. Added .ptoe-flush and p.ptoe-indent format classes
+4. Updated _block_class_html() whitelist to preserve ptoe-flush and ptoe-indent classes
+5. Enhanced test_htmlmanage.py with tests for new CSS rules and class preservation
+</summary>
+<changes>
+- htmlmanage.py: 
+  * Lines ~186-327: Added h1 rule (color: #FF6A00; border-bottom: 1px solid #999; padding-bottom: 0.35em;)
+  * Lines ~203-212: Added default p { text-indent: 2em; } with safety guards (nav.toc p, .cover p { text-indent: 0; })
+  * Lines ~225-233: Added format classes (.ptoe-flush { text-indent: 0; } and p.ptoe-indent { text-indent: 2em; })
+  * Line 28: Added _NOTE_CLASS = "ptoe-note" (existing)
+  * Line 29: Added _ALIGN_CLASSES = ("ptoe-align-left", "ptoe-align-center", "ptoe-align-right") (existing)
+  * Line 30: Added _PAGE_BREAK_CLASS = "ptoe-page-break" (existing)
+  * Line 32: Added _NOTE_LABEL_CLASS = "ptoe-note-label" (existing)
+  * Lines 36-39: Added _IMG_CLASSES (existing)
+  * Line 41: Added _FORMAT_CLASSES = ("ptoe-flush", "ptoe-indent") (NEW)
+  * Lines 63-73: Updated _block_class_html() to include _FORMAT_CLASSES in whitelist
+- test_htmlmanage.py:
+  * Lines 111-143: Enhanced TestCSSManagerStylesheet with tests for h1 rule, default text-indent, and format classes
+  * Lines 170-202: Added TestHTMLConverterIntegration.test_convert_document_with_format_classes to verify format class preservation
+</changes>
+<verification>
+- Performed: python -m unittest test_htmlmanage -v
+- Result: 17 tests passed
+- Performed: python -m unittest test_correctmanage.TestRenderFragment -v
+- Result: 18 tests passed
+- Performed: python -c "import htmlmanage"
+- Result: Import successful
+</verification>

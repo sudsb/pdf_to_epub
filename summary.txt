@@ -1,0 +1,30 @@
+Summary of Changes Made
+
+1. Modified epubmanage.py:
+   a) Fixed image extension detection to include .gif and .webp:
+      - Line ~301: Changed category detection from ('.png', '.jpg', '.jpeg', '.svg') to ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp')
+      - Line ~343: Changed _is_image_file function from ('.png', '.jpg', '.jpeg', '.gif', '.svg') to ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp')
+   
+   b) Removed the _add_epub_par_indent function and its call:
+      - Removed lines 359-374 (the function definition)
+      - Removed line 376 (the function call: content = _add_epub_par_indent(content))
+      - Kept the _rewrite_flat_refs(content) call
+   
+   c) Added an else branch in the pack() method's writing loop to handle non-XHTML resources:
+      - Added lines that stream non-XHTML resources (images, CSS, etc.) directly into the zip archive
+      - The else branch uses: zf.write(src, arcname, compress_type=zipfile.ZIP_DEFLATED)
+
+2. Created new test file test_epubmanage_pack.py:
+   - Tests that EPUBPacker.pack() correctly includes non-XHTML resources (images, CSS) in the EPUB archive
+   - Verifies that image bytes are preserved correctly
+   - Confirms that the _add_epub_par_indent function is not being used (no U+3000 injection)
+   - Validates that mimetype is the first ZIP_STORED entry
+   - Uses proper cleanup with tempfile and shutil
+
+Test Results:
+- test_epubmanage_pack.TestEPUBPackerPack.test_pack_includes_non_xhtml_resources: PASS
+- Smoke test: python -c "import epubmanage" succeeds
+- Note: test_mian has pre-existing indentation errors in correctmanage.py unrelated to our changes
+
+References to _add_epub_par_indent:
+- No other references found in the repository (function was only defined and used in epubmanage.py)

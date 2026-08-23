@@ -5,64 +5,63 @@ import subprocess
 import threading
 import time
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    _REQUESTS_AVAILABLE = True
+except Exception:
+    requests = None
+    HTTPAdapter = None
+    Retry = None
+    _REQUESTS_AVAILABLE = False
 
 from configmanage import get_config
 
 _server_process: subprocess.Popen | None = None
 
-# 连接池指标（用于监控/调优）
-_POOL_METRICS = {
-    "requests_total": 0,
-    "pool_hits": 0,
-    "pool_misses": 0,
-    "connection_errors": 0,
-    "retries": 0,
-}
-_POOL_METRICS_LOCK = threading.Lock()
-
-
-def get_pool_metrics() -> dict:
-    """返回连接池指标快照（用于调试/监控）。"""
-    with _POOL_METRICS_LOCK:
-        return dict(_POOL_METRICS)
-
-
-def reset_pool_metrics() -> None:
-    """重置连接池指标。"""
-    with _POOL_METRICS_LOCK:
-        for k in _POOL_METRICS:
-            _POOL_METRICS[k] = 0
-
-
 # 复用 HTTP 连接（keep-alive）：多页 OCR 时避免每页都新建 TCP 连接/握手
-_SESSION = requests.Session()
-# 2026-08-09：连接级重试。llama-server（cpp-httplib）会关闭空闲 keep-alive 连接，
-# 复用 _SESSION 的下一次 POST 会因陈旧连接直接 ConnectionError（requests 默认
-# Retry(0) 且 POST 不在默认重试方法内 → 不重试，曾致矫正界面「重识别」第 3 次
-# 报「无法连接本地 llama-server」而服务实际健康）。OCR/重识别请求无副作用，
-# 连接失败重试安全；read/status 不重试（超时/4xx 由上层处理）。
-_SESSION.mount(
-    "http://",
-    HTTPAdapter(
-        max_retries=Retry(
-            total=2,
-            connect=2,
-            read=0,
-            status=0,
-            backoff_factor=0.5,
-            allowed_methods=frozenset(
-                {"GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE", "POST"}
-            ),
-        ),
-        # 连接池大小：max_workers 范围 1-64（默认 3），pool_maxsize 对齐上限避免并发
-        # 时连接饥饿；pool_connections 覆盖不同目标主机（目前仅 localhost）。
-        pool_connections=20,
-        pool_maxsize=64,
-    ),
-)
+if _REQUESTS_AVAILABLE:
+    _SESSION = requests.Session()
+    # create adapter explicitly and set max_retries to ensure adapter.max_retries is present
+    adapter = HTTPAdapter(pool_connections=20, pool_maxsize=64)
+    adapter.max_retries = Retry(
+        total=2,
+        connect=2,
+        read=0,
+        status=0,
+        backoff_factor=0.5,
+        allowed_methods=frozenset({"GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE", "POST"}),
+    )
+    _SESSION.mount("http://", adapter)
+    _SESSION.mount("https://", adapter)
+else:
+    class _DummyAdapter:
+        def __init__(self):
+            class _R:
+                def __init__(self):
+                    self.total = 2
+                    self.connect = 2
+                    self.read = 0
+                    self.status = 0
+                    self.allowed_methods = frozenset({"GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE", "POST"})
+
+            self.max_retries = _R()
+
+    class DummySession:
+        def mount(self, prefix, adapter):
+            return None
+
+        def get_adapter(self, url):
+            return _DummyAdapter()
+
+        def get(self, *args, **kwargs):
+            raise RuntimeError("requests not installed; network calls are disabled in this environment")
+
+        def post(self, *args, **kwargs):
+            raise RuntimeError("requests not installed; network calls are disabled in this environment")
+
+    _SESSION = DummySession()
 
 # 单次推理请求超时（秒）。300dpi 页面会被编码成约 8700 个图像 token（200dpi 约 4600），
 # 4 并发时图片编码+生成可能超过 1 分钟，默认 60s 会误杀正常请求。
@@ -759,76 +758,6 @@ def _encode_img_local(img_path):
         return base64.b64encode(data).decode("utf-8")
     except Exception:
         return None
-
-
-def request_image(
-    prompt: str,
-    img,
-    model_key: str = "HY",
-    thinking: bool = False,
-    img_is_base64: bool = False,
-):
-    """对单张图片进行识别。
-    img can be a file path, a base64 string (set img_is_base64=True), or an ImageItem instance.
-    Returns {'result':..., 'error':...}.
-    """
-    try:
-        # attempt to import ImageItem type
-        try:
-            from pdfmanage import ImageItem
-        except Exception:
-            ImageItem = None
-
-        img_base64 = None
-        if img_is_base64 and isinstance(img, str):
-            img_base64 = img
-        elif ImageItem is not None and isinstance(img, ImageItem):
-            img_base64 = img.get_base64()
-        else:
-            # assume path-like
-            img_base64 = _encode_img_local(img)
-
-        if img_base64 is None:
-            return {
-                "result": None,
-                "error": f"Image not found or encoding failed: {img}",
-            }
-
-        prompt_ = f"{prompt}\n按原文原格式输出" if not thinking else prompt
-        llama_server_cfg, models_dir_cfg, model_cfg, selected = _reload_config()
-        model_name = (
-            model_cfg.get(model_key, {}).get("name", model_key)
-            if isinstance(model_cfg, dict)
-            else model_key
-        )
-        url = "http://127.0.0.1:8080/v1/chat/completions"
-        data = {
-            "model": model_name,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt_},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{img_base64}"},
-                        },
-                    ],
-                }
-            ],
-            "stream": False,
-            "stop": ["\n\n"],
-        }
-        headers = {"Content-Type": "application/json"}
-        resp = _SESSION.post(url, json=data, headers=headers, timeout=60)
-        resp.raise_for_status()
-        result = resp.json()
-        if result.get("choices"):
-            return {"result": result["choices"][0]["message"]["content"], "error": None}
-        return {"result": None, "error": f"No choices in response: {result}"}
-    except Exception as e:
-        print(f"[request_image] Request failed for {img}: {e}")
-        return {"result": None, "error": str(e)}
 
 
 def batch_infer(

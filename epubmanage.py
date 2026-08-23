@@ -231,8 +231,20 @@ class EPUBPacker:
         spine = ET.SubElement(package, 'spine')
         # NCX 目录引用：EPUB2/EPUB3 均设置，保证旧阅读器能跳转目录
         spine.set('toc', 'ncx')
+        # EPUB3：nav.xhtml 以 linear="no" 进入 spine——部分阅读器要求目录文档
+        # 在 spine 中才能解析并跳转目录链接；linear="no" 使其不进入阅读顺序，
+        # 正文不会出现重复的目录页（2026-08-23 修复目录点击跳转失效）
+        nav_spine_id = None
+        if pkg_version.startswith('3') and nav_href is not None:
+            for i, (href, _m) in enumerate(manifest_items):
+                if href == nav_href:
+                    nav_spine_id = f'item{i+1}'
+                    break
         for ref in spine_itemrefs:
-            ET.SubElement(spine, 'itemref', idref=ref)
+            if ref is not None and ref == nav_spine_id:
+                ET.SubElement(spine, 'itemref', idref=ref, **{'linear': 'no'})
+            else:
+                ET.SubElement(spine, 'itemref', idref=ref)
 
         # 注册命名空间前缀，避免 ElementTree 输出 ns0:title 等无意义前缀
         ET.register_namespace('dc', 'http://purl.org/dc/elements/1.1/')
@@ -298,7 +310,7 @@ class EPUBPacker:
                     category = 'Text'
                 elif rel.lower().endswith('.css'):
                     category = 'Styles'
-                elif rel.lower().endswith(('.png', '.jpg', '.jpeg', '.svg')):
+                elif rel.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp')):
                     category = 'Images'
                 epub_path = self.mapper.map_file(src, category)
                 manifest_sources.append((src, epub_path))
@@ -338,30 +350,40 @@ class EPUBPacker:
             zf.writestr('mimetype', self.generate_mimetype(), compress_type=zipfile.ZIP_STORED)
             # container.xml
             container_xml = self.generate_container_xml()
-            zf.writestr('META-INF/container.xml', container_xml)
             # write all mapped resources streaming from disk
             def _is_image_file(path: str) -> bool:
-                return path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg'))
-
+                return path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp'))
+            # Deduplicate manifest_sources by mapped epub path to avoid writing
+            # the same archive name multiple times (can happen if mapping resolves
+            # different source paths to same epub href). Keep first occurrence.
+            unique_map: dict[str, str] = {}
             for src, epub_path in manifest_sources:
-                arcname = os.path.join('OEBPS', epub_path).replace('\\', '/')
+                if epub_path not in unique_map:
+                    unique_map[epub_path] = src
+
+            for epub_path, src in unique_map.items():
+                arcname = os.path.join('OEBPS', epub_path).replace('\\','/')
                 if epub_path.lower().endswith(('.xhtml', '.html', '.htm')):
                     # XHTML files move into OEBPS/Text/; references written for the
                     # flat OEBPS/ layout (style.css, Images/, Styles/) move up a level
                     with open(src, 'r', encoding='utf-8') as f:
                         content = f.read()
                     zf.writestr(arcname, _rewrite_flat_refs(content))
-                elif _is_image_file(src):
-                    # Images already compressed; skip re-compression
-                    zf.write(src, arcname, compress_type=zipfile.ZIP_STORED)
                 else:
-                    zip_type = zipfile.ZIP_STORED if _is_image_file(arcname) else zipfile.ZIP_DEFLATED
-                    zf.write(src, arcname, compress_type=zip_type)
-            # write content.opf
+                    # Non-XHTML resources (images, CSS, etc.) are streamed directly
+                    zf.write(src, arcname, compress_type=zipfile.ZIP_DEFLATED)
+            # Ensure stylesheet is present under OEBPS/Styles/style.css (some flows write it to OEBPS/style.css)
+            css_src = os.path.join(oebps, 'style.css')
+            css_arc = os.path.join('OEBPS', 'Styles', 'style.css').replace('\\','/')
+            if os.path.isfile(css_src) and css_arc not in zf.namelist():
+                zf.write(css_src, css_arc, compress_type=zipfile.ZIP_DEFLATED)
             zf.writestr('OEBPS/content.opf', opf_content)
             # write toc.ncx（EPUB2/EPUB3 均写入，给旧阅读器做目录兜底）
             if ncx_content:
                 zf.writestr('OEBPS/toc.ncx', ncx_content)
+            # Ensure container.xml exists in the archive (some zip backends
+            # may omit earlier writes under dup keys); write again at end.
+            zf.writestr('META-INF/container.xml', container_xml)
         return self.epub_path
 
 def pack_from_oebps(root_dir: str, epub_path: str, metadata: EPUBMetadata, epub_version: str = '2.0', toc_items: Optional[List[Dict[str, str]]] = None) -> str:
@@ -376,16 +398,19 @@ def pack_from_oebps(root_dir: str, epub_path: str, metadata: EPUBMetadata, epub_
     files = sorted([f for f in os.listdir(oebps) if os.path.isfile(os.path.join(oebps, f))], key=_natural_key)
     cover = 'cover.xhtml' if 'cover.xhtml' in files else None
     contents = [f for f in files if f.startswith('content_') and f.endswith('.xhtml')]
-    # nav.xhtml 不在 spine 中（2026-08-15）：正文不显示目录页，阅读器导航栏
-    # 经 manifest properties="nav" 仍可发现目录（EPUB 3.3 §7.3 MAY + RS §7 MUST）；
-    # title.xhtml 书名页已不再生成（书名保留在元数据与导航栏目录条目中）
+    nav = 'nav.xhtml' if 'nav.xhtml' in files else None
     spine = []
     if cover:
         spine.append(os.path.join('OEBPS', cover))
+    if nav and str(epub_version).startswith('3'):
+        # 仅 EPUB3：nav.xhtml 以 linear="no" 进入 spine（generate_content_opf 中标记）：
+        # 部分阅读器要求目录文档在 spine 中才能跳转目录链接；linear="no"
+        # 保证它不进入阅读顺序、正文不出现重复目录页（2026-08-23）
+        spine.append(os.path.join('OEBPS', nav))
     for c in contents:
         spine.append(os.path.join('OEBPS', c))
     if toc_items is None:
-        toc_items = [{'title': os.path.splitext(os.path.basename(p))[0], 'href': os.path.relpath(p, 'OEBPS')} for p in spine]
+        toc_items = [{'title': os.path.splitext(os.path.basename(p))[0], 'href': os.path.relpath(p, 'OEBPS')} for p in spine if os.path.basename(p) != 'nav.xhtml']
     packer = EPUBPacker(epub_path, root_dir, compression_level=6, epub_version=epub_version)
     return packer.pack(metadata, [os.path.relpath(s, 'OEBPS') for s in spine], toc_items)
 

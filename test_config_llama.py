@@ -1,36 +1,46 @@
+# -*- coding: utf-8 -*-
+"""configmanage / llamamanage 基础行为测试（unittest 版）。
+
+原为 pytest 风格（模块级测试函数 + pytest.main），导致 `python -m unittest
+discover` 加载器报错（环境未安装 pytest）。2026-08-23 审计整改：改为标准库
+unittest，断言语义保持不变。
+"""
 import os
-import json
-import tempfile
-import pytest
+import sys
+import unittest
 
-import configmanage as cfgm
-import llamamanage as llm
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-
-def test_get_config_defaults_and_update():
-    cfg = cfgm.get_config()
-    assert isinstance(cfg, dict)
-    assert 'llama_server' in cfg
-    assert 'models_dir' in cfg
-    orig_selected = cfg.get('selected_model')
-    # update selected_model to a non-existing key and ensure fallback
-    cfg2 = cfgm.update_config('selected_model', 'NON_EXISTENT_MODEL')
-    assert 'selected_model' in cfg2
-    # restore original
-    cfgm.update_config('selected_model', orig_selected)
+import configmanage as cfgm  # noqa: E402
+import llamamanage as llm  # noqa: E402
 
 
-def test_llama_check_and_request_structure():
-    cfg = cfgm.get_config()
-    sel = cfg.get('selected_model')
-    # check should be callable and return a bool
-    ok = llm.check(None, None, sel)
-    assert isinstance(ok, bool)
-    # request should return dict with result/error keys
-    r = llm.request('test', model_key=sel)
-    assert isinstance(r, dict)
-    assert 'result' in r and 'error' in r
+class TestConfigLlama(unittest.TestCase):
+    def test_get_config_defaults_and_update(self):
+        cfg = cfgm.get_config()
+        self.assertIsInstance(cfg, dict)
+        self.assertIn("llama_server", cfg)
+        self.assertIn("models_dir", cfg)
+
+        orig = cfg.get("selected_model")
+        try:
+            cfgm.update_config("selected_model", "NON_EXISTENT_MODEL")
+            cfg2 = cfgm.get_config()
+            self.assertEqual(cfg2.get("selected_model"), "NON_EXISTENT_MODEL")
+        finally:
+            if orig is not None:
+                cfgm.update_config("selected_model", orig)
+
+    def test_llama_check_and_request_structure(self):
+        sel = cfgm.get_config().get("selected_model")
+        ok = llm.check(None, None, sel)
+        self.assertIsInstance(ok, bool)
+
+        res = llm.request("test", model_key=sel)
+        self.assertIsInstance(res, dict)
+        self.assertIn("result", res)
+        self.assertIn("error", res)
 
 
-if __name__ == '__main__':
-    pytest.main([__file__])
+if __name__ == "__main__":
+    unittest.main()

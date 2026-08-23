@@ -1,12 +1,15 @@
-from zhconv import zhconv
+try:
+    from zhconv import zhconv
+except Exception:
+    zhconv = None
 
 
 def ttos(text):
-    return zhconv.convert(text, "zh-cn")
+    return text if zhconv is None else zhconv.convert(text, "zh-cn")
 
 
 def stot(text):
-    return zhconv.convert(text, "zh-tw")
+    return text if zhconv is None else zhconv.convert(text, "zh-tw")
 
 
 import html

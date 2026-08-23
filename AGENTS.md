@@ -1,148 +1,90 @@
 # Repository Guidelines
 
 ## Project Overview
-
-ptoe is a small CLI tool that converts PDFs to EPUB via local OCR and local model servers. Primary flow:
-- split PDF into images (pdfmanage.py)
-- run OCR against a local llama-server-like service (llamamanage.py; engine dispatch to vllmmanage.py for vLLM-Omni)
-- clean/structure OCR text (stringmanage.py)
-- convert structured text to XHTML and build an EPUB (htmlmanage.py, epubmanage.py)
-- optional browser-based manual correction stage (correctmanage.py) with history and export
-
-Entry point: mian.py (CLI subcommands `epub`, `correct`, `resume`, `model`, `config`, `gui` via argparse `add_subparsers`) and an interactive terminal menu when run with no args. User-facing manual: USAGE.md. Shipped as a single-file Windows exe via PyInstaller (pack.ps1).
-
-**Git state (important):** the repo has only a handful of commits; nearly all current functionality lives in the uncommitted working tree (branch diverged from origin/master). Trust the source files, not `git log`/`git diff`, for current behavior.
+- Purpose: CLI tool (ptoe) that converts PDF → images → OCR → structured XHTML → EPUB, with an optional browser-based manual correction UI.
+- Entrypoint: `mian.py` (subcommands: `epub`, `correct`, `resume`, `model`, `config`, `gui`). See `mian.py` docstring / CLI help (mian.py:1-200).
 
 ## Architecture & Data Flow
-
-1. mian.py orchestrates a job: calls pdfmanage.split_pdf_to_images(pdf, dpi, fmt).
-2. Image pages are queued/represented by ImageItem / ImageQueue (pdfmanage.py).
-3. llamamanage.batch_infer posts page images to a local llama-server (OpenAI-compatible /v1/chat/completions) and returns per-page text. With config.json `engine: "vllm"` (or CLI `--engine vllm`), llamamanage dispatches to vllmmanage.py which drives a vLLM-Omni server instead (default port 8000).
-4. stringmanage.clean_and_structure_text applies bbox conversion, page-number stripping, heading detection, whitespace normalization, and optional zh conversion.
-5. htmlmanage.HTMLConverter converts structured pages into OEBPS XHTML fragments and writes Images/ and Styles/.
-6. epubmanage.EPUBPacker packages OEBPS into .epub (mimetype written first, ZIP_STORED, spine ordering, nav.xhtml).
-
-Optional correction stage (correctmanage.py): a ThreadingHTTPServer serves a browser UI for editing pages; handlers stage and save revisioned JSON under data/correction_history/. apply_markers converts UI markers to structured articles for HTML conversion.
-
-Runtime interactions:
-- configmanage.get_config() reads/writes config.json (atomic write + lock) and may show tkinter dialogs when paths are missing.
-- llamamanage.runserver() may spawn a persistent external llama-server process; _probe_server() compares /health and /v1/models to avoid model mismatch.
-- Engine dispatch: `_active_engine()` reads config.json `engine` ("llama" default | "vllm"); CLI `--engine` overrides via `set_engine()` (not persisted). Each public llamamanage function (run/check/_probe_server/runserver/stopserver/request/batch_infer/_request_image_new) forwards to vllmmanage.py when engine=vllm; llama.cpp path is byte-identical when engine=llama.
-- Batch inference uses ThreadPoolExecutor and reuses a shared requests.Session for keep-alive. No asyncio.
+- High level flow (implementor path): mian.py → pdfmanage.split_pdf_to_images() → llamamanage.batch_infer()/vllmmanage.batch_infer() → stringmanage.clean_and_structure_text() → htmlmanage.HTMLConverter → epubmanage.EPUBPacker.
+  - OCR engines: default engine chosen by `config.json` `engine` key; runtime dispatch in `llamamanage._active_engine()` (llama vs vllm). See `llamamanage.py` (1-200).
+  - Optional correction stage: `correctmanage.correct_pages()` serves a ThreadingHTTPServer and returns corrected pages, then `mian.py` `apply_markers()` merges markers into article structure (correctmanage.py:1-200).
+- Concurrency:
+  - Batch inference uses ThreadPoolExecutor (vllmmanage/llamamanage) and a shared requests.Session with retries (`llamamanage._SESSION`) to reuse HTTP keep-alive connections.
+  - Correction and GUI services use ThreadingHTTPServer and module-level locks (`pages_lock`, config `_CFG_LOCK`). See `correctmanage.py`, `guimanage.py`, and `configmanage.py`.
+- State & globals to be careful with during refactor: `_server_process`, `_SESSION` (llamamanage.py), `_CFG_LOCK` (configmanage.py), `_ENGINE_CACHE`/`_BATCH_ENGINE` (llamamanage.py). These names appear across modules and must be preserved or renamed with LSP-aware refactor.
 
 ## Key Directories
-
-- Repo root: all Python scripts at top level (not a package). Main files: mian.py, pdfmanage.py, llamamanage.py, vllmmanage.py, configmanage.py, stringmanage.py, correctmanage.py, htmlmanage.py, epubmanage.py, dictionarymanage.py, proofreadmanage.py
-- data/ — per-PDF output directories (`data/<pdf_stem>/1.png, 2.png …`), `correction_history/<sha1>_<timestamp>_<rand>.json`, final .epub, proofread_dict.json (user proofreading dictionary)
-- dicts/ — dictionaries bundled into the exe: jieba_dict.txt (large), shapes.txt, homophones.txt
-- scripts/ — dev/perf scripts (e.g. test_proofread_perf.py)
-- .logs/ — dev run logs; .opencode/, .crush/, .idea/ — local/editor tooling; ignored
-- build/, dist/, ptoe.spec — PyInstaller artifacts (regenerated by pack.ps1; ignored)
+- Root scripts: `mian.py`, `pdfmanage.py`, `llamamanage.py`, `vllmmanage.py`, `configmanage.py`, `stringmanage.py`, `htmlmanage.py`, `epubmanage.py`, `correctmanage.py`, `guimanage.py`, `dictionarymanage.py`, `proofreadmanage.py`, `rulemanage.py`.
+- data/: per-PDF output (images, correction_history, final .epub). (Referenced across pdfmanage.py/correctmanage.py.)
+- dicts/: dictionaries bundled into exe (jieba, shapes, homophones). Lookups in `dictionarymanage.py`.
+- scripts/: developer helpers (e.g., `check_js.py`, `test_proofread_perf.py`).
+- build/ and dist/ (PyInstaller artifacts) — packaging flow anchored by `pack.ps1`.
 
 ## Development Commands
-
-Primary runner: uv (uv + uv.lock; .venv/ present). Commands below also work with `.venv/Scripts/python.exe`.
-- Run CLI:
-  - `python mian.py epub <pdf> [--dpi 0] [--model HY] [--workers 3] [--timeout 600] [--title TITLE] [--author AUTHOR] [--lang zh-CN] [--out-dir DIR] [--epub-path PATH] [--thinking] [--correct] [--correct-timeout 600] [--engine llama|vllm] [--resume|--restart]`
-  - `python mian.py resume <pdf> [--restart]`  # OCR 断点续传：继续上次中断的识别（只处理未完成页）或直接转换；无进度时询问是否从头转换；--restart 强制重来；其余参数同 epub（--dpi/--model/--engine/--workers/--timeout/--thinking/--title/--author/--lang/--out-dir/--epub-path/--correct/--correct-timeout）
-  - `python mian.py correct [<pdf>] [--title TITLE] [--author AUTHOR] [--lang zh-CN] [--out-dir DIR] [--epub-path PATH] [--correct-timeout 600] [--engine llama|vllm]`  # pdf 可选（nargs="?"，无 pdf 时直接进矫正界面）
-  - `python mian.py model list|show|set <key>|add <key> --name NAME --mmproj MMPROJ [--force]|remove|rm <key>`
-  - `python mian.py config set <key> <value>`  # 支持键：llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / llama_server_args.<参数> / vllm_server_args.<参数> / proofread.<param>
-  - `python mian.py gui [--host 127.0.0.1] [--port 0] [--no-browser] [--idle-timeout 120]`  # HTML 配置操作界面（guimanage.py）：浏览器中查看/修改 config 与启动参数、启停推理服务；浏览器关闭超 idle_timeout 自动退出；终端菜单第 8 项同入口
-- Tests (stdlib unittest):
-  - `python -m unittest test_pdfmanage` / `python -m unittest discover -v`
-  - test_image_queue_request.py is a standalone script: `python test_image_queue_request.py`
-  - scripts/test_proofread_perf.py: `python scripts/test_proofread_perf.py`
-  - After editing correctmanage.py's embedded UI script: `python check_js.py` (brace/paren/template balance) then extract JS and `node --check` it (see Notes & Gotchas)
-- Packaging (Windows): `powershell -ExecutionPolicy Bypass -File .\pack.ps1` → builds dist\ptoe.exe via PyInstaller onefile console, --add-data dicts + pyproject.toml, --collect-all pymupdf.
-
-Quick troubleshooting:
-- Stop a stray llama-server: `python -c "from llamamanage import stopserver; stopserver()"`
-- If config.json lacks paths, get_config() may pop tkinter dialogs; use get_config(show_dialogs=False) for headless tests.
+- Run CLI (local Python):
+  - python mian.py epub <pdf> [--dpi 0..4] [--model KEY] [--workers N] [--engine llama|vllm] [--thinking]
+  - python mian.py correct <pdf?> [--engine llama|vllm]
+  - python mian.py gui [--host 127.0.0.1] [--port 0] [--no-browser]
+- Unit tests (stdlib unittest):
+  - python -m unittest discover -v
+  - Targeted: python -m unittest test_stringmanage
+  - Note: test_config_llama.py is pytest-style and may error under unittest discover if pytest not installed.
+- Packaging (Windows):
+  - powershell -ExecutionPolicy Bypass -File .\pack.ps1  # builds onefile exe via PyInstaller (mian.py entry)
+- UI edit checks:
+  - python check_js.py  # validates embedded UI script in correctmanage.py
+  - node --check extracted_ui.js  # syntax check
+  - (Optional) jsdom harness at %TEMP%/ptoe_ui_harness2.mjs for DOM tests (documented in repo).
 
 ## Code Conventions & Common Patterns
-
-- Flat script layout: top-level .py files, not a package. Imports are often lazy (import inside functions) to avoid heavy deps in non-OCR flows.
-- Atomic config writes: configmanage writes JSON atomically (tempfile + os.replace) under a module-level lock (`_CFG_LOCK`).
-- Module-global state: llamamanage._server_process, shared requests.Session, cached dicts/datasets in dictionarymanage — consider callers before renaming exported symbols.
-- Thread-safety via threading.Lock/RLock around shared state (pages_lock, preview_doc_lock in correctmanage). Many server endpoints assume these locks.
-- Concurrency: ThreadPoolExecutor for batch_infer; ThreadingHTTPServer for the correction UI. No asyncio.
-- Result shapes: functions often return dicts with explicit keys, e.g. {'result': ..., 'error': ...} or {'ok': True/False, 'message': ...}. Failures are usually returned, not raised, in OCR/client APIs — follow the existing pattern.
-- Frozen exe support: modules check `getattr(sys, 'frozen', False)` and read bundled assets from sys._MEIPASS. When adding files to the exe, update pack.ps1.
-- EPUB internal paths MUST use forward slashes ('/') — never os.path.join for final internal URIs (Windows readers break otherwise).
-- DPI levels: --dpi 0-4 → {0: 100, 1: 150, 2: 200, 3: 300, 4: 600}. Higher DPI = more image tokens = slower but more accurate OCR.
-- --thinking (default False): when False (default), the prompt gets "\n按原文原格式输出" appended and enable_thinking=False; when True, the suffix is skipped and enable_thinking=True (Qwen3.5 hidden CoT slows OCR ~7x). `llamamanage.request(prompt, model_key, thinking, append_ocr_instruction=True)` — pass append_ocr_instruction=False for JSON-output prompts (e.g. proofread LLM suggestions; the OCR suffix contradicts "返回 JSON" and makes json.loads fail).
+- Flat script layout: top-level .py files, lazy imports inside functions to avoid heavy deps during unrelated commands (mian.py, correctmanage.py import lazily).
+- Atomic writes for config and small persistent files: `configmanage._atomic_write_json(path, obj)` uses tempfile + os.replace to guarantee atomic replacement; preserve this pattern for any persistent JSON writes.
+- Module-global state: many modules expose module-level globals (e.g. `llamamanage._server_process`, `llamamanage._SESSION`, `configmanage._CFG_LOCK`, `correctmanage._preview_warm_started`). Do not rename/replace without using LSP rename across callsites.
+- Concurrency:
+  - Use ThreadPoolExecutor for CPU/IO parallelism in inference and ProcessPoolExecutor guarded for preview warming (see correctmanage._PREVIEW_POOL_CLS).
+  - ThreadingHTTPServer is used for browser UIs; shutdown must call server.shutdown() before server.server_close() on Windows to avoid OSError 10038.
+  - Use threading.Lock / RLock around shared mutable module state; `_CFG_LOCK` in configmanage protects reads/writes.
+- IO robustness:
+  - Avoid synchronous heavy imports at module top; lazy import in function scope.
+  - When spawning external servers, probe `--help` support first (`llamamanage._server_supports_arg`) to avoid process-exit due to unsupported flags.
+- Text and EPUB rules:
+  - EPUB internal paths must use forward slashes ('/') — htmlmanage/epubmanage enforce this.
+  - Embedded UI HTML/JS is large; after edits run `check_js.py` + `node --check` before committing.
 
 ## Important Files
-
-- mian.py — CLI entrypoint and pipeline orchestration (do not rename)
-- pdfmanage.py — split_pdf_to_images(), ImageItem, ImageQueue
-- llamamanage.py — runserver(), stopserver(), batch_infer(), request_image (= _request_image_new); module-global _server_process and _SESSION; engine dispatch layer (_active_engine()/set_engine()/_vllm_module())
-- vllmmanage.py — vLLM-Omni adapter, same API shape as llamamanage: _vll_args(), _base_url(), _resolve_model(), _probe_server(), runserver(model_key, with_mmproj=True) (parity only), stopserver(), request(), _request_image_new() (payload adds `modalities: ["text"]`, no stop key), batch_infer(). runserver builds `vllm serve <model>` args from vllm_server_args (keys → --kebab-case flags, default port 8000); `vllm_server: ""` = connect-only mode (no process spawn)
-- configmanage.py — get_config(), update_config(), set_ocr_prompt(), set_llama_server_arg(), set_vllm_server_arg(), set_proofread_param(), set_format_rules(), validate_and_patch_config(); DEFAULT_CONFIG 含 format_rules:[] 种子
-- guimanage.py — HTML 配置操作界面（`mian.py gui` 启动，2026-08-17 新增）：gui_serve(host, port, open_browser, idle_timeout) 起 ThreadingHTTPServer + 内嵌 _UI_HTML（浏览器 UI，设计稿由独立工作流产出后嵌入）；端点 GET /（UI）、/api/config（读配置+模型文件存在性+defaults+path）、/api/status（engine/probe/port/busy）、/api/ping（心跳）、POST /api/config（校验 engine∈{llama,vllm}/selected_model∈choices/路径为 str → _CFG_LOCK 内 _atomic_write_json 原子写）、/api/server/start（serve_lock 非阻塞 + daemon 线程 runserver，busy 标志）、/api/server/stop、/api/pick（tkinter 文件/目录对话框经 dlg_queue 主线程弹出，cancelled 返回 {ok,cancelled:true}，可选 filter:"pdf" 限制文件对话框）、/api/bye（pagehide 信标）；浏览器关闭超 idle_timeout 自动退出（_browser_gone：gone_at 信标 / 心跳失联 idle_timeout*2）；镜像 correctmanage 服务端模式（先 shutdown 再 server_close、_send/_json helper、中文错误 {ok:false,error}）。**转换流程页（2026-08-17）**：POST /api/convert/start（body {pdf,dpi 0-4,model,engine,workers,timeout,thinking,title,author,lang,out_dir,epub_path}，全中文校验，单飞 409「已有转换在运行」，Popen 子进程跑 `mian.py epub`——dev `[sys.executable, ROOT/mian.py, 'epub', ...]`、冻结 `[sys.executable, 'epub', ...]`，CREATE_NO_WINDOW + stdout 逐行入环形缓冲 _CONVERT_MAX_LINES=2000）+ GET /api/convert/status（{ok,running,done,success,exit_code,lines:最后200,error,epub_path}，成功从尾部解析 `Done: <path>`）+ POST /api/convert/stop（kill 运行中进程）；gui_serve finally 清理残留 convert 进程（_convert_argv/_convert_monitor/_api_convert_*）
-- stringmanage.py — clean_and_structure_text(), convert_bbox_text(), clean_bbox_text() (纯文本版 bbox 清理，供 /api/reocr 处理 ULQ4/ULQ8 输出), strip_think_blocks(), strip_page_numbers(), detect_headings(), ttos/stot
-- correctmanage.py — correct_pages(), ThreadingHTTPServer handlers, sanitize_html(), apply_markers(), proofread_page() (rule-based character correction), diff_reocr_texts(), _parse_llm_suggestions(), _validate_format_rules(); large UI payload embedded in _UI_HTML (edit carefully). 端点含 /api/format_rules (GET/POST，格式规则 CRUD)。前端含 insertImageDataUrl（整页图/外部/裁剪共用插入）、openCrop（左侧图拖拽选区 canvas 裁剪）、格式规则弹窗 + 应用引擎（evalCondition/evalFormatRule/applyFormatsList/applySingleFormat）
-- htmlmanage.py — HTMLConverter, convert_document, extract/write Images/. TOC nav must carry `epub:type="toc"` + `xmlns:epub` namespace (EPUB 3.3 §11; strict readers like Apple Books won't recognize the nav without it)
-- epubmanage.py — EPUBPacker, pack_from_oebps (mimetype first, ZIP_STORED)
-- dictionarymanage.py — tokenization/wordlist helpers used by proofreader (P0/P1/P2 pipeline: whitelist, unknown-word detection with shape/homophone candidates, user dictionary persistence)
-- proofreadmanage.py — visual proofreading via VLM (proofread_page_image() sends image+text for correction, diff_corrections() compares). Not wired into the main flow by default.
-- pyproject.toml / uv.lock — project metadata and locked dependencies (Python >= 3.11; pymupdf, requests, zhconv)
-- pack.ps1 — PyInstaller packaging; check_js.py — dev helper to pre-check the embedded <script> in correctmanage.py; USAGE.md — user manual
+- mian.py — CLI entry and orchestration; key functions: `pdf_to_epub`, `correct_pdf`. (mian.py:1-200)
+- llamamanage.py — engine dispatch, server lifecycle, shared HTTP session `_SESSION`, batch_infer, runserver/stopserver. (llamamanage.py:1-200)
+- vllmmanage.py — vLLM-Omni adapter (same API shape as llamamanage). (vllmmanage.py)
+- configmanage.py — `get_config()`, `_atomic_write_json()`, DEFAULT_CONFIG, set_format_rules. (configmanage.py:1-200)
+- correctmanage.py — correction UI server, `correct_pages()`, `apply_markers()`, HTML sanitizer, format rules CRUD/validation (`/api/format_rules`). (correctmanage.py:1-200)
+- guimanage.py — GUI server endpoints (`/api/convert/*`, `/api/server/*`, `/api/pick`), `_UI_HTML` placeholder. (guimanage.py:1-220)
+- htmlmanage.py / epubmanage.py — HTML conversion and EPUB packaging; EPUBPacker and HTMLConverter classes.
+- dictionarymanage.py — tokenization and candidate generation used by proofreader.
+- rulemanage.py — server-side format rules application engine (pure stdlib html.parser mini DOM): condition evaluation (contains/prefix/suffix/regex with `/pattern/flags`), rule modes (first/all), match/group/target formats, conflict resolution (first-wins). Served via POST `/api/format_rules/apply` ({page, html, rule_id|all, sel_start, sel_end} → sanitized new HTML); the browser only renders — the old client-side JS engine (evalCondition/evalFormatRule/applyRegexMatchFormats/applyRegexGroupFormats/applyTargetFormats/applyFormatsList) was removed. Tests: `test_rulemanage.py`.
 
 ## Runtime / Tooling Preferences
-
-- Python >= 3.11. Stdlib unittest; one file is pytest-style (test_config_llama.py) — pytest needed only for that file.
-- Package manager / runner: uv (`uv run` for a consistent env). Deps (pymupdf, requests, zhconv) are lazily imported, so many paths run without all deps.
-- Editor tooling: pyrefly diagnostics used in dev (LSP). Use LSP-aware refactors when available.
+- Python >= 3.11 recommended (typing features used). Tests / runner expect stdlib unittest; pytest only for one file.
+- Package runner: `uv` recommended in repo docs but standard `python` runner works.
+- Node (for `node --check`) is required to validate inlined UI JS edits. jsdom optional for DOM-level checks.
+- Windows-first packaging: `pack.ps1` targets PyInstaller and produces a single exe (mian.py entry). vLLM-Omni typically Linux-only; vllm_server is often used in connect-only mode on Windows.
 
 ## Testing & QA
+- Test organization: many test_*.py files at repo root. Unit tests use stdlib unittest; run discover for full suite.
+- Fast smoke tests suggested after edits:
+  - python -m unittest test_stringmanage
+  - python -m unittest test_pdfmanage
+  - python -m unittest test_llamamanage
+- GUI & packaging tests require dependencies (PyMuPDF/requests) and may spawn subprocesses; run them only when environment has those deps.
+- After any edit to correctmanage.py's embedded UI script:
+  1. python check_js.py
+  2. python _extract_js.py to extract JS
+  3. node --check <extracted.js>
+  4. (Optional) run jsdom harness at %TEMP%/ptoe_ui_harness2.mjs with url option to validate DOM usage.
 
-- Primary runner: `python -m unittest discover -v` → **398 tests, OK**（2026-08-17 验证；此前 340/367/387 基线含 test_config_llama 缺 pytest 的既有 error，该文件为 pytest 风格不参与 discover）。Per-file: test_correctmanage 245 (含 TestFormatRules/TestFormatRulesConfig 等), test_stringmanage 38, test_vllmmanage 15, test_pdfmanage 13, test_llamamanage 12, test_mian 13 (含 TestOcrResume 断点续传/TestAutoHistory 历史保存/gui 接线), test_guimanage 29 (GUI 端点/浏览器存活/菜单接线/TestGuiConvert 转换子进程 9+TestConvertArgv 3), test_proofread_text 5. test_image_queue_request.py is a standalone script (0 unittest tests).
-- Common local failures: missing third-party deps cause import errors (install via `uv sync`); correctmanage import is fragile because of the embedded UI script string.
-- Recommended workflow for changes touching core modules: 1) fast unit tests for the changed module → 2) pipeline tests (test_mian.py, OCR mocked) → 3) full discover. If packaging/frozen-exe behavior changed, smoke-test the built exe.
+## Practical notes for AI-assisted edits
+- For cross-file renames and exported symbol changes, use LSP rename (symbol-aware) rather than regex/text replace to avoid missing callsites. Relevant symbols: `_server_process`, `_SESSION`, `_CFG_LOCK`, `apply_markers`, `correct_pages`.
+- Preserve atomic-write helpers and lock order (e.g., do not call get_config() while holding _CFG_LOCK).
+- When changing server start/stop logic, ensure probe/start/stop functions keep the same external behavior: runserver(model_key, with_mmproj=True) and stopserver() semantics.
 
-## Notes & Gotchas for Assistants
 
-Durable rules distilled from past bug fixes. Line numbers drift as files grow — grep for symbol names.
-
-**Critical before edits:**
-
-- **correctmanage.py UI script**: The embedded `<script>` in `_UI_HTML` is ~1700 lines of inline JS Python raw string. After ANY edit to that script:
-  1. Run `python check_js.py` (brace/paren/template balance)
-  2. Extract the JS and run `node --check` it
-  3. For DOM-level tests, use jsdom harness at `%TEMP%\ptoe_ui_harness2.mjs` with **`url` option set** (missing it makes localStorage throw DOMException) + injection of fetch stub/sendBeacon/rAF via `beforeParse`
-  - ⚠️ Missing function definitions break the entire script silently until first undefined reference; verify all `addEventListener(..., HANDLER)` targets exist
-
-- **GPU auto-detection**: `runserver()` calls `_detect_gpu()` (CUDA/Vulkan/ROCm/Metal via `--list-devices`) and sets `--n-gpu-layers 999` when available; explicit `n_gpu_layers` in llama_server_args overrides
-
-- **启动参数兼容性探测（2026-08-17）**: 部分 llama-server 构建不支持某些 flag（如 llama13 无 `--max-tokens`/`--ngram-size`/`--window-size`，遇之直接 `error: invalid argument` 退出码 1 → "Server process exited unexpectedly"）。`runserver()` 启动前经 `_server_supports_arg(exe, flag)` 探测：`[exe, "--help"]`（subprocess.run, timeout=15, errors="replace"）输出按行 `re.split(r"[\s,=]+")` 拆 token 精确匹配（防 `--spec-ngram-size-n` 误命中）；结果按 exe 缓存于模块级 `_ARG_HELP_CACHE`；探测失败（exe 不存在等）保守返回 True 不阻断启动。`--max-tokens`/`--ngram-size`/`--window-size` 仅当支持时附加；`MAX_TOKENS`（请求级 HTTP payload 上限）不受影响始终更新。DEFAULT_CONFIG 的 llama_server_args 种子已移除 `ngram_size`/`window_size`（纯启动参数、部分构建不支持、OCR 无增益），`max_tokens: "8192"` 保留（请求级用途）。
-
-- **ThreadingHTTPServer shutdown (Windows)**: Always must call `server.shutdown()` BEFORE `server.server_close()` (closing socket while serve_forever's select() blocks raises OSError WinError 10038). unittest.addCleanup runs LIFO: register server_close before shutdown.
-
-- **request_image dead code**: llamamanage.py has old definition (~:452) shadowed by live `_request_image_new` (~:625), rebound as `request_image = _request_image_new` at bottom (~:729). Edit the new one. vllmmanage.py similar pattern.
-
-- **EPUB internal paths**: MUST use forward slashes ('/') — never os.path.join for final internal URIs (Windows readers break otherwise)
-
-- **Renaming exported symbols**: Use LSP-aware rename/references, never blind multi-file text replace due to module-global state dependencies.
-
-- **proofread flow order**: in runProofread, snapshot `proofreadOriginal[i]` BEFORE `clearProofread(i, true)` (reversed order deletes the snapshot). `clearProofread(i, keepDismissed)` must also delete proofreadDismissed/_prTextBefore and call syncContent(ed).
-- **`stripProofreadMarkup(html)`** removes `.ptoe-fix`, unwraps `.ptoe-err` (keeps wrong text), and preserves `.ptoe-marker`; apply it in collect()'s non-md branch so save/stage/finish/export/clean/convert payloads carry no annotations. Do NOT use `_plainNoAnno` (it strips markers too and returns plain text).
-- **renderProofread must be two-phase** (collect intersecting text nodes → then wrap): a single-pass wrap breaks `walker.nextNode()` after replaceChild (jsdom-verified, covers only 1/6 chars). Multi-segment `.ptoe-err` share one data-err-i; the `.ptoe-fix` element is inserted once, in the first segment. After accept/reject: querySelectorAll by data-err-i, splice + delta rebase (shift non-overlapping e.start>=err.end), NO manual reindex — finish with renderProofread(i) + syncContent(ed) + scheduleRemeasure. `_proofreadAutoDismiss` iterates with forEach (no splice) and marks `err._gone`.
-- **proofread settings persist in config.json** `proofread` (enable_llm, llm_model, enable_legacy_rules) via /api/proofread_settings + configmanage.set_proofread_param — NOT localStorage (correct_pages uses a random port per run, so localStorage origin isolation fails every run; this caused "勾选不生效"). Model must be registered in model_choices (else 400/llm_error); empty llm_model falls back to selected_model. DEFAULT seed: enable_llm:False, llm_model:'qwen2b'. Thresholds in the same section: similarity_min, score_min, max_cand_cache, max_replacement_combinations, auto_fix_score.
-- **LLM JSON parsing**: `_parse_llm_suggestions(raw, text)` (+ module-level `_strip_trailing_commas`) parses model output: whole-string json.loads (original and trailing-comma-stripped) → per-`{` json.JSONDecoder().raw_decode preferring objects with a `suggestions` key → Chinese error message. Every failure path returns Chinese text (「模型响应解析失败：…」); never leak raw English JSONDecodeError to the UI. `_friendly_llm_error` maps connection/timeout failures (Max retries exceeded, WinError 10061, WinError 10060) to guidance (llama-server not running), unclassified errors pass through unchanged.
-- **`llamamanage.runserver(model_key, with_mmproj=True)`**: with_mmproj=False starts the server without `--mmproj` (text-only, for sentence/LLM proofreading). `/api/llm_start` decides via `has_mmproj = bool(model_info.get("mmproj"))` → runserver(model_key, with_mmproj=has_mmproj). Correction UI has 启动/停止服务 buttons + `#prLlmStatus` line driven by `/api/llm_status|llm_start|llm_stop`.
-- **/api/reocr** (大模型重识别): POST {page, model, html} → `_full_bytes(state, page_no)` (img_dir original or PDF 220dpi, None → 404) → write a temp file (extension decides MIME — `_request_image_new` guesses jpg/png from the path; a base64 param is always treated as image/png) → `llamamanage._request_image_new(ocr_prompt, tmp_path, ...)` → `_proofread_plain_text(html)` vs result through `diff_reocr_texts` → 200 {ok, text, diff}. `diff_reocr_texts` is content-level: strip all whitespace with a position map, `SequenceMatcher(None, a, b, autojunk=False)` — **autojunk=False is required** (common CJK chars like 「的」 get excluded from matching otherwise); replace → candidates=[new text], delete → candidates=[] pure underline (原文本增字), insert → anchor to the neighboring existing char (原文本少字); output shape {start, end, wrong, candidates: list of STRINGS, line} — dicts in candidates render as [object Object], forbidden. Paragraph/split differences produce no annotations.
-- **config.json**: `engine` ("llama" default | "vllm"); `vllm_server` (exe path, empty = connect-only) + `vllm_server_args`; CLI `--engine` overrides without writing config. `shortcuts` key holds correction-UI keyboard shortcuts. `batch_infer` resolves config once per batch (not per page) to avoid repeated get_config() overhead.
-- **proofread_page rules**: default (enable_legacy_rules=False) runs only 连续重复/连续标点/中英混排; enable_legacy_rules=True adds 半角→全角/引号配对/混淆表/词典滑窗. `stringmanage.clean_bbox_text` strips PaddleOCR-style bbox prefixes to plain text for /api/reocr (ULQ4/ULQ8 outputs).
-- **model CLI subcommand** only registers the config entry — the actual .gguf/.mmproj files must exist at the configured path.
-- **OCR 断点续传（2026-08-12）**：进度文件 `data/<pdf_stem>/.ocr_progress.json`（{pdf, dpi, model_key, total, status: running|ocr_done, pages: {页码: {status: done|error, result?, error?}}}）。`batch_infer` 新增 `on_result` 回调（llamamanage/vllmmanage 均支持），每页完成即原子写盘。epub 命令检测到进度时交互询问（继续识别/直接转换/重新识别/取消），`--resume`/`--restart` 跳过询问；`resume` 子命令同语义。**进度文件在 EPUB 生成成功后才删除**（OCR 完成标记 ocr_done 保留，供结构化/打包失败后续转）；restart 或成功转换时删除。继续识别只请求未完成页，done 页结果直接合并。
-- **无矫正 epub 流程自动写历史（2026-08-12）**：非 --correct 分支 OCR/结构化后经 `_save_ocr_history` 把页面文本写入 correction_history（复用 correctmanage._write_history_version），之后 `correct [<pdf>]`（默认 preload_history）可打开该书矫正；保存失败不阻断转换。**2026-08-13 修复**：原用 `initial_html` 会把结构化 HTML 转义成可见文本，改用 `correctmanage._page_text`（与 /api/pages 一致）。**2026-08-15 变更**：传入矫正界面的文本一律为正文——`_headings_to_body` 把 `<h1>-<h6>` 归一为 `<p>`（应用于 `_page_text`、correct_pages 初始 state、/api/history/load 响应与状态同步），OCR 自动标题不再以标题样式进编辑器，标题由用户手动标记。**2026-08-15 修复（保存后重开标题格式丢失）**：`_headings_to_body` 改为**只在写入历史时归一一次**（`_save_ocr_history` 走 `_page_text` 默认 normalize_headings=True）；载入路径一律按原样 serve 已存内容——`_page_text(raw, *, normalize_headings=False)`（/api/pages 与 correct_pages 初始 state 对历史内容传 False，仅对无历史的原始 OCR 文本兜底归一）、/api/history/load 响应与 state 同步去掉 `_headings_to_body`。用户手动设置的 `<h1>-<h6>`（标题按钮/格式规则）保存后重开不再丢失；旧历史（08-12~08-15 间写入）含原始 OCR 标题会按原样显示（可接受）。测试：TestPageText +1（normalize_headings=False 保留标题）、TestPagesEndpoint 改断言（serve 原样）、TestHistoryLoadEndpoint +1（历史标题保留）。**用时统计（2026-08-15）**：`pdf_to_epub` 结束时输出各阶段用时（分割图片含图片处理/模型启动/文字识别/文字整理/矫正界面/EPUB 生成/历史记录保存/总流程）+ 平均每页识别用时（本次实际识别页数），见 `_print_timing_summary`。
-- **格式规则（2026-08-12）**：config.json `format_rules`（数组：{id, name, formats, condition{enabled,type:regex|contains|prefix|suffix,pattern,scope:selection|paragraph}, else_formats}）。后端 `/api/format_rules` GET/POST，`_validate_format_rules` 过滤非法 op（_VALID_FORMAT_OPS 白名单）、非法正则/空名/空条件整条丢弃。前端弹窗（工具栏「规」/Ctrl+Shift+Q）管理 CRUD；应用引擎按条件满足→formats / 不满足→else_formats 依次叠加（applySingleFormat 复用 execCommand/applyAlign/_convertBlockTag/toggleNote），整体一次撤销；条件作用范围支持选中文字与光标所在段落。**2026-08-15 优化**：① **冲突模型**——`FORMAT_OP_GROUPS`/`opGroup`/`opsConflict`：块标签互斥（p/h1-6）、对齐互斥（align_left/center/right）、bold/italic/note 独立可共存、remove 与任何其他格式冲突；`applyFormatsList` 应用时跳过冲突 op（first-wins）并返回 skipped，`applyAllFormatRules` 跨规则累计 appliedOps 同样跳过；保存时 `ruleConditionKey`/`rulesConflict`（条件 type+pattern+scope 相同且格式互斥）confirm 预警。② **批量执行**：弹窗新增「应用全部规则」`#formatRulesApplyAllBtn` → `applyAllFormatRules()` 按列表顺序执行全部规则（一次 histRun 撤销），toast 汇总「已应用 N 条规则，跳过 M 个冲突格式」。③ **顺序**：表格加「顺序」列（编号=执行顺序），每行 ↑/↓（`moveFormatRule`，首尾禁用）。④ **正则 flags**：`parseRegexPattern` 支持 `/pattern/flags` 语法（evalFormatRuleBranch regex 分支）。⑤ **bug 修复**：histRun 加 `_histDepth` 嵌套折叠（toggleNote/applyAlign 内层 histRun 不再产生双撤销条目）；行「应用」仅成功时关弹窗（applyFormatRule 返回 bool）；`openFormatRulesModal` 捕获选区 `_frRange`、应用前 `restoreFrRange()` 恢复（避免 selection 丢失作用错页）。验证：check_js.py + node --check + test_correctmanage 261 全绿。**2026-08-15 重构（多条件列表 + 求值模式 + none op）**：数据模型改为 `{id, name, mode(first|all), conditions:[{type, pattern, scope, formats}]}`——每条规则含**有序条件列表**（空 pattern = 无条件恒匹配），每个条件独立设置格式（新增 `none`=无（不对文本处理），`_VALID_FORMAT_OPS` 白名单含 none）；`mode=first` 首个匹配条件生效即停（none-only 条件 = 该处不处理），`mode=all` 全部匹配条件格式按序叠加（冲突自动跳过）；`else_formats` 删除。旧模型（formats/condition/else_formats）由 `_validate_format_rules` 读取时迁移（enabled→单条件、disabled→无条件、else_formats 丢弃），GET /api/format_rules 亦迁移存储的旧规则；`configmanage.set_format_rules` 兼容双形状（新模型保留 mode/conditions，旧模型原样透传）。前端：主弹窗表格改 顺序/名称/条件（含格式）/操作 四列（`condSummary` 逐条件摘要 `包含「X」/选中 → 加粗、居中`）；独立规则编辑弹窗 `#frRuleModalBg`（名称/求值模式 `#frMode`/条件列表 `#frConditions`）+ 格式勾选弹窗 `#frFmtPopupBg`（`#frFmtOpts` 复用 renderFmtOptions/setFmtChecks/collectFmtChecks）；条件行 = 类型 select（contains/prefix/suffix/regex）+ pattern input + 作用域 select（selection/paragraph）+ 格式按钮（`.fr-tags` 高亮标签，none 灰显）+ ↑/↓/✕；`_frConds` 镜像 DOM，`syncCondsFromDom()` 在每次变更/渲染前回读（防丢 pattern 输入）；`evalFormatRuleBranch` 拆为 `evalCondition`（空 pattern 恒 true；regex 走 parseRegexPattern）+ `evalFormatRule`（按 mode 求值，none 过滤后不进 applyFormatsList）；`applyFormatRule`/`applyAllFormatRules` 改调 evalFormatRule；冲突预警 `rulesConflict` 改按条件键集合（type+pattern+scope）∩ 格式并集冲突。验证：check_js.py（括号平衡）+ node --check + test_correctmanage 267 全绿（TestFormatRules 7 + TestFormatRulesConfig 3，含迁移/模式/none 新测试）+ discover 367（仅既有 test_config_llama 缺 pytest 报错）。**2026-08-15 新增「当前页面」作用域 + 右键快速应用**：① **scope=page**——作用域下拉新增 `当前页面`（renderConditions 选项 `['page','当前页面']`，新条件默认 scope=page——addCondition/newFormatRule 初始条件均改 `scope:'page'`）；`evalCondition` page 分支取 `ed.innerText`（整页可见文本）求值；`evalFormatRule` 返回 `{fmts, page}`（page=任一匹配条件 scope==='page'），`applyFormatRule`/`applyAllFormatRules` 解构同步；`applyFormatsList(fmts, ed, pageScope)` 第三参 + 新 helper `withPageSelection(ed, fn)`（临时 `selectNodeContents(ed)` 全选整页→跑 fn→恢复原选区；`applyToSelectedBlocks` 在 startBlock===ed 时置空从首块收集全部块，故整页选区下格式对每块逐个生效）；后端 `_validate_format_rules` 两处 scope 白名单 `("selection","paragraph")` → `("selection","paragraph","page")`，configmanage.set_format_rules 透传无需改；`condSummary` 摘要映射 `当前页`。② **右键「添加规则」**——contextMenu HTML 新增 `<div class="ctx-item ctx-sub" data-ctx="rules">添加规则 ▸ <div class="ctx-submenu" id="ctxRulesSub">`（空容器，hover/点击展开同其他 sub）；`openContextMenu` 调 `refreshCtxRulesSub()`（fetch /api/format_rules → 渲染规则名按钮 data-ctx-rule=下标 + 空态「暂无规则」/失败「加载失败」）；点击委托**优先于通用 `.ctx-submenu .ctx-item` 分支**处理 `[data-ctx-rule]`（`ctxRun(() => ctxApplyFormatRule(rule))`，`_ctxFormatRules[idx]` 取规则）；`ctxApplyFormatRule(rule)` 用 `ctxTargetEditable()` 取右键目标页、光标不在该页时先移入（复用 ctxMarkerInsert 的 _ctxRange 逻辑），再 `applyFormatRule(rule, ed)`——edArg 传入时跳过 `restoreFrRange()`（右键场景不恢复弹窗捕获选区）。验证：node --check + check_js.py（括号 1054/1054 平衡）+ test_correctmanage 270 全绿（TestFormatRules +2：page 作用域保留/旧模型无 scope 仍落 selection；TestFormatRulesConfig +1：page 作用域透传写盘）+ discover 370（仅既有 test_config_llama 缺 pytest 报错）。
-- **图片插入（2026-08-12）**：`insertImageDataUrl(dataUrl, size, i)` 是整页图/外部/裁剪插入的共用入口（插入到 `_lastEditableRange` 光标处，按 imgModeSel 全画幅/局部/行内）。左侧每页「裁」按钮 → openCrop 叠加裁剪层（box-shadow 挖洞遮罩 + 4 角手柄），确认后用 /full/ 原图按显示比例换算像素 canvas 裁剪（小图 PNG/大图 JPEG），dataUrl 插入。工具栏「外部」按钮选择本地图片插入。图片均为 base64 data URL 内嵌（沿用既有方案）。
-- **EPUB 导出对齐修复 + 目录页/书名页移出正文（2026-08-15）**：① `/api/export epub` 分支先 `sanitize_html` 再 `apply_markers`（此前浏览器编辑产生的 `<div>` 块直接进 apply_markers，`_BLOCK_TAG_RE` 只认 `p|h[1-6]` → 产出 `<p><div class="ptoe-align-center">…</div></p>` 非法嵌套、对齐丢失；finish 路径本就 sanitize 所以正常）。② EPUB CSS 增 `p.ptoe-align-center/left/right { text-indent: 0 }`——`p` 默认 `text-indent: 1.5em` 会让居中/居右段落首行偏移，与矫正界面不一致。③ **nav.xhtml 移出 spine**（EPUB 3.3 §5.7.2/§7.3：导航文档不强制入 spine，manifest `properties="nav"` 即可，epubcheck 干净；正文不再显示目录页，阅读器导航栏目录仍可用）；landmarks 的 toc 链接从 `href="nav.xhtml"` 改为首个 content 文件（否则 nav 离 spine 后 epubcheck RSC-011）。④ **自动 `<h1>书名</h1>` 移除**：无标题正文不再自动补书名标题（书名保留在 EPUB 元数据 + 导航栏目录项，toc 项 href 指向 content_N.xhtml 无锚点）；`is_full_img_page`/`used_titles` 逻辑保留。⑤ **title.xhtml 移除**：首页整页图片场景不再生成独立书名页（封面保持 image_only），`render_title_page` 方法删除（无外部引用）；spine = cover → content_*。⑥ 附带修复：export epub 的 全文 标记此前因 UI 格式 `<span class="ptoe-marker" data-ptoe-marker="full">` 不匹配 `_MARKER_SPAN_RE`（要求 `data-ptoe-marker` 在前，即 sanitize 后格式）而静默失效（标记原样留在正文），sanitize 后标记正确生效 → 多文章 → 多 content 页。测试：TestRenderFragment +3（对齐 CSS 无缩进/无自动书名 h1/landmarks 链接指向 content）、TestExportEpub +2（div 块对齐保留、nav 不在 spine 且 manifest 带 properties="nav"）；`test_epub_export_with_path` 改 sorted 遍历全部 content 页（原 set 迭代顺序不定，多文章时偶发取到第二页）。
-- **矫正界面图片/弹窗修复 + EPUB 封面与全画幅（2026-08-15）**：① **「规」弹窗不可见**——`#formatRulesModalBg` 只有后代规则、无基础 CSS（display:flex 作用于 static 元素不可见）；补 `#formatRulesModalBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}`（同 searchModalBg 模式）。② **裁剪插入默认行内**：`insertImageDataUrl(dataUrl, size, i, modeOverride)` 新增第 4 参（缺省读 imgModeSel 下拉），openCrop okBtn 传 `'inline'`——截图插入不再受全局下拉影响。③ **编辑器内图片拖拽**：原生 contenteditable 拖放会把 base64 src 当可见文本插入、或把裸 `<img>` 拖出 `<p class="ptoe-img-full/fit">` 包裹丢 class；文档级 dragstart/dragover/drop/dragend 接管（`_dragImgBlock`=带 class 的 p 包裹或裸 img、`_dragImgEd`；dragstart 清旧状态 + setData 非空才能启动拖拽），drop 按 `caretRangeFromPoint` 落点插克隆（落点在块内→插到该块之后避免 p 套 p；落点在被拖块内→no-op）、移除原块、光标移到克隆后、`syncContent` 双页、`markDirty`+`scheduleRemeasure`、`histRun('移动图片', pagesArr, ...)` 包裹，finally/dragend 清状态。④ **EPUB 不再生成书名页 + 封面图不重复**：新 helper `_is_img_page(text)`（含 `<img` 且剥标签后无文字或仅 OCR 噪声如 `#`——不再依赖 `ptoe-img-full` class，拖拽 bug 会丢 class）；`convert_document` 封面逻辑重写——`first_is_img_page` 用 `_is_img_page`，封面图 = meta `cover_rel`，首章为整页图片时取首张 `<img src>`；**有封面图才写 cover.xhtml 且恒 `image_only=True`**（无 `<h1>` 书名页）；`render_chapters = chapters[1:]` 仅当 `first_is_img_page and cover_img`（防无封面图时丢章）；无封面图不生成 cover.xhtml。⑤ **全画幅图片独立占页 + 占满整页**：CSS `p.ptoe-img-full{page-break-before:always;page-break-after:always;margin:0;padding:0;text-align:center}` + `p.ptoe-img-full img{width:100%;max-height:100vh;object-fit:contain}`（无 vh 支持回退宽度填充；fit 保持 `height:auto` 原尺寸居中）。测试：TestRenderFragment +3（封面仅图无 h1 且正文无重复图/纯文本首章无 cover.xhtml/CSS 含 page-break+max-height+object-fit）；discover 364 全绿（1 既有 error=test_config_llama 缺 pytest）。
-
-## Notes
-
-- **内嵌预览图共享 sidecar（2026-08-18，保存/暂存卡死根因修复）**：历史版本文件此前把整本书预览图 base64 打包进 payload（实测 536 页书 ~110MB/次 json.dumps+写盘，CPU 飙升、保存/暂存按钮卡死数秒；`_HISTORY_KEEP=20` 下累积数 GB）。修复=**版本文件不再携带 `images` 键**，预览图改由后台线程写入每 book 一份的共享 sidecar `data/correction_history/<prefix>.images.json`（`_write_images_cache`/`_load_images_cache`/`_images_cache_path`，原子写 tempfile+os.replace）；辅助函数 `_version_prefix(version_id)`（manual_ 会话取前两段，sha1 前缀取首段）在载入时回退读 sidecar（旧格式版本文件自带 `images` 键仍优先用文件内值）。新版 `_write_history_version`/`_overwrite_history` 写版本后调 `_schedule_images_flush(state)`（`_images_flush_started` 单飞守卫 → daemon 线程 `_flush_embedded_images_once` 在 preview_doc_lock 下快照 `embedded_images` 写 sidecar，**非周期循环**，避免反复重写 100MB）；`_prerender_embedded_images` 跑完全部页后在 `target is None` 分支补写完整 sidecar（覆盖保存时缓存不完整）。`_build_embedded_images` 保留（测试引用）但不再被保存路径调用。`_history_entries` glob 排除 `*.images.json`（否则 sidecar 被解析成 0 页伪历史条目）；`_delete_history` 按 ids 删光某 book 全部版本后清理孤儿 sidecar。跨电脑导入历史时把 `<prefix>.images.json` 一并拷走。验证：TestImagesSidecar 6 测试 + test_correctmanage 295 + discover 459 全绿。
+-- End of AGENTS.md draft

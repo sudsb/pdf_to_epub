@@ -595,6 +595,74 @@ class TestApplyMarkers(unittest.TestCase):
             [{"text": '<p>正文</p><p class="ptoe-note">注一</p>'}],
         )
 
+    def test_note_no_marker_join_merges_adjacent_notes(self):
+        # 无注释标记时，段落标记仍生效：相邻两个注释段落合并为一个 <p>
+        # （2026-08-22 修复：原位保留路径此前忽略 join，注释合并失效）
+        pages = [
+            {"page": 1, "text": '<p>正文</p><p class="ptoe-note">注一</p>'
+             '<p class="ptoe-note"><span data-ptoe-marker="join">段落</span>注二</p>'}
+        ]
+        self.assertEqual(
+            apply_markers(pages),
+            [{"text": '<p>正文</p><p class="ptoe-note">注一注二</p>'}],
+        )
+
+    def test_note_no_marker_trailing_join_merges_next_note(self):
+        # 段尾段落标记：本注释与下一注释合并
+        pages = [
+            {"page": 1, "text": '<p>正文</p><p class="ptoe-note">注一<span data-ptoe-marker="join">段落</span></p>'
+             '<p class="ptoe-note">注二</p>'}
+        ]
+        self.assertEqual(
+            apply_markers(pages),
+            [{"text": '<p>正文</p><p class="ptoe-note">注一注二</p>'}],
+        )
+
+    def test_note_no_marker_cross_page_join_merge(self):
+        # 因分页折断的注释（无注释标记路径）：后半段带段落标记 → 合并为一个 <p>
+        pages = [
+            {"page": 1, "text": '<p>正文</p><p class="ptoe-note">注一前半</p>'},
+            {"page": 2, "text": '<p class="ptoe-note"><span data-ptoe-marker="join">段落</span>注一后半</p>'},
+        ]
+        self.assertEqual(
+            apply_markers(pages),
+            [{"text": '<p>正文</p><p class="ptoe-note">注一前半注一后半</p>'}],
+        )
+
+    def test_note_no_marker_join_not_into_body(self):
+        # 正文段尾的段落标记不把注释并进正文：注释保持独立 <p>
+        pages = [
+            {"page": 1, "text": '<p>正文前半<span data-ptoe-marker="join">段落</span></p>'
+             '<p class="ptoe-note">注一</p>'}
+        ]
+        self.assertEqual(
+            apply_markers(pages),
+            [{"text": '<p>正文前半</p><p class="ptoe-note">注一</p>'}],
+        )
+
+    def test_note_no_marker_join_chain_three_notes(self):
+        # 连续多个段落标记：三个注释段落合并为一个
+        pages = [
+            {"page": 1, "text": '<p>正文</p><p class="ptoe-note">注一</p>'
+             '<p class="ptoe-note"><span data-ptoe-marker="join">段落</span>注二</p>'
+             '<p class="ptoe-note"><span data-ptoe-marker="join">段落</span>注三</p>'}
+        ]
+        self.assertEqual(
+            apply_markers(pages),
+            [{"text": '<p>正文</p><p class="ptoe-note">注一注二注三</p>'}],
+        )
+
+    def test_note_no_marker_join_broken_by_body(self):
+        # 中间隔了正文块：段落标记不跨非注释块生效
+        pages = [
+            {"page": 1, "text": '<p>正文</p><p class="ptoe-note">注一</p><p>中间正文</p>'
+             '<p class="ptoe-note"><span data-ptoe-marker="join">段落</span>注二</p>'}
+        ]
+        self.assertEqual(
+            apply_markers(pages),
+            [{"text": '<p>正文</p><p class="ptoe-note">注一</p><p>中间正文</p><p class="ptoe-note">注二</p>'}],
+        )
+
     def test_note_cross_page_join_merge(self):
         # 因分页被折断的注释：后半段带段落标记 → 与前半段合并为一条后插入正文
         pages = [
@@ -628,8 +696,9 @@ class TestRenderFragment(unittest.TestCase):
         self.assertEqual(self.conv._render_fragment("a\n\nb"), "<p>a</p>\n<p>b</p>")
 
     def test_plain_text_escaped(self):
+        # 2026-08-23: 导出清理空白符——非英数相邻的空白被移除
         self.assertEqual(
-            self.conv._render_fragment("a < b & c"), "<p>a &lt; b &amp; c</p>"
+            self.conv._render_fragment("a < b & c"), "<p>a&lt;b&amp;c</p>"
         )
 
     def test_markup_rendered(self):
@@ -669,7 +738,8 @@ class TestRenderFragment(unittest.TestCase):
 
     def test_page_break_class_preserved_in_render(self):
         out = self.conv._render_fragment('<p>甲</p><p class="ptoe-page-break"> </p><p>乙</p>')
-        self.assertIn('<p class="ptoe-page-break"> </p>', out)
+        # 2026-08-23: 空白符清理后分页占位段内部空格被移除
+        self.assertIn('<p class="ptoe-page-break"></p>', out)
         self.assertIn("<p>甲</p>", out)
         self.assertIn("<p>乙</p>", out)
         css = self.conv.cssm.generate_stylesheet()
@@ -727,12 +797,13 @@ class TestRenderFragment(unittest.TestCase):
             def _headings(t):
                 return _re.findall(r"<h[1-6][^>]*>(.*?)</h[1-6]>", t)
 
-            self.assertEqual(_headings(texts[0]), ["第一章 引言"])
+            # 2026-08-23: 标题文本经空白符清理（「第一章 引言」→「第一章引言」）
+            self.assertEqual(_headings(texts[0]), ["第一章引言"])
             self.assertEqual(_headings(texts[1]), [])
             self.assertEqual(_headings(texts[2]), [])
             # TOC 只列一次
             toc_html = (Path(outdir) / res["toc_file"]).read_text(encoding="utf-8")
-            self.assertEqual(toc_html.count("第一章 引言"), 1)
+            self.assertEqual(toc_html.count("第一章引言"), 1)
             # EPUB 3 导航声明 + TOC 片段↔正文 id 一致（2026-08 回归）：
             # 缺 epub:type="toc" / xmlns:epub 时严格阅读器不识别目录无法跳转
             self.assertIn('epub:type="toc"', toc_html)
@@ -749,6 +820,15 @@ class TestRenderFragment(unittest.TestCase):
         css = self.conv.cssm.generate_stylesheet()
         self.assertIn("p.ptoe-align-center, p.ptoe-align-left, p.ptoe-align-right", css)
         self.assertIn("text-indent: 0", css)
+
+    def test_note_css_no_text_indent(self):
+        # 注释段落顶格（2026-08-22）：p 默认 text-indent 1.5em，注释段落
+        # 不需要首行缩进，直接顶格开始
+        css = self.conv.cssm.generate_stylesheet()
+        self.assertIn("p.ptoe-note", css)
+        note_rule = css[css.index("p.ptoe-note"):]
+        note_rule = note_rule[: note_rule.index("}")]
+        self.assertIn("text-indent: 0", note_rule)
 
     def test_no_auto_book_title_h1_in_body(self):
         # 无标题正文不再自动补 <h1>书名</h1>（2026-08-15）：书名仅保留在
@@ -1824,8 +1904,8 @@ class TestExportEpub(unittest.TestCase):
             self._stop(server)
 
     def test_epub_export_nav_not_in_spine(self):
-        # nav.xhtml 移出 spine（2026-08-15）：正文不显示目录页，导航栏目录
-        # 经 manifest properties="nav" 仍可用；nav 仍在 manifest 中
+        # nav.xhtml 回到 spine（2026-08-23）：以 linear="no" 存在（阅读器可发现
+        # 目录但不进阅读顺序，正文不显示目录页）；manifest properties="nav" 保留
         import re as _re
         import zipfile
 
@@ -1847,18 +1927,27 @@ class TestExportEpub(unittest.TestCase):
                 opf = zf.read("OEBPS/content.opf").decode("utf-8")
                 # nav 项带 properties="nav"
                 self.assertIn('properties="nav"', opf)
-                # spine 不含 nav.xhtml：把 itemref idref 映射回 href 校验
+                # spine 含 nav.xhtml 且 itemref 带 linear="no"：把 idref 映射回 href 校验
                 ids = dict(
                     _re.findall(
                         r'<item\b[^>]*\bid="([^"]+)"[^>]*\bhref="([^"]+)"', opf
                     )
                 )
-                refs = _re.findall(r'<itemref\b[^>]*\bidref="([^"]+)"', opf)
-                spine_hrefs = [ids.get(r, "") for r in refs]
+                refs = _re.findall(r'<itemref\b[^>]*\bidref="([^"]+)"[^>]*>', opf)
+                ref_attrs = {
+                    m.group(1): m.group(0)
+                    for m in _re.finditer(r'<itemref\b[^>]*\bidref="([^"]+)"[^>]*>', opf)
+                }
+                spine_hrefs = [ids.get(_re.search(r'idref="([^"]+)"', a).group(1), "") for a in ref_attrs.values()]
                 self.assertTrue(spine_hrefs, "spine 应含 itemref")
-                self.assertNotIn(
-                    "nav.xhtml", spine_hrefs, "nav.xhtml 不应在 spine 中"
+                self.assertIn(
+                    "Text/nav.xhtml", spine_hrefs, "nav.xhtml 应在 spine 中（linear=no）"
                 )
+                nav_ref = next(
+                    (a for a in ref_attrs.values() if ids.get(_re.search(r'idref="([^"]+)"', a).group(1)) == "Text/nav.xhtml"),
+                    "",
+                )
+                self.assertIn('linear="no"', nav_ref, "nav itemref 应为 linear=\"no\"")
                 self.assertTrue(
                     any("content_" in h for h in spine_hrefs), "spine 应含正文页"
                 )
@@ -5786,6 +5875,151 @@ class TestHistoryImportExport(unittest.TestCase):
             server.shutdown()
             server.server_close()
             shutil.rmtree(hist_dir, ignore_errors=True)
+
+
+class TestPreviewCache(unittest.TestCase):
+    """预览图磁盘缓存：路径规则、/preview 读缓存与回写、多进程预热 worker。"""
+
+    def setUp(self):
+        import correctmanage as cm
+
+        self.cm = cm
+        self._tmp = Path(tempfile.mkdtemp(prefix="test_preview_cache_"))
+        self._pdf = self._tmp / "book.pdf"
+        _make_pdf(self._pdf, n=3)
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _state(self, **over):
+        import threading
+        from collections import OrderedDict
+
+        st = {
+            "preview_cache": OrderedDict(),
+            "pdf_path": str(self._pdf),
+            "img_dir": None,
+            "preview_dpi": 110,
+            "preview_quality": 70,
+            "preview_doc": None,
+            "preview_doc_lock": threading.Lock(),
+            "embedded_images": {},
+        }
+        st.update(over)
+        return st
+
+    def test_cache_path_uses_history_prefix(self):
+        prefix = self.cm._history_prefix(str(self._pdf))
+        p = self.cm._preview_cache_path(str(self._pdf), 110, 7)
+        self.assertIsNotNone(p)
+        self.assertTrue(
+            p.endswith(f"{prefix}_110{os.sep}7.jpg"), f"unexpected path: {p}"
+        )
+        # 无 pdf → 磁盘缓存禁用
+        self.assertIsNone(self.cm._preview_cache_path(None, 110, 1))
+
+    def test_preview_serves_disk_cache_first(self):
+        cache_dir = Path(self.cm._preview_cache_dir(str(self._pdf), 110))
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "2.jpg").write_bytes(b"FAKEJPEG")
+        state = self._state()
+
+        def _boom(*a, **k):  # 不应被调用
+            raise AssertionError("_render_jpeg must not run on disk-cache hit")
+
+        orig = self.cm._render_jpeg
+        self.cm._render_jpeg = _boom
+        try:
+            data = self.cm._preview_bytes(state, 2)
+        finally:
+            self.cm._render_jpeg = orig
+        self.assertEqual(data, ("image/jpeg", b"FAKEJPEG"))
+        # 命中结果进内存 LRU
+        self.assertIn(2, state["preview_cache"])
+
+    def test_preview_write_back_after_live_render(self):
+        state = self._state()
+        orig = self.cm._render_jpeg
+        self.cm._render_jpeg = lambda *a, **k: ("image/jpeg", b"LIVE")
+        try:
+            data = self.cm._preview_bytes(state, 1)
+        finally:
+            self.cm._render_jpeg = orig
+        self.assertEqual(data, ("image/jpeg", b"LIVE"))
+        fp = Path(self.cm._preview_cache_path(str(self._pdf), 110, 1))
+        self.assertTrue(fp.is_file())
+        self.assertEqual(fp.read_bytes(), b"LIVE")
+
+    def test_render_preview_chunk_real_pdf(self):
+        out = self.cm._render_preview_chunk((str(self._pdf), 110, [1, 3]))
+        self.assertEqual([pn for pn, _ in out], [1, 3])
+        for _, raw in out:
+            self.assertTrue(raw.startswith(b"\xff\xd8"))  # JPEG magic
+
+    def test_warm_skips_small_books_without_pool(self):
+        class _NoPool:
+            def __init__(self, *a, **k):
+                raise AssertionError("pool must not be created for small books")
+
+        orig_cls = self.cm._PREVIEW_POOL_CLS
+        orig_min = self.cm._WARM_MIN_PAGES
+        self.cm._PREVIEW_POOL_CLS = _NoPool
+        self.cm._WARM_MIN_PAGES = 80
+        try:
+            self.cm._warm_preview_cache(self._state())  # 3 页 < 80：静默返回
+        finally:
+            self.cm._PREVIEW_POOL_CLS = orig_cls
+            self.cm._WARM_MIN_PAGES = orig_min
+
+    def test_warm_skips_existing_pages(self):
+        cache_dir = Path(self.cm._preview_cache_dir(str(self._pdf), 110))
+        cache_dir.mkdir(parents=True)
+        for i in range(1, 4):
+            (cache_dir / f"{i}.jpg").write_bytes(b"X")
+
+        submitted = []
+
+        class _FakePool:
+            def __init__(self, max_workers=None):
+                pass
+
+            def submit(self, fn, args):
+                submitted.append(args)
+
+                class _F:
+                    def result(self):
+                        return []
+
+                return _F()
+
+            def shutdown(self, wait=False):
+                pass
+
+        orig_cls = self.cm._PREVIEW_POOL_CLS
+        orig_min = self.cm._WARM_MIN_PAGES
+        self.cm._PREVIEW_POOL_CLS = _FakePool
+        self.cm._WARM_MIN_PAGES = 0
+        try:
+            self.cm._warm_preview_cache(self._state())
+        finally:
+            self.cm._PREVIEW_POOL_CLS = orig_cls
+            self.cm._WARM_MIN_PAGES = orig_min
+        self.assertEqual(submitted, [])  # 全部页已有缓存，不提交任何块
+
+    def test_warm_pool_failure_graceful(self):
+        class _BoomPool:
+            def __init__(self, *a, **k):
+                raise RuntimeError("no spawn in tests")
+
+        orig_cls = self.cm._PREVIEW_POOL_CLS
+        orig_min = self.cm._WARM_MIN_PAGES
+        self.cm._PREVIEW_POOL_CLS = _BoomPool
+        self.cm._WARM_MIN_PAGES = 0
+        try:
+            self.cm._warm_preview_cache(self._state())  # 异常被吞，不外抛
+        finally:
+            self.cm._PREVIEW_POOL_CLS = orig_cls
+            self.cm._WARM_MIN_PAGES = orig_min
 
 
 def _b64(raw: bytes) -> str:

@@ -46,6 +46,16 @@
       "name": "dots/dots.ocr.Q8_0.gguf",
       "mmproj": "dots/dots.ocr.mmproj-Q8_0.gguf",
       "workers": 4
+    },
+    "glm8": {
+      "name": "glm/GLM-OCR-Q8_0.gguf",
+      "mmproj": "glm/mmproj-GLM-OCR-Q8_0.gguf",
+      "workers": 5
+    },
+    "glm16": {
+      "name": "glm/GLM-OCR-f16.gguf",
+      "mmproj": "glm/mmproj-GLM-OCR-Q8_0.gguf",
+      "workers": 4
     }
   },
   "selected_model": "DOTS4",
@@ -69,7 +79,7 @@
     "auto_fix_score": 0.85,
     "enable_llm": true,
     "enable_legacy_rules": false,
-    "llm_model": "ULQ4",
+    "llm_model": "glm8",
     "llm_timeout": 3
   },
   "engine": "llama",
@@ -127,42 +137,8 @@
   },
   "format_rules": [
     {
-      "id": "7305745e793b4233b216be614aa1a779",
-      "name": "合段",
-      "mode": "first",
-      "conditions": [
-        {
-          "type": "contains",
-          "pattern": "",
-          "scope": "selection",
-          "formats": [
-            "merge"
-          ],
-          "target": "match"
-        }
-      ]
-    },
-    {
-      "id": "b25f9eb73beb450b8edfe9c14d389772",
-      "name": "中粗",
-      "mode": "first",
-      "conditions": [
-        {
-          "type": "regex",
-          "pattern": "[\\s\\S]*",
-          "scope": "paragraph",
-          "formats": [
-            "bold",
-            "align_center",
-            "p"
-          ],
-          "target": "match"
-        }
-      ]
-    },
-    {
-      "id": "5b2211ac296541919e7d7ddd76537982",
-      "name": "模板：标-注2",
+      "id": "8411f14d397b4fc2ad4481207e10c3f5",
+      "name": "标注",
       "mode": "first",
       "conditions": [
         {
@@ -173,8 +149,7 @@
           "target": "match",
           "group_formats": [
             [
-              "heading1",
-              "merge"
+              "heading1"
             ],
             [
               "align_center",
@@ -195,17 +170,30 @@
             ],
             [
               "note"
-            ],
-            [
-              "note"
             ]
           ]
         }
       ]
     },
     {
-      "id": "6dfb153a44aa4d90875c2683fd4795c0",
-      "name": "模板：标",
+      "id": "7305745e793b4233b216be614aa1a779",
+      "name": "合段",
+      "mode": "first",
+      "conditions": [
+        {
+          "type": "contains",
+          "pattern": "",
+          "scope": "selection",
+          "formats": [
+            "merge"
+          ],
+          "target": "match"
+        }
+      ]
+    },
+    {
+      "id": "8bd703066dd548e1ab92cc688438fb52",
+      "name": "标",
       "mode": "first",
       "conditions": [
         {
@@ -225,58 +213,8 @@
             [
               "align_left",
               "p"
-            ],
-            [
-              "no_bold",
-              "align_right",
-              "p"
             ]
           ]
-        }
-      ]
-    },
-    {
-      "id": "288e2a3d0eb84c8da54fcac200610585",
-      "name": "模板：注",
-      "mode": "first",
-      "conditions": [
-        {
-          "type": "regex",
-          "pattern": "([\\s\\S]*)(注\\s*释)([\\s\\S]*)",
-          "scope": "page",
-          "formats": [],
-          "target": "match",
-          "group_formats": [
-            [
-              "p"
-            ],
-            [
-              "bold",
-              "align_left",
-              "p"
-            ],
-            [
-              "align_left",
-              "note"
-            ]
-          ]
-        }
-      ]
-    },
-    {
-      "id": "27f5fd2ccab2466dbdb9063d0a3ce117",
-      "name": "正文",
-      "mode": "first",
-      "conditions": [
-        {
-          "type": "contains",
-          "pattern": "",
-          "scope": "page",
-          "formats": [
-            "no_bold",
-            "p"
-          ],
-          "target": "match"
         }
       ]
     },
@@ -298,42 +236,65 @@
       ]
     },
     {
-      "id": "bbbf3e31f1e5478795b9a1f03068d078",
-      "name": "模板：标-注",
+      "id": "c4d053c8b0dc4c238233a0bba05401b9",
+      "name": "注",
       "mode": "first",
       "conditions": [
         {
           "type": "regex",
-          "pattern": "([\\s\\S]*)([\\(（]\\s*.+\\s*年\\s*.+\\s*月\\s*(?:.+\\s*日)?\\s*[\\）)])([\\s\\S]*?)(注[\\s]*释)([\\s\\S]*)",
+          "pattern": "([\\s\\S]*)(注\\s*释)([\\s\\S]*)",
           "scope": "page",
           "formats": [],
           "target": "match",
           "group_formats": [
-            [
-              "heading1",
-              "merge"
-            ],
-            [
-              "no_bold",
-              "align_center",
-              "p"
-            ],
-            [
-              "no_bold",
-              "p"
-            ],
+            [],
             [
               "bold",
+              "align_left",
               "p"
             ],
             [
-              "no_bold",
-              "note"
-            ],
-            [
+              "align_left",
               "note"
             ]
           ]
+        }
+      ]
+    },
+    {
+      "id": "b25f9eb73beb450b8edfe9c14d389772",
+      "name": "中粗",
+      "mode": "first",
+      "conditions": [
+        {
+          "type": "regex",
+          "pattern": "",
+          "scope": "selection",
+          "formats": [
+            "bold",
+            "align_center",
+            "p"
+          ],
+          "target": "match"
+        }
+      ]
+    },
+    {
+      "id": "eef213f404014713bc38878f1845e799",
+      "name": "正文",
+      "mode": "first",
+      "conditions": [
+        {
+          "type": "contains",
+          "pattern": "",
+          "scope": "page",
+          "formats": [
+            "no_bold",
+            "align_left",
+            "p",
+            "remove"
+          ],
+          "target": "match"
         }
       ]
     }
@@ -345,11 +306,11 @@
     "citation": "cursive"
   },
   "image_preprocess": {
-    "enabled": false,
+    "enabled": true,
     "gray": true,
     "denoise": true,
     "sharpen": true,
-    "binarize": false,
-    "workers": 0
+    "binarize": true,
+    "workers": 8
   }
 }

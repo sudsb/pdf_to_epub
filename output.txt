@@ -1,0 +1,2 @@
+<summary>
+Implemented bounded fix in epubmanage.py: added else branch for non-XHTML resources in pack() loop, updated image extension lists to include .gif and .webp, removed _add_epub_par_indent function and its call. Created new test file test_epubmanage_pack.py that verifies the fix.

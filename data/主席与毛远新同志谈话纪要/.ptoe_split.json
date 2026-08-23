@@ -3,5 +3,10 @@
   "dpi": 300,
   "fmt": "png",
   "pages": 12,
-  "preprocess": null
+  "preprocess": {
+    "gray": true,
+    "denoise": true,
+    "sharpen": true,
+    "binarize": true
+  }
 }

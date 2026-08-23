@@ -28,13 +28,116 @@ _MARKUP_RE = re.compile(r"</?(?:p|h[1-6]|strong|em|br|span)([^>]*)>", flags=re.I
 _NOTE_CLASS = "ptoe-note"
 _ALIGN_CLASSES = ("ptoe-align-left", "ptoe-align-center", "ptoe-align-right")
 _PAGE_BREAK_CLASS = "ptoe-page-break"
+# 注释标签 class：加粗注释标签转换后的块级标记（取消首行缩进）
+_NOTE_LABEL_CLASS = "ptoe-note-label"
 # 插入图片的显示模式 class（全画幅 / 局部），随 <p> 块与 <img> 一起保留
 # 尺寸 class（ptoe-img-w25/50/75/100）控制图片宽度百分比
 # 位置 class（ptoe-img-left/center/right）控制图片对齐
 _IMG_CLASSES = ("ptoe-img-full", "ptoe-img-fit", "ptoe-img-inline",
-               "ptoe-img-w25", "ptoe-img-w50", "ptoe-img-w75", "ptoe-img-w100",
-               "ptoe-img-left", "ptoe-img-center", "ptoe-img-right",
-               "ptoe-img-vtop", "ptoe-img-vmid", "ptoe-img-vbot")
+                "ptoe-img-w25", "ptoe-img-w50", "ptoe-img-w75", "ptoe-img-w100",
+                "ptoe-img-left", "ptoe-img-center", "ptoe-img-right",
+                "ptoe-img-vtop", "ptoe-img-vmid", "ptoe-img-vbot")
+# 手动段落格式类：顶格和缩进、引文
+_FORMAT_CLASSES = ("ptoe-flush", "ptoe-indent", "ptoe-citation")
+
+# ---------------------------------------------------------------------------
+# 段落缩进/间距 data 属性 → 导出内联样式（2026-08-23）
+# 矫正界面「段落设置」面板把设置存为块级标签的 data-* 属性（sanitize 白名单放行），
+# 导出 EPUB 时在此转为内联 style（阅读器无需理解 data 属性）：
+#   data-pl/data-pr = 左/右缩进(em 字符) → margin-left/right
+#   data-ind=first + data-indv=N    → text-indent:N em（首行缩进）
+#   data-ind=hang  + data-indv=N    → margin-left:(pl+N) em + text-indent:-N em（悬挂缩进）
+#   data-spb/data-spa = 段前/段后(行) → margin-top/bottom（1 行 ≈ 1.5em）
+#   data-lh = 行距倍数              → line-height
+_INDENT_DATA_NUM_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+_WS_RUN_RE = re.compile(r"[\s\u3000\u200b\u200c\ufeff]+")
+
+
+def _indent_style_attrs(attrs: str) -> str:
+    """从块级开标签属性串提取缩进/间距 data 属性，返回 ' style="..."' 或 ''。"""
+    vals: Dict[str, str] = {}
+    for m in re.finditer(r'(data-(?:pl|pr|ind|indv|spb|spa|lh))="([^"]*)"', attrs or ""):
+        k, v = m.group(1), m.group(2).strip()
+        if k == "data-ind":
+            if v in ("first", "hang"):
+                vals[k] = v
+        elif _INDENT_DATA_NUM_RE.match(v):
+            vals[k] = v
+
+    def num(key: str, default: float = 0.0) -> float:
+        try:
+            return float(vals.get(key, ""))
+        except ValueError:
+            return default
+
+    parts: List[str] = []
+    pl = num("data-pl") if "data-pl" in vals else None
+    pr = num("data-pr") if "data-pr" in vals else None
+    indv = num("data-indv", 2.0)
+    mode = vals.get("data-ind")
+    if mode == "hang":
+        # 悬挂缩进：margin-left 一次性取 pl+indv（不与 data-pl 的 margin-left
+        # 重复声明——重复虽以后者为准，但输出冗余且易误读）
+        base = (pl or 0.0) + indv
+        parts.append(f"margin-left:{base:g}em")
+        parts.append(f"text-indent:-{indv:g}em")
+    else:
+        if pl is not None:
+            parts.append(f"margin-left:{pl:g}em")
+        if mode == "first":
+            parts.append(f"text-indent:{indv:g}em")
+    if pr is not None:
+        parts.append(f"margin-right:{pr:g}em")
+    if "data-spb" in vals:
+        parts.append(f"margin-top:{num('data-spb') * 1.5:g}em")
+    if "data-spa" in vals:
+        parts.append(f"margin-bottom:{num('data-spa') * 1.5:g}em")
+    if "data-lh" in vals and num("data-lh") > 0:
+        parts.append(f"line-height:{num('data-lh'):g}")
+    return f' style="{";".join(parts)}"' if parts else ""
+
+
+def _strip_ws_text(s: str) -> str:
+    """去掉文本中的空白符（含全角空格/零宽字符）；英文/数字之间的空白保留为单个半角空格。
+
+    用于导出时清理 OCR 残留的字符间空隙：标题、正文、注释默认全部清理，
+    仅居右段落（ptoe-align-right）与注释标签段（ptoe-note-label 的 注　　释：）
+    豁免——前者用户显式要求保留，后者空白是版式的一部分。
+    """
+    def _sub(m: "re.Match[str]") -> str:
+        prev_ch = s[m.start() - 1] if m.start() > 0 else ""
+        next_ch = s[m.end()] if m.end() < len(s) else ""
+        if prev_ch.isascii() and prev_ch.isalnum() and next_ch.isascii() and next_ch.isalnum():
+            return " "
+        return ""
+
+    return _WS_RUN_RE.sub(_sub, s)
+
+
+def _split_at_block_boundary(text: str, limit: int) -> List[str]:
+    """把超长章节文本按块边界（</p>/</h1-6> 之后）切成 ≤limit 的片段。
+
+    旧实现按任意字符偏移硬切，会把 HTML 标签拦腰截断 → 输出非法 XHTML，
+    阅读器解析失败 → 目录点击跳转到该文件失效。无块边界可切时才退回硬切。
+    """
+    if len(text) <= limit:
+        return [text]
+    chunks: List[str] = []
+    start = 0
+    n = len(text)
+    while start < n:
+        if n - start <= limit:
+            chunks.append(text[start:])
+            break
+        seg = text[start : start + limit]
+        cut = max(seg.rfind("</p>"), *(seg.rfind(f"</h{i}>") for i in range(1, 7)))
+        if cut <= 0:
+            end = start + limit  # 无块边界：退回硬切（与旧行为一致）
+        else:
+            end = start + cut + len("</p>")
+        chunks.append(text[start:end])
+        start = end
+    return chunks
 
 
 def _is_img_page(text: str) -> bool:
@@ -59,16 +162,146 @@ def _self_close_img(html: str) -> str:
 
 
 def _block_class_html(attrs: str) -> str:
-    """从块标签属性中提取应保留的 class（ptoe-note + 对齐类 + 换页 + 图片模式），返回 class 属性。"""
+    """从块标签属性中提取应保留的 class（ptoe-note, ptoe-note-label + 对齐类 + 换页 + 图片模式 + 手动格式类），返回 class 属性。"""
     m = re.search(r'class="([^"]*)"', attrs)
     if not m:
         return ""
     keep = [
         c
         for c in m.group(1).split()
-        if c == _NOTE_CLASS or c in _ALIGN_CLASSES or c == _PAGE_BREAK_CLASS or c in _IMG_CLASSES
+        if c == _NOTE_CLASS or c == _NOTE_LABEL_CLASS or c in _ALIGN_CLASSES or c == _PAGE_BREAK_CLASS or c in _IMG_CLASSES or c in _FORMAT_CLASSES
     ]
     return f' class="{" ".join(keep)}"' if keep else ""
+
+
+# 正则：匹配加粗的「注释」二字（含可选冒号），支持 <strong> 和 <b>，标签内允许首尾空白
+# 1) <strong>注释</strong> 或 <strong>注释：</strong>
+# 2) <strong>注释</strong>： 或 <strong>注释：</strong>（冒号在标签外紧跟）
+# 3) <b> 同理
+# 替换为：注释： （2026-08-23 用户要求：注/释 之间不插入空白符）
+# 冒号去重：标签内/外若已有冒号，只输出一个
+_BOLD_NOTE_RE = re.compile(
+    r'(?:<strong>\s*注释\s*：?\s*</strong>|<b>\s*注释\s*：?\s*</b>)\s*：?',
+    flags=re.IGNORECASE
+)
+
+# 替换目标：注释 + 全角冒号（无空白符）
+_NOTE_REPLACEMENT = "注释\uFF1A"
+
+# 给包含替换结果的最近块级祖先（p/h1-h6/div）注入 ptoe-note-label class
+# 正则：从匹配位置向前找最近的未闭合 <p...>/<hN...>/<div...> 开标签
+_BLOCK_OPEN_RE = re.compile(r'<(p|h[1-6]|div)\b[^>]*>', flags=re.IGNORECASE)
+
+# 纯文本「注释」独立成段（无加粗标签，如 <p>注释：</p>）：整段内容仅为
+# 注释/注释：（允许首尾空白、<br/>、&nbsp;），给该块注入 ptoe-note-label 顶格显示，
+# 文本保持原样（2026-08-23 用户要求：注释两字独立成段默认顶格处理）
+_BARE_NOTE_BLOCK_RE = re.compile(
+    r'<(p|h[1-6]|div)\b([^>]*)>(.*?)</\1\s*>',
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_BARE_NOTE_INNER_RE = re.compile(
+    r'^(?:<br\s*/?>|\s|&nbsp;|&#160;)*注释\s*：?(?:<br\s*/?>|\s|&nbsp;|&#160;)*$',
+    flags=re.IGNORECASE,
+)
+
+
+def _inject_block_class(tag_name: str, attrs: str, cls: str) -> str:
+    """给块级开标签属性注入 class（去重），返回完整新开标签。"""
+    m = re.search(r'class="([^"]*)"', attrs)
+    if m:
+        classes = m.group(1).split()
+        if cls not in classes:
+            classes.append(cls)
+        new_attrs = attrs[: m.start()] + f'class="{" ".join(classes)}"' + attrs[m.end():]
+    else:
+        new_attrs = f' class="{cls}"' + attrs
+    return f'<{tag_name}{new_attrs}>'
+
+
+def transform_note_labels(html: str) -> str:
+    """
+    将 HTML 中加粗的「注释」二字（含可选冒号）替换为「注　　释：」，
+    并给包含该文本的最近块级祖先（p/h1-h6/div）注入 ptoe-note-label class，
+    使其顶格显示（CSS 取消 text-indent）。
+
+    处理逻辑：
+    1. 找到所有 <strong>注释</strong> / <b>注释</b>（含可选冒号、标签内空白）
+    2. 替换为「注　　释：」（冒号去重：标签内/外若已有冒号，只输出一个）
+    3. 给包含替换结果的最近块级祖先（p/h1-h6/div）注入 ptoe-note-label class
+       （同一块内多处匹配只加一次 class；已有 class 则追加、去重）
+
+    返回处理后的 HTML 字符串。
+    """
+    if not html or "注释" not in html:
+        return html
+
+    # 第一步：替换加粗注释标签
+    def _replace_bold_note(match: re.Match) -> str:
+        return _NOTE_REPLACEMENT
+
+    # 先替换所有匹配
+    new_html = _BOLD_NOTE_RE.sub(_replace_bold_note, html)
+
+    # 第二步：给包含替换结果的块级元素注入 ptoe-note-label class
+    # 策略：扫描 new_html，每遇到一个 _NOTE_REPLACEMENT，向前找最近的块级开标签
+    # 并在该标签上注入 class（去重）
+    result_parts = []
+    last_end = 0
+    # 记录已处理的块级标签位置，避免重复注入
+    processed_block_positions = set()
+
+    for match in re.finditer(re.escape(_NOTE_REPLACEMENT), new_html):
+        match_start = match.start()
+        # 向前查找最近的块级开标签
+        prefix = new_html[:match_start]
+        block_matches = list(_BLOCK_OPEN_RE.finditer(prefix))
+        if not block_matches:
+            continue
+        # 取最近的一个（最后一个）
+        block_match = block_matches[-1]
+        block_start = block_match.start()
+        block_end = block_match.end()
+        block_tag = block_match.group(1).lower()
+
+        # 避免重复处理同一个块级标签
+        if block_start in processed_block_positions:
+            continue
+        processed_block_positions.add(block_start)
+
+        tag_text = new_html[block_start:block_end]
+        # 提取现有 class 并注入（保持去重）
+        class_match = re.search(r'class="([^"]*)"', tag_text)
+        if class_match:
+            existing_classes = class_match.group(1).split()
+            if _NOTE_LABEL_CLASS not in existing_classes:
+                existing_classes.append(_NOTE_LABEL_CLASS)
+                # 用整个 class 属性替换原始属性（保持其它属性不变）
+                tag_text = tag_text[: class_match.start()] + f'class="{" ".join(existing_classes)}"' + tag_text[class_match.end():]
+        else:
+            # 无 class 属性，插入到标签名后第一个空白或右尖括号之前
+            tag_name_end = tag_text.find('>')
+            if tag_name_end > 0:
+                insert_pos = tag_text.find(' ', 0, tag_name_end)
+                if insert_pos == -1:
+                    insert_pos = tag_name_end
+                tag_text = tag_text[:insert_pos] + f' class="{_NOTE_LABEL_CLASS}"' + tag_text[insert_pos:]
+        # 重建 HTML
+        result_parts.append(new_html[last_end:block_start])
+        result_parts.append(tag_text)
+        last_end = block_end
+
+    result_parts.append(new_html[last_end:])
+
+    # 第三步：纯文本「注释」独立成段（如 <p>注释：</p>）也顶格处理（文本保持原样）
+    def _replace_bare_note_block(match: re.Match) -> str:
+        tag = match.group(1)
+        attrs = match.group(2) or ""
+        inner = match.group(3)
+        if not _BARE_NOTE_INNER_RE.match(inner):
+            return match.group(0)
+        return _inject_block_class(tag, attrs, _NOTE_LABEL_CLASS) + inner + f'</{tag}>'
+
+    return _BARE_NOTE_BLOCK_RE.sub(_replace_bare_note_block, "".join(result_parts))
 
 
 class CSSManager:
@@ -85,144 +318,170 @@ class CSSManager:
             # if provided a template string, do lightweight interpolation
             return self.css_template.replace("{font_family}", self.font_family).replace("{line_height}", str(self.line_height))
 
-        css = f"""
-        /* Basic ebook stylesheet - conservative for reader compatibility */
-        html, body {{
-          margin: 0;
-          padding: 0.8em;
-          font-family: {self.font_family};
-          line-height: {self.line_height};
-          font-size: 1em;
-          /* 不硬编码背景/文字颜色（2026-08-13）：交阅读器自身的阅读背景/夜间模式等主题设置，
-             否则 epub 内固定白底黑字会覆盖阅读器内的背景/主题设置 */
-        }}
-        h1, h2, h3, h4, h5, h6 {{
-          font-weight: bold;
-          margin: 1em 0 0.5em 0;
-          text-align: center;
-          /* 标题默认金光红（2026-08）：R255 G0 B0 */
-          color: #ff0000;
-        }}
-        h1 {{
-          /* 一级标题下方分隔线（2026-08）：全宽自适应（随版面宽度伸展） */
+        css = """
+        /* 标题红色 + 标题与正文分割线（2026-08-23 用户要求改为 RGB(255,0,0)） */
+        h1 {
+          color: #FF0000;
           border-bottom: 1px solid #999;
           padding-bottom: 0.35em;
-        }}
-        p {{
-          text-indent: 1.5em;
-          margin: 0.5em 0;
-          orphans: 2; widows: 2;
-        }}
-        .ptoe-note {{
-          font-size: 0.85em;
-        }}
-        .ptoe-align-center {{
+        }
+        /* 标题居中 + 紧凑间距（2026-08-23 用户反馈）：部分阅读器套用自身默认
+           UA 样式——标题左对齐、上下 margin 偏大，导致标题不居中、正文与标题
+           间距过大。显式声明 text-align/margin 保证跨阅读器一致；
+           h2 同样处理（bbox title 转换出的章节标题） */
+        h1, h2 {
           text-align: center;
-        }}
-        .ptoe-align-left {{
+          margin: 0.6em 0 0.35em;
+        }
+        /* 段落间距显式化：部分阅读器默认段距偏大，显式声明保证一致
+           （分页占位段/全画幅图片段等已有各自 margin 规则，特异性更高不受影响） */
+        p {
+          margin: 0.4em 0;
+        }
+        /* 注释标签顶格（2026-08-22）：加粗注释标签转换后的块级元素
+           取消首行缩进，直接顶格开始（2026-08-23 起标签文本为「注释：」无空白） */
+        p.ptoe-note-label {
+          text-indent: 0;
           text-align: left;
-        }}
-        .ptoe-align-right {{
+          white-space: pre;
+        }
+        p.ptoe-note {
+          text-indent: 0;
+        }
+        /* 注释视觉样式（2026-08-23）：块级与行内注释均为小号灰字，
+           导出后仍可辨识「注」格式（此前仅缩进覆盖，视觉样式丢失） */
+        p.ptoe-note, span.ptoe-note {
+          font-size: 0.85em;
+          color: #555555;
+        }
+        /* 正文/注释默认顶格（2026-08-23 用户要求）：不再全局首行缩进；
+           需要缩进的段落用「缩进」格式（p.ptoe-indent）或段落设置面板显式指定 */
+        /* 目录与封面不缩进 */
+        nav.toc p, .cover p {
+          text-indent: 0;
+        }
+        .ptoe-align-center {
+          text-align: center;
+        }
+        .ptoe-align-left {
+          text-align: left;
+        }
+        .ptoe-align-right {
           text-align: right;
-        }}
+        }
         /* 对齐段落取消首行缩进（2026-08-15）：p 默认 text-indent 1.5em 会让
            居中/居右段落首行偏移，与矫正界面（无缩进）显示不一致 */
-        p.ptoe-align-center, p.ptoe-align-left, p.ptoe-align-right {{
+        p.ptoe-align-center, p.ptoe-align-left, p.ptoe-align-right {
           text-indent: 0;
-        }}
-        .ptoe-page-break {{
+        }
+        /* 顶格/缩进为手动段落格式；对齐段落（ptoe-align-*，特异性更高）不受影响 */
+        .ptoe-flush {
+          text-indent: 0;
+        }
+        p.ptoe-indent {
+          text-indent: 2em;
+        }
+        /* 引文格式：斜体显示 */
+        .ptoe-citation {
+          font-style: italic;
+        }
+        .ptoe-page-break {
           page-break-before: always;
           break-before: page;
           margin: 0;
           padding: 0;
           height: 0;
           overflow: hidden;
-        }}
-        img {{
+        }
+        img {
           display: block;
           max-width: 100%;
           height: auto;
-        }}
+        }
         /* 插入图片：全画幅（独立占页 + 占满整页）与局部（按原尺寸居中）
            全画幅（2026-08-15 用户要求）：page-break 保证图片单独一页不与文字
            同页；width/height 100% + object-fit:contain 让图片按比例填满
            整个页面（不裁切）。局部保持原尺寸居中。 */
-        p.ptoe-img-full, p.ptoe-img-fit {{
+        p.ptoe-img-full, p.ptoe-img-fit {
           text-indent: 0;
           margin: 0.8em 0;
-        }}
-        p.ptoe-img-full {{
+        }
+        p.ptoe-img-full {
           page-break-before: always;
           page-break-after: always;
           margin: 0;
           padding: 0;
           text-align: center;
           height: 100%;
-        }}
+        }
         /* 全画幅图片位于内容文件首位时不再强制前置分页（否则封面后出现空白页，2026-08 修复） */
-        p.ptoe-img-full:first-child {{
+        p.ptoe-img-full:first-child {
           page-break-before: auto;
-        }}
-        p.ptoe-img-full img, p.ptoe-img-fit img {{
+        }
+        p.ptoe-img-full img, p.ptoe-img-fit img {
           display: inline-block;
           max-width: 100%;
           vertical-align: middle;
-        }}
-        p.ptoe-img-full img {{
+        }
+        p.ptoe-img-full img {
           width: 100%;
           height: 100%;
           object-fit: contain;
-        }}
-        p.ptoe-img-fit img {{
+        }
+        p.ptoe-img-fit img {
           height: auto;
-        }}
+        }
         /* 尺寸 class：唯一宽度控制（全画幅默认 w100，局部默认无尺寸=原图） */
-        .ptoe-img-w25 {{ width: 25%; }}
-        .ptoe-img-w50 {{ width: 50%; }}
-        .ptoe-img-w75 {{ width: 75%; }}
-        .ptoe-img-w100 {{ width: 100%; }}
+        .ptoe-img-w25 { width: 25%; }
+        .ptoe-img-w50 { width: 50%; }
+        .ptoe-img-w75 { width: 75%; }
+        .ptoe-img-w100 { width: 100%; }
         /* 位置 class：p 上 text-align 控制 img 对齐 */
-        p.ptoe-img-left {{ text-align: left; }}
-        p.ptoe-img-center {{ text-align: center; }}
-        p.ptoe-img-right {{ text-align: right; }}
-        /* 行内图片（2026-08-10）：直接嵌在文字流中（无 <p> 包裹），
+        p.ptoe-img-left { text-align: left; }
+        p.ptoe-img-center { text-align: center; }
+        p.ptoe-img-right { text-align: right; }
+        /* 行内图片（2026-08-10）：直接嵌在文字流中（无 p 标签包裹），
            vertical-align 控制上下对齐；尺寸 class 同样生效。
+           注意：CSS 会被内联进 nav.xhtml/cover.xhtml 的 style 元素——XHTML 按
+           XML 解析，注释里出现字面 < > 会被当成标签导致整个文件非法
+           （曾致 nav.xhtml 解析失败、目录点击跳转全部失效，2026-08-23 修复）。
            img.ptoe-img-inline 特异性(0,1,1)高于通用 img(0,0,1)，覆盖 display:block */
-        img.ptoe-img-inline {{
+        img.ptoe-img-inline {
           display: inline-block;
           max-width: 100%;
           height: auto;
           vertical-align: middle;
-        }}
-        img.ptoe-img-vtop {{ vertical-align: top; }}
-        img.ptoe-img-vmid {{ vertical-align: middle; }}
-        img.ptoe-img-vbot {{ vertical-align: bottom; }}
-        .cover {{
+        }
+        img.ptoe-img-vtop { vertical-align: top; }
+        img.ptoe-img-vmid { vertical-align: middle; }
+        img.ptoe-img-vbot { vertical-align: bottom; }
+        .cover {
           text-align: center;
           margin-top: 2em;
-        }}
-        nav.toc {{
+        }
+        nav.toc {
           margin: 1em 0;
-        }}
+        }
         /* 目录编号与文字不重叠：序号以文本显式输出（.toc-num），关闭列表 marker——
            部分阅读器对多位数字（>9）的 list-style marker 渲染会截断/数字叠加（2026-08） */
-        nav.toc ol {{
+        nav.toc ol {
           list-style: none;
           padding-left: 1.8em;
           margin: 0.2em 0;
-        }}
-        nav.toc li {{
+        }
+        nav.toc li {
           margin: 0.2em 0;
-        }}
-        nav.toc .toc-num {{
+        }
+        nav.toc .toc-num {
           display: inline-block;
           min-width: 2.2em;
           text-align: right;
           margin-right: 0.4em;
-        }}
-        """
-        return css
-
+        }
+        
+"""
+        # perform placeholder substitution for font family and line height
+        return css.replace('{font_family}', self.font_family).replace('{line_height}', str(self.line_height))
     def inject_styles(self, html_content: str, inline: bool = True) -> str:
         """If inline is True, inject a minimal style into the head of the document.
         Otherwise return original content unchanged (expect external style link).
@@ -230,11 +489,17 @@ class CSSManager:
         if not inline:
             return html_content
         css = self.generate_stylesheet()
+        # XHTML 兼容包裹（2026-08-23）：内联 CSS 出现在 nav.xhtml/cover.xhtml 的
+        # <style> 里，XHTML 按 XML 解析——CSS 注释中的字面 < > 会被当成标签，
+        # 整个文件变非法 XML（曾致 nav.xhtml 解析失败、目录点击跳转全部失效）。
+        # CDATA 对 XML 解析器隐藏 < >；对按 HTML 解析的旧阅读器，/* */ 是
+        # CSS 注释，标记被忽略，双向兼容。
+        block = "<style type='text/css'>\n/* <![CDATA[ */\n" + css + "\n/* ]]> */\n</style>\n"
         # safe insertion into <head>
         if "<head>" in html_content:
-            return html_content.replace("<head>", "<head>\n<style type='text/css'>\n" + css + "\n</style>\n")
+            return html_content.replace("<head>", "<head>\n" + block)
         # fallback: prepend
-        return "<style type='text/css'>\n" + css + "\n</style>\n" + html_content
+        return block + html_content
 
     def handle_images(self, css_rules: Dict[str, str]) -> Dict[str, str]:
         """Return modified css_rules with conservative image rules applied.
@@ -351,38 +616,31 @@ class HTMLConverter:
 
     def render_toc_page(self, toc_items: List[Dict[str, Any]]) -> str:
         """Generate a nav.xhtml-like page (HTML5) for table of contents.
-        toc_items: list of {'title': str, 'href': str, 'level': int}，按 level 嵌套 <ol>。
+        toc_items: list of {'title': str, 'href': str, 'level': int}。
+        目录一律平铺为一级列表（2026-08-23 用户要求）：OCR 的 bbox title→<h2>
+        等杂讯标题曾把章节标题嵌成其他标题的二级条目，层级信息不可靠。
         序号以文本显式输出（<span class="toc-num">N.</span>），不依赖阅读器
         list-style marker 渲染——多位数字（>9）在部分阅读器中被截断/数字叠加（2026-08）。
         """
         out: List[str] = []
-        depth = 0
-        counters: Dict[int, int] = {}  # 每级列表独立计数，新开一级从 1 重计
+        counters = 0  # 平铺一级列表统一计数
         for it in toc_items:
             t = self._escape_text(it.get('title', ''))
             href = self._escape_text(it.get('href', '#'))
-            level = max(1, int(it.get('level', 1)))
-            while depth < level:
-                out.append('<ol>')
-                depth += 1
-                counters[depth] = 0
-            while depth > level:
-                out.append('</ol>')
-                depth -= 1
-            counters[level] = counters.get(level, 0) + 1
-            out.append(f'<li><a href="{href}"><span class="toc-num">{counters[level]}.</span>{t}</a></li>')
-        while depth > 0:
+            counters += 1
+            out.append(f'<li><a href="{href}"><span class="toc-num">{counters}.</span>{t}</a></li>')
+        if out:
+            out.insert(0, '<ol>')
             out.append('</ol>')
-            depth -= 1
         # EPUB 3.3 §11 导航文档规范：目录 <nav> 必须带 epub:type="toc"，
         # 且 <html> 需声明 xmlns:epub 命名空间——否则严格阅读器（Apple Books、
         # Google Play 等）不识别为目录，TOC 面板空白或链接无法跳转（2026-08）。
         # role="doc-toc" 为 ARIA 角色，辅助阅读器识别目录导航区域。
         nav_html = '<nav class="toc" epub:type="toc" role="doc-toc">' + ''.join(out) + '</nav>'
         # Landmarks nav：为阅读器提供目录/正文的语义入口（EPUB 3.3 §11.3）。
-        # nav.xhtml 不在 spine 中（正文不显示目录页，导航栏经 manifest properties="nav"
-        # 仍可用）：landmarks 链接必须指向 spine 内资源，否则 epubcheck RSC-011 报错
-        # （2026-08-15）
+        # nav.xhtml 以 linear="no" 在 spine 中（2026-08-23，部分阅读器要求目录文档
+        # 在 spine 才能跳转；linear="no" 保证正文不出现重复目录页）：
+        # landmarks 链接必须指向 spine 内资源，否则 epubcheck RSC-011 报错
         first_content_href = toc_items[0]['href'] if toc_items else 'content_1.xhtml'
         # 取纯文件路径（去掉 #fragment），landmarks 链接指向文件即可
         first_content_file = first_content_href.split('#', 1)[0]
@@ -418,7 +676,7 @@ class HTMLConverter:
         if not _MARKUP_RE.search(text):
             parts = []
             for p in [ln.strip() for ln in text.split('\n') if ln.strip()]:
-                parts.append(f"<p>{self._escape_text(p)}</p>")
+                parts.append(f"<p>{self._escape_text(_strip_ws_text(p))}</p>")
             return '\n'.join(parts)
         # 手动矫正路径：text 已经 correctmanage.sanitize_html 白名单清洗
         # （仅含 <p>/<h1-6>/<strong>/<em>/<br/>、ptoe-note span 与转义文本），
@@ -429,6 +687,7 @@ class HTMLConverter:
         open_tag: Optional[str] = None  # 当前块的开标签（含 id/class）
         hcount = 0  # 标题锚点计数（每片段内 h1..hN）
         heading: Optional[Tuple[int, List[str]]] = None  # 当前标题 (级别, 文本缓冲)
+        strip_ws = True  # 当前块是否清理文本空白符（居右段落与注释标签段豁免）
 
         def _flush_block() -> None:
             nonlocal cur, kind, open_tag, heading
@@ -460,16 +719,25 @@ class HTMLConverter:
                 # 开标签：先收掉上一块；开标签本身不进 cur（flush 时合成包裹）
                 if kind:
                     _flush_block()
-                cls = _block_class_html(m.group(2) or "")
+                raw_attrs = m.group(2) or ""
+                cls = _block_class_html(raw_attrs)
+                dstyle = _indent_style_attrs(raw_attrs)
+                # 空白符清理豁免：居右段落（用户显式要求保留）与注释标签段（注　　释：
+                # 的全角空格是版式的一部分）；标题/正文/注释一律清理
+                strip_ws = not ('ptoe-align-right' in raw_attrs or _NOTE_LABEL_CLASS in raw_attrs)
                 if tag.startswith('h'):
                     hcount += 1
                     kind = tag
                     heading = (int(tag[1]), [])
-                    open_tag = f'<{tag} id="h{hcount}"{cls}>'
+                    open_tag = f'<{tag} id="h{hcount}"{cls}{dstyle}>'
                 else:
                     kind = 'p'
-                    open_tag = f'<p{cls}>'
+                    open_tag = f'<p{cls}{dstyle}>'
                 continue
+            # 空白符清理只作用于文本 token——标签 token（如 <img src="..." alt="..."/>）
+            # 内部的属性间空格是语法的一部分，清掉会产出非法 XHTML（src="..."alt=...）
+            if strip_ws and not tok.startswith("<"):
+                tok = _strip_ws_text(tok)
             cur.append(tok)
             if heading is not None:
                 heading[1].append(tok)
@@ -503,33 +771,54 @@ class HTMLConverter:
         for ch in chapters:
             title = ch.get('title') or f"Chapter {ch.get('page', file_index)}"
             text = ch.get('text', '')
-            # split by chars if needed（后续分卷标题带「（第N部分）」）
-            if len(text) <= split_by_chars:
-                chunks = [(title, text)]
-            else:
-                chunks = [
-                    (title if i == 0 else f"{title}（第{i + 1}部分）", text[start:start + split_by_chars])
-                    for i, start in enumerate(range(0, len(text), split_by_chars))
-                ]
+            # split by chars if needed（后续分卷标题带「第N部分」）
+            # 按块边界切分（</p>/</h1-6> 之后），避免把标签拦腰截断产出非法 XHTML
+            raw_chunks = _split_at_block_boundary(text, split_by_chars)
+            chunks = [
+                (title if i == 0 else f"{title}（第{i + 1}部分）", c)
+                for i, c in enumerate(raw_chunks)
+            ]
             for sub_title, chunk in chunks:
                 fname = f"content_{file_index}.xhtml"
                 toc = []  # 本页标题（含锚点 id）
+                # 应用加粗注释标签转换（注　　释：+ 顶格 class）
+                chunk = transform_note_labels(chunk)
                 body = self._render_fragment(chunk, toc_out=toc)
-                if not toc:
-                    # 无标题：目录项保留（导航栏可跳转到该页），但不再向正文补
-                    # <h1>书名</h1>——「自动添加的图书名」从正文移除（2026-08-15），
-                    # 书名仅保留在导航栏目录条目与 EPUB 元数据中。
-                    # 全幅图片页（整页仅图片，无文字内容）不列目录项——整页即图片（2026-08）
-                    is_full_img_page = _is_img_page(text)
-                    if not is_full_img_page and sub_title.strip() not in used_titles:
-                        toc.append({'title': sub_title, 'level': 1, 'id': None})
-                for it in toc:
-                    used_titles.add(it['title'])
-                html_doc = f"<?xml version='1.0' encoding='{self.encoding}'?>\n<!DOCTYPE html>\n<html lang='zh-CN' xmlns=\"http://www.w3.org/1999/xhtml\">\n<head>\n<meta charset='{self.encoding}'/>\n<title>{self._escape_text(sub_title)}</title>\n</head>\n<body>\n{body}\n</body>\n</html>"
+
+                # compose XHTML document
+                html_doc = (
+                    f"<?xml version='1.0' encoding='{self.encoding}'?>\n"
+                    "<!DOCTYPE html>\n"
+                    "<html lang='zh-CN' xmlns=\"http://www.w3.org/1999/xhtml\">\n"
+                    "<head>\n"
+                    f"<meta charset='{self.encoding}'/>\n<title>{self._escape_text(sub_title)}</title>\n"
+                    "</head>\n<body>\n"
+                    f"{body}\n"
+                    "</body>\n</html>"
+                )
+
+                # Decide whether this chapter is a full-image page (affects TOC entries)
+                is_full_img_page = _is_img_page(text)
+
+                # write the content output first
                 outputs.append((fname, html_doc))
+
+                # Always include a TOC entry for this chunk unless it's a full-image page.
+                if not is_full_img_page:
+                    # only add fallback title when fragment provided no headings
+                    if not toc:
+                        # avoid duplicate titles in TOC across chapters
+                        # （2026-08-23：标题文本导出时清理空白，比对口径需一致）
+                        fb_title = _strip_ws_text(sub_title)
+                        if fb_title not in used_titles:
+                            toc.append({'title': fb_title, 'level': 1, 'id': None})
+
+                # emit collected toc entries for this file
                 for it in toc:
-                    href = fname if not it['id'] else f"{fname}#{it['id']}"
+                    href = fname if not it.get('id') else f"{fname}#{it['id']}"
                     toc_items.append({'title': it['title'], 'href': href, 'level': it['level']})
+                    used_titles.add(it['title'])
+
                 file_index += 1
         return outputs, toc_items
 
@@ -648,7 +937,8 @@ class HTMLConverter:
                             rel = 'Images/' + fname  # EPUB 路径必须正斜杠（Windows os.path.join 会产出反斜杠）
                             data_img_map[src] = rel
                         for ch in chapters:
-                            ch['text'] = ch['text'].replace(src, rel)
+                            if src in ch['text']:
+                                ch['text'] = ch['text'].replace(src, rel)
                     except Exception:
                         # 解码/写盘失败则保留原样（不阻断打包）
                         pass
@@ -664,7 +954,8 @@ class HTMLConverter:
                             # replace occurrences in chapters text to relative Images/ path
                             rel = 'Images/' + os.path.basename(src_path)  # EPUB 路径必须正斜杠
                             for ch in chapters:
-                                ch['text'] = ch['text'].replace(src, rel)
+                                if src in ch['text']:
+                                    ch['text'] = ch['text'].replace(src, rel)
                         except Exception:
                             # ignore copy errors; leave original src
                             pass
