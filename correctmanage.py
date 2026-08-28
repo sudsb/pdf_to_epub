@@ -352,14 +352,24 @@ def _validate_format_rules(rules) -> list:
                 conditions.append(cond_d)
         if not conditions:
             continue  # 无有效条件：整条丢弃
-        out.append(
-            {
-                "id": str(r.get("id") or uuid4().hex),
-                "name": name,
-                "mode": mode,
-                "conditions": conditions,
-            }
-        )
+        # Compute optional fields: pin and label
+        pin_val = bool(r.get("pin", False))  # default False if missing
+        label_val = str(r.get("label") or "").strip()
+        if label_val:
+            label_val = label_val[:4]  # cap at 4 chars
+        else:
+            label_val = None
+        rule_out = {
+            "id": str(r.get("id") or uuid4().hex),
+            "name": name,
+            "mode": mode,
+            "conditions": conditions,
+        }
+        if label_val is not None:
+            rule_out["label"] = label_val
+        if "pin" in r:  # only include if present in input (even if False)
+            rule_out["pin"] = pin_val
+        out.append(rule_out)
     return out
 
 
@@ -671,11 +681,24 @@ def diff_reocr_texts(current: str, new_text: str) -> list:
     字符使前端可渲染插入文本。输出与 proofread_page 同形状：
     {start, end, wrong, candidates: [str, ...], line}，candidates 一律纯字符串列表
     （前端 join('/') 渲染、candidates[0] 替换，dict 会渲染成 [object Object]，严禁 dict）。
-    start/end 为 current 原始字符偏移（可含内部空白）。空 current → []。
+    start/end 为 current 原始字符偏移（可含内部空白）。空 current + 新文本有内容
+    → 返回单条插入建议（wrong=""，candidates=[new_text.strip()]），供前端填充空白页；
+    双方均空 → []。
     """
     cur_norm, cur_pos = _strip_ws(current)
     new_norm, _ = _strip_ws(new_text)
     out = []
+    # 空 current + 新文本有内容 → 视为空白页填充：返回单条插入建议
+    if not cur_norm and new_norm:
+        return [
+            {
+                "start": 0,
+                "end": 0,
+                "wrong": "",
+                "candidates": [new_text.strip()],
+                "line": 1,
+            }
+        ]
     # autojunk=False：中文常见字（如「的」）默认会被 autojunk 排除出匹配，导致对齐错乱
     sm = SequenceMatcher(None, cur_norm, new_norm, autojunk=False)
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -3190,8 +3213,58 @@ _HISTORY_INDEX: dict[str, Any] = {"sig": None, "items": None}
 
 
 def _history_dir() -> Path:
-    """历史缓存目录：data/correction_history/。"""
-    return Path(__file__).resolve().parent / "data" / _HISTORY_DIR_NAME
+    """历史缓存目录：程序所在目录 data/correction_history/。
+
+    冻结（onefile）运行时 __file__ 指向一次性解包临时目录，历史记录必须
+    跟随 exe 所在目录（pdfmanage.app_base_dir），否则写进 %TEMP% 丢失。
+    """
+    from pdfmanage import app_base_dir
+
+    return app_base_dir() / "data" / _HISTORY_DIR_NAME
+
+
+def _server_info_path() -> Path:
+    """矫正服务信息 sidecar 路径：data/correct_server.json。
+
+    记录当前正在运行的矫正 HTTP 服务的端口、PID 和启动时间，供 GUI 配置
+    中心发现并恢复已存活的矫正界面（浏览器关闭但服务仍在等待时）。
+    """
+    from pdfmanage import app_base_dir
+
+    return app_base_dir() / "data" / "correct_server.json"
+
+
+def _write_server_info(port: int) -> None:
+    """原子写矫正服务信息 sidecar：{"port", "pid", "started"}。
+
+    失败仅打印警告，不抛出——矫正流程不应因 sidecar 写入失败而中断。
+    """
+    try:
+        from configmanage import _atomic_write_json
+
+        p = _server_info_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(str(p), {"port": int(port), "pid": os.getpid(), "started": time.time()})
+    except Exception as e:  # noqa: BLE001
+        print(f"[correctmanage] 写入矫正服务信息 sidecar 失败: {e}")
+
+
+def _clear_server_info() -> None:
+    """清除矫正服务信息 sidecar，仅当记录的 pid 匹配当前进程时删除。
+
+    防止误删由更新实例写入的记录（竞态保护）。
+    任何异常静默吞掉。
+    """
+    try:
+        p = _server_info_path()
+        if not p.exists():
+            return
+        with open(p, "r", encoding="utf-8") as f:
+            info = json.load(f)
+        if isinstance(info, dict) and info.get("pid") == os.getpid():
+            p.unlink()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _history_prefix(pdf_path: str | None) -> str | None:
@@ -3338,6 +3411,7 @@ def _history_entries(prefix: str | None = None) -> list[dict[str, Any]]:
                         "id": fp.stem,
                         "pdf": pdf,
                         "name": str(data.get("name") or Path(pdf).name or fp.stem),
+                        "display_name": str(data.get("display_name") or "") or None,
                         "path": pdf,
                         "updated": str(data.get("updated") or ""),
                         "pages": len(data.get("pages") or {}),
@@ -3762,6 +3836,234 @@ def _html_to_export_blocks(html: str) -> list[tuple]:
     return parser.blocks
 
 
+# 富文本块的行内标签集合（加粗/斜体/通用 span）
+_RICH_INLINE_TAGS = ("span", "strong", "b", "em", "i")
+
+
+def _rich_parse_indent(attrs_d: dict[str, str]) -> dict[str, Any]:
+    """块属性 → 段落设置字典（与 htmlmanage._indent_style_attrs 同一语义）。
+
+    data-pl/data-pr=左/右缩进(em)、data-ind=first|hang、data-indv=缩进量(em)、
+    data-spb/data-spa=段前/段后(行)、data-lh=行距倍数；缺失键一律为 None
+    （data-ind 非法值归一为 ""）。
+    """
+
+    def _num(key: str) -> float | None:
+        v = (attrs_d.get(key) or "").strip()
+        try:
+            return float(v)
+        except ValueError:
+            return None
+
+    mode = (attrs_d.get("data-ind") or "").strip()
+    return {
+        "pl": _num("data-pl"),
+        "pr": _num("data-pr"),
+        "ind": mode if mode in ("first", "hang") else "",
+        "indv": _num("data-indv"),
+        "spb": _num("data-spb"),
+        "spa": _num("data-spa"),
+        "lh": _num("data-lh"),
+    }
+
+
+def _rich_align(attrs_str: str) -> str:
+    """从块属性串提取对齐类 → ""|"center"|"right"|"justify"。"""
+    m = re.search(r'class="([^"]*)"', attrs_str or "")
+    toks = (m.group(1) if m else "").split()
+    for a in ("center", "right", "justify"):
+        if f"ptoe-align-{a}" in toks:
+            return a
+    return ""
+
+
+def _html_to_rich_blocks(html: str) -> list[dict]:
+    """已清洗 HTML → 富文本块列表，供 TXT/DOCX/MD 导出（保留格式信息）。
+
+    与 _html_to_export_blocks 的差异：
+    - 行内加粗/斜体保留为 runs（[{text,bold,italic}]），不再拍平成纯文本；
+    - 对齐类（ptoe-align-*）、注释类（ptoe-note）、段落设置 data-* 属性
+      （data-pl/pr/ind/indv/spb/spa/lh）逐块捕获；
+    - 保留块原始标签名/属性串/内嵌 HTML（供 Markdown 导出原样透传，
+      与前端 htmlToMd「带 class=/data- 属性的块保留 raw HTML」规则一致）；
+    - <div> 视为段落边界（与 EPUB 路径 sanitize 归一 <p> 的行为一致）。
+
+    块形状：
+    - 文本块：{"kind": "p"|"h1".."h6", "tag": 原始标签名, "text": 纯文本,
+      "runs": [...], "align": ..., "note": bool, "attrs": 属性串,
+      "inner": 内嵌 HTML, "indent": _rich_parse_indent 形状}；
+    - 图片块：{"kind": "img", "src", "alt", "cls"}（块内图片把周围文本
+      拆成独立块，延续旧导出行为）。
+    标记 span（ptoe-marker）整体剥除（文本与 inner 均不含）。
+    """
+
+    class _Parser(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.blocks: list[dict] = []
+            self.kind = "p"  # 当前块语义类型（div 归一为 p）
+            self.tag = "p"  # 当前块原始标签名
+            self.attrs_str = ""  # 当前块开标签属性串
+            self.runs: list[dict] = []
+            self.inner: list[str] = []
+            self.note = False
+            self.indent = _rich_parse_indent({})
+            self.block_seen = False  # 是否已进入过块（孤立 img 不产生块）
+            self.skip = 0  # >0 表示处于 script/style 等跳过区域
+            self.stack: list[tuple[str, bool]] = []  # (行内标签, 是否标记 span)
+
+        def _flags(self) -> tuple[bool, bool]:
+            bold = any(t in ("strong", "b") for t, _ in self.stack)
+            italic = any(t in ("em", "i") for t, _ in self.stack)
+            return bold, italic
+
+        def _push_text(self, txt: str) -> None:
+            if not txt:
+                return
+            bold, italic = self._flags()
+            if self.runs:
+                last = self.runs[-1]
+                if last["bold"] == bold and last["italic"] == italic:
+                    last["text"] += txt
+                    return
+            self.runs.append({"text": txt, "bold": bold, "italic": italic})
+
+        def _open_block(self, tag: str, attrs) -> None:
+            self._flush()
+            d: dict[str, str] = {}
+            parts: list[str] = []
+            for k, v in attrs:
+                parts.append(f'{k}="{v}"' if v is not None else k)
+                d.setdefault(k, v or "")
+            self.kind = "p" if tag == "div" else tag
+            self.tag = tag
+            self.attrs_str = " ".join(parts)
+            self.runs = []
+            self.inner = []
+            self.note = "ptoe-note" in (d.get("class") or "").split()
+            self.indent = _rich_parse_indent(d)
+            self.block_seen = True
+
+        def _flush(self) -> None:
+            runs = self.runs
+            self.runs = []
+            inner = "".join(self.inner)
+            self.inner = []
+            # 去掉块首尾空白（与旧导出的整块 .strip() 等价）
+            while runs and not runs[0]["text"].strip():
+                runs.pop(0)
+            while runs and not runs[-1]["text"].strip():
+                runs.pop()
+            if runs:
+                runs[0]["text"] = runs[0]["text"].lstrip()
+                runs[-1]["text"] = runs[-1]["text"].rstrip()
+            text = "".join(r["text"] for r in runs)
+            if text:
+                self.blocks.append(
+                    {
+                        "kind": self.kind,
+                        "tag": self.tag,
+                        "text": text,
+                        "runs": runs,
+                        "align": _rich_align(self.attrs_str),
+                        "note": self.note,
+                        "attrs": self.attrs_str,
+                        "inner": inner,
+                        "indent": self.indent,
+                    }
+                )
+            self.kind, self.tag, self.attrs_str = "p", "p", ""
+            self.note = False
+            self.indent = _rich_parse_indent({})
+
+        def _emit_img(self, attrs) -> None:
+            d = dict(attrs)
+            self._flush()
+            self.blocks.append(
+                {
+                    "kind": "img",
+                    "src": d.get("src") or "",
+                    "alt": d.get("alt") or "插图",
+                    "cls": d.get("class") or "",
+                }
+            )
+
+        def handle_starttag(self, tag, attrs) -> None:
+            if tag in _SKIP_TAGS:
+                self.skip += 1
+                return
+            if tag in ("p", "div") or (
+                len(tag) == 2 and tag[0] == "h" and tag[1] in "123456"
+            ):
+                self._open_block(tag, attrs)
+                return
+            if self.skip:
+                return
+            if tag == "br":
+                self._push_text("\n")
+                self.inner.append("<br>")
+                return
+            if tag == "img":
+                if self.block_seen:
+                    self._emit_img(attrs)
+                return
+            if tag in _RICH_INLINE_TAGS:
+                cls = (dict(attrs).get("class") or "").split()
+                if "ptoe-note" in cls:
+                    self.note = True
+                self.stack.append((tag, "ptoe-marker" in cls))
+                if "ptoe-marker" not in cls:
+                    self.inner.append(self.get_starttag_text() or f"<{tag}>")
+                return
+            # 其他标签（白名单外，罕见）：不进 runs，仅透传进 inner
+            self.inner.append(self.get_starttag_text() or f"<{tag}>")
+
+        def handle_startendtag(self, tag, attrs) -> None:
+            if tag in _SKIP_TAGS:
+                return
+            if tag == "br":
+                self._push_text("\n")
+                self.inner.append("<br>")
+            elif tag == "img" and self.block_seen:
+                self._emit_img(attrs)
+
+        def handle_endtag(self, tag) -> None:
+            if tag in _SKIP_TAGS:
+                self.skip = max(0, self.skip - 1)
+                return
+            if tag in ("p", "div") or (
+                len(tag) == 2 and tag[0] == "h" and tag[1] in "123456"
+            ):
+                self._flush()
+                return
+            if tag in _RICH_INLINE_TAGS:
+                # 弹栈到匹配标签（容忍未闭合嵌套）；被弹掉的标记 span 不写入 inner
+                for idx in range(len(self.stack) - 1, -1, -1):
+                    if self.stack[idx][0] == tag:
+                        seg = self.stack[idx:]
+                        del self.stack[idx:]
+                        if not any(mk for _, mk in seg):
+                            self.inner.append(f"</{tag}>")
+                        break
+
+        def handle_data(self, data) -> None:
+            if self.skip:
+                return
+            if any(mk for _, mk in self.stack):
+                return  # 标记 span 内容整体剥除
+            self._push_text(data)
+            # inner 重转义（convert_charrefs 已解码实体；保持 HTML 形态供透传）
+            self.inner.append(
+                str(data).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            )
+
+    parser = _Parser()
+    parser.feed(str(html or ""))
+    parser.close()
+    parser._flush()
+    return parser.blocks
+
+
 def _image_dims(data: bytes) -> tuple[int, int] | None:
     """从图片字节解析固有尺寸 (宽, 高)；无法解析返回 None。
 
@@ -3823,23 +4125,71 @@ def _data_uri_bytes(src: str) -> tuple[bytes, str] | None:
         return None
 
 
-def _build_docx(blocks: list[tuple], path: str) -> None:
+def _norm_export_block(block: Any) -> dict:
+    """兼容旧元组块与富文本字典块：统一归一为富文本块字典。
+
+    - dict → 原样返回（_html_to_rich_blocks 产物）；
+    - ('img', src, alt, cls) → 图片块字典；
+    - ('p'|'hN', 文本) → 无格式信息的普通文本块（runs 单条）。
+    """
+    if isinstance(block, dict):
+        return block
+    if block[0] == "img":
+        return {"kind": "img", "src": block[1], "alt": block[2], "cls": block[3]}
+    kind, text = str(block[0]), str(block[1])
+    return {
+        "kind": kind,
+        "tag": kind,
+        "text": text,
+        "runs": [{"text": text, "bold": False, "italic": False}],
+        "align": "",
+        "note": False,
+        "attrs": "",
+        "inner": "",
+        "indent": {},
+    }
+
+
+def _docx_escape(text: str) -> str:
+    """XML 文本转义（& < > "）。"""
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _build_docx(blocks: list[Any], path: str) -> None:
     """块列表 → 最小合法 .docx（zipfile 打包，无第三方依赖）。
 
-    文本块 ('p'|'hN', 文本) 渲染为普通段落/标题段落；
-    图片块 ('img', src, alt, cls) 内嵌真实图片字节（data URI）：
-    - 尺寸 class ptoe-img-w25/50/75/100 → 宽度 5 英寸 × 比例，高度按固有宽高比；
-    - 非 data URI 或解析失败 → 以 [图片] 占位段落输出（与 TXT 一致）。
+    接受两种块形状：富文本字典（_html_to_rich_blocks 产物，保留对齐/缩进/
+    行内样式/注释）与旧二元/四元组（无格式信息，行为不变）。
+
+    与 EPUB 导出对齐的段落格式（2026-08-24）：
+    - h1-h6 默认居中；h1 底部加分隔线（对应 EPUB CSS border-bottom）；
+    - 对齐类 ptoe-align-center/right/justify → w:jc center/right/both；
+    - 段落设置 data-* 属性 → w:spacing/w:ind（1em≈240 twips、段前/后 1 行
+      ≈360 twips、行距 ×240，与 htmlmanage._indent_style_attrs 同语义）；
+    - 注释块（ptoe-note）→ 斜体 + 灰色（808080）；行内加粗/斜体逐 run 保留；
+    - 图片块内嵌真实图片字节（data URI）：尺寸 class ptoe-img-w25/50/75/100
+      → 宽度 5 英寸 × 比例，高度按固有宽高比；非 data URI 或解析失败 →
+      以 [图片] 占位段落输出（与 TXT 一致）。
     """
     import zipfile
+
+    EM_TWIPS = 240  # 1em ≈ 240 twips（12pt 基准的近似换算）
 
     parts: list[str] = [_DOCX_DOCUMENT_HEAD]
     media: list[tuple[str, bytes]] = []  # (word/media/imageN.ext, 字节)
     rels: list[str] = []
     img_no = 0
-    for block in blocks:
-        if block[0] == "img":
-            _, src, alt, cls = block
+    for raw in blocks:
+        block = _norm_export_block(raw)
+        if block["kind"] == "img":
+            src = block.get("src") or ""
+            cls = block.get("cls") or ""
             decoded = _data_uri_bytes(src)
             if decoded is None:
                 # 无法内嵌（非 data URI）：输出 [图片] 占位段落
@@ -3858,7 +4208,7 @@ def _build_docx(blocks: list[tuple], path: str) -> None:
             )
             # 尺寸：ptoe-img-w25/50/75/100 → 宽度比例；无尺寸 class → 100%
             frac = 1.0
-            for c in (cls or "").split():
+            for c in cls.split():
                 if c in _DOCX_IMG_FRAC:
                     frac = _DOCX_IMG_FRAC[c]
             cx = int(_DOCX_IMG_BASE_CX * frac)
@@ -3881,29 +4231,89 @@ def _build_docx(blocks: list[tuple], path: str) -> None:
                 f"</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"
             )
             continue
-        kind, text = block[0], block[1]
-        xml_text = (
-            str(text)
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-        )
-        # 段内换行（<br>）转 w:br
-        xml_text = xml_text.replace("\n", '</w:t><w:br/><w:t xml:space="preserve">')
-        if kind.startswith("h") and len(kind) == 2 and kind[1].isdigit():
-            lvl = int(kind[1])
-            sz = _DOCX_HEADING_SZ.get(lvl, 24)
-            parts.append(
-                f'<w:p><w:pPr><w:outlineLvl w:val="{lvl - 1}"/>'
-                f'<w:rPr><w:b/><w:sz w:val="{sz}"/><w:szCs w:val="{sz}"/></w:rPr></w:pPr>'
-                f'<w:r><w:rPr><w:b/><w:sz w:val="{sz}"/><w:szCs w:val="{sz}"/></w:rPr>'
-                f'<w:t xml:space="preserve">{xml_text}</w:t></w:r></w:p>'
+
+        kind = block["kind"]
+        runs = block.get("runs") or [
+            {"text": block.get("text", ""), "bold": False, "italic": False}
+        ]
+        is_heading = kind.startswith("h") and len(kind) == 2 and kind[1].isdigit()
+        lvl = int(kind[1]) if is_heading else 0
+        align = block.get("align") or ""
+        indent = block.get("indent") or {}
+        note = bool(block.get("note"))
+
+        # -- pPr（按 OOXML schema 顺序：pBdr → spacing → ind → jc → outlineLvl）--
+        ppr_parts: list[str] = []
+        if is_heading and lvl == 1 and not align:
+            # 与 EPUB 一致：一级标题下加分隔线（CSS border-bottom 的 DOCX 对应物）
+            ppr_parts.append(
+                '<w:pBdr><w:bottom w:val="single" w:sz="6" w:space="4" '
+                'w:color="999999"/></w:pBdr>'
             )
-        else:
-            parts.append(
-                f'<w:p><w:r><w:t xml:space="preserve">{xml_text}</w:t></w:r></w:p>'
+        sp_attrs = ""
+        if indent.get("spb") is not None:
+            # 段前：1 行 ≈ 1.5em ≈ 360 twips（与 EPUB margin-top ×1.5em 同源）
+            sp_attrs += f' w:before="{int(round(indent["spb"] * 360))}"'
+        if indent.get("spa") is not None:
+            sp_attrs += f' w:after="{int(round(indent["spa"] * 360))}"'
+        if indent.get("lh") is not None and indent["lh"] > 0:
+            sp_attrs += f' w:line="{int(round(indent["lh"] * 240))}" w:lineRule="auto"'
+        if sp_attrs:
+            ppr_parts.append(f"<w:spacing{sp_attrs}/>")
+        ind_attrs = ""
+        pl = indent.get("pl")
+        pr = indent.get("pr")
+        indv = indent.get("indv")
+        mode = indent.get("ind") or ""
+        left = pl
+        hanging = 0.0
+        firstline = 0.0
+        if mode == "hang":
+            # 悬挂缩进：左缩进 = pl + indv，悬挂量 = indv（同 htmlmanage）
+            left = (pl or 0.0) + (indv if indv is not None else 2.0)
+            hanging = indv if indv is not None else 2.0
+        elif mode == "first":
+            # 首行缩进：默认 2 字符（与 htmlmanage 缺省一致）
+            firstline = indv if indv is not None else 2.0
+        if left:
+            ind_attrs += f' w:left="{int(round(left * EM_TWIPS))}"'
+        if pr:
+            ind_attrs += f' w:right="{int(round(pr * EM_TWIPS))}"'
+        if firstline:
+            ind_attrs += f' w:firstLine="{int(round(firstline * EM_TWIPS))}"'
+        if hanging:
+            ind_attrs += f' w:hanging="{int(round(hanging * EM_TWIPS))}"'
+        if ind_attrs:
+            ppr_parts.append(f"<w:ind{ind_attrs}/>")
+        jc = align  # center / right / justify
+        if is_heading and not jc:
+            jc = "center"  # 与 EPUB 一致：标题默认居中
+        if jc:
+            ppr_parts.append(f'<w:jc w:val="{jc}"/>')
+        if is_heading:
+            ppr_parts.append(f'<w:outlineLvl w:val="{lvl - 1}"/>')
+
+        sz = _DOCX_HEADING_SZ.get(lvl, 24) if is_heading else None
+        run_xml_parts: list[str] = []
+        for r in runs:
+            rpr = ""
+            if is_heading or r.get("bold"):
+                rpr += "<w:b/>"
+            if r.get("italic") or note:
+                rpr += "<w:i/>"
+            if note:
+                rpr += '<w:color w:val="808080"/>'
+            if sz:
+                rpr += f'<w:sz w:val="{sz}"/><w:szCs w:val="{sz}"/>'
+            t = _docx_escape(r.get("text", "")).replace(
+                "\n", '</w:t><w:br/><w:t xml:space="preserve">'
             )
+            run_xml_parts.append(
+                f"<w:r><w:rPr>{rpr}</w:rPr>"
+                f'<w:t xml:space="preserve">{t}</w:t></w:r>'
+            )
+        ppr_xml = f"<w:pPr>{''.join(ppr_parts)}</w:pPr>" if ppr_parts else ""
+        parts.append(f"<w:p>{ppr_xml}{''.join(run_xml_parts)}</w:p>")
     parts.append(_DOCX_DOCUMENT_TAIL)
     rels_xml = _DOCX_DOCUMENT_RELS_HEAD + "".join(rels) + _DOCX_DOCUMENT_RELS_TAIL
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -3915,6 +4325,55 @@ def _build_docx(blocks: list[tuple], path: str) -> None:
             zf.writestr(fname, data)
 
 
+def _build_md(blocks: list[Any], path: str) -> None:
+    """块列表 → Markdown 文件。
+
+    转换规则与前端 ui/app.js 的 htmlToMd/inlineToMd 保持一致（格式一致性）：
+    - h1-h6 → '#'*N 标题；普通段落 → 正文；块间空一行；文件末尾单个换行；
+    - 带 class=/data- 属性的块整块原样透传原始 HTML（对齐/缩进等版式信息
+      不丢失，且可被界面 Markdown 模式 mdToHtml 无损还原）；
+    - 加粗 **…**、斜体 *…*（同时加粗斜体 ***…***）；<br> 已在解析时转为换行；
+    - 图片 ![alt](src)，data URI 原样内联（单文件自包含，与 DOCX/EPUB 内嵌一致）；
+    - 不做额外 Markdown 转义（与前端 inlineToMd 一致，避免同一内容两种输出）。
+    编码 utf-8（无 BOM，Markdown 标准形态；TXT 才用 utf-8-sig）。
+    """
+
+    def _inline(rs: list[dict]) -> str:
+        out: list[str] = []
+        for r in rs:
+            t = r.get("text", "")
+            if r.get("bold") and r.get("italic"):
+                out.append(f"***{t}***")
+            elif r.get("bold"):
+                out.append(f"**{t}**")
+            elif r.get("italic"):
+                out.append(f"*{t}*")
+            else:
+                out.append(t)
+        return "".join(out)
+
+    parts: list[str] = []
+    for raw in blocks:
+        b = _norm_export_block(raw)
+        if b["kind"] == "img":
+            parts.append(f"![{b.get('alt') or ''}]({b.get('src') or ''})")
+            continue
+        attrs = b.get("attrs") or ""
+        if "class=" in attrs or "data-" in attrs:
+            # 带属性块：原样透传（与前端 htmlToMd 规则一致）
+            tag = b.get("tag") or b["kind"]
+            parts.append(
+                f"<{tag}{(' ' + attrs) if attrs else ''}>{b.get('inner') or ''}</{tag}>"
+            )
+            continue
+        kind = b["kind"]
+        if kind.startswith("h") and len(kind) == 2 and kind[1].isdigit():
+            parts.append("#" * int(kind[1]) + " " + _inline(b["runs"]))
+        else:
+            parts.append(_inline(b["runs"]))
+    Path(path).write_text("\n\n".join(parts) + "\n", encoding="utf-8")
+
+
 def _pick_export_path(
     state: dict[str, Any], fmt: str, fallback_dir: str | None = None
 ) -> tuple[str | None, bool]:
@@ -3923,7 +4382,8 @@ def _pick_export_path(
     - 用户取消 → (None, True)，调用方直接回「已取消」；
     - tkinter 不可用（headless/无桌面）→ (None, False)，调用方用默认路径兜底。
     """
-    ext = "txt" if fmt == "txt" else ("epub" if fmt == "epub" else "docx")
+    ext = {"txt": "txt", "epub": "epub", "docx": "docx", "md": "md"}.get(fmt, "docx")
+    label = "Markdown 文件" if fmt == "md" else f"{ext.upper()} 文件"
     base = (state.get("history_name") or "").removesuffix(".pdf")
     base = (base or "矫正导出").strip() or "矫正导出"
     initial = f"{base}.{ext}"
@@ -3941,9 +4401,9 @@ def _pick_export_path(
             pass
         try:
             path = filedialog.asksaveasfilename(
-                title=f"导出为 {ext.upper()} 文件",
+                title=f"导出为 {label}",
                 defaultextension=f".{ext}",
-                filetypes=[(f"{ext.upper()} 文件", f"*.{ext}"), ("所有文件", "*.*")],
+                filetypes=[(label, f"*.{ext}"), ("所有文件", "*.*")],
                 initialfile=initial,
                 initialdir=fallback_dir or ".",
             )
@@ -4252,6 +4712,68 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 "application/json; charset=utf-8",
             )
 
+    def _config(self) -> None:
+        """字体/界面配置：POST 写入 config.json fonts + citationItalicEnabled。
+
+        与 _shortcuts/_proofread_settings 同构：get_config 读取 → 合并 →
+        update_config 原子写回。仅在确有变更时写盘。
+        """
+        try:
+            from configmanage import get_config, update_config
+
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            body = json.loads(raw.decode("utf-8"))
+            fonts = body.get("fonts")
+            citationItalicEnabled = body.get("citationItalicEnabled")
+            if fonts is not None and not isinstance(fonts, dict):
+                self._send(
+                    400,
+                    self._json({"ok": False, "error": "fonts 必须是对象"}),
+                    "application/json; charset=utf-8",
+                )
+                return
+            if citationItalicEnabled is not None and not isinstance(
+                citationItalicEnabled, bool
+            ):
+                self._send(
+                    400,
+                    self._json(
+                        {"ok": False, "error": "citationItalicEnabled 必须是布尔值"}
+                    ),
+                    "application/json; charset=utf-8",
+                )
+                return
+            cfg = get_config(show_dialogs=False) or {}
+            changed = False
+            if fonts is not None:
+                cur = cfg.get("fonts")
+                if not isinstance(cur, dict):
+                    cur = {}
+                merged = dict(cur)
+                for k in ("body", "heading", "note", "citation"):
+                    if k in fonts:
+                        merged[k] = str(fonts[k])
+                if merged != cur:
+                    cfg["fonts"] = merged
+                    changed = True
+            if citationItalicEnabled is not None:
+                if cfg.get("citationItalicEnabled") != citationItalicEnabled:
+                    cfg["citationItalicEnabled"] = citationItalicEnabled
+                    changed = True
+            if changed:
+                update_config("fonts", cfg.get("fonts"))
+                update_config(
+                    "citationItalicEnabled", cfg.get("citationItalicEnabled")
+                )
+            self._send(200, self._json({"ok": True}), "application/json; charset=utf-8")
+        except Exception as e:  # noqa: BLE001
+            self._send(
+                500,
+                self._json({"ok": False, "error": str(e)}),
+                "application/json; charset=utf-8",
+            )
+
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
         if path == "/":
@@ -4271,6 +4793,12 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
         if path == "/api/heartbeat":
             self._touch_heartbeat()
             self._send(204, b"", "text/plain")
+            return
+        if path == "/api/ping":
+            # 轻量存活探测：仅返回 ok，不修改任何状态。供外部（如 GUI）
+            # 发现并恢复已存活的矫正界面。
+            self._send(200, self._json({"ok": True}), "application/json; charset=utf-8")
+            return
         if path == "/api/pages":
             state = self.server.state
             # S5：跨线程读 pages 时加锁快照（与保存/暂存/完成写入并发）
@@ -4335,6 +4863,19 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
             # 2026-08-23：全局按修改时间倒序——最近修改/读取的文件排在历史记录第一位
             # （此前仅组内排序用于版本号，返回列表仍是文件名序 ≈ 哈希序，与新旧无关）
             items.sort(key=lambda x: x.get("updated") or "", reverse=True)
+            # 为每条记录确定 display_name：优先使用版本文件中的 display_name，否则回退到 name
+            for it in items:
+                pid = it["id"]
+                # 读取对应版本文件检查 display_name
+                fp = _history_dir() / f"{pid}.json"
+                disp = None
+                if fp.is_file():
+                    try:
+                        data = json.loads(fp.read_text(encoding="utf-8"))
+                        disp = data.get("display_name")
+                    except Exception:
+                        pass
+                it["display_name"] = disp if disp else it["name"]
             self._send(
                 200, self._json({"items": items}), "application/json; charset=utf-8"
             )
@@ -4383,6 +4924,33 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/shortcuts":
             self._shortcuts()
+            return
+        if path == "/api/config":
+            # 字体/界面配置：GET 读取 config.json fonts + citationItalicEnabled
+            from configmanage import get_config
+
+            cfg = get_config(show_dialogs=False) or {}
+            fonts = cfg.get("fonts") or {}
+            if not isinstance(fonts, dict):
+                fonts = {}
+            self._send(
+                200,
+                self._json(
+                    {
+                        "ok": True,
+                        "fonts": {
+                            "body": fonts.get("body", "serif"),
+                            "heading": fonts.get("heading", "sans-serif"),
+                            "note": fonts.get("note", "serif"),
+                            "citation": fonts.get("citation", "cursive"),
+                        },
+                        "citationItalicEnabled": bool(
+                            cfg.get("citationItalicEnabled", False)
+                        ),
+                    }
+                ),
+                "application/json; charset=utf-8",
+            )
             return
         if path == "/api/llm_status":
             # llama-server 运行状态探测（深度校对/句子校正用）
@@ -4700,6 +5268,17 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                         st["preview_doc"] = None
                 # 记录 history_name 供后续暂存/保存使用（测试断言）
                 st["history_name"] = Path(pdf).name if pdf else None
+                # 从版本文件读取 display_name（重命名功能的结果），供 EPUB 导出 fallback 使用
+                # 遵循 GET /api/history 同一模式：版本 JSON 中有则优先，无则回退到 name
+                _disp = None
+                vp = _history_dir() / f"{pid}.json"
+                if vp.is_file():
+                    try:
+                        _ddata = json.loads(vp.read_text(encoding="utf-8"))
+                        _disp = _ddata.get("display_name")
+                    except Exception:
+                        pass
+                st["display_name"] = _disp if _disp else st.get("display_name")
                 # 加载内嵌预览图供跨电脑时 fallback
                 st["embedded_images"] = loaded.get("embedded_images") or {}
                 # 返回页面数据（与 /api/convert 约定一致）+ 文字纠错状态
@@ -4718,6 +5297,98 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "application/json; charset=utf-8",
                 )
 
+            except Exception as e:  # noqa: BLE001
+                self._send(
+                    500,
+                    self._json({"ok": False, "error": str(e)}),
+                    "application/json; charset=utf-8",
+                )
+            return
+        if path == "/api/history/rename":
+            # 重命名历史记录条目：更新 display_name，应用到同一 PDF 组的所有版本文件
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b"{}"
+                body = json.loads(raw.decode("utf-8"))
+                vid = str(body.get("id") or "").strip()
+                new_name = str(body.get("newName") or "").strip()
+                if not vid:
+                    self._send(
+                        400,
+                        self._json({"ok": False, "error": "缺少版本 ID"}),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+                if not new_name:
+                    self._send(
+                        400,
+                        self._json({"ok": False, "error": "新名称不能为空"}),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+                # 验证：拒绝包含路径分隔符的名称
+                if "\\" in new_name or "/" in new_name or ":" in new_name:
+                    self._send(
+                        400,
+                        self._json({"ok": False, "error": "名称含非法字符（含 \\ / :）"}),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+                # 长度限制（最多 100 个字符，与文件名惯例一致）
+                if len(new_name) > 100:
+                    self._send(
+                        400,
+                        self._json({"ok": False, "error": "名称过长（最多 100 字符）"}),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+                prefix = _version_prefix(vid)  # 由版本文件名 stem 算出的 book 前缀
+                if not prefix:
+                    self._send(
+                        404,
+                        self._json({"ok": False, "error": "无法定位所属 PDF 组"}),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+                d = _history_dir()
+                # 遍历该 PDF 组的所有版本文件（前缀匹配），写入 display_name
+                # 注意用 Path.glob（返回 Path 对象）；glob.glob 返回 str 无 .read_text
+                matched = False
+                for fp in d.glob(f"{prefix}_*.json"):
+                    try:
+                        data = json.loads(fp.read_text(encoding="utf-8"))
+                        # 保留原有字段，仅更新/写入 display_name
+                        data["display_name"] = new_name
+                        # 使用原子写入：先写临时文件再 os.replace
+                        import tempfile, os as _os
+                        fd, tmp = tempfile.mkstemp(dir=str(d), prefix=".rename-", suffix=".tmp")
+                        try:
+                            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                                json.dump(data, f, ensure_ascii=False, indent=2)
+                                f.flush()
+                                os.fsync(f.fileno())
+                            _os.replace(tmp, str(fp))
+                        except Exception:
+                            try:
+                                _os.unlink(tmp)
+                            except Exception:
+                                pass
+                        matched = True
+                    except Exception:
+                        continue
+                # 更新内存中 _HISTORY_INDEX 以立即反映变更
+                # 重新计算签名使下次 _history_entries 重读
+                fps = sorted(fp for fp in d.glob("*.json") if not fp.name.endswith(".images.json"))
+                sig = "|".join(
+                    f"{fp.name}:{fp.stat().st_mtime_ns}:{fp.stat().st_size}" for fp in fps
+                )
+                # 只要取第一个版本的显示名作为组名变更的凭证
+                first_items = _history_entries(prefix)
+                first_display = first_items[0].get("display_name", first_items[0].get("name", "")) if first_items else new_name
+                self._send(
+                    200, self._json({"ok": True, "display_name": first_display}), "application/json; charset=utf-8"
+                )
+                return
             except Exception as e:  # noqa: BLE001
                 self._send(
                     500,
@@ -4899,6 +5570,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/shortcuts":
             self._shortcuts()
+            return
+        if path == "/api/config":
+            self._config()
             return
         if path == "/api/llm_start":
             # 启动 llama-server（默认附加 --mmproj 图像投影，供大模型重识别 OCR 使用；
@@ -5279,8 +5953,14 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 # 2026-08-23：模型可能把图片页脚的页码一并识别进来，剥掉末尾
                 # 独立成行的页码（第 N 页 / 纯数字），避免被当成正文差异标注；
                 # 要求页码前有换行（独立成行），正文段落末尾的正常数字不受影响
+                # 2026-08-28：模型也可能把页码包在括号里输出（〔121〕/【121】/[121]/
+                # （121）等，经 _normalize_brackets 后多为 〔121〕），一并剥掉。
                 new_text = re.sub(
-                    r"[\n\r][\s\-—–·・.。、_]*(?:第\s*\d+\s*页|\d{1,4})[\s。]*$",
+                    r"[\n\r][\s\-—–·・.。、_]*(?:"
+                    r"(?:第\s*\d+\s*页|\d{1,4})"  # 裸页码：第121页 / 121
+                    r"|"
+                    r"[〔【\[（(［〈《「『][\s\-—–·・.。、_]*(?:第\s*\d+\s*页|\d{1,4})[\s\-—–·・.。、_]*[〕】\]）)］〉》」』]"  # 括号包裹页码：〔121〕
+                    r")[\s。]*$",
                     "",
                     new_text,
                 )
@@ -5364,7 +6044,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 raw = self.rfile.read(length) if length else b"{}"
                 body = json.loads(raw.decode("utf-8"))
                 fmt = str(body.get("format") or "")
-                if fmt not in ("txt", "docx", "epub"):
+                if fmt not in ("txt", "docx", "epub", "md"):
                     self._send(
                         400,
                         self._json({"ok": False, "error": f"bad format: {fmt}"}),
@@ -5375,11 +6055,11 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     (x for x in (body.get("pages") or []) if isinstance(x, dict)),
                     key=lambda x: _safe_int(x.get("page")),
                 )
-                blocks: list[tuple[str, str]] = []
+                blocks: list[dict] = []
                 for item in items:
                     # 应用加粗注释标签转换（注　　释：）
                     html_text = transform_note_labels(str(item.get("html") or ""))
-                    blocks.extend(_html_to_export_blocks(html_text))
+                    blocks.extend(_html_to_rich_blocks(html_text))
                 st = self.server.state
                 explicit = body.get("path")
                 used_dialog = False
@@ -5416,14 +6096,24 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 out = Path(out_path)
                 out.parent.mkdir(parents=True, exist_ok=True)
                 if fmt == "txt":
-                    # 图片块（4 元组）在 TXT 中以 [图片] 占位符表示
-                    text = (
-                        "\n\n".join(
-                            ("[图片]" if b[0] == "img" else b[1]) for b in blocks
-                        )
-                        + "\n"
-                    )
+
+                    def _txt_line(b: dict) -> str:
+                        # 图片块以 [图片] 占位符表示；首行缩进（data-ind=first）
+                        # 以全角空格前缀近似（纯文本唯一能承载的版式信息）
+                        if b["kind"] == "img":
+                            return "[图片]"
+                        line = "".join(r["text"] for r in b["runs"])
+                        ind = b.get("indent") or {}
+                        if ind.get("ind") == "first":
+                            n = int(ind.get("indv") or 2)
+                            line = "\u3000" * max(1, min(8, n)) + line
+                        return line
+
+                    text = "\n\n".join(_txt_line(b) for b in blocks) + "\n"
                     out.write_text(text, encoding=_TXT_ENCODING)
+                elif fmt == "md":
+                    # Markdown 导出：与前端 htmlToMd 规则一致（见 _build_md）
+                    _build_md(blocks, str(out))
                 elif fmt == "epub":
                     # epub：标记→文章结构→XHTML→打包（临时目录隔离，完成后清理）
                     import shutil as _sh
@@ -5444,7 +6134,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                             for p in items
                         ]
                         articles = apply_markers(src_items)
-                        title = st.get("history_name") or "矫正导出"
+                        title = st.get("display_name") or (st.get("history_name") or "矫正导出")
                         structured = {
                             "articles": articles,
                             "pages": src_items,
@@ -5729,6 +6419,8 @@ def correct_pages(
             ).start()
     url = f"http://{server.server_address[0]}:{server.server_address[1]}/"
     print(f"      矫正界面已启动: {url}（对比原图与识别文字，完成后点「完成并转换」）")
+    # 记录服务信息 sidecar，供 GUI 配置中心发现并恢复已存活的矫正界面
+    _write_server_info(server.server_address[1])
     if open_browser:
         webbrowser.open(url)
     try:
@@ -5756,6 +6448,8 @@ def correct_pages(
     except KeyboardInterrupt:
         print("\n      手动矫正被中断，放弃本次矫正结果，继续原流程")
     finally:
+        # 清除服务信息 sidecar（仅当前进程 pid 匹配时删除）
+        _clear_server_info()
         server.shutdown()
         server.server_close()
         serve_thread.join(timeout=5)
@@ -5873,7 +6567,7 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
 /* 全局延迟提示：悬停超过设定时间才显示（含快捷键），延迟可在「快捷键」设置中调整 */
 #tip{position:fixed;z-index:80;display:none;background:#1c2733;color:#fff;font-size:12px;line-height:1.5;padding:5px 9px;border-radius:4px;max-width:320px;pointer-events:none;}
 #tip .tip-key{color:#bcd0e5;margin-left:6px;white-space:nowrap;}
-#popup{position:fixed;z-index:60;display:none;flex-wrap:wrap;gap:4px;max-width:280px;padding:6px 8px;background:#fff;border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 18px rgba(0,0,0,.22);}
+#popup{position:fixed;z-index:60;display:none;flex-wrap:wrap;gap:4px;max-width:360px;padding:6px 8px;background:#fff;border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 18px rgba(0,0,0,.22);}
 .pop-btn{min-width:34px;height:30px;padding:0 8px;font-size:13px;border:1px solid var(--border);background:#fff;color:#1c2733;border-radius:6px;cursor:pointer;line-height:1;}
 /* 右键上下文菜单（2026-08-08）：浅色主题、圆角、分组分隔线、二级菜单向右展开（右缘不足向左） */
 #contextMenu{position:fixed;z-index:80;min-width:172px;padding:5px;background:#fff;border:1px solid var(--border);border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,.22);display:flex;flex-direction:column;gap:1px;user-select:none;}
@@ -5895,7 +6589,7 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
 .ctx-empty{padding:7px 12px;font-size:12px;color:#9aa7b4;white-space:nowrap;cursor:default;}
 /* 格式刷：激活态高亮 + 激活时光标变复制样式 */
 .pop-btn.active{background:#ffe9a8;outline:1px solid #d9a400;}
-.pop-rule-wrap{position:relative;}
+.pop-rule-wrap{position:relative;display:flex;flex-wrap:nowrap;gap:4px;align-items:center;min-width:224px;}
 .pop-rule-sub{display:none;position:absolute;left:100%;top:-4px;margin-left:4px;min-width:120px;max-height:260px;overflow-y:auto;background:#fff;border:1px solid var(--border);border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,.15);z-index:61;padding:4px 0;}
 .pop-rule-sub .ctx-item{display:block;width:100%;text-align:left;padding:4px 10px;border:none;background:none;cursor:pointer;font-size:13px;white-space:nowrap;}
 .pop-rule-sub .ctx-item:hover{background:#f0f0f0;}
@@ -5994,8 +6688,15 @@ body.paint-mode{cursor:copy;}
 #finishModalBg{position:fixed;inset:0;z-index:70;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
 #historyModalBg{position:fixed;inset:0;z-index:70;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
 #helpModalBg{position:fixed;inset:0;z-index:65;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+#historyTable{table-layout:fixed;}
 #historyTable th{position:sticky;top:0;background:#f4f6f9;}
 #historyTable td{word-break:break-all;vertical-align:top;}
+/* 历史记录行：文件名支持 inline rename、路径三行 clamp、✎ 图标 */
+.hist-name-display {display:inline-block;max-width:calc(100% - 20px);word-break:break-all;line-height:1.4;}
+.hist-rename-icon {display:inline-block;cursor:pointer;margin-left:4px;color:#666;font-size:12px;vertical-align:middle;}
+.hist-rename-input {font-size:12px;padding:2px 3px;margin:2px 0;background:#fafafa;border:1px solid #ddd;border-radius:3px;width:auto;}
+/* 路径列：最多 3 行，悬停显示完整路径 */
+#historyTable td.hist-path {display: -webkit-box;-webkit-line-clamp: 3;-webkit-box-orient: vertical;overflow: hidden;cursor:help;}
 .modal{background:#fff;border-radius:10px;padding:18px 22px;max-width:520px;width:92%;max-height:80vh;overflow:auto;}
 .modal h3{margin:0 0 10px;}
 .modal h4{margin:14px 0 6px;font-size:14px;color:#1c2733;}
@@ -6093,7 +6794,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <option value="fit">局部</option>
       <option value="inline">行内</option>
     </select>
-    <button type="button" id="imgExternalBtn" title="从本地文件选择图片，插入到文字光标处">外部</button>
+    <button type="button" id="imgExternalBtn" onmousedown="event.preventDefault()" title="从本地文件选择图片，插入到文字光标处">外部</button>
     <input type="file" id="imgExternalInput" accept="image/*" style="display:none"/>
   </div>
   <div class="tb-group" role="group" aria-label="搜索替换">
@@ -6145,6 +6846,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
     <div class="ctx-submenu" id="ctxExportSub">
       <button type="button" class="ctx-item" data-ctx-export="txt">txt格式</button>
       <button type="button" class="ctx-item" data-ctx-export="docx">docx格式</button>
+      <button type="button" class="ctx-item" data-ctx-export="md">md格式</button>
       <button type="button" class="ctx-item" data-ctx-export="epub">epub格式</button>
     </div>
   </div>
@@ -6199,9 +6901,10 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
 </div></div>
 <div id="exportModalBg"><div class="modal search-modal">
   <div class="search-head"><h3>导出</h3><button type="button" id="exportCloseBtn" class="x-btn" title="关闭导出" aria-label="关闭导出">✕</button></div>
-  <p class="export-desc">把全部页面的文字（含未保存的修改）导出为文本文件；点击下方按钮后弹出窗口选择保存位置。DOCX 中标题自动加粗加大，并带章节大纲。</p>
+  <p class="export-desc">把全部页面的文字（含未保存的修改）导出为文件；点击下方按钮后弹出窗口选择保存位置。DOCX 中标题自动加粗加大并居中，带章节大纲；对齐、缩进等段落格式同步导出；Markdown 与界面规则保持一致。</p>
   <div class="export-actions">
     <button type="button" id="exportDocxBtn" title="导出为 Word 文档（.docx）">导出为 DOCX</button>
+    <button type="button" id="exportMdBtn" title="导出为 Markdown 文件（.md）">导出为 MD</button>
     <button type="button" id="exportTxtBtn" class="primary" title="导出为纯文本文件（.txt）">导出为 TXT</button>
   </div>
 </div></div>
@@ -6308,6 +7011,12 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   <div style="margin-bottom:8px;">
     <label style="font-size:13px;">规则名称 <input type="text" id="frName" placeholder="如：书名标题" style="width:240px;"></label>
   </div>
+  <div style="margin-bottom:8px;">
+    <label style="font-size:13px;">快捷位 <input type="checkbox" id="frPin"></label>
+  </div>
+  <div style="margin-bottom:8px;">
+    <label style="font-size:13px;">简称 <input type="text" id="frLabel" maxlength="4" placeholder="如：标"></label>
+  </div>
   <div style="margin-bottom:10px;font-size:13px;color:#33414f;">
     求值模式
     <select id="frMode">
@@ -6334,19 +7043,19 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
     <button type="button" id="frFmtCancelBtn">取消</button>
   </div>
 </div></div>
-<div id="historyModalBg"><div class="modal" style="max-width:780px;">
+<div id="historyModalBg"><div class="modal" style="max-width:960px; min-width:360px;">
   <h3>历史记录</h3>
   <p style="font-size:12px;color:#5a6b7c;">本地矫正缓存（同一文件保留多个版本，v1 为最新）。文件名与路径分列显示，同名不同路径的文件可区分；勾选后可删除或导出（支持多选）。</p>
   <div style="max-height:50vh;overflow:auto;border:1px solid var(--border);border-radius:4px;margin-top:6px;">
     <table id="historyTable" style="width:100%;border-collapse:collapse;font-size:13px;">
       <thead><tr style="text-align:left;color:#33414f;">
-        <th style="padding:6px 8px;border-bottom:1px solid var(--border);"><input type="checkbox" id="historyCheckAll" title="全选"></th>
-        <th style="padding:6px 8px;border-bottom:1px solid var(--border);">文件名</th>
-        <th style="padding:6px 8px;border-bottom:1px solid var(--border);">文件路径</th>
-        <th style="padding:6px 8px;border-bottom:1px solid var(--border);">版本</th>
-        <th style="padding:6px 8px;border-bottom:1px solid var(--border);">更新时间</th>
-        <th style="padding:6px 8px;border-bottom:1px solid var(--border);">校正页码</th>
-        <th style="padding:6px 8px;border-bottom:1px solid var(--border);">操作</th>
+        <th style="padding:6px 8px;border-bottom:1px solid var(--border);width:34px;"><input type="checkbox" id="historyCheckAll" title="全选"></th>
+        <th style="padding:6px 8px;border-bottom:1px solid var(--border);width:20%;">文件名</th>
+        <th style="padding:6px 8px;border-bottom:1px solid var(--border);width:32%;">文件路径</th>
+        <th style="padding:6px 8px;border-bottom:1px solid var(--border);width:7%;">版本</th>
+        <th style="padding:6px 8px;border-bottom:1px solid var(--border);width:16%;">更新时间</th>
+        <th style="padding:6px 8px;border-bottom:1px solid var(--border);width:11%;">校正页码</th>
+        <th style="padding:6px 8px;border-bottom:1px solid var(--border);width:8%;">操作</th>
       </tr></thead>
       <tbody></tbody>
     </table>

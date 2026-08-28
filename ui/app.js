@@ -8,6 +8,7 @@ const OPS = [
   ['bold','粗体'], ['italic','斜体'], ['heading','标题'], ['p','正文'],
   ['remove','清除格式'], ['note','注释'],
   ['align_left','居左'], ['align_center','居中'], ['align_right','居右'],
+  ['centerbold','居中加粗'], ['merge','合并段落'], ['popup','弹出菜单'],
   ['marker_full','全文标记'], ['marker_note','注释标记'], ['marker_join','段落标记'],
   ['marker_page','换页标记'],
   ['flush','顶格'], ['indent','缩进'],
@@ -25,12 +26,14 @@ const OP_ICON = {
   heading:'<span class="ic-h">标</span>', p:'<span class="ic-p">正</span>',
   remove:'<span class="ic-t">清</span>', note:'注',
   align_left:'左', align_center:'中', align_right:'右',
+  centerbold:'中粗', merge:'合',
   marker_full:'篇', marker_note:'释', marker_join:'段', marker_page:'页'
 };
 const OP_TIP = {
   bold:'粗体', italic:'斜体', heading:'标题（循环 H1→H6→正文）', p:'正文',
   remove:'清除格式', note:'注释格式（整段小字）',
   align_left:'居左', align_center:'居中', align_right:'居右',
+  centerbold:'居中加粗（转为正文段落并居中加粗）', merge:'合并选中段落', popup:'弹出选中菜单',
   marker_full:'全文标记（文章到此结束，开新页）',
   marker_note:'注释标记（由对应注释段落替换）',
   marker_join:'段落标记（段首合上段，段尾合下段）',
@@ -41,6 +44,7 @@ const DEFAULTS = {
   bold:'Ctrl+B', italic:'Ctrl+I', heading:'Ctrl+1', p:'Ctrl+0',
   note:'Ctrl+Shift+N',
   align_left:'Ctrl+Shift+Left', align_center:'Ctrl+Shift+Up', align_right:'Ctrl+Shift+Right',
+   centerbold:'Alt+B', merge:'Alt+G', popup:'Alt+P',
   marker_full:'Ctrl+Shift+F', marker_note:'Ctrl+Shift+M', marker_join:'Ctrl+Shift+J',
   marker_page:'Ctrl+Shift+P',
   // 工具操作默认快捷键
@@ -172,12 +176,19 @@ function inlineToMd(t) {
 }
 function htmlToMd(html) {
   // 已清洗 HTML（p/h1-6/strong/em/br/span）→ markdown 源码；标记 span 原样保留
+  // 修复 Markdown↔富文本切换丢失格式：带 class/data-* 的块级标签原样保留为 raw HTML，
+  // mdToHtml 会原样输出（/^<(p|h[1-6]|div)(\s|>)/i.test(line) 分支），实现格式无损往返。
   let s = String(html || '');
   s = s.replace(/<br\s*\/?>/gi, '\n');
-  s = s.replace(/<h([1-6])([^>]*)>([\s\S]*?)<\/h\1>/gi, function(m, l, a, inner) {
-    return new Array(Number(l) + 1).join('#') + ' ' + inlineToMd(inner).trim() + '\n\n';
+  s = s.replace(/<(h[1-6]|p|div)(\s[^>]*)>([\s\S]*?)<\/\1>/gi, function(m, tag, attrs, inner) {
+    // 带 class 或 data-* 属性的块：原样保留 raw HTML 供 mdToHtml 原样输出
+    if (attrs && /class=|data-/.test(attrs)) return m;
+    if (tag[0] === 'h') {
+      const l = Number(tag[1]);
+      return new Array(l + 1).join('#') + ' ' + inlineToMd(inner).trim() + '\n\n';
+    }
+    return inlineToMd(inner).trim() + '\n\n';
   });
-  s = s.replace(/<p([^>]*)>([\s\S]*?)<\/p>/gi, function(m, a, inner) { return inlineToMd(inner).trim() + '\n\n'; });
   s = inlineToMd(s);
   s = s.replace(/\n{3,}/g, '\n\n');
   return s.trim();
@@ -561,11 +572,30 @@ function insertImage(row, i) {
 
 // 把 dataUrl 图片插入到第 i 页文字光标处（整页图插入 / 外部插入 / 裁剪插入共用）。
 // modeOverride 可选：显式指定插入模式（full/fit/inline），缺省读 imgModeSel 下拉框。
+function viewportPage() {
+  // 当前视口顶部可见的页行索引：滚动到第 N 页时（即使未聚焦），插入目标页 = N。
+  // 复用 updateViewport 的二分查找逻辑（prefixTop + scrollY），但不依赖任何行存活。
+  const hostTop = host.getBoundingClientRect().top + window.scrollY;
+  const y = Math.max(0, window.scrollY - hostTop - 60);
+  let lo = 0, hi = pages.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (prefixTop(mid) < y) lo = mid + 1; else hi = mid; }
+  return lo < pages.length ? lo : 0;
+}
 function insertImageDataUrl(dataUrl, size, i, modeOverride) {
   let ed = null;
   if (i != null) {
     const row = host.querySelector('.page-row[data-i="' + i + '"]');
     ed = row ? row.querySelector('.editable') : null;
+  }
+  // 修复：插入图片时目标页优先取当前视口页（用户滚动到第 N 页后点击工具栏「图」按钮），
+  // 而非 currentEditable()（可能停留在更早聚焦的上一页）。仅当视口页解析失败才回退焦点启发式。
+  if (!ed) {
+    const vp = viewportPage();
+    if (vp != null && vp >= 0) {
+      const row = host.querySelector('.page-row[data-i="' + vp + '"]');
+      ed = row ? row.querySelector('.editable') : null;
+      if (ed) i = vp;
+    }
   }
   if (!ed) ed = currentEditable();
   if (!ed) { showToast('未找到可插入的编辑区', 'fail'); return; }
@@ -755,8 +785,11 @@ function openCrop(row, i) {
     if (!file) return;
     const fr = new FileReader();
     fr.onload = () => {
-      const ed = currentEditable();
-      const row = ed ? ed.closest('.page-row') : null;
+      // 修复：插入图片目标页优先取当前视口页（而非 currentEditable() 可能落在上一页）
+      const vp = viewportPage();
+      const row = (vp != null && vp >= 0)
+        ? host.querySelector('.page-row[data-i="' + vp + '"]')
+        : null;
       insertImageDataUrl(fr.result, file.size, row ? Number(row.dataset.i) : null);
     };
     fr.onerror = () => showToast('读取图片失败', 'fail');
@@ -1311,8 +1344,15 @@ function applyOp(op) { const ed = currentEditable(); if (!ed) return;
      if (op === 'bold') applyToSelectedBlocks(ed, function() { withScrollStable(() => document.execCommand('bold')); });
      else if (op === 'italic') applyToSelectedBlocks(ed, function() { withScrollStable(() => document.execCommand('italic')); });
      else if (op === 'remove') applyToSelectedBlocks(ed, function() { withScrollStable(() => document.execCommand('removeFormat')); });
-     else if (op === 'p') applyToSelectedBlocks(ed, function(block) { _convertBlockTag(block, 'p'); }); // 与 heading 一致逐块转换（execCommand formatBlock 对跨块选区只转起始块）
-     else if (op === 'merge') _mergeSelectedBlocks(ed);
+      else if (op === 'p') applyToSelectedBlocks(ed, function(block) { _convertBlockTag(block, 'p'); }); // 与 heading 一致逐块转换（execCommand formatBlock 对跨块选区只转起始块）
+      else if (op === 'centerbold') applyToSelectedBlocks(ed, function(block) {
+        // 顺序：先设对齐（_convertBlockTag 会保留 class）→ 再加粗（selection 仍指向原 block）→ 最后转 <p>
+        block.classList.remove('ptoe-align-left', 'ptoe-align-right');
+        block.classList.add('ptoe-align-center');
+        withScrollStable(() => document.execCommand('bold'));
+        _convertBlockTag(block, 'p');
+      });
+      else if (op === 'merge') _mergeSelectedBlocks(ed);
      syncContent(ed);
      if (row) { markDirty(i); scheduleRemeasure(i); }
    });
@@ -1999,44 +2039,164 @@ function onHistoryImportFile(e) {
 }
 function historyRow(it) {
   const tr = document.createElement('tr');
-  const tdCheck = document.createElement('td'); tdCheck.style.padding = '6px 8px';
+  tr.dataset.histId = it.id; // 添加数据属性供前端定位
+  const tdCheck = document.createElement('td'); tdCheck.style.padding = '4px 6px';
   const cb = document.createElement('input');
   cb.type = 'checkbox'; cb.className = 'hist-check'; cb.dataset.id = it.id;
   tdCheck.appendChild(cb);
-  const tdName = document.createElement('td'); tdName.style.padding = '6px 8px'; tdName.textContent = it.name;
-  const tdPath = document.createElement('td'); tdPath.style.padding = '6px 8px'; tdPath.style.color = '#5a6b7c'; tdPath.textContent = it.path;
-  const tdVer = document.createElement('td'); tdVer.style.padding = '6px 8px'; tdVer.textContent = 'v' + (it.version || 1);
-  const tdTime = document.createElement('td'); tdTime.style.padding = '6px 8px'; tdTime.style.color = '#5a6b7c'; tdTime.textContent = it.updated;
-  const tdProof = document.createElement('td'); tdProof.style.padding = '6px 8px'; tdProof.style.color = '#5a6b7c'; tdProof.textContent = it.last_proofread_page ? '校正至第 ' + it.last_proofread_page + ' 页' : '-';
-  const tdOp = document.createElement('td'); tdOp.style.padding = '6px 8px';
+  // 文件名单元格：支持 inline rename（点 ✎ 进入编辑模式）
+  const tdName = document.createElement('td'); tdName.style.padding = '4px 6px'; tdName.style.fontSize = '12px';
+  // 显示名优先用 display_name（重命名结果），否则回退 name（2026-08-28 修复：
+  // 此前用 it.name 导致重命名后 loadHistory 重绘仍显示旧名，重命名「不生效」）
+  const shownName = it.display_name || it.name || '';
+  const nameSpan = document.createElement('span'); nameSpan.className = 'hist-name-display'; nameSpan.textContent = shownName;
+  const nameIcon = document.createElement('span'); nameIcon.className = 'hist-rename-icon'; nameIcon.textContent = '✎'; nameIcon.title = '重命名';
+  const renameInput = document.createElement('input'); renameInput.type = 'text'; renameInput.className = 'hist-rename-input'; renameInput.value = shownName; renameInput.style.display = 'none'; renameInput.style.width = '100%'; renameInput.style.boxSizing = 'border-box'; renameInput.style.padding = '2px 3px'; renameInput.style.margin = '2px 0';
+  tdName.appendChild(nameSpan); tdName.appendChild(nameIcon); tdName.appendChild(renameInput);
+  // 点击 ✎ 进入重命名模式
+  nameIcon.addEventListener('click', (e) => {
+    e.stopPropagation(); // 防止冲击 td 选中
+    nameSpan.style.display = 'none';
+    nameIcon.style.display = 'none';
+    renameInput.style.display = 'inline';
+    renameInput.focus();
+    // 监听 Enter 确认、Esc 取消、blur 兜底确认
+    const onKeyDown = (e) => { if (e.key === 'Enter') { renameInput.blur(); } else if (e.key === 'Escape') { cancelRename(it.id); } };
+    const onBlur = () => { renameInput.blur(); commitRename(it.id, renameInput.value, shownName); };
+    renameInput.addEventListener('keydown', onKeyDown);
+    renameInput.addEventListener('blur', onBlur);
+  });
+  // 点击名称文本也可进入重命名（次要入口）
+  nameSpan.addEventListener('click', (e) => { e.stopPropagation(); nameIcon.click(); });
+  const tdPath = document.createElement('td'); tdPath.className = 'hist-path'; tdPath.style.padding = '4px 6px'; tdPath.style.color = '#5a6b7c'; tdPath.style.fontSize = '12px'; tdPath.title = it.path || '';
+  tdPath.textContent = it.path || '';
+  const tdVer = document.createElement('td'); tdVer.style.padding = '4px 6px'; tdVer.style.fontSize = '12px'; tdVer.textContent = 'v' + (it.version || 1);
+  const tdTime = document.createElement('td'); tdTime.style.padding = '4px 6px'; tdTime.style.color = '#5a6b7c'; tdTime.style.fontSize = '12px'; tdTime.textContent = it.updated;
+  const tdProof = document.createElement('td'); tdProof.style.padding = '4px 6px'; tdProof.style.color = '#5a6b7c'; tdProof.style.fontSize = '12px'; tdProof.textContent = it.last_proofread_page ? '校正至第 ' + it.last_proofread_page + ' 页' : '-';
+  const tdOp = document.createElement('td'); tdOp.style.padding = '4px 6px';
   const btn = document.createElement('button');
-  btn.type = 'button'; btn.textContent = '打开';
-  btn.title = '把该版本的文本重新载入编辑器进行再次矫正（覆盖当前未保存的修改）';
-  btn.addEventListener('click', () => loadHistoryVersion(it.id, it.name, it.version || 1));
-  const btnExport = document.createElement('button');
-  btnExport.type = 'button'; btnExport.textContent = '导出';
-  btnExport.title = '把该版本导出为 ZIP 压缩包（含预览图），可在其他电脑通过「导入」继续矫正';
-  btnExport.addEventListener('click', () => exportHistoryVersion(it.id));
+  btn.type = 'button'; btn.textContent = '打开'; btn.title = '把该版本的文本重新载入编辑器进行再次矫正（覆盖当前未保存的修改）';
+  btn.addEventListener('click', () => loadHistoryVersion(it.id, shownName, it.version || 1));
   tdOp.appendChild(btn);
-  tdOp.appendChild(btnExport);
+  // 已移除 per-record '导出' 按钮——导出改为 toolbar 多选 ZIP
   tr.append(tdCheck, tdName, tdPath, tdVer, tdTime, tdProof, tdOp);
   return tr;
 }
+
+// 在提交重命名：Enter/blur 确认，Esc 取消（不改动 UI）
+function commitRename(id, newName, originalName) {
+  const trimmed = (newName || '').trim();
+  // 守卫：若新名为空或与原名完全相同，仅在本地恢复 UI 而不发送 fetch
+  if (!trimmed || trimmed === originalName) {
+    // 找到对应行的 rename UI 元素并还原
+    const tr = document.querySelector(`tr[data-hist-id="${id}"]`);
+    if (tr) {
+      const nameSpan = tr.querySelector('.hist-name-display');
+      const nameIcon = tr.querySelector('.hist-rename-icon');
+      const renameInput = tr.querySelector('.hist-rename-input');
+      if (nameSpan && nameIcon && renameInput) {
+        renameInput.style.display = 'none';
+        nameSpan.style.display = '';
+        nameIcon.style.display = '';
+        nameSpan.textContent = originalName || '';
+      }
+    }
+    return; // 无需 fetch
+  }
+  fetch('/api/history/rename', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, newName: trimmed })
+  }).then(async res => {
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      showToast(j && j.error ? j.error : '重命名失败', 'fail');
+      // 恢复 UI 状态
+      const tr = document.querySelector(`tr[data-hist-id="${id}"]`);
+      if (tr) {
+        const nameSpan = tr.querySelector('.hist-name-display');
+        const nameIcon = tr.querySelector('.hist-rename-icon');
+        const renameInput = tr.querySelector('.hist-rename-input');
+        if (nameSpan && nameIcon && renameInput) {
+          renameInput.style.display = 'none';
+          nameSpan.style.display = '';
+          nameIcon.style.display = '';
+          nameSpan.textContent = originalName || '';
+        }
+      }
+      return;
+    }
+    const j = await res.json();
+    if (j.ok) {
+      showToast('重命名成功', 'ok');
+      loadHistory();
+    } else {
+      showToast(j.error || '重命名失败', 'fail');
+      // 恢复 UI 状态
+      const tr = document.querySelector(`tr[data-hist-id="${id}"]`);
+      if (tr) {
+        const nameSpan = tr.querySelector('.hist-name-display');
+        const nameIcon = tr.querySelector('.hist-rename-icon');
+        const renameInput = tr.querySelector('.hist-rename-input');
+        if (nameSpan && nameIcon && renameInput) {
+          renameInput.style.display = 'none';
+          nameSpan.style.display = '';
+          nameIcon.style.display = '';
+          nameSpan.textContent = originalName || '';
+        }
+      }
+    }
+  }).catch(e => {
+    showToast('重命名失败：' + e, 'fail');
+    // 恢复 UI 状态
+    const tr = document.querySelector(`tr[data-hist-id="${id}"]`);
+    if (tr) {
+      const nameSpan = tr.querySelector('.hist-name-display');
+      const nameIcon = tr.querySelector('.hist-rename-icon');
+      const renameInput = tr.querySelector('.hist-rename-input');
+      if (nameSpan && nameIcon && renameInput) {
+        renameInput.style.display = 'none';
+        nameSpan.style.display = '';
+        nameIcon.style.display = '';
+        nameSpan.textContent = originalName || '';
+      }
+    }
+  });
+}
+
+function cancelRename(id) {
+  // 找到对应行的 rename UI 元素并还原
+  const tr = document.querySelector(`tr[data-hist-id="${id}"]`);
+  if (tr) {
+    const nameSpan = tr.querySelector('.hist-name-display');
+    const nameIcon = tr.querySelector('.hist-rename-icon');
+    const renameInput = tr.querySelector('.hist-rename-input');
+    if (nameSpan && nameIcon && renameInput) {
+      renameInput.style.display = 'none';
+      nameSpan.style.display = '';
+      nameIcon.style.display = '';
+      // 还原为原名（从 input 的最初值保存，这里通过重新获取原名）
+      // 由于输入已失焦，我们通过行的 data 属性或全局状态恢复
+      // 最简单的做法是重新加载历史
+      loadHistory();
+    }
+  }
+}
 async function loadHistory() {
   const tbody = document.querySelector('#historyTable tbody');
-  tbody.innerHTML = '<tr><td colspan="6" style="padding:12px;color:#9aa7b4;">加载中 ...</td></tr>';
+  tbody.innerHTML = '<tr><td colspan="7" style="padding:12px;color:#9aa7b4;">加载中 ...</td></tr>';
   document.getElementById('historyCheckAll').checked = false;
   try {
     const res = await fetchJSON('/api/history');
     const items = res.items || [];
     tbody.innerHTML = '';
     if (!items.length) {
-      tbody.innerHTML = '<tr><td colspan="6" style="padding:12px;color:#9aa7b4;">暂无历史记录</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="7" style="padding:12px;color:#9aa7b4;">暂无历史记录</td></tr>';
       return;
     }
     for (const it of items) tbody.appendChild(historyRow(it));
   } catch (e) {
-    tbody.innerHTML = '<tr><td colspan="5" style="padding:12px;color:#b3543a;">加载失败: ' + e + '</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" style="padding:12px;color:#b3543a;">加载失败: ' + e + '</td></tr>';
   }
 }
 function openHistory() { loadHistory(); document.getElementById('historyModalBg').style.display = 'flex'; }
@@ -2263,29 +2423,26 @@ document.getElementById('historyImportBtn').addEventListener('click', importHist
 document.getElementById('historyImportFile').addEventListener('change', onHistoryImportFile);
 
 // ---------- 弹出快捷菜单（图标 + 悬停提示，置于选中文字正上方） ----------
+function _makePopBtn(op) {
+  const b = document.createElement('button');
+  b.type = 'button'; b.className = 'pop-btn'; b.dataset.op = op;
+  b.innerHTML = OP_ICON[op] || op;
+  b.setAttribute('aria-label', OP_TIP[op] || op);
+  b.addEventListener('mouseenter', scheduleTip);
+  b.addEventListener('mouseleave', hideTip);
+  b.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    hideTip();
+    suppressPopupUntil = performance.now() + 250;
+    applyOp(op); hidePopup();
+  });
+  return b;
+}
 function buildPopup() {
   popup.innerHTML = '';
-  // 快捷菜单显示格式按钮（OPS 前 9 项：粗体/斜体/标题/正文/清除/注释/居左/居中/居右）；标记按钮已移至工具栏；规则按钮单独追加
-  const ops = OPS.slice(0, 9);
-  const groups = [ops.slice(0, 7), ops.slice(7)];
-  groups.forEach((group, gi) => {
-    if (gi > 0) { const d = document.createElement('div'); d.className = 'sep'; popup.appendChild(d); }
-    for (const op of group.map(g => g[0])) {
-      const b = document.createElement('button');
-      b.type = 'button'; b.className = 'pop-btn'; b.dataset.op = op;
-      b.innerHTML = OP_ICON[op] || op;
-      b.setAttribute('aria-label', OP_TIP[op] || op);
-      b.addEventListener('mouseenter', scheduleTip);
-      b.addEventListener('mouseleave', hideTip);
-      b.addEventListener('mousedown', (e) => {
-        e.preventDefault();
-        hideTip();
-        suppressPopupUntil = performance.now() + 250;
-        applyOp(op); hidePopup();
-      });
-      popup.appendChild(b);
-    }
-  });
+  // Row1：格式按钮 + 格式刷
+  const row1Ops = ['bold','italic','heading','p','remove','note'];
+  row1Ops.forEach(function(op) { popup.appendChild(_makePopBtn(op)); });
   // 格式刷（单次模式）
   const paintBtn = document.createElement('button');
   paintBtn.type = 'button'; paintBtn.className = 'pop-btn'; paintBtn.id = 'popPaint';
@@ -2301,8 +2458,14 @@ function buildPopup() {
     if (paintActive) applyPaint(); else activatePaint();
   });
   popup.appendChild(paintBtn);
-  // 规则按钮 + 子菜单（改为点击展开，不再依赖 hover）
-  const sep = document.createElement('div'); sep.className = 'sep'; popup.appendChild(sep);
+  // 分隔
+  const sep1 = document.createElement('div'); sep1.className = 'sep'; popup.appendChild(sep1);
+  // Row2：对齐 + 中粗 + 合并
+  const row2Ops = ['align_left','align_center','align_right','centerbold','merge'];
+  row2Ops.forEach(function(op) { popup.appendChild(_makePopBtn(op)); });
+  // 分隔
+  const sep2 = document.createElement('div'); sep2.className = 'sep'; popup.appendChild(sep2);
+  // Row3：规则按钮 + 内联规则快捷按钮（最多5个，单行显示，优先显示 pinned 规则）
   const ruleWrap = document.createElement('div');
   ruleWrap.className = 'pop-rule-wrap';
   const ruleBtn = document.createElement('button');
@@ -2310,53 +2473,29 @@ function buildPopup() {
   ruleBtn.textContent = '规'; ruleBtn.title = '应用格式规则';
   ruleBtn.setAttribute('aria-label', '应用格式规则');
   ruleWrap.appendChild(ruleBtn);
-  const ruleSub = document.createElement('div');
-  ruleSub.className = 'pop-rule-sub';
-  ruleSub.innerHTML = '<div class="ctx-empty">加载中…</div>';
-  ruleWrap.appendChild(ruleSub);
-  let _ruleSubOpen = false;
-  function _toggleRuleSub() {
-    _ruleSubOpen = !_ruleSubOpen;
-    ruleSub.style.display = _ruleSubOpen ? 'block' : 'none';
-    if (_ruleSubOpen) _refreshPopRuleSub(ruleSub);
-  }
-  ruleBtn.addEventListener('mousedown', (e) => {
-    e.preventDefault();
-    suppressPopupUntil = performance.now() + 250;
-    hideTip();
-  });
-  ruleBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    _toggleRuleSub();
-  });
-  // 点击 popup 外部（或规则子菜单项）自动关闭子菜单
-  ruleSub.addEventListener('mousedown', (e) => {
-    if (e.target.closest('.ctx-item')) {
-      _ruleSubOpen = false;
-      ruleSub.style.display = 'none';
-    }
-  });
-  popup.appendChild(ruleWrap);
-}
-function _refreshPopRuleSub(box) {
-  if (box.dataset.loaded) return;
-  box.innerHTML = '<div class="ctx-empty">加载中…</div>';
+  // Fetch rules and render up to 5 buttons (pinned first)
   fetchJSON('/api/format_rules').then(function (res) {
     const rules = (res && res.rules) || [];
-    box.innerHTML = '';
-    if (!rules.length) {
-      const empty = document.createElement('div');
-      empty.className = 'ctx-empty';
-      empty.textContent = '暂无规则';
-      box.appendChild(empty);
-      return;
+    if (!rules.length) return;
+    // Select rules to show: pinned ones first, up to 5; if none pinned, then first 5 rules.
+    const pinnedRules = rules.filter(function (rule) { return rule.pin === true; });
+    let rulesToShow;
+    if (pinnedRules.length > 0) {
+      rulesToShow = pinnedRules.slice(0, 5);
+    } else {
+      rulesToShow = rules.slice(0, 5);
     }
-    rules.forEach(function (rule) {
+    rulesToShow.forEach(function (rule) {
       const btn = document.createElement('button');
       btn.type = 'button';
-      btn.className = 'ctx-item';
-      btn.textContent = rule.name || '（未命名规则）';
+      btn.className = 'pop-btn';
+      // 显示第一个字符：label 或 name 的第一个字符，空则 '规'
+      const nm = (rule.label && rule.label.trim()) || (rule.name || '');
+      btn.textContent = nm.trim().charAt(0) || '规';
       btn.title = '应用规则「' + (rule.name || '') + '」';
+      btn.setAttribute('aria-label', '应用规则：' + (rule.name || ''));
+      btn.addEventListener('mouseenter', scheduleTip);
+      btn.addEventListener('mouseleave', hideTip);
       btn.addEventListener('mousedown', (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -2365,19 +2504,34 @@ function _refreshPopRuleSub(box) {
         const ed = currentEditable();
         if (ed) applyFormatRule(rule, ed);
       });
-      box.appendChild(btn);
+      ruleWrap.appendChild(btn);
     });
-    box.dataset.loaded = '1';
-  }).catch(function () {
-    box.innerHTML = '<div class="ctx-empty">加载失败</div>';
+  }).catch(function () {});
+
+  // Rule button click: open the rules modal
+  ruleBtn.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    suppressPopupUntil = performance.now() + 250;
+    hideTip();
   });
+  ruleBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openFormatRulesModal();
+    hidePopup();
+  });
+
+  popup.appendChild(ruleWrap);
 }
+
 function hidePopup() { hideTip(); popup.style.display = 'none'; }
 function showPopup(range) {
   buildPopup();
   popup.style.display = 'flex';
   const r = popup.getBoundingClientRect();
-  const rect = range.getBoundingClientRect();
+  // 跨页/多段选择时 getBoundingClientRect 返回覆盖全选区的巨大矩形，
+  // 优先用第一块 client rect 定位，保证菜单出现在选中起点上方。
+  const rects = range.getClientRects();
+  const rect = (rects && rects.length > 0) ? rects[0] : range.getBoundingClientRect();
   let left = rect.left + rect.width / 2 - r.width / 2;
   left = Math.max(8, Math.min(left, window.innerWidth - r.width - 8));
   let top = rect.top - r.height - 8;   // 选中文字正上方，不遮盖选中内容
@@ -2388,14 +2542,30 @@ function showPopup(range) {
 // 选中文字 → 弹出快捷菜单。触发点：mouseup（鼠标框选）与 keyup（Shift+方向键
 // 键盘选择）；Ctrl/Meta/Alt 组合键是快捷键操作，不弹菜单。点击操作按钮后
 // suppressPopupUntil 窗口内不弹（避免格式操作后菜单反复弹出）。
+// 从选区推断所属 .editable：优先 commonAncestorContainer，跨页（多个
+// .editable）时 commonAncestor 落在 #pages 容器上，closest('.editable')
+// 为空，改从 startContainer / endContainer / anchorNode / focusNode 推断。
+function _editableFromSelection(range, sel) {
+  const candidates = [];
+  const add = (node) => {
+    if (node) {
+      const el = node.nodeType === 3 ? node.parentNode : node;
+      if (el && el.closest) candidates.push(el.closest('.editable'));
+    }
+  };
+  add(range.commonAncestorContainer);
+  add(range.startContainer);
+  add(range.endContainer);
+  if (sel) { add(sel.anchorNode); add(sel.focusNode); }
+  for (const c of candidates) { if (c) return c; }
+  return null;
+}
 function maybeShowPopup() {
   if (performance.now() < suppressPopupUntil) return;
   const sel = window.getSelection();
   if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { hidePopup(); return; }
   const range = sel.getRangeAt(0);
-  let n = range.commonAncestorContainer;
-  if (n && n.nodeType === 3) n = n.parentNode;
-  const ed = n && n.closest ? n.closest('.editable') : null;
+  const ed = _editableFromSelection(range, sel);
   if (!ed) { hidePopup(); return; }
   showPopup(range);
 }
@@ -2409,10 +2579,9 @@ document.addEventListener('selectionchange', () => {
   hideErrPopup();
   // 记录选区（仅在 .editable 内且非折叠时）
   if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
-    const node = sel.getRangeAt(0).commonAncestorContainer;
-    const el = node && node.nodeType === 3 ? node.parentNode : node;
-    if (el && el.closest && el.closest('.editable')) {
-      _lastEditableRange = sel.getRangeAt(0).cloneRange();
+    const range = sel.getRangeAt(0);
+    if (_editableFromSelection(range, sel)) {
+      _lastEditableRange = range.cloneRange();
     }
   }
 });
@@ -2929,16 +3098,33 @@ function renderProofread(i) {
   // 幂等：先清除本页既有标注（与 clearProofread 同构），避免重复叠加
   const _fixes = ed.querySelectorAll('.ptoe-fix');
   for (const el of _fixes) el.parentNode.removeChild(el);
-  const _errs = ed.querySelectorAll('.ptoe-err');
-  for (const el of _errs) {
-    const t = document.createTextNode(el.textContent);
-    el.parentNode.replaceChild(t, el);
-  }
+   const _errs = ed.querySelectorAll('.ptoe-err');
+   for (const el of _errs) {
+     if (el.dataset.errEmpty) { el.parentNode.removeChild(el); }
+     else { const t = document.createTextNode(el.textContent); el.parentNode.replaceChild(t, el); }
+   }
   ed.normalize();
   // 倒序处理，避免 DOM 修改影响后续偏移
   for (let k = errors.length - 1; k >= 0; k--) {
     const err = errors[k];
     if (err._gone) continue; // F5: 已标记消失的条目跳过渲染
+    // 空白页填充：wrong 为空表示插入到空白页，无文本节点可包裹 → 直接插入候选文本
+    if (!err.wrong && err.start === 0 && err.end === 0 && Array.isArray(err.candidates) && err.candidates.length) {
+      const frag = document.createDocumentFragment();
+      const sEl = document.createElement('s');
+      sEl.className = 'ptoe-err';
+      sEl.setAttribute('data-err-i', k);
+      sEl.setAttribute('data-err-empty', '1');
+      sEl.textContent = err.candidates[0];
+      frag.appendChild(sEl);
+      const fixEl = document.createElement('span');
+      fixEl.className = 'ptoe-fix';
+      fixEl.setAttribute('data-err-i', k);
+      fixEl.textContent = err.candidates[0];
+      frag.appendChild(fixEl);
+      ed.insertBefore(frag, ed.firstChild);
+      continue;
+    }
     // Phase 1: 收集与 [err.start, err.end) 相交的文本节点（不修改树，偏移稳定）
     const segs = [];
     {
@@ -3031,8 +3217,8 @@ function clearProofread(i, keepDismissed) {
   for (const el of fixes) el.parentNode.removeChild(el);
   const errs = ed.querySelectorAll('.ptoe-err');
   for (const el of errs) {
-    const t = document.createTextNode(el.textContent);
-    el.parentNode.replaceChild(t, el);
+    if (el.dataset.errEmpty) { el.parentNode.removeChild(el); }
+    else { const t = document.createTextNode(el.textContent); el.parentNode.replaceChild(t, el); }
   }
   ed.normalize();
   proofreadErrors[i] = [];
@@ -3089,8 +3275,8 @@ function _plainNoAnno(ed) {
   c.querySelectorAll('.ptoe-marker').forEach(function (el) { el.remove(); });
   c.querySelectorAll('.ptoe-fix').forEach(function (el) { el.parentNode.removeChild(el); });
   c.querySelectorAll('.ptoe-err').forEach(function (el) {
-    const t = document.createTextNode(el.textContent);
-    el.parentNode.replaceChild(t, el);
+    if (el.dataset.errEmpty) { el.parentNode.removeChild(el); }
+    else { const t = document.createTextNode(el.textContent); el.parentNode.replaceChild(t, el); }
   });
   c.normalize();
   return c.textContent || '';
@@ -3122,6 +3308,8 @@ function _proofreadAutoDismiss(ed, i, skipRender) {
     const delta = (ae - p) - (be - p);
     for (const err of errors) {
       if (err._gone) continue;
+      // 空白页填充：用户在空白页输入文字后，填充建议失效
+      if (!err.wrong && !before && after) { err._gone = true; changed = true; continue; }
       if (err.end <= p) continue;                     // 编辑点之前：不动
       if (err.start >= be) {                          // 编辑点之后：整体平移
         err.start += delta; err.end += delta;
@@ -3303,8 +3491,15 @@ async function runReocr() {
     if (proofreadErrors[i].length) {
       renderProofread(i);
       scheduleRemeasure(i);
-      setStatus('第 ' + page + ' 页重识别完成，标注 ' + proofreadErrors[i].length + ' 处差异');
-      showToast('第 ' + page + ' 页重识别完成，标注 ' + proofreadErrors[i].length + ' 处差异', 'ok');
+      // 空白页填充：wrong 为空的条目表示插入到空白页
+      const isEmptyFill = proofreadErrors[i].some(function (e) { return !e.wrong && e.start === 0 && e.end === 0; });
+      if (isEmptyFill) {
+        setStatus('第 ' + page + ' 页为空白页，检测到可填充内容，点击绿色建议插入');
+        showToast('第 ' + page + ' 页为空白页，检测到可填充内容，点击绿色建议插入', 'ok');
+      } else {
+        setStatus('第 ' + page + ' 页重识别完成，标注 ' + proofreadErrors[i].length + ' 处差异');
+        showToast('第 ' + page + ' 页重识别完成，标注 ' + proofreadErrors[i].length + ' 处差异', 'ok');
+      }
     } else {
       setStatus('第 ' + page + ' 页重识别完成，未发现差异');
       showToast('第 ' + page + ' 页重识别完成，未发现差异', 'ok');
@@ -3527,9 +3722,10 @@ document.getElementById('errNo').addEventListener('click', function () {
     const fixEl2 = ed.querySelector('.ptoe-fix[data-err-i="' + k + '"]');
     if (fixEl2) fixEl2.parentNode.removeChild(fixEl2);
     // 解包：每段 .ptoe-err 替换为等文本的 textNode（wrong 文本保留原位，不重定位）
+    // 空白页填充（data-err-empty）：忽略 = 移除建议，不插入任何文本
     for (const s of sEls) {
-      const t = document.createTextNode(s.textContent);
-      s.parentNode.replaceChild(t, s);
+      if (s.dataset.errEmpty) { s.parentNode.removeChild(s); }
+      else { const t = document.createTextNode(s.textContent); s.parentNode.replaceChild(t, s); }
     }
     ed.normalize();
     if (!proofreadDismissed[i]) proofreadDismissed[i] = new Set();
@@ -3812,26 +4008,70 @@ function renderFormatRules() {
     return;
   }
   formatRules.forEach(function (rule, idx) {
-    const tr = document.createElement('tr');
-    tr.innerHTML =
-      '<td class="fr-order">' + (idx + 1) + '</td>' +
-      '<td class="fr-name">' + _escHtml(rule.name) + '</td>' +
-      '<td class="fr-sum">' + _escHtml(condSummary(rule)) + '</td>' +
-      '<td style="white-space:nowrap;">' +
-        '<button type="button" class="fr-up" title="上移"' + (idx === 0 ? ' disabled' : '') + '>↑</button> ' +
-        '<button type="button" class="fr-down" title="下移"' + (idx === formatRules.length - 1 ? ' disabled' : '') + '>↓</button> ' +
-        '<button type="button" class="fr-apply">应用</button> ' +
-        '<button type="button" class="fr-edit">编辑</button> ' +
-        '<button type="button" class="fr-del">删除</button>' +
-      '</td>';
-    tr.querySelector('.fr-up').addEventListener('click', function () { moveFormatRule(rule, -1); });
-    tr.querySelector('.fr-down').addEventListener('click', function () { moveFormatRule(rule, 1); });
-    tr.querySelector('.fr-apply').addEventListener('click', function () {
-      if (applyFormatRule(rule)) closeFormatRulesModal();
-    });
-    tr.querySelector('.fr-edit').addEventListener('click', function () { editFormatRule(rule); });
-    tr.querySelector('.fr-del').addEventListener('click', function () { deleteFormatRule(rule); });
-    tbody.appendChild(tr);
+ const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td class="fr-order">' + (idx + 1) + '</td>' +
+        '<td class="fr-name">' + _escHtml(rule.name) + '</td>' +
+        '<td class="fr-pin">' +
+          '<input type="checkbox" class="fr-pin-checkbox"' + (rule.pin ? ' checked' : '') + '>' +
+        '</td>' +
+        '<td class="fr-label">' +
+          '<input type="text" class="fr-label-input" maxlength="4" value="' + _escHtml(rule.label || '') + '" placeholder="' + _escHtml((rule.name || '').trim().charAt(0) || '') + '">' +
+        '</td>' +
+        '<td class="fr-sum">' + _escHtml(condSummary(rule)) + '</td>' +
+        '<td style="white-space:nowrap;">' +
+          '<button type="button" class="fr-up" title="上移"' + (idx === 0 ? ' disabled' : '') + '>↑</button> ' +
+          '<button type="button" class="fr-down" title="下移"' + (idx === formatRules.length - 1 ? ' disabled' : '') + '>↓</button> ' +
+          '<button type="button" class="fr-apply">应用</button> ' +
+          '<button type="button" class="fr-edit">编辑</button> ' +
+          '<button type="button" class="fr-del">删除</button>' +
+        '</td>';
+      tbody.appendChild(tr);
+      // 上移/下移
+      const upBtn = tr.querySelector('.fr-up');
+      if (upBtn) upBtn.addEventListener('click', function () { moveFormatRule(rule, -1); });
+      const downBtn = tr.querySelector('.fr-down');
+      if (downBtn) downBtn.addEventListener('click', function () { moveFormatRule(rule, 1); });
+      // 应用
+      const applyBtn = tr.querySelector('.fr-apply');
+      if (applyBtn) applyBtn.addEventListener('click', function () { applyFormatRule(rule); });
+      // 编辑
+      const editBtn = tr.querySelector('.fr-edit');
+      if (editBtn) editBtn.addEventListener('click', function () { editFormatRule(rule); });
+      // 删除
+      const delBtn = tr.querySelector('.fr-del');
+      if (delBtn) delBtn.addEventListener('click', function () { deleteFormatRule(rule); });
+     // Pin toggle change event
+     const pinCheckbox = tr.querySelector('.fr-pin-checkbox');
+     pinCheckbox.addEventListener('change', function () {
+       // Update the rule's pin property
+       rule.pin = this.checked;
+       // We could persist immediately, but we'll let the user save via the save button.
+       // However, to keep the popup in sync, we might want to persist now? 
+       // The popup reads from formatRules array, so we need to update the array.
+       // We'll update the array and then persist to backend? 
+       // But the user might not want to save immediately. 
+       // However, the popup is built from the formatRules array, so we must update the array.
+       // We'll update the array and then call persistFormatRules to save to backend.
+       // This might be too frequent, but it's acceptable.
+       persistFormatRules();
+     });
+// Label input change event
+      const labelInput = tr.querySelector('.fr-label-input');
+      labelInput.addEventListener('input', function () {
+        // Trim and cap at 4 chars
+        let value = this.value.trim();
+        if (value.length > 4) {
+          value = value.substring(0, 4);
+          this.value = value;
+        }
+        rule.label = value;
+        // Do not persist on every keystroke; persist on change (blur)
+      });
+      labelInput.addEventListener('change', function () {
+        // Persist to backend
+        persistFormatRules();
+      });
   });
 }
 function moveFormatRule(rule, dir) {
@@ -4159,17 +4399,20 @@ function closeFmtPopup() {
   _frFmtMatchIdx = -1;
 }
 function editFormatRule(rule) {
-  formatRuleEditingId = rule.id || null;
-  document.getElementById('frName').value = rule.name || '';
-  document.getElementById('frMode').value = rule.mode || 'first';
-  renderConditions((rule.conditions || []).map(function (c) {
-    return { type: c.type, pattern: c.pattern, scope: c.scope, formats: (c.formats || []).slice(),
-      group_formats: (c.group_formats || []).map(function (g) { return (g || []).slice(); }),
-      match_formats: (c.match_formats || []).map(function (m) { return (m || []).slice(); }),
-      target: c.target || 'match', between_end_pattern: c.between_end_pattern || '',
-    };
-  }));
-  document.getElementById('frRuleModalBg').style.display = 'flex';
+   formatRuleEditingId = rule.id || null;
+   document.getElementById('frName').value = rule.name || '';
+   document.getElementById('frMode').value = rule.mode || 'first';
+   document.getElementById('frPin').checked = !!rule.pin;
+   document.getElementById('frLabel').value = rule.label || '';
+renderConditions((rule.conditions || []).map(function (c) {
+      return { type: c.type, pattern: c.pattern, scope: c.scope, formats: (c.formats || []).slice(),
+        group_formats: (c.group_formats || []).map(function (g) { return (g || []).slice(); }),
+        match_formats: (c.match_formats || []).map(function (m) { return (m || []).slice(); }),
+        target: c.target || 'match',
+        between_end_pattern: c.between_end_pattern || ''
+      };
+    }));
+   document.getElementById('frRuleModalBg').style.display = 'flex';
 }
 function newFormatRule() {
   formatRuleEditingId = null;
@@ -4204,39 +4447,41 @@ async function saveFormatRule() {
       try { new RegExp(c.pattern); } catch (e) { showToast('正则表达式无效: ' + e.message, 'fail'); return; }
     }
   }
-  const rule = {
-    name: name,
-    mode: document.getElementById('frMode').value,
-    conditions: _frConds.map(function (c) {
-      var cond = { type: c.type, pattern: c.pattern, scope: c.scope, formats: (c.formats || []).slice() };
-      if (c.type === 'regex' && c.group_formats && c.group_formats.length) {
-        cond.group_formats = c.group_formats.map(function (g) { return (g || []).slice(); });
-      }
-      if (c.type === 'regex' && c.match_formats && c.match_formats.length) {
-        cond.match_formats = c.match_formats.map(function (m) { return (m || []).slice(); });
-      }
-      if (c.target && c.target !== 'match') cond.target = c.target;
-      if (c.target === 'between' && c.between_end_pattern) cond.between_end_pattern = c.between_end_pattern;
-      return cond;
-    }),
-  };
+const rule = {
+     name: name,
+     mode: document.getElementById('frMode').value,
+     pin: document.getElementById('frPin').checked,
+     label: document.getElementById('frLabel').value.trim().substring(0,4),
+     conditions: _frConds.map(function (c) {
+       var cond = { type: c.type, pattern: c.pattern, scope: c.scope, formats: (c.formats || []).slice() };
+       if (c.type === 'regex' && c.group_formats && c.group_formats.length) {
+         cond.group_formats = c.group_formats.map(function (g) { return (g || []).slice(); });
+       }
+       if (c.type === 'regex' && c.match_formats && c.match_formats.length) {
+         cond.match_formats = c.match_formats.map(function (m) { return (m || []).slice(); });
+       }
+       if (c.target && c.target !== 'match') cond.target = c.target;
+       if (c.target === 'between' && c.between_end_pattern) cond.between_end_pattern = c.between_end_pattern;
+       return cond;
+     }),
+   };
   if (formatRuleEditingId) rule.id = formatRuleEditingId;
   // 保存前冲突预警：与既有规则（排除正在编辑的）存在相同条件且格式互斥时提示
   const clash = formatRules.find(function (r) { return r.id !== formatRuleEditingId && rulesConflict(r, rule); });
   if (clash && !confirm('规则「' + rule.name + '」与「' + clash.name + '」存在相同条件且格式冲突（对齐/块标签互斥），执行时后者将被跳过。仍要保存？')) return;
   const idx = formatRules.findIndex(function (r) { return r.id === rule.id; });
   if (idx >= 0) formatRules[idx] = rule; else formatRules.push(rule);
-  const ok = await persistFormatRules();
-  if (!ok) return;
-  closeRuleModal();
-  renderFormatRules();
+   const ok = await persistFormatRules();
+    if (!ok) return;
+    closeRuleModal();
+   renderFormatRules();
 }
 async function deleteFormatRule(rule) {
-  if (!confirm('删除规则「' + rule.name + '」？')) return;
-  formatRules = formatRules.filter(function (r) { return r.id !== rule.id; });
-  const ok = await persistFormatRules();
-  if (!ok) return;
-  renderFormatRules();
+   if (!confirm('删除规则「' + rule.name + '」？')) return;
+   formatRules = formatRules.filter(function (r) { return r.id !== rule.id; });
+   const ok = await persistFormatRules();
+    if (!ok) return;
+    renderFormatRules();
 }
 
 // ---- 规则应用引擎：条件评估 → 求值模式 → 叠加应用 ----
@@ -4881,6 +5126,17 @@ const SHORTCUT_ACTIONS = {
   proofread_revert: proofreadRevertCurrent,
   proofread_accept: acceptErrShortcut,
   proofread_ignore: ignoreErrShortcut,
+  popup: function() {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return true;
+    const range = sel.getRangeAt(0);
+    let n = range.commonAncestorContainer;
+    if (n && n.nodeType === 3) n = n.parentNode;
+    const ed = n && n.closest ? n.closest('.editable') : null;
+    if (!ed) return true;
+    showPopup(range);
+    return true;
+  },
 };
 
 // ---------- 全局事件（统一快捷键分发） ----------
@@ -5124,6 +5380,7 @@ document.getElementById('searchModalBg').addEventListener('click', (e) => { if (
 document.getElementById('exportBtn').addEventListener('click', openExportModal);
 document.getElementById('exportTxtBtn').addEventListener('click', () => exportFile('txt'));
 document.getElementById('exportDocxBtn').addEventListener('click', () => exportFile('docx'));
+document.getElementById('exportMdBtn').addEventListener('click', () => exportFile('md'));
 document.getElementById('exportCloseBtn').addEventListener('click', closeExportModal);
 document.getElementById('exportModalBg').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeExportModal(); });
 // 段落设置面板：打开/关闭/实时预览/确定/清除
@@ -5278,7 +5535,7 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
   } catch (e) { document.body.textContent = '加载失败: ' + e; return; }
   heights.length = pages.length; heights.fill(0);
   est = pages.length ? 420 : 420;
-  loadBindingsFromServer();   // 服务端快捷键设置（异步覆盖，失败静默回退 localStorage/DEFAULTS）
+   loadBindingsFromServer();   // 服务端快捷键设置（异步覆盖，失败静默回退 localStorage/DEFAULTS）
   mdMode = loadBool('ptoe_md_mode');
   if (mdMode) {
     for (let i = 0; i < pages.length; i++) mdSourceMap.set(i, htmlToMd(pages[i].text));

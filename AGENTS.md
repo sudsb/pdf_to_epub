@@ -1,90 +1,116 @@
 # Repository Guidelines
 
 ## Project Overview
-- Purpose: CLI tool (ptoe) that converts PDF → images → OCR → structured XHTML → EPUB, with an optional browser-based manual correction UI.
-- Entrypoint: `mian.py` (subcommands: `epub`, `correct`, `resume`, `model`, `config`, `gui`). See `mian.py` docstring / CLI help (mian.py:1-200).
+
+- Purpose: CLI tool (ptoe) to convert PDFs → images → OCR → structured XHTML → EPUB. Includes optional browser-based manual correction UI and a lightweight web config GUI.
+- Entrypoint: `mian.py` (subcommands: `epub`, `correct`, `resume`, `model`, `config`, `gui`, `stop`).
+- Target: Windows-first packaging (single-file PyInstaller exe); inference adapters support local and remote engines (llama.cpp, vLLM-Omni, PaddleOCR adapter).
 
 ## Architecture & Data Flow
-- High level flow (implementor path): mian.py → pdfmanage.split_pdf_to_images() → llamamanage.batch_infer()/vllmmanage.batch_infer() → stringmanage.clean_and_structure_text() → htmlmanage.HTMLConverter → epubmanage.EPUBPacker.
-  - OCR engines: default engine chosen by `config.json` `engine` key; runtime dispatch in `llamamanage._active_engine()` (llama vs vllm). See `llamamanage.py` (1-200).
-  - Optional correction stage: `correctmanage.correct_pages()` serves a ThreadingHTTPServer and returns corrected pages, then `mian.py` `apply_markers()` merges markers into article structure (correctmanage.py:1-200).
-- Concurrency:
-  - Batch inference uses ThreadPoolExecutor (vllmmanage/llamamanage) and a shared requests.Session with retries (`llamamanage._SESSION`) to reuse HTTP keep-alive connections.
-  - Correction and GUI services use ThreadingHTTPServer and module-level locks (`pages_lock`, config `_CFG_LOCK`). See `correctmanage.py`, `guimanage.py`, and `configmanage.py`.
-- State & globals to be careful with during refactor: `_server_process`, `_SESSION` (llamamanage.py), `_CFG_LOCK` (configmanage.py), `_ENGINE_CACHE`/`_BATCH_ENGINE` (llamamanage.py). These names appear across modules and must be preserved or renamed with LSP-aware refactor.
 
-## Key Directories
-- Root scripts: `mian.py`, `pdfmanage.py`, `llamamanage.py`, `vllmmanage.py`, `configmanage.py`, `stringmanage.py`, `htmlmanage.py`, `epubmanage.py`, `correctmanage.py`, `guimanage.py`, `dictionarymanage.py`, `proofreadmanage.py`, `rulemanage.py`.
-- data/: per-PDF output (images, correction_history, final .epub). (Referenced across pdfmanage.py/correctmanage.py.)
-- dicts/: dictionaries bundled into exe (jieba, shapes, homophones). Lookups in `dictionarymanage.py`.
-- scripts/: developer helpers (e.g., `check_js.py`, `test_proofread_perf.py`).
-- build/ and dist/ (PyInstaller artifacts) — packaging flow anchored by `pack.ps1`.
+- High-level pipeline (canonical):
+  - mian.py → pdfmanage.split_pdf_to_images() → llamamanage/vllmmanage.batch_infer() → stringmanage.clean_and_structure_text() → htmlmanage.HTMLConverter → epubmanage.EPUBPacker
+  - Optional manual correction: correctmanage.correct_pages() (ThreadingHTTPServer) → apply_markers() → repackage
+  - Web config UI: guimanage.py serves small web endpoints for runtime configuration.
+- Engine adapters share the same API shape (llamamanage.py ↔ vllmmanage.py). Paddle OCR lives in paddleocrmanage.py (optional heavy dependency).
+- Outputs and state:
+  - Per-PDF files under `data/` (images, correction_history, final .epub)
+  - Dictionaries under `dicts/` (jieba, shapes, homophones)
+  - Embedded UI JS/HTML kept in the server files and extracted by helper scripts when needed.
 
-## Development Commands
-- Run CLI (local Python):
-  - python mian.py epub <pdf> [--dpi 0..4] [--model KEY] [--workers N] [--engine llama|vllm] [--thinking]
-  - python mian.py correct <pdf?> [--engine llama|vllm]
-  - python mian.py gui [--host 127.0.0.1] [--port 0] [--no-browser]
+## Key Directories and files (paths)
+
+- Top-level Python modules: `mian.py`, `pdfmanage.py`, `llamamanage.py`, `vllmmanage.py`, `configmanage.py`, `stringmanage.py`, `htmlmanage.py`, `epubmanage.py`, `correctmanage.py`, `guimanage.py`, `dictionarymanage.py`, `rulemanage.py`, `proofreadmanage.py`, `paddleocrmanage.py`.
+- Data and assets: `data/`, `dicts/`, `ui/` (embedded UI assets when present).
+- Build / packaging: `pack.ps1`, `ptoe.spec`, `build/`, `dist/`.
+- Developer scripts: `check_js.py`, `extract_js.py`, `_extract_js.py`, `scripts/test_proofread_perf.py`.
+
+## Development Commands (examples)
+
+- Convert PDF to EPUB (basic):
+  - python mian.py epub <file.pdf> --dpi 2 --model <MODEL_KEY> --workers 4 --title "Book Title"
+- Launch correction UI for a PDF:
+  - python mian.py correct <file.pdf>
+- Start config GUI:
+  - python mian.py gui
+- Stop a running engine/server:
+  - python mian.py stop --engine llama
 - Unit tests (stdlib unittest):
   - python -m unittest discover -v
-  - Targeted: python -m unittest test_stringmanage
-  - Note: test_config_llama.py is pytest-style and may error under unittest discover if pytest not installed.
-- Packaging (Windows):
-  - powershell -ExecutionPolicy Bypass -File .\pack.ps1  # builds onefile exe via PyInstaller (mian.py entry)
-- UI edit checks:
-  - python check_js.py  # validates embedded UI script in correctmanage.py
-  - node --check extracted_ui.js  # syntax check
-  - (Optional) jsdom harness at %TEMP%/ptoe_ui_harness2.mjs for DOM tests (documented in repo).
-
-## Code Conventions & Common Patterns
-- Flat script layout: top-level .py files, lazy imports inside functions to avoid heavy deps during unrelated commands (mian.py, correctmanage.py import lazily).
-- Atomic writes for config and small persistent files: `configmanage._atomic_write_json(path, obj)` uses tempfile + os.replace to guarantee atomic replacement; preserve this pattern for any persistent JSON writes.
-- Module-global state: many modules expose module-level globals (e.g. `llamamanage._server_process`, `llamamanage._SESSION`, `configmanage._CFG_LOCK`, `correctmanage._preview_warm_started`). Do not rename/replace without using LSP rename across callsites.
-- Concurrency:
-  - Use ThreadPoolExecutor for CPU/IO parallelism in inference and ProcessPoolExecutor guarded for preview warming (see correctmanage._PREVIEW_POOL_CLS).
-  - ThreadingHTTPServer is used for browser UIs; shutdown must call server.shutdown() before server.server_close() on Windows to avoid OSError 10038.
-  - Use threading.Lock / RLock around shared mutable module state; `_CFG_LOCK` in configmanage protects reads/writes.
-- IO robustness:
-  - Avoid synchronous heavy imports at module top; lazy import in function scope.
-  - When spawning external servers, probe `--help` support first (`llamamanage._server_supports_arg`) to avoid process-exit due to unsupported flags.
-- Text and EPUB rules:
-  - EPUB internal paths must use forward slashes ('/') — htmlmanage/epubmanage enforce this.
-  - Embedded UI HTML/JS is large; after edits run `check_js.py` + `node --check` before committing.
-
-## Important Files
-- mian.py — CLI entry and orchestration; key functions: `pdf_to_epub`, `correct_pdf`. (mian.py:1-200)
-- llamamanage.py — engine dispatch, server lifecycle, shared HTTP session `_SESSION`, batch_infer, runserver/stopserver. (llamamanage.py:1-200)
-- vllmmanage.py — vLLM-Omni adapter (same API shape as llamamanage). (vllmmanage.py)
-- configmanage.py — `get_config()`, `_atomic_write_json()`, DEFAULT_CONFIG, set_format_rules. (configmanage.py:1-200)
-- correctmanage.py — correction UI server, `correct_pages()`, `apply_markers()`, HTML sanitizer, format rules CRUD/validation (`/api/format_rules`). (correctmanage.py:1-200)
-- guimanage.py — GUI server endpoints (`/api/convert/*`, `/api/server/*`, `/api/pick`), `_UI_HTML` placeholder. (guimanage.py:1-220)
-- htmlmanage.py / epubmanage.py — HTML conversion and EPUB packaging; EPUBPacker and HTMLConverter classes.
-- dictionarymanage.py — tokenization and candidate generation used by proofreader.
-- rulemanage.py — server-side format rules application engine (pure stdlib html.parser mini DOM): condition evaluation (contains/prefix/suffix/regex with `/pattern/flags`), rule modes (first/all), match/group/target formats, conflict resolution (first-wins). Served via POST `/api/format_rules/apply` ({page, html, rule_id|all, sel_start, sel_end} → sanitized new HTML); the browser only renders — the old client-side JS engine (evalCondition/evalFormatRule/applyRegexMatchFormats/applyRegexGroupFormats/applyTargetFormats/applyFormatsList) was removed. Tests: `test_rulemanage.py`.
-
-## Runtime / Tooling Preferences
-- Python >= 3.11 recommended (typing features used). Tests / runner expect stdlib unittest; pytest only for one file.
-- Package runner: `uv` recommended in repo docs but standard `python` runner works.
-- Node (for `node --check`) is required to validate inlined UI JS edits. jsdom optional for DOM-level checks.
-- Windows-first packaging: `pack.ps1` targets PyInstaller and produces a single exe (mian.py entry). vLLM-Omni typically Linux-only; vllm_server is often used in connect-only mode on Windows.
-
-## Testing & QA
-- Test organization: many test_*.py files at repo root. Unit tests use stdlib unittest; run discover for full suite.
-- Fast smoke tests suggested after edits:
+  - python -m unittest test_stringmanage
+- Fast smoke tests after edits:
   - python -m unittest test_stringmanage
   - python -m unittest test_pdfmanage
   - python -m unittest test_llamamanage
-- GUI & packaging tests require dependencies (PyMuPDF/requests) and may spawn subprocesses; run them only when environment has those deps.
-- After any edit to correctmanage.py's embedded UI script:
-  1. python check_js.py
-  2. python _extract_js.py to extract JS
-  3. node --check <extracted.js>
-  4. (Optional) run jsdom harness at %TEMP%/ptoe_ui_harness2.mjs with url option to validate DOM usage.
+  - python -m unittest test_vllmmanage
+- Embedded-UI JS validation (after editing correctmanage.py):
+  - python check_js.py
+  - python extract_js.py && node --check extracted_ui.js
+- Packaging (Windows):
+  - powershell -ExecutionPolicy Bypass -File .\pack.ps1  # builds onefile PyInstaller exe
 
-## Practical notes for AI-assisted edits
-- For cross-file renames and exported symbol changes, use LSP rename (symbol-aware) rather than regex/text replace to avoid missing callsites. Relevant symbols: `_server_process`, `_SESSION`, `_CFG_LOCK`, `apply_markers`, `correct_pages`.
-- Preserve atomic-write helpers and lock order (e.g., do not call get_config() while holding _CFG_LOCK).
-- When changing server start/stop logic, ensure probe/start/stop functions keep the same external behavior: runserver(model_key, with_mmproj=True) and stopserver() semantics.
+(Repository uses `uv run ...` wrappers in developer scripts; plain `python` commands work too.)
 
+## Code Conventions & Common Patterns — what to follow as an assistant
 
--- End of AGENTS.md draft
+- Flat script layout. Keep heavy imports lazy: import fitz/PyMuPDF, cv2, requests, zhconv, paddleocr, jieba inside functions to avoid expensive top-level imports.
+- Atomic persistent writes: use the provided helper `configmanage._atomic_write_json(path, obj)` (tempfile + os.replace). Hold `configmanage._CFG_LOCK` when reading/writing config.
+- Preserve module-global state and names. Common globals to not rename silently: `configmanage._CFG_LOCK`, `configmanage._CONFIG_PATH`, `configmanage._atomic_write_json`, `llamamanage._SESSION`, `llamamanage._server_process` (server lifecycle cache), `llamamanage._ARG_HELP_CACHE`, `llamamanage._BATCH_ENGINE`/`_ENGINE_CACHE`, `correctmanage._PREVIEW_WARM_STARTED`, `correctmanage._PREVIEW_WARMED_KEYS`. Use LSP-aware rename for cross-file symbol changes.
+- Concurrency model:
+  - ThreadPoolExecutor for batch inference and I/O parallelism (llamamanage.batch_infer).
+  - ProcessPoolExecutor used for heavy rendering/preview warming in pdfmanage/correctmanage where present.
+  - ThreadingHTTPServer for GUI/correction UIs (guimanage.py and correctmanage.py).
+  - Protect shared mutable state with threading.Lock / RLock; lock order matters (config lock vs other locks).
+- Network client reuse: a shared requests.Session with mounted HTTPAdapter+Retry is used (llamamanage._SESSION). Preserve this pattern to keep connection reuse and retry semantics.
+- EPUB rules: internal EPUB paths must use forward slashes ('/'); htmlmanage/epubmanage enforce this. Do not os.path.join EPUB internal paths.
+- Format-rule engine: rulemanage implements a small DOM-like parser for rule application (conditions: contains/prefix/suffix/regex; modes: first/all). Tests exist — prefer using that engine rather than re-implementing client-side rule logic.
+- Marker system: content markers use data attributes (e.g., data-ptoe-marker). When refactoring HTML conversion or marker application, update apply_markers() callsites.
+- Frozen exe support: access bundled assets via sys._MEIPASS when reading pyproject/embedded assets. Packaging scripts expect these assets to be present.
+
+## Important files (what you'll open/edit often)
+
+- mian.py — CLI orchestration and subcommand wiring.
+- configmanage.py — get_config(), validate_and_patch_config(), `_atomic_write_json()`, DEFAULT_CONFIG. Preserve `_CFG_LOCK` semantics.
+- llamamanage.py — engine lifecycle, `_SESSION`, batch_infer(), server probe/start/stop helpers (probe uses `--help`).
+- vllmmanage.py — vLLM adapter; keep API parity with llamamanage.
+- pdfmanage.py — PDF→image splitting and preprocess, rendering helpers.
+- stringmanage.py — text cleaning and structure heuristics (bbox→HTML, heading detection, brackets).
+- htmlmanage.py / epubmanage.py — HTML→XHTML conversion and EPUB packaging (OPF/nav generation).
+- correctmanage.py — browser correction server, preview warming, apply_markers(), embedded UI script.
+- guimanage.py — config GUI endpoints and small management UI.
+- rulemanage.py — server-side format-rule engine; tests: `test_rulemanage.py`.
+- scripts: `check_js.py`, `extract_js.py`, `_extract_js.py`, `scripts/test_proofread_perf.py` (benchmarks).
+- pack.ps1, ptoe.spec, pyproject.toml — packaging metadata and packaging script.
+
+## Runtime / Tooling Preferences
+
+- Python >= 3.11 recommended.
+- Windows-first packaging via PyInstaller (pack.ps1). The released exe is single-file (onefile), no UPX.
+- Node required only for static JS syntax checks (`node --check`).
+- Tests primarily use the stdlib `unittest`; `pytest` is required only for `test_config_llama.py`.
+- Avoid adding new heavy runtime dependencies; prefer optional imports guarded by try/except and conservative fallbacks.
+
+## Testing & QA — verification checklist for edits
+
+- Unit tests: `python -m unittest discover -v` (full run). Use targeted tests for fast feedback: `test_stringmanage`, `test_pdfmanage`, `test_llamamanage`, `test_vllmmanage`.
+- After editing embedded UI in `correctmanage.py`:
+  - Run `python check_js.py` (repo helper)
+  - Extract JS: `python extract_js.py` (or `_extract_js.py` depending on area)
+  - Syntax check: `node --check extracted_ui.js`
+- After edits touching config behavior: run tests including `test_config_llama.py` (requires pytest) and verify `configmanage._atomic_write_json` still used by code paths that persist config.
+- After server lifecycle or engine argument changes: verify server probe/start/stop flows and `mian.py stop` path.
+- Packaging: if you change bundled assets (dicts/, pyproject.toml, ui files), run `powershell -ExecutionPolicy Bypass -File .\pack.ps1` and smoke the exe.
+
+## Quick editing safety rules (short)
+
+- Re-ground before edits: run the small smoke tests that exercise the module you change.
+- Use lazy-import pattern already present; do not move heavy imports to module top-level.
+- For cross-file symbol renames, use LSP `rename` to update callsites — do not sed/regex replace.
+- Preserve `_SESSION`, `_CFG_LOCK`, `_server_process` semantics and lock order.
+- If you change embedded UI, run check_js + node check before committing.
+
+---
+
+Paths and commands in this file were synthesized from repository source and developer scripts (see: `mian.py`, `configmanage.py`, `llamamanage.py`, `correctmanage.py`, `check_js.py`, `extract_js.py`, `pack.ps1`, `pyproject.toml`).
+
+If you want, I will also: (a) add a one-line per-file quick reference table, or (b) produce a short `DEV_CHECKLIST.md` with the smoke-test commands and exact test set to run after edits. Which should I write next? (Recommended: 0)

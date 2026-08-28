@@ -19,14 +19,17 @@ Set-Location -LiteralPath $PSScriptRoot
 Write-Host "==> 构建 dist\ptoe.exe（PyInstaller onefile / console）..." -ForegroundColor Cyan
 
 # 2026-08 词典数据（形近/同音/通用词表）随 --add-data "dicts;dicts" 打包
+# 2026-08 矫正界面脚本 ui/app.js 随 --add-data "ui;ui" 打包（缺失则矫正页 404）
 uv run --with pyinstaller pyinstaller --noconfirm --clean `
   --onefile --console `
   --noupx `
   --name ptoe `
   --add-data "pyproject.toml;." `
   --add-data "dicts;dicts" `
+  --add-data "ui;ui" `
   --collect-all pymupdf `
   --collect-all cv2 `
+  --collect-all zhconv `
   mian.py
 
 if ($LASTEXITCODE -ne 0) {

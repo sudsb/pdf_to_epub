@@ -34,8 +34,11 @@ _user_fixes: Dict[str, str] = {}
 # 用户排除表（P2 忽略）
 _user_ignored: Set[str] = set()
 
-# 持久化路径（CWD 相对）
-_USER_DICT_PATH = os.path.join("data", "proofread_dict.json")
+# 持久化路径：程序所在目录 data/proofread_dict.json（冻结时为 exe 目录，
+# 不随启动时 CWD 漂移；与分割图片/历史记录同属用户数据）
+from pdfmanage import app_base_dir as _app_base_dir
+
+_USER_DICT_PATH = os.path.join(str(_app_base_dir()), "data", "proofread_dict.json")
 
 # CJK 统一表意文字范围（基本 + 扩展 A）
 _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")

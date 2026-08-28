@@ -176,7 +176,7 @@ class TestPdfToEpub(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertIn("请选择操作", out, "无参数交互模式应显示终端菜单")
             self.assertIn("PDF → EPUB 转换", out)
-            self.assertIn("手动矫正", out)
+            self.assertIn("矫正界面", out)
             self.assertNotIn("nothing to do", out)
         finally:
             sys.stdin = old_stdin

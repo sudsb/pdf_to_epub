@@ -1,0 +1,67 @@
+<results>
+<files>
+- D:\code-project\python\PToEA\correctmanage.py:4304-4322 - GET /api/format_rules handler
+- D:\code-project\python\PToEA\correctmanage.py:4799-4819 - POST /api/format_rules (update) handler
+- D:\code-project\python\PToEA\correctmanage.py:4821-4896 - POST /api/format_rules/apply handler
+- D:\code-project\python\PToEA\correctmanage.py:4274-4302 - GET /api/pages handler
+- D:\code-project\python\PToEA\correctmanage.py:2087-2188 - _clean_blocks and clean_page_html (merge conditions)
+- D:\code-project\python\PToEA\correctmanage.py:1103-1111 - sanitize_html function
+- D:\code-project\python\PToEA\correctmanage.py:904-1033 - _Sanitizer class (whitelist details)
+- D:\code-project\python\PToEA\check_js.py:1-40 - extracts and checks embedded UI script
+- D:\code-project\python\PToEA\test_correctmanage.py:39 - first test class (TestSanitize) - 40+ test classes
+- D:\code-project\python\PToEA\test_rulemanage.py:31 - first test class (TestParseSerialize) - 6 test classes
+- C:\Users\Administrator\AppData\Local\Temp\opencode\ptoe_realdom_test.cjs:1-66 - jsdom test with API stubs
+- C:\Users\Administrator\AppData\Local\Temp\opencode\repro_correct_serve.py:1-69 - launches correction server and checks / and /ui/app.js
+</files>
+<answer>
+1. /api/format_rules endpoints in correctmanage.py:
+   - GET /api/format_rules (lines 4304-4322): Returns {"ok":True, "rules":list} where rules are from config.json's "format_rules" key, validated and migrated by _validate_format_rules. On error, returns {"ok":False, "error":str}.
+   - POST /api/format_rules (lines 4799-4819): Accepts JSON {"rules":list}, validates via _validate_format_rules, persists via configmanage.set_format_rules, returns {"ok":True, "rules":list}. On error, returns {"ok":False, "error":str}.
+   - No PUT or DELETE endpoints; rules are replaced entirely via POST.
+
+2. POST /api/format_rules/apply (lines 4821-4896):
+   - Request JSON: {page:int (>=1), html:string, rule_id?:string, all?:boolean, sel_start?:int, sel_end?:int}
+   - Response: {"ok":True, "html":string} on success; {"ok":False, "error":string} on failure.
+   - Validation: page must be positive integer, html must be string.
+   - Process: retrieves rules from config.json (same as GET), validates via _validate_format_rules, calls rulemanage.apply_rules(html, rules, rule_id, all_rules, sel_start, sel_end). If rulemanage returns error, returns 400 with error. Otherwise, runs sanitize_html on the result and returns it.
+   - Error paths: 500 if rulemanage module not loaded; 400 for invalid input or rulemanage error; 500 for unexpected exceptions.
+
+3. Init payload (/api/pages, lines 4274-4302):
+   - Returns {"pages":list} where each item has: "page":int, "text":string (raw HTML with marker classes ensured, headings not normalized to <p> for saved content), and optionally "w","h":int (original image dimensions from PDF, empty if PDF unavailable).
+   - Does NOT include format-rules or shortcuts; those are fetched separately via /api/format_rules and /api/shortcuts.
+
+4. clean_page_html / _clean_blocks adjacent-paragraph merge conditions (lines 2087-2188):
+   - _clean_blocks merges adjacent <p> blocks only when merge_paragraphs=True.
+   - Conditions for merging two consecutive <p> blocks:
+        * Both blocks must be "plain": no class attribute and no internal tags (checked via _block_is_plain).
+        * Both blocks' inner text (stripped) must be non-empty.
+        * The last character of the previous block's text must NOT be in _SENT_END_PUNCT (。！？…；).
+        * If the last char of previous block and first char of next block are both ASCII alphanumeric, a space is inserted; otherwise, no space.
+   - clean_page_html (line 2191) calls _clean_blocks with merge_paragraphs=False by default; merge_paragraphs=True is used explicitly by format rules and paragraph-merge op.
+
+5. sanitize_html whitelist (lines 1103-1111, _Sanitizer class lines 904-1033):
+   - Allowed tags: <p>, <h1>-<h6>, <strong>, <em>, <br/>, <img>, <span data-ptoe-marker="...">.
+   - <div> is normalized to <p>; <b>/<i> normalized to <strong>/<em>.
+   - Allowed classes on <p>/_h1-6>: ptoe-note (注释), ptoe-align-*/left/center/right (对齐), ptoe-page-break (换页), ptoe-img-*/w25/50/75/100/left/center/right/inline/vtop/vmid/vbot (图片显示模式和尺寸), ptoe-flush, ptoe-indent, ptoe-citation.
+   - Allowed data-* attributes on block-level tags (via _INDENT_DATA_ATTRS): data-pl, data-pr, data-ind, data-indv, data-spb, data-spa, data-lh (段落缩进/间距).
+   - <img> preserves src (data URI or relative path), alt (truncated to 100), and class (only from _IMG_CLASSES list).
+   - All other tags and attributes are stripped; script/style content is removed entirely.
+
+6. check_js.py behavior (lines 1-40):
+   - Extracts the embedded UI script from correctmanage.py's _UI_HTML string (between <script> and </script>).
+   - Performs basic syntax checks: unclosed template literals, brace/parenthesis counts, and prints last 30 lines.
+   - Does NOT auto-detect ui/app.js; it only checks the embedded script. To validate ui/app.js, one must run check_js.py after any edit to correctmanage.py's embedded UI, then separately extract ui/app.js (via _extract_js.py) and run node --check on it.
+
+7. Test inventory:
+   - test_correctmanage.py: 40+ test classes (e.g., TestSanitize, TestCleanPageHtml, TestPagesEndpoint, TestExport, TestFormatRules, TestShortcutsEndpoint, TestLlmServerControl, TestReocr, TestProofreadHistory, etc.). Covers sanitize_html, clean_page_html, markup rendering, /api/format_rules endpoints, /api/convert, /api/clean, export endpoints, history, proofread settings, shortcuts, format rules CRUD, embedded UI behavior via harness.
+   - test_rulemanage.py: 6 test classes (TestParseSerialize, TestTextIndexing, TestParseRegexPattern, TestConflictModel, TestRuleEvaluation, TestApplyRules). Covers HTML parsing/serialization, text indexing, regex pattern parsing, conflict model (first-wins), rule evaluation (mode, scopes, targets, group/formats), and apply_rules integration.
+
+8. Server-side references to 格式刷/brush or 段落合并/merge beyond clean_page_html:
+   - 格式刷: No server-side (Python) references beyond the embedded UI string (_UI_HTML). The button and its logic (id="formatBrushBtn", CSS .pop-btn.active, body.paint-mode) are entirely in the client-side JavaScript.
+   - 段落合并: Beyond clean_page_html/_clean_blocks, server-side references appear in the correction UI rendering logic:
+        * _render_fragment (line ~2473) processes 段落标记 (join) to merge adjacent <p> blocks during HTML reconstruction.
+        * Handling of 段落标记 in _apply_markers and related functions (e.g., line 2537, 2559) for merging annotation segments.
+        * The 段落标记 button (data-op="marker_join") triggers client-side merge operations that rely on the server's definition of plain blocks and merge conditions (same as clean_page_html).
+   - No other server-side merge logic exists for 格式刷; it is purely a client-side format-copying feature.
+</answer>
+</results>

@@ -5,8 +5,8 @@
   "pages": 12,
   "preprocess": {
     "gray": true,
-    "denoise": true,
+    "denoise": false,
     "sharpen": true,
-    "binarize": true
+    "binarize": false
   }
 }

@@ -1,0 +1,123 @@
+1. UI JS file path and line count:
+   - File: D:\code-project\python\PToEA\ui\app.js
+   - Total lines: 5302
+
+2. buildPopup function (lines 2267-2340):
+   - Popup element id: 'popup' (see line 68: const popup = document.getElementById('popup');)
+   - CSS for #popup and .pop-btn lives in correctmanage.py (the _UI_HTML string):
+     * #popup: line 5876 in correctmanage.py: #popup{position:fixed;z-index:60;display:none;flex-wrap:wrap;gap:4px;max-width:280px;padding:6px 8px;background:#fff;border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 18px rgba(0,0,0,.22);}
+     * .pop-btn: line 5877 in correctmanage.py: .pop-btn{min-width:34px;height:30px;padding:0 8px;font-size:13px;border:1px solid var(--border);background:#fff;color:#1c2733;border-radius:6px;cursor:pointer;line-height:1;}
+     * Hover: line 5872: .pop-btn:hover{background:#eef3fb;border-color:var(--accent);}
+     * Active: line 5897: .pop-btn.active{background:#ffe9a8;outline:1px solid #d9a400;}
+   - Construction: ops = OPS.slice(0,9); groups = [ops.slice(0,7), ops.slice(7)]; first group (indices 0-6) for formatting buttons, second group (indices 7-8) for alignment buttons, separated by a separator div.
+
+3. OPS array (lines 7-45):
+   Index | Op ID          | Label
+   ------|----------------|-------
+   0     | bold           | 粗体
+   1     | italic         | 斜体
+   2     | heading        | 标题
+   3     | p              | 正文
+   4     | remove         | 清除格式
+   5     | note           | 注释
+   6     | align_left     | 居左
+   7     | align_center   | 居中
+   8     | align_right    | 居右
+   9     | marker_full    | 全文标记
+   10    | marker_note    | 注释标记
+   11    | marker_join    | 段落标记
+   12    | marker_page    | 换页标记
+   13    | flush          | 顶格
+   14    | indent         | 缩进
+   15    | search         | 搜索
+   16    | clean          | 智能清理
+   17    | convert_t2s    | 繁→简
+   18    | convert_s2t    | 简→繁
+   19    | toggle_md      | Markdown模式
+   20    | undo           | 撤销
+   21    | redo           | 重做
+   22    | history        | 历史记录
+   23    | export         | 导出
+   24    | save           | 保存
+   25    | stage          | 暂存
+   26    | finish         | 完成并转换
+   27    | jump           | 跳转
+   28    | help           | 帮助
+   29    | settings       | 快捷键设置
+   30    | proofread_correct| 校正
+   31    | proofread_reocr| 重识别
+   32    | proofread_apply| 应用
+   33    | proofread_clear| 清除标注
+   34    | proofread_revert| 回退
+   35    | proofread_accept| 采纳纠错
+   36    | proofread_ignore| 忽略纠错
+   - Note: 格式刷 (brush) is not in OPS; it is implemented as a special button in the popup (id='popPaint', see lines 2291-2303).
+
+4. Format brush implementation:
+   - Capture function (misnamed applyFormatBrushToSelection, lines 1280-1299):
+     * Returns fmt object with:
+       - blockClasses: array of classes from ['ptoe-note','ptoe-align-left','ptoe-align-center','ptoe-align-right'] present on the block element.
+       - bold: boolean from document.queryCommandState('bold')
+       - italic: boolean from document.queryCommandState('italic')
+       - color: string from window.getComputedStyle(block).color
+   - Apply function (applyFormatBrushToSelection, lines 1248-1262):
+     * For block classes: removes ['ptoe-note','ptoe-align-left','ptoe-align-center','ptoe-align-right'] then adds format.blockClasses.
+     * For inline: uses withScrollStable to execCommand('bold') if format.bold, execCommand('italic') if format.italic, execCommand('foreColor', false, format.color) if format.color.
+   - Recent "mousedown preventDefault + _lastFocusedEd fallback" fix:
+     * In currentEditable() function (lines 450-465), lines 462-464: 
+       // 兜底：最近聚焦且仍在文档中的编辑区（工具栏按钮点击会夺走焦点）
+       if (_lastFocusedEd && _lastFocusedEd.isConnected) return _lastFocusedEd;
+     * Mousedown preventDefault appears in buildPopup for paint button (line 2299) and rule button (line 2323) and each pop-btn in groups (line 2281).
+   - Plausible reasons it may not work:
+     * Selection lost on click: mousedown preventDefault stops default behavior but click may still lose focus; suppressPopupUntil prevents immediate re-popup but selection may be lost during the interaction.
+     * execCommand quirks: inline formatting relies on document.execCommand which may behave inconsistently across browsers or contexts.
+     * Popup button handler flow: applyOp is called in the click handler after mousedown; selection may be altered between mousedown and click.
+
+5. Paragraph merge:
+   - Client-side paragraph merge exists: function _mergeSelectedBlocks (lines 4456-4498), invoked via applyOp for op === 'merge' (line 1315).
+   - 清理(clean) op calls /api/clean: see cleanAll function (lines 1447-1476). It sends a POST to /api/clean with body { pages: collect() }, then updates content with res.pages.
+   - Context-menu op patterns:
+     * ctxMarkdown→清空 (kind === 'clearpage', lines 2626-2638): clears page content, updates history, marks dirty.
+     * fmtall 格式化 (kind === 'fmtall', lines 2639-2672): converts all blocks to <p>, removes formatting and attributes, preserves ptoe-marker and images.
+
+6. Rules integration:
+   - 规 button: in buildPopup (lines 2309-2313): 
+     * <button type="button" class="pop-btn pop-rule-btn" ...>规</button>
+     * data-op not used; handled via click listener.
+   - formatRulesModalBg:
+     * openFormatRulesModal (lines 3779-3796): fetches /api/format_rules, stores rules in formatRules variable, renders modal.
+     * closeFormatRulesModal (lines 3797-3799): hides modal.
+   - Rules list fetch: GET /api/format_rules (see line 3788 in openFormatRulesModal). Response shape: { rules: [...] }.
+   - Rule application: POST /api/format_rules/apply (see lines 4298-4308 in applyFormatRule). Payload: { page: i+1, html: ed.innerHTML, rule_id: rule.id, all: false, sel_start: sel_start, sel_end: sel_end }. Response handling: sets ed.innerHTML = res.html, restores scroll and selection, syncContent, markDirty, scheduleRemeasure, histEnd(before, '格式规则').
+
+7. Shortcut system:
+   - To add a new op with default key + action:
+     1. Add [op_id, label] to OPS array (lines 7-45).
+     2. Add op_id: "default key combo" to DEFAULTS object (lines 40-54).
+     3. If the op is a tool operation (does not need currentEditable), add op_id: function to SHORTCUT_ACTIONS (lines 4861-4884).
+     4. If the op is a format/marker operation, it will be handled by applyOp (no SHORTCUT_ACTIONS entry needed).
+   - Dispatcher guards (lines 4887-4915):
+     * _inField(): checks if active element is INPUT, TEXTAREA, or SELECT (used in proofread shortcuts).
+     * errKey: used in proofread_accept/ignore shortcuts to avoid firing when error popup is open.
+     * isComposing: checked in applyToSelectedBlocks (line 1134) and maybeShowPopup keyup listener (line 2403) to avoid firing during IME composition.
+   - Action mapping: act() maps op ids to implementations via SHORTCUT_ACTIONS for tool operations; for format/marker ops, applyOp(op) is called (line 4911).
+
+8. Selection/popup show logic:
+   - maybeShowPopup (lines 2391-2401): checks suppressPopupUntil, selection non-collapsed, then calls showPopup.
+   - showPopup (lines 2376-2387): builds popup, positions it at selection midpoint (above or below if insufficient space).
+   - hidePopup (line 2375): hides popup and hides tip.
+   - suppressPopupUntil (line 70): timestamp to suppress popup after button clicks.
+   - selectionchange handler (lines 2406-2417): hides popup if selection becomes collapsed; also tracks _lastEditableRange for image insertion.
+   - Popup buttons avoid destroying selection via mousedown preventDefault (see lines 2281-2285, 2299, 2323-2326) which prevents default mousedown behavior that could blur editable or change selection; click handler then sets suppressPopupUntil and hides popup.
+   - Keyboard-only selection (Shift+arrows) triggers popup: keyup listener (line 2403) calls maybeShowPopup for any keyup that is not isComposing, ctrl, meta, or alt (Shift is not excluded), so Shift+arrows keyup will show popup.
+
+9. applyToSelectedBlocks / _blocksBetween / _convertBlockTag:
+   - applyToSelectedBlocks(ed, fn): lines 1133-1166
+   - _blocksBetween(ed, startBlock, endBlock): lines 1089-1109
+   - _convertBlockTag(block, newTag): lines 1171-1189
+
+10. Align class names and op ids; note/note-label class names:
+    - Align op ids: align_left (index 6), align_center (index 7), align_right (index 8) in OPS array.
+    - Align class names: ptoe-align-left, ptoe-align-center, ptoe-align-right (set in applyAlign function, lines 1235-1246).
+    - Note op id: note (index 5) in OPS array.
+    - Note class name: ptoe-note (used in toggleNote function, lines 1192-1207, and referenced in format brush capture/apply functions).

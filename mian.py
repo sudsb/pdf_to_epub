@@ -24,9 +24,10 @@ import sys
 import time
 import tomllib
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 from pdfmanage import split_pdf_to_images
+
 # Defer importing llamamanage (requests dependency) to runtime paths that need OCR.
 # Provide a safe fallback for REQUEST_TIMEOUT so CLI help and flags work.
 REQUEST_TIMEOUT = 600
@@ -129,7 +130,9 @@ def _active_ocr_engine() -> str:
     return _active_engine()
 
 
-def _apply_correction(structured: dict, corrected: List[Dict[str, Any]], *, strict_markers: bool) -> None:
+def _apply_correction(
+    structured: dict, corrected: list[dict[str, Any]], *, strict_markers: bool
+) -> None:
     """把矫正后的 pages 写入 structured（body/paragraphs/articles）。
 
     strict_markers=True 时，标记处理失败（如注释标记与注释数量不匹配）抛异常
@@ -147,7 +150,8 @@ def _apply_correction(structured: dict, corrected: List[Dict[str, Any]], *, stri
     # 标记 → 文章结构（全文=新文章/新页，段落=合并，注释=替换进正文）
     structured.pop("articles", None)
     if any(
-        "data-ptoe-marker" in (p.get("text") or "") or "ptoe-note" in (p.get("text") or "")
+        "data-ptoe-marker" in (p.get("text") or "")
+        or "ptoe-note" in (p.get("text") or "")
         for p in corrected
     ):
         try:
@@ -205,8 +209,8 @@ def correct_pdf(
         pdf = None
         total = 0
         pdf_title = ""
-    pages: List[Dict[str, Any]] = [{"page": n, "text": ""} for n in range(1, total + 1)]
-    structured: Dict[str, Any] = {"pages": pages, "body": "", "paragraphs": []}
+    pages: list[dict[str, Any]] = [{"page": n, "text": ""} for n in range(1, total + 1)]
+    structured: dict[str, Any] = {"pages": pages, "body": "", "paragraphs": []}
     structured["meta"] = {
         "title": title or pdf_title or (pdf.stem if pdf else "未命名"),
         "author": author or "",
@@ -215,14 +219,23 @@ def correct_pdf(
         "package_epub": True,
         "epub_path": str(Path(epub_path).resolve()) if epub_path else None,
     }
-    root = Path(out_dir) if out_dir else (Path("data") / pdf.stem if pdf else Path("data"))
+    # 默认输出目录跟随程序所在目录（冻结时为 exe 目录），与分割图片一致
+    from pdfmanage import app_base_dir
+
+    root = (
+        Path(out_dir)
+        if out_dir
+        else (
+            app_base_dir() / "data" / pdf.stem if pdf else app_base_dir() / "data"
+        )
+    )
     root.mkdir(parents=True, exist_ok=True)
 
-    last_convert: Dict[str, Any] = {}
+    last_convert: dict[str, Any] = {}
 
     def _convert_corrected(
-        corrected: List[Dict[str, Any]], name: str | None = None
-    ) -> Dict[str, Any]:
+        corrected: list[dict[str, Any]], name: str | None = None
+    ) -> dict[str, Any]:
         """「完成并转换」回调：每次点击都转换，结果回给浏览器界面。
 
         无文件模式（pdf 为 None）同样支持转换：只要内容非空（打开历史记录
@@ -230,12 +243,17 @@ def correct_pdf(
         （无文件模式下用作 EPUB 标题，除非命令行已指定 --title）。
         """
         if not corrected or not any((p.get("text") or "").strip() for p in corrected):
-            return {"ok": False, "message": "没有可转换的内容（请先录入或打开历史记录）"}
+            return {
+                "ok": False,
+                "message": "没有可转换的内容（请先录入或打开历史记录）",
+            }
         if name and not title:
             structured["meta"]["title"] = name
         try:
             _apply_correction(structured, corrected, strict_markers=True)
-            result = HTMLConverter(output_dir=str(root), epub_version="3.0").convert_document(structured)
+            result = HTMLConverter(
+                output_dir=str(root), epub_version="3.0"
+            ).convert_document(structured)
             last_convert["result"] = result
             return {"ok": True, "message": "转换完成", "epub": result.get("epub")}
         except Exception as e:  # 注释数量不匹配等 → 回给浏览器提示
@@ -243,7 +261,9 @@ def correct_pdf(
 
     print("      矫正（直接启动：不跑 OCR；历史缓存优先，空白页可手动录入）")
     corrected = correct_pages(
-        pages, pdf_path=pdf, img_dir=None,
+        pages,
+        pdf_path=pdf,
+        img_dir=None,
         idle_timeout=idle_timeout,
         on_convert=_convert_corrected,
     )
@@ -253,7 +273,9 @@ def correct_pdf(
     elif any((p.get("text") or "").strip() for p in corrected):
         # 浏览器被关闭且未点过完成并转换：有内容则按已保存内容补转一次
         _apply_correction(structured, corrected, strict_markers=False)
-        result = HTMLConverter(output_dir=str(root), epub_version="3.0").convert_document(structured)
+        result = HTMLConverter(
+            output_dir=str(root), epub_version="3.0"
+        ).convert_document(structured)
     else:
         print("      未产生转换（没有可转换的内容）")
         return {"content_files": []}
@@ -266,7 +288,7 @@ def correct_pdf(
 
 
 # 各流程阶段的中文名（输出顺序 = 流水线顺序）；未执行的阶段不输出
-_STAGE_LABELS: List[tuple[str, str]] = [
+_STAGE_LABELS: list[tuple[str, str]] = [
     ("split", "分割图片（含图片处理）"),
     ("model", "模型启动"),
     ("ocr", "文字识别"),
@@ -277,7 +299,7 @@ _STAGE_LABELS: List[tuple[str, str]] = [
 ]
 
 
-def _print_timing_summary(timings: Dict[str, float], *, ocr_pages: int) -> None:
+def _print_timing_summary(timings: dict[str, float], *, ocr_pages: int) -> None:
     """流程结束时输出各阶段总用时与总流程用时，并单独给出平均每页识别用时。
 
     timings 键 = _STAGE_LABELS 各阶段 + "total"（总流程）；ocr_pages 为本次
@@ -293,7 +315,9 @@ def _print_timing_summary(timings: Dict[str, float], *, ocr_pages: int) -> None:
         print(f"  总流程：{total:.1f} 秒")
     ocr = timings.get("ocr")
     if ocr is not None and ocr_pages > 0:
-        print(f"  平均每页识别：{ocr / ocr_pages:.2f} 秒/页（本次共识别 {ocr_pages} 页）")
+        print(
+            f"  平均每页识别：{ocr / ocr_pages:.2f} 秒/页（本次共识别 {ocr_pages} 页）"
+        )
 
 
 def pdf_to_epub(
@@ -328,7 +352,7 @@ def pdf_to_epub(
 
     pdf_title = _pdf_title(pdf)
     t_start = time.perf_counter()
-    timings: Dict[str, float] = {}  # 各流程阶段用时（结束时统一输出）
+    timings: dict[str, float] = {}  # 各流程阶段用时（结束时统一输出）
 
     print(f"[1/4] Splitting PDF to images (dpi={dpi}) ...", end="", flush=True)
     t0 = time.perf_counter()
@@ -337,7 +361,11 @@ def pdf_to_epub(
     print(f" done in {timings['split']:.1f}s")
     print(f"      {len(img_paths)} page(s) -> {img_dir}")
 
-    print(f"[2/4] OCR via llama-server (model='{model_key}', workers={max_workers if max_workers else 'auto'}) ...", end="", flush=True)
+    print(
+        f"[2/4] OCR via llama-server (model='{model_key}', workers={max_workers if max_workers else 'auto'}) ...",
+        end="",
+        flush=True,
+    )
     t0 = time.perf_counter()
     total_pages = len(img_paths)
     t_ocr = time.perf_counter()
@@ -370,7 +398,7 @@ def pdf_to_epub(
         print("已取消。")
         return {"ok": False, "message": "cancelled", "epub_error": None}
 
-    cached: Dict[int, str] = {}  # 页码 -> 已识别文本（继续/转换时复用，不再请求）
+    cached: dict[int, str] = {}  # 页码 -> 已识别文本（继续/转换时复用，不再请求）
     if resume_mode == "restart":
         _clear_ocr_progress(img_dir)
         progress = None
@@ -410,9 +438,7 @@ def pdf_to_epub(
     # 与 batch_infer 共用同一值。
     from llamamanage import default_workers
 
-    eff_workers = (
-        max_workers if (max_workers or 0) >= 1 else default_workers(model_key)
-    )
+    eff_workers = max_workers if (max_workers or 0) >= 1 else default_workers(model_key)
     if max_workers is None:
         print(f"      workers={eff_workers}（模型推荐）")
 
@@ -462,12 +488,13 @@ def pdf_to_epub(
     # Lazy imports used only when running the OCR pipeline — keep CLI (non-OCR)
     # commands working without optional deps like requests/zhconv.
     from configmanage import get_config
-    from llamamanage import batch_infer, OCR_PROMPT
+    from llamamanage import OCR_PROMPT, batch_infer
+
     # OCR 提示词优先取 config.json 的 ocr_prompt（用户可自定义），
     # 缺失/为空时回退到 llamamanage.OCR_PROMPT 默认值。
     prompt = get_config(show_dialogs=False).get("ocr_prompt") or OCR_PROMPT
-    from stringmanage import clean_and_structure_text
     from htmlmanage import HTMLConverter
+    from stringmanage import clean_and_structure_text
 
     if todo_images:
         t_batch = time.perf_counter()
@@ -503,7 +530,7 @@ def pdf_to_epub(
         print()
 
     # 合并缓存结果 + 本次识别结果（按页排序）
-    merged: Dict[int, dict] = {
+    merged: dict[int, dict] = {
         k: {"result": v, "error": None} for k, v in cached.items()
     }
     for r in results:
@@ -539,20 +566,21 @@ def pdf_to_epub(
         """矫正后的 pages → 结构化 → XHTML/EPUB；返回 convert_document 结果。"""
         _apply_correction(structured, corrected, strict_markers=strict_markers)
         t0 = time.perf_counter()
-        result = HTMLConverter(output_dir=str(root), epub_version="3.0").convert_document(structured)
+        result = HTMLConverter(
+            output_dir=str(root), epub_version="3.0"
+        ).convert_document(structured)
         timings["render"] = time.perf_counter() - t0
         return result
 
     if correct:
         print("      矫正（OCR 文字与原文对照；默认关闭，仅 --correct 时启用）")
         t0 = time.perf_counter()
-        last_convert: Dict[str, Any] = {}
+        last_convert: dict[str, Any] = {}
         from correctmanage import correct_pages
 
-
         def _convert_corrected(
-            corrected: List[Dict[str, Any]], name: str | None = None
-        ) -> Dict[str, Any]:
+            corrected: list[dict[str, Any]], name: str | None = None
+        ) -> dict[str, Any]:
             """「完成并转换」回调：每次点击都转换，结果回给浏览器界面。
 
             name（历史记录名）在此流水线中不使用——标题来自 PDF 元数据/--title。
@@ -566,7 +594,9 @@ def pdf_to_epub(
                 return {"ok": False, "message": str(e)}
 
         corrected = correct_pages(
-            structured["pages"], pdf_path=pdf, img_dir=img_dir,
+            structured["pages"],
+            pdf_path=pdf,
+            img_dir=img_dir,
             idle_timeout=correct_idle_timeout,
             on_convert=_convert_corrected,
             # 重新识别后的新文本优先：不能用上一次暂存/保存的历史内容覆盖
@@ -587,9 +617,11 @@ def pdf_to_epub(
         t_hist = time.perf_counter()
         _save_ocr_history(pdf, structured)
         timings["history"] = time.perf_counter() - t_hist
-        print(f"[4/4] Rendering XHTML and packing EPUB ...", end="", flush=True)
+        print("[4/4] Rendering XHTML and packing EPUB ...", end="", flush=True)
         t0 = time.perf_counter()
-        result = HTMLConverter(output_dir=str(root), epub_version="3.0").convert_document(structured)
+        result = HTMLConverter(
+            output_dir=str(root), epub_version="3.0"
+        ).convert_document(structured)
         timings["render"] = time.perf_counter() - t0
         print(f" done in {timings['render']:.1f}s")
 
@@ -652,7 +684,6 @@ def _save_ocr_progress(img_dir, progress: dict) -> None:
 
 def _clear_ocr_progress(img_dir) -> None:
     """删除 OCR 进度文件（重新识别 / 转换成功时调用）。"""
-    import os
 
     try:
         _ocr_progress_path(img_dir).unlink(missing_ok=True)
@@ -671,8 +702,8 @@ def _save_ocr_history(pdf: Path, structured: dict) -> None:
     try:
         from correctmanage import (
             _history_prefix,
-            _write_history_version,
             _page_text,
+            _write_history_version,
         )
 
         state = {
@@ -715,11 +746,17 @@ def _ask_ocr_resume(progress: dict) -> str:
         if _gui_prompt_mode():
             return _ask_ui_choice(
                 f"检测到上次 OCR 已全部完成（{done}/{total} 页），尚未生成 EPUB。",
-                [("convert", "直接继续转换"), ("restart", "重新识别全部"), ("abort", "取消")],
+                [
+                    ("convert", "直接继续转换"),
+                    ("restart", "重新识别全部"),
+                    ("abort", "取消"),
+                ],
                 default="convert",
             )
         print(f"\n检测到上次 OCR 已全部完成（{done}/{total} 页），尚未生成 EPUB。")
-        choice = _ask("选择操作：1) 直接继续转换  2) 重新识别全部  3) 取消 [1]：") or "1"
+        choice = (
+            _ask("选择操作：1) 直接继续转换  2) 重新识别全部  3) 取消 [1]：") or "1"
+        )
         if choice == "2":
             return "restart"
         if choice == "3":
@@ -729,11 +766,18 @@ def _ask_ocr_resume(progress: dict) -> str:
     if _gui_prompt_mode():
         return _ask_ui_choice(
             f"检测到上次未完成的 OCR 进度（{done}/{total} 页完成{extra}）。",
-            [("resume", "继续识别（只处理未完成页）"), ("restart", "重新识别全部"), ("abort", "取消")],
+            [
+                ("resume", "继续识别（只处理未完成页）"),
+                ("restart", "重新识别全部"),
+                ("abort", "取消"),
+            ],
             default="resume",
         )
     print(f"\n检测到上次未完成的 OCR 进度（{done}/{total} 页完成{extra}）。")
-    choice = _ask("选择操作：1) 继续识别（只处理未完成页）  2) 重新识别全部  3) 取消 [1]：") or "1"
+    choice = (
+        _ask("选择操作：1) 继续识别（只处理未完成页）  2) 重新识别全部  3) 取消 [1]：")
+        or "1"
+    )
     if choice == "2":
         return "restart"
     if choice == "3":
@@ -825,13 +869,17 @@ def _menu_epub(cfg: dict) -> None:
     dpi_in = _ask("DPI 档位 0-4（默认 0=100，回车用默认）：")
     if dpi_in.isdigit() and int(dpi_in) in DPI_LEVELS:
         dpi = int(dpi_in)
-    rec_workers = int((cfg.get("model_choices") or {}).get(model, {}).get("workers") or 3)
+    rec_workers = int(
+        (cfg.get("model_choices") or {}).get(model, {}).get("workers") or 3
+    )
     workers = rec_workers
     workers_in = _ask(f"OCR 并发数（默认 {rec_workers}（模型推荐），回车用默认）：")
     if workers_in.isdigit():
         workers = int(workers_in)
     correct = _ask("开启手动矫正（浏览器对照原图修字）？(y/N)：").lower() == "y"
-    print(f"\n开始转换：{pdf}\n  模型={model}，dpi={DPI_LEVELS[dpi]}，并发={workers}，矫正={'开' if correct else '关'}")
+    print(
+        f"\n开始转换：{pdf}\n  模型={model}，dpi={DPI_LEVELS[dpi]}，并发={workers}，矫正={'开' if correct else '关'}"
+    )
     try:
         result = pdf_to_epub(
             pdf,
@@ -914,12 +962,16 @@ def _menu_config() -> None:
     cfg = get_config()
     for k in ("engine", "llama_server", "models_dir", "selected_model"):
         print(f"  {k}: {cfg.get(k, '')}")
-    key = _ask("要修改的键（engine/llama_server/models_dir/selected_model，留空跳过）：")
+    key = _ask(
+        "要修改的键（engine/llama_server/models_dir/selected_model，留空跳过）："
+    )
     if key not in ("engine", "llama_server", "models_dir", "selected_model"):
         print("已跳过（键名无效或为空）。")
         return
     if key == "selected_model":
-        value = _ask(f"{key} 的新值（可选：{', '.join(cfg.get('model_choices', {}).keys())}）：")
+        value = _ask(
+            f"{key} 的新值（可选：{', '.join(cfg.get('model_choices', {}).keys())}）："
+        )
     elif key == "engine":
         value = _ask(f"{key} 的新值（llama / vllm）：")
     else:
@@ -928,7 +980,9 @@ def _menu_config() -> None:
         print("已跳过（未输入新值）。")
         return
     if key == "selected_model" and value not in cfg.get("model_choices", {}):
-        print(f"错误：未知模型键 {value}；可用：{', '.join(cfg.get('model_choices', {}).keys())}")
+        print(
+            f"错误：未知模型键 {value}；可用：{', '.join(cfg.get('model_choices', {}).keys())}"
+        )
         return
     if key == "engine" and value not in ("llama", "vllm"):
         print("错误：engine 仅支持 llama / vllm")
@@ -967,14 +1021,14 @@ def _run_menu(name: str, version: str) -> int:
 
     while True:
         print("\n请选择操作：")
-        print("  1) PDF → EPUB 转换（OCR 全流程）")
-        print("  2) 手动矫正（correct，不跑 OCR）")
-        print("  3) 查看/修改配置（config）")
-        print("  4) 模型管理（model）")
-        print("  5) 继续识别上次中断的转换（resume）")
-        print("  6) 帮助（CLI 用法）")
-        print("  7) 停止推理服务（llama-server / vLLM）")
-        print("  8) 配置界面（GUI）")
+        print("  1) PDF → EPUB 转换")
+        print("  2) 矫正界面")
+        print("  3) 配置信息")
+        print("  4) 模型管理")
+        print("  5) 中断重试 ")
+        print("  6) 帮助信息")
+        print("  7) 关闭引擎")
+        print("  8) 配置界面")
         print("  0) 退出")
         choice = _ask("请输入序号 [0-8]：")
         if not choice:
@@ -995,7 +1049,9 @@ def _run_menu(name: str, version: str) -> int:
             _menu_resume()
         elif choice == "6":
             print("  命令行用法（功能与菜单相同）：")
-            print("    mian.py epub <pdf> [--dpi 0-4] [--model KEY] [--workers N] [--thinking] [--correct] [--resume|--restart]")
+            print(
+                "    mian.py epub <pdf> [--dpi 0-4] [--model KEY] [--workers N] [--thinking] [--correct] [--resume|--restart]"
+            )
             print("    mian.py resume <pdf> [--restart]")
             print("    mian.py correct [<pdf>]")
             print("    mian.py config show|set <key> <value>")
@@ -1018,9 +1074,17 @@ def main(argv: list[str] | None = None) -> int:
     # S6：打包 exe 在非交互管道下 stdout/stderr 可能是 GBK 编码，
     # 遇到无法编码的字符（如 emoji、特殊符号）会抛 UnicodeEncodeError 直接崩溃；
     # errors="replace" 保证任何输出都不会因编码问题中断。
+    # 2026-08-25：实测 PyInstaller 冻结子进程忽略 PYTHONIOENCODING/PYTHONUTF8
+    # 环境变量（GUI 父进程注入无效），管道下 stdout 落到系统 ANSI（GBK），
+    # GUI 父进程按 UTF-8 解码即乱码；且管道下 stdout 全缓冲，日志成块延迟到达
+    # （界面显示不完整）。故非 tty（管道/重定向）时强制 UTF-8 + 行缓冲；
+    # tty（双击 exe 的控制台菜单）保持系统编码，避免控制台代码页不匹配。
     for _s in (sys.stdout, sys.stderr):
         try:
-            _s.reconfigure(errors="replace")
+            if not _s.isatty():
+                _s.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+            else:
+                _s.reconfigure(errors="replace")
         except Exception:
             pass
 
@@ -1029,7 +1093,8 @@ def main(argv: list[str] | None = None) -> int:
     # user's selected_model in config.json. get_config() is robust and will
     # auto-create/repair config.json if necessary (interactive prompts are
     # suppressed in headless environments).
-    from configmanage import get_config, update_config, set_llama_server_arg
+    from configmanage import get_config, set_llama_server_arg, update_config
+
     cfg = get_config()
     default_model = cfg.get("selected_model", "HY")
 
@@ -1056,7 +1121,11 @@ def main(argv: list[str] | None = None) -> int:
         default=0,
         help="DPI level 0-4: 0=100, 1=150, 2=200, 3=300, 4=600 (default: 0=100)",
     )
-    epub_p.add_argument("--model", default=default_model, help="Model key in config.json model_choices (default: from config.json)")
+    epub_p.add_argument(
+        "--model",
+        default=default_model,
+        help="Model key in config.json model_choices (default: from config.json)",
+    )
     epub_p.add_argument(
         "--engine",
         choices=("llama", "vllm", "paddle"),
@@ -1065,7 +1134,9 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     epub_p.add_argument(
-        "--workers", type=int, default=None,
+        "--workers",
+        type=int,
+        default=None,
         help="OCR worker threads (default: 模型推荐并发 model_choices.<key>.workers，未配置时 3；视觉模型每张数千图像 token，并发过高会让 KV 缓存溢出到 CPU 反而变慢；显存充足可调大如 6)",
     )
     epub_p.add_argument(
@@ -1079,15 +1150,21 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Pass the prompt through without appending the '按原文原格式输出' suffix",
     )
-    epub_p.add_argument("--title", default=None, help="EPUB title (default: auto from PDF metadata)")
+    epub_p.add_argument(
+        "--title", default=None, help="EPUB title (default: auto from PDF metadata)"
+    )
     epub_p.add_argument("--author", default=None, help="EPUB author")
-    epub_p.add_argument("--lang", default="zh-CN", help="EPUB language code (default: zh-CN)")
+    epub_p.add_argument(
+        "--lang", default="zh-CN", help="EPUB language code (default: zh-CN)"
+    )
     epub_p.add_argument(
         "--out-dir",
         default=None,
         help="Output directory for OEBPS/ and the EPUB (default: data/<pdf stem>/)",
     )
-    epub_p.add_argument("--epub-path", default=None, help="Explicit output path for the .epub file")
+    epub_p.add_argument(
+        "--epub-path", default=None, help="Explicit output path for the .epub file"
+    )
     epub_p.add_argument(
         "--correct",
         action="store_true",
@@ -1120,7 +1197,9 @@ def main(argv: list[str] | None = None) -> int:
         "（空白界面，用于历史记录管理/手动录入）。",
     )
     correct_p.add_argument(
-        "pdf", nargs="?", default=None,
+        "pdf",
+        nargs="?",
+        default=None,
         help="Path to the source PDF（可省略：无文件直接启动，用于历史记录管理）",
     )
     correct_p.add_argument(
@@ -1129,15 +1208,21 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="推理引擎：llama（llama.cpp，默认）或 vllm（vLLM-Omni）；缺省用 config.json 的 engine 键",
     )
-    correct_p.add_argument("--title", default=None, help="EPUB title (default: auto from PDF metadata)")
+    correct_p.add_argument(
+        "--title", default=None, help="EPUB title (default: auto from PDF metadata)"
+    )
     correct_p.add_argument("--author", default=None, help="EPUB author")
-    correct_p.add_argument("--lang", default="zh-CN", help="EPUB language code (default: zh-CN)")
+    correct_p.add_argument(
+        "--lang", default="zh-CN", help="EPUB language code (default: zh-CN)"
+    )
     correct_p.add_argument(
         "--out-dir",
         default=None,
         help="Output directory for OEBPS/ and the EPUB (default: data/<pdf stem>/)",
     )
-    correct_p.add_argument("--epub-path", default=None, help="Explicit output path for the .epub file")
+    correct_p.add_argument(
+        "--epub-path", default=None, help="Explicit output path for the .epub file"
+    )
     correct_p.add_argument(
         "--correct-timeout",
         type=int,
@@ -1160,7 +1245,11 @@ def main(argv: list[str] | None = None) -> int:
         default=0,
         help="DPI level 0-4: 0=100, 1=150, 2=200, 3=300, 4=600 (default: 0=100)",
     )
-    resume_p.add_argument("--model", default=default_model, help="Model key in config.json model_choices (default: from config.json)")
+    resume_p.add_argument(
+        "--model",
+        default=default_model,
+        help="Model key in config.json model_choices (default: from config.json)",
+    )
     resume_p.add_argument(
         "--engine",
         choices=("llama", "vllm", "paddle"),
@@ -1168,7 +1257,9 @@ def main(argv: list[str] | None = None) -> int:
         help="推理引擎：llama（llama.cpp，默认）或 vllm（vLLM-Omni）；缺省用 config.json 的 engine 键",
     )
     resume_p.add_argument(
-        "--workers", type=int, default=None,
+        "--workers",
+        type=int,
+        default=None,
         help="OCR worker threads (default: 模型推荐并发 model_choices.<key>.workers，未配置时 3；显存充足可调大如 6)",
     )
     resume_p.add_argument(
@@ -1182,15 +1273,21 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Pass the prompt through without appending the '按原文原格式输出' suffix",
     )
-    resume_p.add_argument("--title", default=None, help="EPUB title (default: auto from PDF metadata)")
+    resume_p.add_argument(
+        "--title", default=None, help="EPUB title (default: auto from PDF metadata)"
+    )
     resume_p.add_argument("--author", default=None, help="EPUB author")
-    resume_p.add_argument("--lang", default="zh-CN", help="EPUB language code (default: zh-CN)")
+    resume_p.add_argument(
+        "--lang", default="zh-CN", help="EPUB language code (default: zh-CN)"
+    )
     resume_p.add_argument(
         "--out-dir",
         default=None,
         help="Output directory for OEBPS/ and the EPUB (default: data/<pdf stem>/)",
     )
-    resume_p.add_argument("--epub-path", default=None, help="Explicit output path for the .epub file")
+    resume_p.add_argument(
+        "--epub-path", default=None, help="Explicit output path for the .epub file"
+    )
     resume_p.add_argument(
         "--correct",
         action="store_true",
@@ -1229,16 +1326,34 @@ def main(argv: list[str] | None = None) -> int:
     )
     model_sub = model_p.add_subparsers(dest="model_cmd", metavar="action")
 
-    model_list_p = model_sub.add_parser("list", help="List available model keys and details")
-    model_show_p = model_sub.add_parser("show", help="Show current selected model key and detail")
-    model_set_p = model_sub.add_parser("set", help="Set selected model key in config.json")
+    model_list_p = model_sub.add_parser(
+        "list", help="List available model keys and details"
+    )
+    model_show_p = model_sub.add_parser(
+        "show", help="Show current selected model key and detail"
+    )
+    model_set_p = model_sub.add_parser(
+        "set", help="Set selected model key in config.json"
+    )
     model_set_p.add_argument("key", help="Model key to select (e.g. HY, QWEN.8)")
 
-    model_add_p = model_sub.add_parser("add", help="Add a model choice (key + name + mmproj)")
+    model_add_p = model_sub.add_parser(
+        "add", help="Add a model choice (key + name + mmproj)"
+    )
     model_add_p.add_argument("key", help="Model key to add (e.g. MY)")
-    model_add_p.add_argument("--name", required=True, help="Model file name (relative to models_dir or full path)")
-    model_add_p.add_argument("--mmproj", required=True, help="mmproj file name (relative to models_dir or full path)")
-    model_add_p.add_argument("--force", action="store_true", help="Overwrite existing key if present")
+    model_add_p.add_argument(
+        "--name",
+        required=True,
+        help="Model file name (relative to models_dir or full path)",
+    )
+    model_add_p.add_argument(
+        "--mmproj",
+        required=True,
+        help="mmproj file name (relative to models_dir or full path)",
+    )
+    model_add_p.add_argument(
+        "--force", action="store_true", help="Overwrite existing key if present"
+    )
 
     model_remove_p = model_sub.add_parser("remove", help="Remove a model choice")
     model_remove_p.add_argument("key", help="Model key to remove")
@@ -1255,7 +1370,10 @@ def main(argv: list[str] | None = None) -> int:
     config_sub = config_p.add_subparsers(dest="config_cmd", metavar="action")
 
     config_set_p = config_sub.add_parser("set", help="修改配置项（key=value）")
-    config_set_p.add_argument("key", help="配置键名（llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / llama_server_args.<参数> / vllm_server_args.<参数> / proofread.<param>）")
+    config_set_p.add_argument(
+        "key",
+        help="配置键名（llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / llama_server_args.<参数> / vllm_server_args.<参数> / proofread.<param>）",
+    )
     config_set_p.add_argument("value", help="配置值")
 
     gui_p = sub.add_parser(
@@ -1265,7 +1383,9 @@ def main(argv: list[str] | None = None) -> int:
         "启动/停止推理服务、选择文件路径等。浏览器关闭超过 idle-timeout 秒后自动退出。",
     )
     gui_p.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
-    gui_p.add_argument("--port", type=int, default=0, help="监听端口（默认 0=自动分配）")
+    gui_p.add_argument(
+        "--port", type=int, default=0, help="监听端口（默认 0=自动分配）"
+    )
     gui_p.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     gui_p.add_argument(
         "--idle-timeout",
@@ -1274,6 +1394,28 @@ def main(argv: list[str] | None = None) -> int:
         help="浏览器关闭后自动退出的等待秒数（默认 120）",
     )
     args = parser.parse_args(argv)
+
+    def _find_model_key(choices: dict | None, key: str) -> str | None:
+        """Return canonical key from choices by case-insensitive match.
+
+        Rules:
+        - If `key` exactly exists in choices -> return it.
+        - Else look for case-insensitive matches (k.lower() == key.lower()).
+          - If exactly one match -> return that canonical key.
+          - If multiple matches -> ambiguous -> return None (caller treats as unknown/ambiguous).
+        - If no match -> return None.
+        """
+        if not isinstance(choices, dict) or not isinstance(key, str) or not key:
+            return None
+        if key in choices:
+            return key
+        key_l = key.lower()
+        matches = [
+            k for k in choices.keys() if isinstance(k, str) and k.lower() == key_l
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
 
     if args.command == "model":
         cmd = getattr(args, "model_cmd", None)
@@ -1300,39 +1442,87 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if cmd == "set":
             key = getattr(args, "key", None)
-            if key not in cfg.get("model_choices", {}):
-                print(f"Error: unknown model key: {key}", file=sys.stderr)
+            choices = dict(cfg.get("model_choices", {}))
+            canonical = _find_model_key(choices, key)
+            if canonical is None:
+                # ambiguous or unknown
+                matches = [
+                    k
+                    for k in choices.keys()
+                    if isinstance(k, str)
+                    and isinstance(key, str)
+                    and k.lower() == (key.lower() if isinstance(key, str) else "")
+                ]
+                if len(matches) > 1:
+                    print(
+                        f"Error: ambiguous model key: '{key}' matches {matches} - use exact key or remove duplicates",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"Error: unknown model key: {key}", file=sys.stderr)
                 return 1
-            cfg = update_config("selected_model", key)
-            print(f"selected_model set to {key}")
+            cfg = update_config("selected_model", canonical)
+            print(f"selected_model set to {canonical}")
             return 0
+
         if cmd == "add":
             key = getattr(args, "key", None)
             name = getattr(args, "name", None)
             mmproj = getattr(args, "mmproj", None)
             force = getattr(args, "force", False)
             choices = dict(cfg.get("model_choices", {}))
-            if key in choices and not force:
-                print(f"Error: model key already exists: {key} (use --force to overwrite)", file=sys.stderr)
+            if not isinstance(key, str) or not key:
+                print(f"Error: invalid model key: {key}", file=sys.stderr)
                 return 1
-            choices[key] = {"name": name, "mmproj": mmproj}
+            matches = [
+                k for k in choices if isinstance(k, str) and k.lower() == key.lower()
+            ]
+            if matches and not force:
+                print(
+                    f"Error: model key already exists: {matches[0]} (case-insensitive match) (use --force to overwrite)",
+                    file=sys.stderr,
+                )
+                return 1
+            if matches:
+                existing_key = next((k for k in matches if k == key), matches[0])
+                choices[existing_key] = {"name": name, "mmproj": mmproj}
+                out_key = existing_key
+            else:
+                choices[key] = {"name": name, "mmproj": mmproj}
+                out_key = key
             cfg2 = update_config("model_choices", choices)
-            print(f"Model '{key}' added/updated.")
+            print(f"Model '{out_key}' added/updated.")
             return 0
+
         if cmd in ("remove", "rm"):
             key = getattr(args, "key", None)
             choices = dict(cfg.get("model_choices", {}))
-            if key not in choices:
-                print(f"Error: unknown model key: {key}", file=sys.stderr)
+            canonical = _find_model_key(choices, key)
+            if canonical is None:
+                matches = [
+                    k
+                    for k in choices.keys()
+                    if isinstance(k, str)
+                    and isinstance(key, str)
+                    and k.lower() == key.lower()
+                ]
+                if len(matches) > 1:
+                    print(
+                        f"Error: ambiguous model key: '{key}' matches {matches} - use exact key or remove duplicates",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"Error: unknown model key: {key}", file=sys.stderr)
                 return 1
             old_sel = cfg.get("selected_model")
-            choices.pop(key)
+            choices.pop(canonical, None)
             cfg2 = update_config("model_choices", choices)
-            print(f"Model '{key}' removed.")
+            print(f"Model '{canonical}' removed.")
             new_sel = cfg2.get("selected_model")
             if old_sel != new_sel:
                 print(f"selected_model changed from {old_sel} to {new_sel}")
             return 0
+
         # unknown subcommand
         print("Unknown model action; use 'model list|show|set|add|remove <args>'")
         return 1
@@ -1348,7 +1538,9 @@ def main(argv: list[str] | None = None) -> int:
             print("  model_choices:")
             for mk, mv in (cfg.get("model_choices", {}) or {}).items():
                 mark = "*" if mk == sel else " "
-                print(f"    {mark}{mk}: name={mv.get('name')}, mmproj={mv.get('mmproj')}")
+                print(
+                    f"    {mark}{mk}: name={mv.get('name')}, mmproj={mv.get('mmproj')}"
+                )
             print(f"  ocr_prompt: {cfg.get('ocr_prompt', '')}")
             sargs = cfg.get("llama_server_args", {}) or {}
             print("  llama_server_args:")
@@ -1384,11 +1576,24 @@ def main(argv: list[str] | None = None) -> int:
                 set_proofread_param(sub, value)
                 print(f"{key} = {value}")
                 return 0
-            if key not in ("llama_server", "models_dir", "selected_model", "ocr_prompt", "engine", "vllm_server"):
-                print(f"Error: 可修改的键名仅限 llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / llama_server_args.<参数名> / vllm_server_args.<参数名> / proofread.<param>", file=sys.stderr)
+            if key not in (
+                "llama_server",
+                "models_dir",
+                "selected_model",
+                "ocr_prompt",
+                "engine",
+                "vllm_server",
+            ):
+                print(
+                    "Error: 可修改的键名仅限 llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / llama_server_args.<参数名> / vllm_server_args.<参数名> / proofread.<param>",
+                    file=sys.stderr,
+                )
                 return 1
             if key == "selected_model" and value not in cfg.get("model_choices", {}):
-                print(f"Error: 未知的 model key: {value}（可用: {', '.join(cfg.get('model_choices', {}).keys())}）", file=sys.stderr)
+                print(
+                    f"Error: 未知的 model key: {value}（可用: {', '.join(cfg.get('model_choices', {}).keys())}）",
+                    file=sys.stderr,
+                )
                 return 1
             if key == "engine" and value not in ("llama", "vllm"):
                 print("Error: engine 仅支持 llama / vllm", file=sys.stderr)
@@ -1448,9 +1653,7 @@ def main(argv: list[str] | None = None) -> int:
                 correct=args.correct,
                 correct_idle_timeout=args.correct_timeout,
                 resume=(
-                    "resume"
-                    if args.resume
-                    else ("restart" if args.restart else None)
+                    "resume" if args.resume else ("restart" if args.restart else None)
                 ),
             )
         except Exception as e:
@@ -1487,7 +1690,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "correct":
         if args.engine == "paddle":
             # PaddleOCR 仅用于 PDF 识别流程；文本矫正仍使用大模型引擎
-            print("PaddleOCR 仅用于 PDF 识别流程；文本矫正仍使用大模型引擎，已忽略 --engine paddle")
+            print(
+                "PaddleOCR 仅用于 PDF 识别流程；文本矫正仍使用大模型引擎，已忽略 --engine paddle"
+            )
         else:
             _apply_engine_arg(args.engine)
         try:
@@ -1519,5 +1724,6 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     import multiprocessing
+
     multiprocessing.freeze_support()
     raise SystemExit(main())

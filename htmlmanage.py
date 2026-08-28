@@ -333,6 +333,11 @@ class CSSManager:
           text-align: center;
           margin: 0.6em 0 0.35em;
         }
+        /* h3-h6 居中（2026-08-23）：与 h1/h2 保持一致，部分阅读器 UA 样式
+           覆盖元素选择器 CSS——内联 style 硬化优先级更高 */
+        h3, h4, h5, h6 {
+          text-align: center;
+        }
         /* 段落间距显式化：部分阅读器默认段距偏大，显式声明保证一致
            （分页占位段/全画幅图片段等已有各自 margin 规则，特异性更高不受影响） */
         p {
@@ -729,7 +734,16 @@ class HTMLConverter:
                     hcount += 1
                     kind = tag
                     heading = (int(tag[1]), [])
-                    open_tag = f'<{tag} id="h{hcount}"{cls}{dstyle}>'
+                    # 标题居中硬化（2026-08-23）：部分 EPUB 阅读器套用自身 UA 样式
+                    # 覆盖元素选择器 CSS，导致标题不居中。内联 style 优先级更高。
+                    # 所有 h1-h6 一律无条件加内联居中——class 属性原样保留
+                    # （ptoe-align-* 类优先级低于内联 style，不抑制）。
+                    # <p> 段落仍尊重 ptoe-align-*（正文对齐不受影响）。
+                    if dstyle:
+                        # 合并到已有 style="..."（避免重复 style 属性，违 XHTML）
+                        open_tag = f'<{tag} id="h{hcount}"{cls}{dstyle[:-1]};text-align:center">'
+                    else:
+                        open_tag = f'<{tag} id="h{hcount}"{cls} style="text-align:center">'
                 else:
                     kind = 'p'
                     open_tag = f'<p{cls}{dstyle}>'

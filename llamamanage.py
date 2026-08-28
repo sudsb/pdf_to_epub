@@ -378,6 +378,29 @@ def check(llama: str, model_cfg: dict, model_key: str = "HY") -> bool:
     return True
 
 
+def _handle_stale_instance(model_name: str) -> bool:
+    """模型不符时清理 8080 上的旧实例；返回 True 表示端口已释放、可继续启动。
+
+    顺序：先停本进程句柄内的实例（stopserver）；若端口仍被占用（旧实例由
+    GUI 子进程/矫正界面/上次运行启动，_server_process 管不到），按端口识别
+    并结束映像名为 llama-server 的进程；仍失败则返回 False 由调用方中止。
+    """
+    if _server_process is not None and _server_process.poll() is None:
+        # 旧实例是本进程启动的：停掉后重启（避免静默用错模型）
+        stopserver()
+        time.sleep(0.5)
+    if _probe_server(model_name) == "none":
+        return True
+    if _kill_stale_llama_on_port(_server_port()):
+        print("已结束占用端口的旧 llama-server 进程，继续启动 ...")
+        return True
+    print(
+        "Port 8080 still occupied by an external process — abort to avoid "
+        "silent model mismatch; close it manually and retry"
+    )
+    return False
+
+
 # 使用 curl http://127.0.0.1:8080/health 检测服务器是否加载完成
 # 加载失败或者未加载完成时
 #   {"error":{"message":"Loading model","type":"unavailable_error","code":503}}
@@ -428,21 +451,7 @@ def runserver(model_key: str = "HY", with_mmproj: bool = True, parallel: int | N
             f"Port 8080 is occupied by a llama-server with a different model "
             f"(need '{model_name}'); stopping stale instance ..."
         )
-        if _server_process is not None and _server_process.poll() is None:
-            # 旧实例是本进程启动的：停掉后重启（避免静默用错模型）
-            stopserver()
-            time.sleep(0.5)
-            if _probe_server(model_name) != "none":
-                print(
-                    "Port 8080 still occupied by an external process — abort to avoid "
-                    "silent model mismatch; close it manually and retry"
-                )
-                return False
-        else:
-            print(
-                "Port 8080 is held by an external process that ptoe cannot verify — "
-                "abort to avoid silent model mismatch; close it manually and retry"
-            )
+        if not _handle_stale_instance(model_name):
             return False
 
     args = [
@@ -661,6 +670,85 @@ def _kill_port_owner(port) -> bool:
         except Exception:
             continue
     return killed
+
+
+def _pid_image_name(pid) -> str:
+    """tasklist 查询进程映像名（小写；查询失败返回空串）。"""
+    import subprocess as sp
+
+    try:
+        out = sp.check_output(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            text=True,
+            errors="replace",
+            timeout=10,
+        )
+    except Exception:
+        return ""
+    line = out.strip().splitlines()[0] if out.strip() else ""
+    if not line:
+        return ""
+    if line.startswith('"'):
+        return line.split('","', 1)[0].lstrip('"').lower()
+    parts = line.split()
+    return parts[0].lower() if parts else ""
+
+
+def _kill_stale_llama_on_port(port) -> bool:
+    """按端口找到监听进程，仅当映像名是 llama-server 时才结束并等端口释放。
+
+    runserver 模型不符时使用：旧实例可能由 GUI/矫正界面/上次运行的其他
+    进程启动，本进程的 _server_process 句柄管不到（此前直接 abort）。
+    非 llama-server 进程一律不动（返回 False，由调用方中止并提示手动
+    处理），避免误杀用户跑在同端口的其他服务。
+    """
+    import subprocess as sp
+
+    port = str(port)
+
+    def _listeners() -> set:
+        try:
+            out = sp.check_output(
+                ["netstat", "-ano", "-p", "tcp"],
+                text=True,
+                errors="replace",
+                timeout=10,
+            )
+        except Exception:
+            return set()
+        pids = set()
+        for line in out.splitlines():
+            parts = line.split()
+            if (
+                len(parts) >= 5
+                and parts[1].rsplit(":", 1)[-1] == port
+                and parts[3].upper() == "LISTENING"
+            ):
+                pids.add(parts[4])
+        return pids
+
+    killed = False
+    for pid in _listeners():
+        name = _pid_image_name(pid)
+        if not name.startswith("llama-server"):
+            continue
+        try:
+            sp.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                timeout=10,
+            )
+            killed = True
+        except Exception:
+            continue
+    if not killed:
+        return False
+    # 等端口真正释放（最多 ~5s），避免紧接着 Popen 绑定失败
+    for _ in range(10):
+        if not _listeners():
+            return True
+        time.sleep(0.5)
+    return False
 
 
 def stopserver():

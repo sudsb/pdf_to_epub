@@ -62,7 +62,7 @@ class GuiServerTestBase(unittest.TestCase):
             "dlg_lock": threading.Lock(),
             "serve_lock": threading.Lock(),
             "gone_at": None,
-            "last_beat": time.time(),
+            "last_beat": time.monotonic(),
             "beat_lock": threading.Lock(),
             "last_error": None,
             "convert": {
@@ -209,6 +209,18 @@ class TestGuiEndpoints(GuiServerTestBase):
             on_disk = json.load(f)
         self.assertEqual(on_disk["engine"], "vllm")
         self.assertEqual(configmanage.get_config(show_dialogs=False)["engine"], "vllm")
+    def test_post_config_case_insensitive(self):
+        """POST /api/config accepts lowercase selected_model when model_choices has uppercase key."""
+        body = {"selected_model": "ulq4", "model_choices": {"ULQ4": {"name": "x", "mmproj": "y"}}}
+        status, resp = self._post("/api/config", body)
+        self.assertEqual(status, 200)
+        data = json.loads(resp)
+        self.assertTrue(data["ok"])
+        # on-disk selected_model should be canonicalized to ULQ4
+        with open(self._cfg_path, 'r', encoding='utf-8') as f:
+            on_disk = json.load(f)
+        self.assertEqual(on_disk.get('selected_model'), 'ULQ4')
+
 
     def test_post_server_stop_ok(self):
         """POST /api/server/stop → ok（mock llamamanage.stopserver）。"""
@@ -313,20 +325,108 @@ class TestBrowserGone(unittest.TestCase):
 
     def test_browser_gone_heartbeat_alive(self):
         """心跳正常 → 未失联。"""
-        state = {"gone_at": None, "last_beat": time.time()}
-        self.assertFalse(guimanage._browser_gone(state, idle_timeout=120))
+        now = time.monotonic()
+        state = {"gone_at": None, "last_beat": now}
+        gone, stale = guimanage._browser_gone(state, idle_timeout=120, now=now)
+        self.assertFalse(gone)
+        self.assertIsNone(stale)
 
     def test_browser_gone_heartbeat_stale(self):
-        """心跳失联超过 idle_timeout*2 → 判定关闭。"""
-        state = {"gone_at": None, "last_beat": time.time() - 300}
-        self.assertTrue(guimanage._browser_gone(state, idle_timeout=120))
+        """心跳失联超过 idle_timeout*2 → 判定关闭（需连续确认）。"""
+        now = time.monotonic()
+        state = {"gone_at": None, "last_beat": now - 300}
+        # 首次失联：返回 False，开始计时
+        gone, stale = guimanage._browser_gone(state, idle_timeout=120, now=now)
+        self.assertFalse(gone)
+        self.assertEqual(stale, now)
+        # 超过 _STALE_CONFIRM_SECONDS 后判定
+        gone, _ = guimanage._browser_gone(
+            state, idle_timeout=120, now=now + 4, stale_since=stale
+        )
+        self.assertTrue(gone)
 
     def test_browser_gone_gone_at_timeout(self):
         """gone_at 信标：超过 idle_timeout 判定，未超过不判定。"""
-        state = {"gone_at": time.time() - 121, "last_beat": time.time()}
-        self.assertTrue(guimanage._browser_gone(state, idle_timeout=120))
-        state = {"gone_at": time.time() - 10, "last_beat": time.time()}
-        self.assertFalse(guimanage._browser_gone(state, idle_timeout=120))
+        now = time.monotonic()
+        state = {"gone_at": now - 121, "last_beat": now}
+        gone, _ = guimanage._browser_gone(state, idle_timeout=120, now=now)
+        self.assertTrue(gone)
+        state = {"gone_at": now - 10, "last_beat": now}
+        gone, _ = guimanage._browser_gone(state, idle_timeout=120, now=now)
+        self.assertFalse(gone)
+
+
+class TestBrowserGoneGuard(GuiServerTestBase):
+    """浏览器关闭监测 guard：刷新场景 + 信标倒计时 + 心跳失联连续确认。
+
+    覆盖报告的 bug：/api/ping 不清空 gone_at 导致页面刷新后仍被判定关闭。
+    """
+
+    def test_refresh_scenario_ping_clears_gone_at(self):
+        """REFRESH SCENARIO（报告的 bug）：/api/bye 置 gone_at，随后 /api/ping
+        应清空 gone_at；即使 idle_timeout 已过，_browser_gone 仍返回 False。"""
+        # 1. 模拟 pagehide 信标：POST /api/bye
+        status, body = self._post("/api/bye")
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        self.assertIsNotNone(self._state["gone_at"])
+        gone_at_time = self._state["gone_at"]
+
+        # 2. 页面刷新/恢复：GET /api/ping 应清空 gone_at
+        status, _, body = self._get("/api/ping")
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        self.assertIsNone(self._state["gone_at"], "心跳应取消关闭倒计时")
+
+        # 3. 即使 now 超过 gone_at + idle_timeout，gone_at 已清空 → 不判定关闭
+        #    （过去若 /api/ping 不清 gone_at，此处 now - gone_at >= idle_timeout 判定 True）
+        now = gone_at_time + 121  # 超过 idle_timeout(120)
+        gone, _ = guimanage._browser_gone(
+            self._state, idle_timeout=120, now=now, stale_since=None
+        )
+        self.assertFalse(gone, "刷新后 gone_at 已清空，应不判定关闭")
+
+    def test_gone_at_countdown_triggers(self):
+        """gone_at 信标倒计时：now - gone_at >= idle_timeout → True。"""
+        now = time.monotonic()
+        state = {"gone_at": now - 120, "last_beat": now}
+        gone, _ = guimanage._browser_gone(state, idle_timeout=120, now=now)
+        self.assertTrue(gone)
+
+    def test_heartbeat_loss_needs_continuous_confirmation(self):
+        """心跳失联需连续确认：首次失联记时不判定，超过 _STALE_CONFIRM_SECONDS 才判定。"""
+        now = time.monotonic()
+        state = {"gone_at": None, "last_beat": now - 9999}
+        # 首次失联：返回 False，记下 stale_since
+        gone, stale = guimanage._browser_gone(state, idle_timeout=120, now=now)
+        self.assertFalse(gone)
+        self.assertEqual(stale, now)
+        # 未满 _STALE_CONFIRM_SECONDS：仍不判定
+        gone, _ = guimanage._browser_gone(
+            state,
+            idle_timeout=120,
+            now=now + guimanage._STALE_CONFIRM_SECONDS - 0.1,
+            stale_since=stale,
+        )
+        self.assertFalse(gone)
+        # 超过 _STALE_CONFIRM_SECONDS：判定
+        gone, _ = guimanage._browser_gone(
+            state,
+            idle_timeout=120,
+            now=now + guimanage._STALE_CONFIRM_SECONDS + 0.1,
+            stale_since=stale,
+        )
+        self.assertTrue(gone)
+
+    def test_healthy_heartbeat_resets_stale(self):
+        """心跳恢复：返回 (False, None)，stale_since 重置。"""
+        now = time.monotonic()
+        state = {"gone_at": None, "last_beat": now}
+        gone, stale = guimanage._browser_gone(
+            state, idle_timeout=120, now=now, stale_since=now - 100
+        )
+        self.assertFalse(gone)
+        self.assertIsNone(stale)
 
 
 class TestGuiConvert(GuiServerTestBase):
@@ -821,7 +921,7 @@ class TestMianWiring(unittest.TestCase):
         self.assertEqual(rc, 0)
         gs.assert_called_once()
         self.assertIn("请选择操作", out)
-        self.assertIn("配置界面（GUI）", out)
+        self.assertIn("配置界面", out)
 
 
 if __name__ == "__main__":

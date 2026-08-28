@@ -113,6 +113,29 @@ def parse_regex_pattern(pattern: str) -> tuple[str, str]:
     return pattern, ""
 
 
+# 编译正则缓存（同一规则的正则在 eval_condition 与 find_matches 中各编译一次）
+_REGEX_CACHE: dict[str, re.Pattern] = {}
+
+
+def _compile_cached(raw: str) -> re.Pattern:
+    """带缓存的正则编译（与 eval_condition / find_matches 共享，命中时省一次编译）。"""
+    pat = _REGEX_CACHE.get(raw)
+    if pat is None:
+        pattern, flags = parse_regex_pattern(raw)
+        fl = 0
+        if "i" in flags:
+            fl |= re.IGNORECASE
+        if "m" in flags:
+            fl |= re.MULTILINE
+        if "s" in flags:
+            fl |= re.DOTALL
+        pat = re.compile(pattern, fl)
+        if len(_REGEX_CACHE) > 256:
+            _REGEX_CACHE.clear()
+        _REGEX_CACHE[raw] = pat
+    return pat
+
+
 # =============================================================================
 # 迷你 DOM：解析 → 树 → 序列化
 # =============================================================================
@@ -439,15 +462,7 @@ def eval_condition(cond: Condition, text: str, selection: tuple[int, int] | None
 
     if ctype == "regex":
         try:
-            pattern, flags = parse_regex_pattern(cond.pattern)
-            fl = 0
-            if "i" in flags:
-                fl |= re.IGNORECASE
-            if "m" in flags:
-                fl |= re.MULTILINE
-            if "s" in flags:
-                fl |= re.DOTALL
-            return re.search(pattern, t, fl) is not None
+            return _compile_cached(cond.pattern).search(t) is not None
         except re.error:
             return False
     elif ctype == "contains":
@@ -464,15 +479,7 @@ def find_matches(cond: Condition, text: str) -> list[re.Match]:
     if cond.type != "regex" or not cond.pattern:
         return []
     try:
-        pattern, flags = parse_regex_pattern(cond.pattern)
-        fl = 0
-        if "i" in flags:
-            fl |= re.IGNORECASE
-        if "m" in flags:
-            fl |= re.MULTILINE
-        if "s" in flags:
-            fl |= re.DOTALL
-        regex = re.compile(pattern, fl)
+        regex = _compile_cached(cond.pattern)
         return list(regex.finditer(text))
     except re.error:
         return []
@@ -968,16 +975,7 @@ def _apply_target_formats(
         if not cond.between_end_pattern:
             return
         try:
-            end_pattern, end_flags = parse_regex_pattern(cond.between_end_pattern)
-            fl = 0
-            if "i" in end_flags:
-                fl |= re.IGNORECASE
-            if "m" in end_flags:
-                fl |= re.MULTILINE
-            if "s" in end_flags:
-                fl |= re.DOTALL
-            end_regex = re.compile(end_pattern, fl)
-            end_match = end_regex.search(page_text, match_end)
+            end_match = _compile_cached(cond.between_end_pattern).search(page_text, match_end)
             if not end_match:
                 return
             range_start, range_end = match_end, end_match.start()
@@ -988,20 +986,28 @@ def _apply_target_formats(
         return
 
     fmts = [op for op in cond.formats if op != "none"]
+    # O(1) 冲突检查（first-wins 语义不变）：原线性扫描 O(n²)，现集合查询 O(1)
+    _seen_groups = {g for g in (op_group(o) for o in applied_ops) if g is not None}
+    _has_remove = "remove" in applied_ops
     for op in fmts:
-        # 检查冲突（first-wins）
-        conflict = False
-        for existing_op in applied_ops:
-            if ops_conflict(op, existing_op):
-                conflict = True
-                break
-        if conflict:
-            continue
+        og = op_group(op)
+        # first-wins 冲突（ops_conflict 语义）：同名不冲突；remove 与任意已应用操作冲突
+        if op not in applied_ops:
+            if op == "remove" and applied_ops:
+                continue
+            if _has_remove:
+                continue
+            if og is not None and og in _seen_groups:
+                continue
         if op in {"bold", "italic", "no_bold", "remove"}:
             apply_inline_format(nodes_info, range_start, range_end, op)
         else:
             apply_block_format(root, nodes_info, range_start, range_end, op)
         applied_ops.append(op)
+        if op == "remove":
+            _has_remove = True
+        elif og is not None:
+            _seen_groups.add(og)
 
 
 def _apply_group_formats(
@@ -1016,6 +1022,8 @@ def _apply_group_formats(
     if cond.type != "regex" or not cond.pattern or not cond.group_formats:
         return
     matches = find_matches(cond, page_text)
+    # O(1) 冲突检查（first-wins 语义不变）
+    _seen_groups_g = {g for g in (op_group(o) for o in applied_ops) if g is not None}
     # 倒序应用，保证偏移有效
     for match in reversed(matches):
         # 收集该匹配的所有组格式操作
@@ -1028,16 +1036,13 @@ def _apply_group_formats(
                 group_start, group_end = match.regs[gi + 1]
             else:
                 continue
-            # 过滤冲突的格式
+            # 过滤冲突的格式（O(1) 集合检查）
             filtered_fmts = []
             for op in fmts:
-                conflict = False
-                for existing_op in applied_ops:
-                    if ops_conflict(op, existing_op):
-                        conflict = True
-                        break
-                if not conflict:
-                    filtered_fmts.append(op)
+                og = op_group(op)
+                if og is not None and og in _seen_groups_g:
+                    continue
+                filtered_fmts.append(op)
             if filtered_fmts:
                 group_ops.append((group_start, group_end, filtered_fmts))
         
@@ -1061,6 +1066,9 @@ def _apply_group_formats(
                     else:
                         apply_block_format(root, nodes_info, group_start, group_end, op)
                     applied_ops.append(op)
+                    og2 = op_group(op)
+                    if og2 is not None:
+                        _seen_groups_g.add(og2)
             continue
         
         text_node = start_node
@@ -1122,6 +1130,9 @@ def _apply_group_formats(
         for _, _, fmts in group_ops:
             for op in fmts:
                 applied_ops.append(op)
+                og3 = op_group(op)
+                if og3 is not None:
+                    _seen_groups_g.add(og3)
 
 
 def _apply_match_formats(
@@ -1136,6 +1147,9 @@ def _apply_match_formats(
     if cond.type != "regex" or not cond.pattern or not cond.match_formats:
         return
     matches = find_matches(cond, page_text)
+    # O(1) 冲突检查（first-wins 语义不变）
+    _seen_ops_m = set(applied_ops)
+    _seen_groups_m = {g for g in (op_group(o) for o in applied_ops) if g is not None}
     # 收集所有匹配的格式操作
     all_ops = []  # [(match_start, match_end, fmts)]
     for mi, match in enumerate(matches):
@@ -1145,16 +1159,13 @@ def _apply_match_formats(
         if not fmts:
             continue
         match_start, match_end = match.span()
-        # 过滤冲突的格式
+        # 过滤冲突的格式（O(1) 集合检查）
         filtered_fmts = []
         for op in fmts:
-            conflict = False
-            for existing_op in applied_ops:
-                if ops_conflict(op, existing_op):
-                    conflict = True
-                    break
-            if not conflict:
-                filtered_fmts.append(op)
+            og = op_group(op)
+            if og is not None and og in _seen_groups_m:
+                continue
+            filtered_fmts.append(op)
         if filtered_fmts:
             all_ops.append((match_start, match_end, filtered_fmts))
     
@@ -1164,18 +1175,26 @@ def _apply_match_formats(
     # 按起始偏移倒序排序，保证偏移有效
     all_ops.sort(key=lambda x: x[0], reverse=True)
     
-    # 应用所有格式，每次应用后重新计算 nodes_info
+    # 只在真正修改树之后才重新收集文本节点（失败/跳过不改变偏移）
+    _, nodes_info = collect_text_nodes(root)
     for match_start, match_end, fmts in all_ops:
         for op in fmts:
-            if op in applied_ops:
+            if op in _seen_ops_m:
                 continue
-            # 重新计算 nodes_info 以获取最新的偏移
-            _, nodes_info = collect_text_nodes(root)
+            og = op_group(op)
+            if og is not None and og in _seen_groups_m:
+                continue
+            ok = False
             if op in {"bold", "italic", "no_bold", "remove", "note"}:
-                apply_inline_format(nodes_info, match_start, match_end, op)
+                ok = apply_inline_format(nodes_info, match_start, match_end, op)
             else:
-                apply_block_format(root, nodes_info, match_start, match_end, op)
+                ok = apply_block_format(root, nodes_info, match_start, match_end, op)
             applied_ops.append(op)
+            _seen_ops_m.add(op)
+            if og is not None:
+                _seen_groups_m.add(og)
+            if ok:
+                _, nodes_info = collect_text_nodes(root)
 
 
 def _apply_pattern_conds(
@@ -1240,23 +1259,31 @@ def _apply_pattern_conds(
     else:
         matches = []
     
-    # 倒序应用，保证偏移有效
+    # O(1) 冲突检查（first-wins）；倒序应用保证偏移有效
+    _seen_groups_p = {g for g in (op_group(o) for o in applied_ops) if g is not None}
+    _has_remove_p = "remove" in applied_ops
+    _seen_ops_p = set(applied_ops)
     for match in reversed(matches):
         match_start, match_end = match.span()
         for op in fmts:
-            # 检查冲突（first-wins）
-            conflict = False
-            for existing_op in applied_ops:
-                if ops_conflict(op, existing_op):
-                    conflict = True
-                    break
-            if conflict:
-                continue
+            if op not in _seen_ops_p:
+                if op == "remove" and applied_ops:
+                    continue
+                if _has_remove_p:
+                    continue
+                og = op_group(op)
+                if og is not None and og in _seen_groups_p:
+                    continue
             if op in {"bold", "italic", "no_bold", "remove"}:
                 apply_inline_format(nodes_info, match_start, match_end, op)
             else:
                 apply_block_format(root, nodes_info, match_start, match_end, op)
             applied_ops.append(op)
+            _seen_ops_p.add(op)
+            if op == "remove":
+                _has_remove_p = True
+            elif (og2 := op_group(op)) is not None:
+                _seen_groups_p.add(og2)
 
 
 def _apply_fmt_entry(
@@ -1281,20 +1308,29 @@ def _apply_fmt_entry(
         # 无选区且非 page scope：不应用（前端 paragraph scope 退回整页，这里同理）
         range_start, range_end = 0, len(page_text)
 
+    # O(1) 冲突检查（first-wins）
+    _seen_groups_f = {g for g in (op_group(o) for o in applied_ops) if g is not None}
+    _has_remove_f = "remove" in applied_ops
+    _seen_ops_f = set(applied_ops)
     for op in fmts:
-        # 检查冲突（first-wins）
-        conflict = False
-        for existing_op in applied_ops:
-            if ops_conflict(op, existing_op):
-                conflict = True
-                break
-        if conflict:
-            continue
+        if op not in _seen_ops_f:
+            if op == "remove" and applied_ops:
+                continue
+            if _has_remove_f:
+                continue
+            og = op_group(op)
+            if og is not None and og in _seen_groups_f:
+                continue
         if op in {"bold", "italic", "no_bold", "remove"}:
             apply_inline_format(nodes_info, range_start, range_end, op)
         else:
             apply_block_format(root, nodes_info, range_start, range_end, op)
         applied_ops.append(op)
+        _seen_ops_f.add(op)
+        if op == "remove":
+            _has_remove_f = True
+        elif (og2 := op_group(op)) is not None:
+            _seen_groups_f.add(og2)
 
 
 # =============================================================================

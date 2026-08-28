@@ -1,9 +1,11 @@
 import importlib.util
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import pdfmanage
 
@@ -38,6 +40,30 @@ class TestCreatedic(unittest.TestCase):
         finally:
             shutil.rmtree(d1, ignore_errors=True)
             shutil.rmtree(d2, ignore_errors=True)
+
+
+class TestAppBaseDir(unittest.TestCase):
+    """冻结（PyInstaller）时用户数据必须跟随 exe 目录，而非 _MEIPASS 临时目录。"""
+
+    def test_dev_mode_uses_script_dir(self):
+        self.assertEqual(
+            pdfmanage.app_base_dir(), Path(pdfmanage.__file__).resolve().parent
+        )
+
+    def test_frozen_uses_executable_dir(self):
+        tmp = Path(tempfile.mkdtemp(prefix="test_appbase_"))
+        try:
+            exe = tmp / "ptoe.exe"
+            exe.write_bytes(b"MZ")
+            with mock.patch.object(sys, "frozen", True, create=True), mock.patch.object(
+                sys, "executable", str(exe)
+            ):
+                self.assertEqual(pdfmanage.app_base_dir(), tmp.resolve())
+                # createdic 默认目录随之走 exe 所在目录（分割图片落点）
+                d = pdfmanage.createdic("frozen_probe")
+                self.assertEqual(d.parent, tmp / "data")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class TestIsPdfFile(unittest.TestCase):

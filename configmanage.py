@@ -205,12 +205,14 @@ DEFAULT_CONFIG = {
     # 旧模型 {id, name, formats, condition, else_formats} 读取时由 correctmanage._validate_format_rules 迁移
     "format_rules": [],
     # 字体设置（2026-08）：正文/标题/注释/引用 独立字体，供 CSS 变量使用
-    "fonts": {
+     "fonts": {
         "body": "serif",
         "heading": "sans-serif",
         "note": "serif",
         "citation": "cursive"
     },
+    # 引用字体是否默认斜体（2026-08）
+    "citationItalicEnabled": True,
     # 图片预处理（2026-08，OpenCV）：PDF 分割图片时启用，提高 OCR 识别率。
     # enabled 开关；gray 灰度 / denoise 中值去噪 / sharpen 锐化 / binarize 自适应二值化；
     # workers 0=自动按 CPU 核数（>0 时限制渲染进程数）。设置变更会使 .ptoe_split.json 缓存失效。
@@ -234,9 +236,13 @@ def validate_and_patch_config(cfg):
         for k, v in default.items():
             if k not in d:
                 d[k] = v
+            # Respect user's explicit model_choices dict: do NOT merge default
+            # model choices back in, otherwise removed built-ins reappear.
+            elif k == "model_choices":
+                continue
             elif isinstance(v, dict):
                 merge(d[k], v)
-        # 删掉冗余老字段（可选）
+
 
     out = dict(cfg)  # 浅拷贝
     merge(out, DEFAULT_CONFIG)
@@ -326,6 +332,13 @@ def update_config(key, value):
                     cfg = json.load(f)
             else:
                 cfg = DEFAULT_CONFIG.copy()
+            # Special-case model_choices: respect the caller-provided dict as the
+            # authoritative set of available models and do not merge DEFAULT_CONFIG
+            # entries back in. This allows users to remove built-in defaults.
+            if key == "model_choices" and isinstance(value, dict):
+                cfg[key] = value
+                _atomic_write_json(_CONFIG_PATH, cfg)
+                return cfg
             cfg[key] = value
             cfg = validate_and_patch_config(cfg)
             _atomic_write_json(_CONFIG_PATH, cfg)

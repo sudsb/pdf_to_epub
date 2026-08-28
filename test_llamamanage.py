@@ -543,5 +543,111 @@ class TestFlashAttnStyle(unittest.TestCase):
         self.assertEqual(run_mock.call_count, 1, "--help 应只探测一次并缓存")
 
 
+class TestKillStaleLlamaOnPort(unittest.TestCase):
+    """runserver 模型不符时跨进程清理旧 llama-server（仅杀映像名匹配的进程）。"""
+
+    NETSTAT_TWO = (
+        "  TCP    127.0.0.1:8080           0.0.0.0:0              LISTENING       111\n"
+        "  TCP    127.0.0.1:8080           0.0.0.0:0              LISTENING       222\n"
+        "  TCP    127.0.0.1:9090           0.0.0.0:0              LISTENING       333\n"
+    )
+
+    def _patch_subprocess(self, netstat_outputs, tasklist_by_pid, kill_ok=True):
+        """统一打桩：check_output 按调用序返回 netstat/tasklist 输出，run 记录 taskkill。"""
+        killed = []
+        outputs = list(netstat_outputs)
+
+        def fake_check_output(cmd, **kw):
+            if cmd[0] == "netstat":
+                return outputs.pop(0) if outputs else ""
+            if cmd[0] == "tasklist":
+                pid = cmd[2].split()[-1]
+                return tasklist_by_pid.get(pid, "")
+            raise AssertionError(f"unexpected cmd {cmd}")
+
+        def fake_run(cmd, **kw):
+            if cmd[0] == "taskkill":
+                pid = cmd[2]
+                if not kill_ok:
+                    raise OSError("kill failed")
+                killed.append(pid)
+                return mock.Mock(returncode=0)
+            raise AssertionError(f"unexpected cmd {cmd}")
+
+        return (
+            mock.patch.object(llm.subprocess, "check_output", side_effect=fake_check_output),
+            mock.patch.object(llm.subprocess, "run", side_effect=fake_run),
+            killed,
+        )
+
+    def test_kills_only_llama_server_listener(self):
+        # 8080 上两个监听进程：111 是 llama-server.exe → 杀；222 是 ollama.exe → 不动
+        tasklist = {
+            "111": '"llama-server.exe","111","Console","1","123,456 K"\n',
+            "222": '"ollama.exe","222","Console","1","999,999 K"\n',
+            "333": '"chrome.exe","333","Console","1","10 K"\n',
+        }
+        # 第一次 netstat：初始监听；第二次（释放轮询）：空 → 端口已释放
+        co, run, killed = self._patch_subprocess([self.NETSTAT_TWO, ""], tasklist)
+        with co, run:
+            self.assertTrue(llm._kill_stale_llama_on_port(8080))
+        self.assertEqual(killed, ["111"], "只应结束 llama-server 进程")
+
+    def test_non_llama_listener_not_killed(self):
+        # 端口被其他服务占用时不误杀，返回 False
+        tasklist = {"111": '"ollama.exe","111","Console","1","1 K"\n'}
+        co, run, killed = self._patch_subprocess([self.NETSTAT_TWO], tasklist)
+        with co, run:
+            self.assertFalse(llm._kill_stale_llama_on_port(8080))
+        self.assertEqual(killed, [])
+
+    def test_kill_failure_returns_false(self):
+        # taskkill 失败（权限等）→ False
+        tasklist = {"111": '"llama-server.exe","111","Console","1","1 K"\n'}
+        co, run, killed = self._patch_subprocess([self.NETSTAT_TWO], tasklist, kill_ok=False)
+        with co, run:
+            self.assertFalse(llm._kill_stale_llama_on_port(8080))
+        self.assertEqual(killed, [])
+
+    def test_no_listener_returns_false(self):
+        co, run, killed = self._patch_subprocess([""], {})
+        with co, run:
+            self.assertFalse(llm._kill_stale_llama_on_port(8080))
+        self.assertEqual(killed, [])
+
+
+class TestRunserverStaleInstance(unittest.TestCase):
+    """mismatch 分支：本进程句柄管不到旧实例时按端口自动清理。"""
+
+    def test_own_handle_stops_and_proceeds(self):
+        proc = mock.Mock()
+        proc.poll.return_value = None  # 本进程启动的实例还活着
+        probes = iter(["none"])
+        with mock.patch.object(llm, "_server_process", proc), \
+             mock.patch.object(llm, "stopserver") as stop_mock, \
+             mock.patch.object(llm, "_probe_server", side_effect=lambda *a: next(probes)), \
+             mock.patch.object(llm, "time") as tmock:
+            tmock.sleep = lambda *_: None
+            self.assertTrue(llm._handle_stale_instance("need.gguf"))
+            stop_mock.assert_called_once()
+
+    def test_external_instance_autokilled(self):
+        # _server_process 为空（GUI 子进程场景）：probe 仍 mismatch → 按端口杀成功 → 继续
+        probes = iter(["mismatch"])
+        with mock.patch.object(llm, "_server_process", None), \
+             mock.patch.object(llm, "_probe_server", side_effect=lambda *a: next(probes)), \
+             mock.patch.object(llm, "_kill_stale_llama_on_port", return_value=True) as kill_mock:
+            self.assertTrue(llm._handle_stale_instance("need.gguf"))
+            kill_mock.assert_called_once()
+
+    def test_unkillable_external_aborts(self):
+        # 端口被非 llama-server 进程占用且无法清理 → False（中止）
+        probes = iter(["mismatch"])
+        with mock.patch.object(llm, "_server_process", None), \
+             mock.patch.object(llm, "_probe_server", side_effect=lambda *a: next(probes)), \
+             mock.patch.object(llm, "_kill_stale_llama_on_port", return_value=False):
+            self.assertFalse(llm._handle_stale_instance("need.gguf"))
+
+
 if __name__ == "__main__":
     unittest.main()

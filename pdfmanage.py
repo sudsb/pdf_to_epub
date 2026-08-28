@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import os
+import sys
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,13 +20,26 @@ def cpath(path: Path | str) -> bool:
     return fold_path.exists() and fold_path.is_dir()
 
 
+def app_base_dir() -> Path:
+    """程序所在目录：PyInstaller 冻结时为 exe 所在目录，否则为脚本目录。
+
+    用户数据（data/）必须落在程序所在目录——冻结（onefile）运行时 __file__
+    指向一次性解包临时目录（sys._MEIPASS），直接用会把分割图片/历史记录写进
+    %TEMP% 而不是 exe 旁边。打包资源（dicts/、ui/、pyproject.toml）仍走
+    _MEIPASS，与本函数无关。
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
 def createdic(name: str, base_dir: Path | str | None = None) -> Path:
     """Create a data subdirectory for `name` under `base_dir` (or script dir/data).
 
     If data/NAME exists, append an incremental suffix: NAME_1, NAME_2, ... and
     return the Path of the created directory.
     """
-    base = Path(base_dir) if base_dir is not None else Path(__file__).resolve().parent
+    base = Path(base_dir) if base_dir is not None else app_base_dir()
     data_dir = base / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -93,7 +107,7 @@ def _find_existing_split(
     返回 (out_dir, out_paths)；未命中返回 None（需要重新分割）。
     """
     p = Path(pdf_path)
-    base = Path(__file__).resolve().parent
+    base = app_base_dir()
     data_dir = base / "data"
     if not data_dir.is_dir():
         return None
@@ -178,19 +192,24 @@ def _normalize_prep_cfg(cfg) -> dict | None:
 _PREP_WARNED = False
 
 
+def _warn_no_cv2():
+    """缺 cv2/numpy 依赖时只打印一次中文提示（顺序/并行渲染路径共用）。"""
+    global _PREP_WARNED
+    if not _PREP_WARNED:
+        _PREP_WARNED = True
+        print("      未安装 opencv-python，已跳过图片预处理（pip install opencv-python）")
+
+
 def _apply_preprocess_array(arr, prep: dict):
     """对图像 ndarray 应用 OpenCV 预处理：灰度→中值去噪→锐化→可选二值化。
 
     cv2/numpy 未安装时打印一次中文提示并原样返回（绝不因缺依赖中断分割）；
     单步处理失败也只跳过该步/整体回退，不影响主流程。
     """
-    global _PREP_WARNED
     try:
         import cv2
     except Exception:
-        if not _PREP_WARNED:
-            _PREP_WARNED = True
-            print("      未安装 opencv-python，已跳过图片预处理（pip install opencv-python）")
+        _warn_no_cv2()
         return arr
     try:
         # OCR 场景颜色无意义：统一在灰度域处理
@@ -210,11 +229,25 @@ def _apply_preprocess_array(arr, prep: dict):
         return arr
 
 
+def _save_raw_pix(pix, out_path: str, fmt: str) -> None:
+    """不经预处理直接保存 Pixmap（jpg 用最高质量）。"""
+    if fmt.lower() in ("jpg", "jpeg"):
+        pix.save(out_path, jpg_quality=100)
+    else:
+        pix.save(out_path)
+
+
 def _write_preprocessed(pix, out_path: str, fmt: str, prep: dict) -> None:
     """把 Pixmap 经 OpenCV 预处理后写盘；任何失败都回退 pix.save 原图。"""
     try:
         import cv2
         import numpy as np
+    except Exception:
+        # 缺依赖：提示一次（并行渲染路径此前静默跳过，用户无从得知预处理未生效）
+        _warn_no_cv2()
+        _save_raw_pix(pix, out_path, fmt)
+        return
+    try:
 
         arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
             pix.height, pix.width, pix.n
@@ -231,10 +264,7 @@ def _write_preprocessed(pix, out_path: str, fmt: str, prep: dict) -> None:
         buf.tofile(out_path)
     except Exception:
         # 兜底：预处理/编码任何环节失败都退回原始渲染结果
-        if fmt.lower() in ("jpg", "jpeg"):
-            pix.save(out_path, jpg_quality=100)
-        else:
-            pix.save(out_path)
+        _save_raw_pix(pix, out_path, fmt)
 
 
 # 多进程渲染阈值：页数低于此值直接顺序渲染（spawn 开销 > 并行收益）
@@ -329,7 +359,10 @@ def split_pdf_to_images(
             preprocess = None
     prep = _normalize_prep_cfg(preprocess)
     if prep:
-        print("      图片预处理已启用（OpenCV：灰度/去噪/锐化）")
+        # 按实际启用的步骤输出日志（顺序固定：灰度→去噪→锐化→二值化）
+        _PREP_LABELS = (("gray", "灰度"), ("denoise", "去噪"), ("sharpen", "锐化"), ("binarize", "二值化"))
+        steps = "/".join(label for key, label in _PREP_LABELS if prep.get(key))
+        print(f"      图片预处理已启用（OpenCV：{steps}）")
 
     # 复用已有分割：相同内容 + 相同参数时不重新切图，直接返回既有图片
     pdf_hash = _pdf_sha256(p)
@@ -612,6 +645,7 @@ class ImageQueue:
 __all__ = [
     "ImageItem",
     "ImageQueue",
+    "app_base_dir",
     "cpath",
     "createdic",
     "is_pdf_file",

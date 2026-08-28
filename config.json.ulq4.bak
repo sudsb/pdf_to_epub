@@ -17,6 +17,11 @@
       "mmproj": "qwen3.5/2b_mmproj-F16.gguf",
       "workers": 4
     },
+    "QWEN4": {
+      "name": "qwen3.5/Qwen3.5-4B-Q8_0.gguf",
+      "mmproj": "qwen3.5/4b_mmproj-F16.gguf",
+      "workers": 3
+    },
     "PD": {
       "name": "paddleocr/PaddleOCR-VL-1.6-GGUF.gguf",
       "mmproj": "paddleocr/PaddleOCR-VL-1.6-GGUF-mmproj.gguf",
@@ -42,10 +47,10 @@
       "mmproj": "glm/mmproj-GLM-OCR-Q8_0.gguf",
       "workers": 4
     },
-    "q34": {
-      "name": "qwenvl/Qwen3VL-4B-Instruct-Q8_0.gguf",
-      "mmproj": "qwenvl/mmproj-Qwen3VL-4B-Instruct-F16.gguf",
-      "workers": 4
+    "ULQ4": {
+      "name": "Unlimited-OCR-Q4_K_S.gguf",
+      "mmproj": "mmproj-Unlimited-OCR-F16.gguf",
+      "workers": 5
     }
   },
   "selected_model": "DOTS8",
@@ -69,7 +74,7 @@
     "auto_fix_score": 0.85,
     "enable_llm": true,
     "enable_legacy_rules": false,
-    "llm_model": "q34",
+    "llm_model": "glm16",
     "llm_timeout": 3
   },
   "engine": "llama",
@@ -115,13 +120,13 @@
     "history": "Ctrl+H",
     "export": "Ctrl+E",
     "save": "Ctrl+S",
-    "stage": "",
+    "stage": "Ctrl+Shift+S",
     "finish": "Ctrl+Enter",
     "jump": "Ctrl+G",
     "help": "F1",
     "settings": "Ctrl+Shift+O",
     "proofread_correct": "Ctrl+K",
-    "proofread_reocr": "Ctrl+Shift+S",
+    "proofread_reocr": "Ctrl+Shift+R",
     "proofread_apply": "Ctrl+Shift+A",
     "proofread_clear": "Ctrl+Shift+X",
     "proofread_revert": "Ctrl+Shift+Z",
@@ -208,6 +213,7 @@
               "p"
             ],
             [
+              "align_left",
               "p"
             ]
           ]
@@ -274,23 +280,6 @@
           "target": "match"
         }
       ]
-    },
-    {
-      "id": "71d33466a5c748678357a2c615cef67e",
-      "name": "中标",
-      "mode": "first",
-      "conditions": [
-        {
-          "type": "contains",
-          "pattern": "",
-          "scope": "selection",
-          "formats": [
-            "align_center",
-            "heading1"
-          ],
-          "target": "match"
-        }
-      ]
     }
   ],
   "fonts": {
@@ -304,7 +293,7 @@
     "gray": true,
     "denoise": false,
     "sharpen": true,
-    "binarize": false,
+    "binarize": true,
     "workers": 8
   },
   "citationItalicEnabled": true

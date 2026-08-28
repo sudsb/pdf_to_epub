@@ -705,11 +705,12 @@ class TestRenderFragment(unittest.TestCase):
         text = "<p>正文<strong>粗</strong>与<em>斜</em></p><h2>章</h2>"
         out = self.conv._render_fragment(text)
         self.assertIn("<p>正文<strong>粗</strong>与<em>斜</em></p>", out)
-        self.assertIn('<h2 id="h1">章</h2>', out)
+        # 2026-08-23：h2 标题硬化内联居中（阅读器 UA 样式覆盖 CSS 问题）
+        self.assertIn('<h2 id="h1" style="text-align:center">章</h2>', out)
         # 同一片段内多个标题锚点递增
         out2 = self.conv._render_fragment("<h2>甲</h2><p>x</p><h3>乙</h3>")
-        self.assertIn('<h2 id="h1">甲</h2>', out2)
-        self.assertIn('<h3 id="h2">乙</h3>', out2)
+        self.assertIn('<h2 id="h1" style="text-align:center">甲</h2>', out2)
+        self.assertIn('<h3 id="h2" style="text-align:center">乙</h3>', out2)
 
     def test_markup_no_double_escape(self):
         out = self.conv._render_fragment("<p>a &amp; b</p>")
@@ -725,7 +726,7 @@ class TestRenderFragment(unittest.TestCase):
     def test_align_classes_preserved_in_render(self):
         out = self.conv._render_fragment('<p class="ptoe-align-center">x</p><h2>章</h2>')
         self.assertIn('<p class="ptoe-align-center">x</p>', out)
-        self.assertIn('<h2 id="h1">章</h2>', out)
+        self.assertIn('<h2 id="h1" style="text-align:center">章</h2>', out)
         # 注释 + 对齐并存
         out2 = self.conv._render_fragment('<p class="ptoe-note ptoe-align-right">注</p>')
         self.assertIn('<p class="ptoe-note ptoe-align-right">注</p>', out2)
@@ -763,7 +764,8 @@ class TestRenderFragment(unittest.TestCase):
             res = htmlmanage.HTMLConverter(outdir).convert_document(doc, merge_pages=True)
             content = Path(outdir) / res["content_files"][0]
             xhtml = content.read_text(encoding="utf-8")
-            self.assertIn('<h2 id="h1">标题</h2>', xhtml)
+            # 2026-08-23：h2 标题硬化内联居中
+            self.assertIn('<h2 id="h1" style="text-align:center">标题</h2>', xhtml)
             self.assertIn("<p>正文<strong>重点</strong></p>", xhtml)
         finally:
             shutil.rmtree(outdir, ignore_errors=True)
@@ -944,7 +946,8 @@ class TestRenderFragment(unittest.TestCase):
             t1 = (Path(outdir) / res["content_files"][0]).read_text(encoding="utf-8")
             t2 = (Path(outdir) / res["content_files"][1]).read_text(encoding="utf-8")
             self.assertIn("<p>文章一</p>\n<p>尾</p>", t1)
-            self.assertIn('<h2 id="h1">第二章节</h2>\n<p>文章二开始</p>', t2)
+            # 2026-08-23：h2 标题硬化内联居中
+            self.assertIn('<h2 id="h1" style="text-align:center">第二章节</h2>\n<p>文章二开始</p>', t2)
         finally:
             shutil.rmtree(outdir, ignore_errors=True)
 
@@ -1524,6 +1527,163 @@ class TestExport(unittest.TestCase):
         text = "\n\n".join(('[图片]' if b[0] == 'img' else b[1]) for b in blocks) + "\n"
         self.assertEqual(text, "前\n\n[图片]\n\n后\n")
 
+    def test_rich_blocks_formatting(self):
+        # 富文本块提取：对齐/注释/缩进/行内样式/标记剥离/图片拆分
+        from correctmanage import _html_to_rich_blocks
+
+        blocks = _html_to_rich_blocks(
+            '<h1 class="ptoe-align-center">标 题</h1>'
+            '<p class="ptoe-align-right" data-pl="2" data-ind="first" data-indv="2">'
+            "<strong>粗</strong><em>斜</em>"
+            '<span class="ptoe-marker" data-ptoe-marker="段落">段落标记</span>尾</p>'
+            '<p class="ptoe-note">注释内容</p>'
+            '<p>前<img src="data:image/png;base64,AAA" alt="图"/>后</p>'
+        )
+        self.assertEqual(
+            [b["kind"] for b in blocks], ["h1", "p", "p", "p", "img", "p"]
+        )
+        h = blocks[0]
+        self.assertEqual((h["align"], h["text"]), ("center", "标 题"))
+        p1 = blocks[1]
+        self.assertEqual(p1["align"], "right")
+        self.assertEqual(p1["indent"]["pl"], 2.0)
+        self.assertEqual((p1["indent"]["ind"], p1["indent"]["indv"]), ("first", 2.0))
+        self.assertEqual(
+            [(r["bold"], r["italic"], r["text"]) for r in p1["runs"]],
+            [(True, False, "粗"), (False, True, "斜"), (False, False, "尾")],
+        )
+        self.assertNotIn("段落标记", p1["text"])  # 标记 span 整体剥除
+        self.assertIn('class="ptoe-align-right"', p1["attrs"])
+        self.assertIn("<strong>", p1["inner"])
+        self.assertTrue(blocks[2]["note"])
+        self.assertEqual(blocks[3]["text"], "前")
+        self.assertEqual(blocks[4]["kind"], "img")
+        self.assertEqual(blocks[4]["alt"], "图")
+        self.assertEqual(blocks[5]["text"], "后")
+
+    def test_build_docx_rich_formatting(self):
+        # 富文本块 → DOCX：对齐/缩进/段距/行距/行内样式/注释灰字（与 EPUB 对齐）
+        import zipfile
+
+        from correctmanage import _build_docx
+
+        out = Path(tempfile.mkdtemp(prefix="test_docx_rich_")) / "rich.docx"
+        blocks = [
+            {
+                "kind": "p",
+                "tag": "p",
+                "text": "粗斜居中缩进段",
+                "runs": [
+                    {"text": "粗", "bold": True, "italic": False},
+                    {"text": "斜", "bold": False, "italic": True},
+                ],
+                "align": "center",
+                "note": False,
+                "attrs": 'class="ptoe-align-center"',
+                "inner": "粗斜居中缩进段",
+                "indent": {
+                    "pl": 1.0,
+                    "pr": None,
+                    "ind": "first",
+                    "indv": 2.0,
+                    "spb": 1.0,
+                    "spa": None,
+                    "lh": 1.5,
+                },
+            },
+            {
+                "kind": "p",
+                "tag": "p",
+                "text": "悬挂注释",
+                "runs": [{"text": "悬挂注释", "bold": False, "italic": False}],
+                "align": "",
+                "note": True,
+                "attrs": "",
+                "inner": "悬挂注释",
+                "indent": {
+                    "pl": None,
+                    "pr": None,
+                    "ind": "hang",
+                    "indv": 2.0,
+                    "spb": None,
+                    "spa": None,
+                    "lh": None,
+                },
+            },
+        ]
+        _build_docx(blocks, str(out))
+        with zipfile.ZipFile(out) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8")
+        self.assertIn('<w:jc w:val="center"/>', xml)
+        self.assertIn('w:firstLine="480"', xml)  # 首行缩进 2em
+        self.assertIn('w:left="240"', xml)  # 左缩进 pl=1em
+        self.assertIn('w:before="360"', xml)  # 段前 1 行
+        self.assertIn('w:line="360"', xml)  # 行距 1.5
+        self.assertIn('w:hanging="480"', xml)  # 悬挂 2em
+        self.assertIn("<w:b/>", xml)
+        self.assertIn("<w:i/>", xml)
+        self.assertIn('<w:color w:val="808080"/>', xml)
+
+    def test_build_md_consistency(self):
+        # Markdown 导出：标题/加粗斜体/带属性块原样透传/图片内联（与前端规则一致）
+        from correctmanage import _build_md
+
+        out = Path(tempfile.mkdtemp(prefix="test_md_")) / "book.md"
+        png = (
+            "data:image/png;base64,"
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+            "AAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+        )
+        blocks = [
+            {
+                "kind": "h1",
+                "tag": "h1",
+                "text": "书名",
+                "runs": [{"text": "书名", "bold": False, "italic": False}],
+                "align": "",
+                "note": False,
+                "attrs": "",
+                "inner": "书名",
+                "indent": {},
+            },
+            {
+                "kind": "p",
+                "tag": "p",
+                "text": "居中段",
+                "runs": [{"text": "居中段", "bold": False, "italic": False}],
+                "align": "center",
+                "note": False,
+                "attrs": 'class="ptoe-align-center"',
+                "inner": "居中段",
+                "indent": {},
+            },
+            {
+                "kind": "p",
+                "tag": "p",
+                "text": "粗和斜",
+                "runs": [
+                    {"text": "粗", "bold": True, "italic": False},
+                    {"text": "和", "bold": False, "italic": False},
+                    {"text": "斜", "bold": False, "italic": True},
+                ],
+                "align": "",
+                "note": False,
+                "attrs": "",
+                "inner": "",
+                "indent": {},
+            },
+            {"kind": "img", "src": png, "alt": "插图", "cls": ""},
+        ]
+        _build_md(blocks, str(out))
+        text = out.read_bytes().decode("utf-8")
+        self.assertFalse(text.startswith("\ufeff"))  # 无 BOM
+        self.assertTrue(text.endswith("\n") and not text.endswith("\n\n"))
+        self.assertIn("# 书名", text)
+        # 带属性块原样透传（对齐信息不丢失，可被 mdToHtml 还原）
+        self.assertIn('<p class="ptoe-align-center">居中段</p>', text)
+        self.assertIn("**粗**和*斜*", text)
+        self.assertIn(f"![插图]({png})", text)
+
 
 class TestExportEndpoint(unittest.TestCase):
     """/api/export：导出 TXT/DOCX 端点。body 带 path 时跳过保存对话框（测试用）。"""
@@ -1587,6 +1747,86 @@ class TestExportEndpoint(unittest.TestCase):
                 raw.decode("utf-8-sig").replace("\r\n", "\n"),
                 "标题\n\n第一段\n换行\n\n第二页\n",
             )
+        finally:
+            self._stop(server)
+
+    def test_txt_export_first_line_indent(self):
+        # TXT 导出：首行缩进（data-ind=first）以全角空格前缀近似
+        server, base = self._start()
+        try:
+            out = Path(tempfile.mkdtemp(prefix="test_export_")) / "indent.txt"
+            res = self._post(
+                base,
+                {
+                    "format": "txt",
+                    "path": str(out),
+                    "pages": [
+                        {
+                            "page": 1,
+                            "html": '<p data-ind="first" data-indv="2">缩进段</p><p>普通段</p>',
+                        }
+                    ],
+                },
+            )
+            self.assertTrue(res["ok"], f"export failed: {res.get('error')}")
+            self.assertEqual(
+                out.read_bytes().decode("utf-8-sig").replace("\r\n", "\n"),
+                "\u3000\u3000缩进段\n\n普通段\n",
+            )
+        finally:
+            self._stop(server)
+
+    def test_md_export_with_path(self):
+        # Markdown 导出端点：标题/透传/行内样式/图片内联/末尾单换行
+        server, base = self._start()
+        try:
+            out = Path(tempfile.mkdtemp(prefix="test_export_")) / "book.md"
+            png = (
+                "data:image/png;base64,"
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+                "AAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+            )
+            res = self._post(
+                base,
+                {
+                    "format": "md",
+                    "path": str(out),
+                    "pages": [
+                        {
+                            "page": 1,
+                            "html": (
+                                "<h1>书名</h1>"
+                                '<p class="ptoe-align-center">居中段</p>'
+                                "<p><strong>粗</strong>和<em>斜</em><br/>第二行</p>"
+                                f'<p><img src="{png}" alt="插图"/></p>'
+                            ),
+                        }
+                    ],
+                },
+            )
+            self.assertTrue(res["ok"], f"export failed: {res.get('error')}")
+            text = out.read_bytes().decode("utf-8")
+            self.assertTrue(text.endswith("\n") and not text.endswith("\n\n"))
+            self.assertIn("# 书名", text)
+            self.assertIn('<p class="ptoe-align-center">居中段</p>', text)
+            self.assertIn("**粗**和*斜*", text)
+            self.assertIn(f"![插图]({png})", text)
+        finally:
+            self._stop(server)
+
+    def test_md_bad_format_rejected(self):
+        # 非法格式仍 400（md 已加入白名单，markdown 不在）
+        import json as _json
+
+        import requests
+
+        server, base = self._start()
+        try:
+            r = requests.post(
+                base + "/api/export",
+                data=_json.dumps({"format": "markdown", "pages": []}),
+            )
+            self.assertEqual(r.status_code, 400)
         finally:
             self._stop(server)
 
@@ -3099,8 +3339,27 @@ class TestReocr(unittest.TestCase):
         self.assertEqual(diff, [], "文字间空格差异应被忽略")
 
     def test_diff_empty_current(self):
-        # 空 current 全 insert → []
+        # 空 current + 新文本有内容 → 返回单条插入建议（空白页填充）
         diff = diff_reocr_texts("", "任意文本")
+        self.assertEqual(len(diff), 1)
+        self.assertEqual(diff[0]["start"], 0)
+        self.assertEqual(diff[0]["end"], 0)
+        self.assertEqual(diff[0]["wrong"], "")
+        self.assertEqual(diff[0]["candidates"], ["任意文本"])
+        self.assertEqual(diff[0]["line"], 1)
+
+    def test_diff_whitespace_only_current(self):
+        # 纯空白 current 视作空 → 同上返回插入建议
+        diff = diff_reocr_texts("   \n\t", "hello")
+        self.assertEqual(len(diff), 1)
+        self.assertEqual(diff[0]["start"], 0)
+        self.assertEqual(diff[0]["end"], 0)
+        self.assertEqual(diff[0]["wrong"], "")
+        self.assertEqual(diff[0]["candidates"], ["hello"])
+
+    def test_diff_both_empty(self):
+        # 双方均空 → 无 diff
+        diff = diff_reocr_texts("", "")
         self.assertEqual(diff, [])
 
     def test_diff_candidates_are_strings(self):
@@ -3370,6 +3629,35 @@ class TestReocr(unittest.TestCase):
             # bbox 前缀与 page_number 行被剥离 → 文本与当前一致 → 无 diff
             self.assertEqual(res["text"], "当前\n文本")
             self.assertEqual(res["diff"], [], "bbox 格式 token 不应成为纠错项")
+        finally:
+            self._stop(server)
+
+    def test_reocr_strips_trailing_bracketed_page_number(self):
+        # 模型把页脚页码包在括号里输出（〔121〕/【121】/[121] 等）→ 剥掉末尾
+        # 独立成行的括号页码，避免被当成正文差异标注（2026-08-28）
+        import json as _json
+
+        import requests
+
+        self._patch_cfg()
+        self._patch_correct_attr("_full_bytes", lambda state, pn: ("image/png", b"fake"))
+        self._patch_llama_attr(
+            "_request_image_new",
+            lambda prompt, img, model_key="HY", thinking=False, timeout=600, **kw: {
+                "result": "当前文本内容\n〔121〕",
+                "error": None,
+            },
+        )
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/reocr",
+                data=_json.dumps({"page": 1, "model": "", "html": "<p>当前文本内容</p>"}),
+            ).json()
+            self.assertTrue(res["ok"])
+            # 末尾括号页码被剥掉 → 文本与当前一致 → 无 diff
+            self.assertEqual(res["text"], "当前文本内容")
+            self.assertEqual(res["diff"], [], "末尾括号页码不应成为纠错项")
         finally:
             self._stop(server)
 
@@ -4478,6 +4766,172 @@ class TestSetShortcutsConfig(unittest.TestCase):
         patched = self.cm.validate_and_patch_config({"llama_server": "x", "models_dir": "y"})
         self.assertEqual(patched["shortcuts"], {})
 
+    def test_default_config_seeds_citation_italic(self):
+        self.assertIn("citationItalicEnabled", self.cm.DEFAULT_CONFIG)
+        patched = self.cm.validate_and_patch_config({"llama_server": "x", "models_dir": "y"})
+        self.assertTrue(patched["citationItalicEnabled"])
+
+
+class TestConfigEndpoint(unittest.TestCase):
+    """/api/config：字体设置 GET/POST 持久化（config.json fonts + citationItalicEnabled）。"""
+
+    def _start(self):
+        import threading
+        from http.server import ThreadingHTTPServer
+
+        from correctmanage import _CorrectionHandler
+
+        state = {
+            "pages": {1: "<p>原文</p>"},
+            "finished": threading.Event(),
+            "preview_cache": {},
+            "pdf_path": None,
+            "img_dir": None,
+            "preview_dpi": 110,
+            "preview_quality": 82,
+            "last_heartbeat": 0.0,
+            "gone_at": None,
+            "idle_timeout": 600.0,
+            "auto_finished": False,
+        }
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _CorrectionHandler)
+        server.daemon_threads = True
+        server.state = state
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+    def _stop(self, server):
+        server.shutdown()
+        server.server_close()
+
+    def _patch_cfg(self, fonts=None, citationItalicEnabled=None):
+        import configmanage
+
+        cfg = {"model_choices": {}, "selected_model": None}
+        if fonts is not None:
+            cfg["fonts"] = fonts
+        if citationItalicEnabled is not None:
+            cfg["citationItalicEnabled"] = citationItalicEnabled
+        orig = configmanage.get_config
+        configmanage.get_config = lambda *a, **k: cfg
+        self.addCleanup(lambda: setattr(configmanage, "get_config", orig))
+        return cfg
+
+    def test_get_returns_fonts_and_citation(self):
+        import requests
+
+        self._patch_cfg(
+            fonts={"body": "serif", "heading": "sans-serif", "note": "serif", "citation": "cursive"},
+            citationItalicEnabled=True,
+        )
+        server, base = self._start()
+        try:
+            res = requests.get(base + "/api/config").json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["fonts"]["body"], "serif")
+            self.assertEqual(res["fonts"]["heading"], "sans-serif")
+            self.assertEqual(res["citationItalicEnabled"], True)
+        finally:
+            self._stop(server)
+
+    def test_get_missing_keys_returns_defaults(self):
+        import requests
+
+        self._patch_cfg(None, None)
+        server, base = self._start()
+        try:
+            res = requests.get(base + "/api/config").json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["fonts"]["body"], "serif")
+            self.assertEqual(res["fonts"]["citation"], "cursive")
+            self.assertEqual(res["citationItalicEnabled"], False)
+        finally:
+            self._stop(server)
+
+    def test_post_fonts_persists(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg(None, None)
+        calls = []
+        import configmanage
+
+        orig = configmanage.update_config
+        configmanage.update_config = lambda key, val: calls.append((key, val))
+        self.addCleanup(lambda: setattr(configmanage, "update_config", orig))
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/config",
+                data=_json.dumps({"fonts": {"body": "monospace", "citation": "fantasy"}}),
+            ).json()
+            self.assertTrue(res["ok"])
+            keys = [k for k, _ in calls]
+            self.assertIn("fonts", keys)
+        finally:
+            self._stop(server)
+
+    def test_post_invalid_fonts_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg(None, None)
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/config", data=_json.dumps({"fonts": "nope"})
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("对象", res["error"])
+        finally:
+            self._stop(server)
+
+    def test_post_invalid_citation_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg(None, None)
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/config",
+                data=_json.dumps({"citationItalicEnabled": "yes"}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("布尔值", res["error"])
+        finally:
+            self._stop(server)
+
+
+class TestRuleListButtons(unittest.TestCase):
+    """规则列表 CRUD 按钮：renderFormatRules 应为 fr-up/fr-down/fr-apply/fr-edit/fr-del 绑定点击事件。
+
+    通过 real-DOM harness 验证（Python 侧验证 HTML 结构 + JS 绑定）。
+    """
+
+    def test_render_format_rules_has_crud_buttons(self):
+        """验证 renderFormatRules 在 ui/app.js 中为 fr-up/fr-down/fr-apply/fr-edit/fr-del 绑定点击事件。"""
+        # 按钮类名在 JS renderFormatRules 中动态生成，HTML 模板只有 tbody#formatRulesBody
+        import pathlib
+
+        appjs_path = pathlib.Path(__file__).parent / "ui" / "app.js"
+        appjs = appjs_path.read_text(encoding="utf-8")
+        # renderFormatRules 使用 innerHTML 生成按钮
+        self.assertIn("fr-up", appjs)
+        self.assertIn("fr-down", appjs)
+        self.assertIn("fr-apply", appjs)
+        self.assertIn("fr-edit", appjs)
+        self.assertIn("fr-del", appjs)
+        # 点击事件绑定
+        self.assertIn("moveFormatRule(rule, -1)", appjs)
+        self.assertIn("moveFormatRule(rule, 1)", appjs)
+        self.assertIn("applyFormatRule(rule)", appjs)
+        self.assertIn("editFormatRule(rule)", appjs)
+        self.assertIn("deleteFormatRule(rule)", appjs)
+
 
 class TestFormatRules(unittest.TestCase):
     """格式规则：_validate_format_rules + /api/format_rules 端点。"""
@@ -4966,6 +5420,127 @@ class TestFormatRules(unittest.TestCase):
             self.assertEqual(calls[0][0]["conditions"][0]["formats"], ["align_center"])
         finally:
             self._stop(server)
+
+    def test_validate_pin_and_label(self):
+        from correctmanage import _validate_format_rules
+
+        # Test 1: legacy payload without pin/label keys -> output has neither key
+        rules = _validate_format_rules([{
+            "name": "规则1",
+            "mode": "first",
+            "conditions": [{"type": "contains", "pattern": "测试", "scope": "selection", "formats": ["bold"]}]
+        }])
+        self.assertEqual(len(rules), 1)
+        r = rules[0]
+        self.assertIn("id", r)
+        self.assertEqual(r["name"], "规则1")
+        self.assertEqual(r["mode"], "first")
+        self.assertEqual(len(r["conditions"]), 1)
+        self.assertNotIn("pin", r)
+        self.assertNotIn("label", r)
+
+        # Test 2: pin=True and pin=False present -> preserved as bool
+        rules = _validate_format_rules([
+            {
+                "name": "规则2",
+                "pin": True,
+                "mode": "first",
+                "conditions": [{"type": "contains", "pattern": "测试", "scope": "selection", "formats": ["bold"]}]
+            },
+            {
+                "name": "规则3",
+                "pin": False,
+                "mode": "first",
+                "conditions": [{"type": "contains", "pattern": "测试", "scope": "selection", "formats": ["bold"]}]
+            }
+        ])
+        self.assertEqual(len(rules), 2)
+        self.assertTrue(rules[0]["pin"])
+        self.assertFalse(rules[1]["pin"])
+        self.assertNotIn("label", rules[0])  # no label provided
+        self.assertNotIn("label", rules[1])
+
+        # Test 3: pin truthy non-bool -> True
+        rules = _validate_format_rules([
+            {
+                "name": "规则4",
+                "pin": "yes",
+                "mode": "first",
+                "conditions": [{"type": "contains", "pattern": "测试", "scope": "selection", "formats": ["bold"]}]
+            },
+            {
+                "name": "规则5",
+                "pin": 1,
+                "mode": "first",
+                "conditions": [{"type": "contains", "pattern": "测试", "scope": "selection", "formats": ["bold"]}]
+            },
+            {
+                "name": "规则6",
+                "pin": 0,
+                "mode": "first",
+                "conditions": [{"type": "contains", "pattern": "测试", "scope": "selection", "formats": ["bold"]}]
+            }
+        ])
+        self.assertEqual(len(rules), 3)
+        self.assertTrue(rules[0]["pin"])  # "yes" -> True
+        self.assertTrue(rules[1]["pin"])  # 1 -> True
+        self.assertFalse(rules[2]["pin"]) # 0 -> False
+
+        # Test 4: label handling
+        rules = _validate_format_rules([
+            {
+                "name": "规则7",
+                "label": "  简称  ",
+                "mode": "first",
+                "conditions": [{"type": "contains", "pattern": "测试", "scope": "selection", "formats": ["bold"]}]
+            },
+            {
+                "name": "规则8",
+                "label": "一二三四五",
+                "mode": "first",
+                "conditions": [{"type": "contains", "pattern": "测试", "scope": "selection", "formats": ["bold"]}]
+            },
+            {
+                "name": "规则9",
+                "label": "",
+                "mode": "first",
+                "conditions": [{"type": "contains", "pattern": "测试", "scope": "selection", "formats": ["bold"]}]
+            },
+            {
+                "name": "规则10",
+                "label": "   ",
+                "mode": "first",
+                "conditions": [{"type": "contains", "pattern": "测试", "scope": "selection", "formats": ["bold"]}]
+            }
+        ])
+        self.assertEqual(len(rules), 4)
+        self.assertEqual(rules[0]["label"], "简称")
+        self.assertEqual(rules[1]["label"], "一二三四")  # capped to 4
+        self.assertNotIn("label", rules[2])  # empty string -> omitted
+        self.assertNotIn("label", rules[3])  # whitespace only -> omitted
+
+        # Test 5: combined: pinned+labeled rule roundtrips all fields
+        rules = _validate_format_rules([{
+            "name": "综合规则",
+            "id": "custom-id",
+            "pin": True,
+            "label": "标",
+            "mode": "all",
+            "conditions": [
+                {"type": "contains", "pattern": "A", "scope": "selection", "formats": ["bold"]},
+                {"type": "contains", "pattern": "B", "scope": "selection", "formats": ["italic"]}
+            ]
+        }])
+        self.assertEqual(len(rules), 1)
+        r = rules[0]
+        self.assertEqual(r["id"], "custom-id")
+        self.assertEqual(r["name"], "综合规则")
+        self.assertTrue(r["pin"])
+        self.assertEqual(r["label"], "标")
+        self.assertEqual(r["mode"], "all")
+        self.assertEqual(len(r["conditions"]), 2)
+        self.assertEqual(r["conditions"][0]["formats"], ["bold"])
+        self.assertEqual(r["conditions"][1]["formats"], ["italic"])
 
 
 class TestFormatRulesConfig(unittest.TestCase):
@@ -6026,6 +6601,349 @@ def _b64(raw: bytes) -> str:
     import base64
 
     return base64.b64encode(raw).decode("ascii")
+
+
+class TestHistoryRenameEndpoint(unittest.TestCase):
+    """/api/history/rename：将版本的 display_name 重命名，同组所有版本同步更新。"""
+
+    def _start_server(self, hist_dir, state):
+        import threading
+        from http.server import ThreadingHTTPServer
+        import correctmanage as _cm
+        from correctmanage import _CorrectionHandler
+
+        _orig_dir = _cm._history_dir
+        _cm._history_dir = lambda: hist_dir
+        self.addCleanup(lambda: setattr(_cm, "_history_dir", _orig_dir))
+        self.addCleanup(lambda: shutil.rmtree(hist_dir, ignore_errors=True))
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _CorrectionHandler)
+        server.daemon_threads = True
+        server.state = state
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        return base, server
+
+    def _create_version_file(self, hist_dir, vid, pdf_path, name, pages, display_name=None):
+        """Create a version JSON file with the given parameters."""
+        import json as _json
+        data = {
+            "pdf": pdf_path,
+            "updated": "2026-01-01 00:00:00",
+            "pages": pages,
+        }
+        if display_name is not None:
+            data["display_name"] = display_name
+        if name is not None:
+            data["name"] = name
+        file_path = hist_dir / f"{vid}.json"
+        file_path.write_text(_json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        return file_path
+
+    def _post_rename(self, base, vid, new_name):
+        import json as _json
+        import requests
+        body = _json.dumps({"id": vid, "newName": new_name})
+        return requests.post(base + "/api/history/rename", data=body).json()
+
+    def test_rename_success_updates_all_versions_and_persists(self):
+        """重命名成功：同一 PDF 组下的所有版本文件都更新 display_name，其他组不受影响。"""
+        import json as _json
+        import requests
+        import shutil
+        import correctmanage as _cm
+
+        hist_dir = Path(tempfile.mkdtemp(prefix="test_rename_"))
+        _orig_dir = _cm._history_dir
+        _cm._history_dir = lambda: hist_dir
+        self.addCleanup(lambda: setattr(_cm, "_history_dir", _orig_dir))
+        self.addCleanup(lambda: shutil.rmtree(hist_dir, ignore_errors=True))
+
+        # 状态：2 版本属于同一组（相同 pdf 前缀），1 版本属于另一组
+        state = {
+            "pages": {}, "finished": __import__("threading").Event(),
+            "preview_cache": {}, "pdf_path": None, "img_dir": None,
+            "preview_dpi": 110, "preview_quality": 82,
+            "last_heartbeat": 0.0, "gone_at": None, "idle_timeout": 600.0,
+            "auto_finished": False,
+            "on_convert": None, "convert_lock": __import__("threading").Lock(),
+            "history_prefix": None, "history_lock": __import__("threading").Lock(),
+        }
+        base, server = self._start_server(hist_dir, state)
+
+        # 组 A：2 个版本文件，共享相同前缀 hash（用 pdf 路径哈希算出的 prefix）
+        # 使用手动前缀 "manual_test123" 确保归属同一组
+        vid1 = "manual_test123_20260101000000_0001"
+        vid2 = "manual_test123_20260101000000_0002"
+        vid3 = "manual_other_20260101000000_0001"  # 另一组
+
+        self._create_version_file(hist_dir, vid1, "C:/books/A.pdf", "旧名A", {"1": "<p>页1</p>"}, display_name="旧显示A")
+        self._create_version_file(hist_dir, vid2, "C:/books/A.pdf", "旧名B", {"1": "<p>页1</p>"}, display_name="旧显示B")
+        self._create_version_file(hist_dir, vid3, "C:/books/B.pdf", "旧名C", {"1": "<p>页1</p>"}, display_name="旧显示C")
+
+        # 在服务端状态中设置 history_prefix，模拟同一 PDF 组
+        state["history_prefix"] = "manual_test123"
+
+        # POST 重命名 vid1 到新名称
+        r = self._post_rename(base, vid1, "新名称测试")
+        self.assertTrue(r["ok"], f"rename 应返回 ok:true，实际: {r}")
+        self.assertEqual(r["display_name"], "新名称测试")
+
+        # 验证：组 A 的 2 个版本文件均更新了 display_name
+        f1_data = (hist_dir / f"{vid1}.json").read_text(encoding="utf-8")
+        f2_data = (hist_dir / f"{vid2}.json").read_text(encoding="utf-8")
+        self.assertIn('"display_name": "新名称测试"', f1_data)
+        self.assertIn('"display_name": "新名称测试"', f2_data)
+
+        # 组 B 的版本文件保持不变
+        f3_data = (hist_dir / f"{vid3}.json").read_text(encoding="utf-8")
+        self.assertNotIn('"display_name": "新名称测试"', f3_data)
+
+        # 关键：清除 _HISTORY_INDEX 缓存，验证 _history_entries 返回最新 display_name
+        _cm._HISTORY_INDEX = {"sig": None, "items": None}
+        r_hist = requests.get(base + "/api/history").json()
+        # 找到组 A 的条目
+        group_a_items = [it for it in r_hist["items"] if it["id"].startswith("manual_test123")]
+        # 找到组 B 的条目
+        group_b_items = [it for it in r_hist["items"] if it["id"].startswith("manual_other")]
+        self.assertEqual(group_a_items[0]["display_name"], "新名称测试")
+        self.assertEqual(group_b_items[0]["display_name"], "旧显示C")
+
+    def test_rename_validation_errors(self):
+        """重命名验证：缺少 ID、空名称、含非法字符(\)、含非法字符(/)、含非法字符(:)、过长>100 字符 → 400 + 中文错误."""
+        import json as _json
+        import requests
+        import tempfile
+        import shutil
+        import correctmanage as _cm
+
+        hist_dir = Path(tempfile.mkdtemp(prefix="test_rename_val_"))
+        _orig_dir = _cm._history_dir
+        _cm._history_dir = lambda: hist_dir
+        self.addCleanup(lambda: setattr(_cm, "_history_dir", _orig_dir))
+        self.addCleanup(lambda: shutil.rmtree(hist_dir, ignore_errors=True))
+
+        state = {
+            "pages": {}, "finished": __import__("threading").Event(),
+            "preview_cache": {}, "pdf_path": None, "img_dir": None,
+            "preview_dpi": 110, "preview_quality": 82,
+            "last_heartbeat": 0.0, "gone_at": None, "idle_timeout": 600.0,
+            "auto_finished": False,
+            "on_convert": None, "convert_lock": __import__("threading").Lock(),
+            "history_prefix": None, "history_lock": __import__("threading").Lock(),
+        }
+        base, server = self._start_server(hist_dir, state)
+
+        # 子测试1：缺少版本 ID
+        r = requests.post(base + "/api/history/rename", data=_json.dumps({"newName": "测试"})).json()
+        self.assertFalse(r["ok"])
+        self.assertIn("缺少版本 ID", r.get("error", ""))
+
+        # 子测试2：新名称不能为空
+        r = requests.post(base + "/api/history/rename", data=_json.dumps({"id": "vid_001", "newName": ""})).json()
+        self.assertFalse(r["ok"])
+        self.assertIn("新名称不能为空", r.get("error", ""))
+
+        # 子测试3：名称含反斜杠
+        r = requests.post(base + "/api/history/rename", data=_json.dumps({"id": "vid_001", "newName": "含\\斜杠"})).json()
+        self.assertFalse(r["ok"])
+        self.assertIn("名称含非法字符", r.get("error", ""))
+
+        # 子测试4：名称含正斜杠
+        r = requests.post(base + "/api/history/rename", data=_json.dumps({"id": "vid_001", "newName": "含/斜杠"})).json()
+        self.assertFalse(r["ok"])
+        self.assertIn("名称含非法字符", r.get("error", ""))
+
+        # 子测试5：名称含冒号
+        r = requests.post(base + "/api/history/rename", data=_json.dumps({"id": "vid_001", "newName": "含:冒号"})).json()
+        self.assertFalse(r["ok"])
+        self.assertIn("名称含非法字符", r.get("error", ""))
+
+        # 子测试6：名称过长 (>100 字符)
+        long_name = "a" * 101
+        r = requests.post(base + "/api/history/rename", data=_json.dumps({"id": "vid_001", "newName": long_name})).json()
+        self.assertFalse(r["ok"])
+        self.assertIn("名称过长", r.get("error", ""))
+
+    def test_rename_unknown_id_creates_no_files(self):
+        """未知 ID（前缀匹配零个文件）→ 200 ok，且历史目录无新 .json 文件产生。"""
+        import json as _json
+        import requests
+        import tempfile
+        import shutil
+        import correctmanage as _cm
+        from pathlib import Path
+
+        hist_dir_before = Path(tempfile.mkdtemp(prefix="test_rename_orphan_"))
+        _orig_dir = _cm._history_dir
+        _cm._history_dir = lambda: hist_dir_before
+        self.addCleanup(lambda: setattr(_cm, "_history_dir", _orig_dir))
+        self.addCleanup(lambda: shutil.rmtree(hist_dir_before, ignore_errors=True))
+
+        # 预先创建一些版本文件
+        state = {
+            "pages": {}, "finished": __import__("threading").Event(),
+            "preview_cache": {}, "pdf_path": None, "img_dir": None,
+            "preview_dpi": 110, "preview_quality": 82,
+            "last_heartbeat": 0.0, "gone_at": None, "idle_timeout": 600.0,
+            "auto_finished": False,
+            "on_convert": None, "convert_lock": __import__("threading").Lock(),
+            "history_prefix": None, "history_lock": __import__("threading").Lock(),
+        }
+        base, server = self._start_server(hist_dir_before, state)
+
+        # 创建 2 个版本文件
+        import json as _json
+        (hist_dir_before / "known_20260101000000_0001.json").write_text(
+            _json.dumps({"pdf": "C:/books/A.pdf", "pages": {"1": "<p>x</p>"}}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (hist_dir_before / "known_20260101000000_0002.json").write_text(
+            _json.dumps({"pdf": "C:/books/A.pdf", "pages": {"1": "<p>y</p>"}}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        # 使用一个完全不匹配的 ID（前缀 unknown_prefix 没有对应文件）
+        r = requests.post(base + "/api/history/rename", data=_json.dumps({"id": "unknown_prefix_20260101000000_0001", "newName": "新名"})).json()
+        self.assertTrue(r["ok"], f"未知 ID 应返回 ok:true，实际: {r}")
+        # 验证历史目录中没有新增 .json 文件
+        import glob as _glob
+        json_files_after = _glob.glob(str(hist_dir_before / "*.json"))
+        # 排除已有的 2 个文件
+        self.assertEqual(len(json_files_after), 2, f"未知 ID 重命名不应创建新文件，实际数量: {len(json_files_after)}")
+
+    def test_history_items_carry_display_name_fallback(self):
+        """历史条目携带 display_name：无重命名时 display_name == name；重命名后 display_name == 新名称."""
+        import json as _json
+        import requests
+        import tempfile
+        import shutil
+        import correctmanage as _cm
+
+        hist_dir = Path(tempfile.mkdtemp(prefix="test_rename_fallback_"))
+        _orig_dir = _cm._history_dir
+        _cm._history_dir = lambda: hist_dir
+        self.addCleanup(lambda: setattr(_cm, "_history_dir", _orig_dir))
+        self.addCleanup(lambda: shutil.rmtree(hist_dir, ignore_errors=True))
+
+        state = {
+            "pages": {}, "finished": __import__("threading").Event(),
+            "preview_cache": {}, "pdf_path": None, "img_dir": None,
+            "preview_dpi": 110, "preview_quality": 82,
+            "last_heartbeat": 0.0, "gone_at": None, "idle_timeout": 600.0,
+            "auto_finished": False,
+            "on_convert": None, "convert_lock": __import__("threading").Lock(),
+            "history_prefix": None, "history_lock": __import__("threading").Lock(),
+        }
+        base, server = self._start_server(hist_dir, state)
+
+        # 创建版本文件：display_name 已设置
+        vid = "manual_fallback_20260101000000_0001"
+        import json as _json
+        (hist_dir / f"{vid}.json").write_text(
+            _json.dumps({"pdf": "C:/books/A.pdf", "name": "A书", "display_name": "已设置的显示名", "pages": {"1": "<p>x</p>"}}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        # GET /api/history → display_name 应等于版本文件的 display_name
+        r = requests.get(base + "/api/history").json()
+        self.assertTrue(r["items"])
+        # 该版本的 display_name 应为文件中的 display_name
+        found = [it for it in r["items"] if it["id"] == vid]
+        self.assertTrue(found)
+        self.assertEqual(found[0]["display_name"], "已设置的显示名")
+
+        # 现在重命名
+        import json as _json2
+        r2 = requests.post(base + "/api/history/rename", data=_json2.dumps({"id": vid, "newName": "新显示名"})).json()
+        self.assertTrue(r2["ok"])
+
+        # 再次 GET /api/history → 该条目的 display_name 应为新名称
+        r3 = requests.get(base + "/api/history").json()
+        found2 = [it for it in r3["items"] if it["id"] == vid]
+        self.assertEqual(found2[0]["display_name"], "新显示名")
+
+    def test_epub_export_title_prefers_display_name_then_history_name(self):
+        """EPUB 导出标题优先级：display_name > history_name > '矫正导出'."""
+        import json as _json
+        import requests
+        import tempfile
+        import shutil
+        import correctmanage as _cm
+        import mian as _mian
+
+        # 场景 (a)：版本文件有 display_name → 导出标题使用 display_name
+        hist_dir_a = Path(tempfile.mkdtemp(prefix="test_epub_title_a_"))
+        _orig_dir_a = _cm._history_dir
+        _cm._history_dir = lambda: hist_dir_a
+        self.addCleanup(lambda: setattr(_cm, "_history_dir", _orig_dir_a))
+        self.addCleanup(lambda: shutil.rmtree(hist_dir_a, ignore_errors=True))
+
+        state_a = {
+            "pages": {}, "finished": __import__("threading").Event(),
+            "preview_cache": {}, "pdf_path": None, "img_dir": None,
+            "preview_dpi": 110, "preview_quality": 82,
+            "last_heartbeat": 0.0, "gone_at": None, "idle_timeout": 600.0,
+            "auto_finished": False,
+            "on_convert": None, "convert_lock": __import__("threading").Lock(),
+            "history_prefix": None, "history_lock": __import__("threading").Lock(),
+            "history_name": "默认历史名",
+        }
+        base_a, server_a = self._start_server(hist_dir_a, state_a)
+
+        vid_a = "manual_epub_title_a_20260101000000_0001"
+        import json as _json
+        (hist_dir_a / f"{vid_a}.json").write_text(
+            _json.dumps({"pdf": "C:/books/A.pdf", "name": "A书", "display_name": "自定义书名", "pages": {"1": "<p>x</p>"}}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        # 加载历史版本，设置 state
+        r = requests.post(base_a + "/api/history/load", data=_json.dumps({"id": vid_a})).json()
+        self.assertTrue(r["ok"])
+        # state 中应记录 display_name
+        self.assertEqual(state_a.get("display_name"), "自定义书名")
+
+        # 场景 (b)：版本文件无 display_name，只有 name → 回退到 history_name
+        hist_dir_b = Path(tempfile.mkdtemp(prefix="test_epub_title_b_"))
+        _orig_dir_b = _cm._history_dir
+        _cm._history_dir = lambda: hist_dir_b
+        self.addCleanup(lambda: setattr(_cm, "_history_dir", _orig_dir_b))
+        self.addCleanup(lambda: shutil.rmtree(hist_dir_b, ignore_errors=True))
+
+        state_b = {
+            "pages": {}, "finished": __import__("threading").Event(),
+            "preview_cache": {}, "pdf_path": None, "img_dir": None,
+            "preview_dpi": 110, "preview_quality": 82,
+            "last_heartbeat": 0.0, "gone_at": None, "idle_timeout": 600.0,
+            "auto_finished": False,
+            "on_convert": None, "convert_lock": __import__("threading").Lock(),
+            "history_prefix": None, "history_lock": __import__("threading").Lock(),
+            "history_name": "回退历史名",
+        }
+        base_b, server_b = self._start_server(hist_dir_b, state_b)
+
+        vid_b = "manual_epub_title_b_20260101000000_0001"
+        # 无 display_name 的版本文件
+        (hist_dir_b / f"{vid_b}.json").write_text(
+            _json.dumps({"pdf": "C:/books/B.pdf", "name": "B书", "pages": {"1": "<p>x</p>"}}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        r = requests.post(base_b + "/api/history/load", data=_json.dumps({"id": vid_b})).json()
+        self.assertTrue(r["ok"])
+        # state 中 display_name 保持为空（文件无 display_name 时不写入）；
+        # 注意 /api/history/load 会把 history_name 重置为 PDF 文件名
+        self.assertFalse(state_b.get("display_name"))
+        self.assertEqual(state_b.get("history_name"), "B.pdf")
+
+        # 模拟 EPUB 导出标题逻辑（同 correctmanage ~:6131 公式）
+        # title = st.get("display_name") or (st.get("history_name") or "矫正导出")
+        title_a = state_a.get("display_name") or (state_a.get("history_name") or "矫正导出")
+        title_b = state_b.get("display_name") or (state_b.get("history_name") or "矫正导出")
+        self.assertEqual(title_a, "自定义书名")
+        # display_name 为空 → 回退到 history_name（load 后为 PDF 文件名）
+        self.assertEqual(title_b, "B.pdf")
 
 
 if __name__ == "__main__":

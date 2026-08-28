@@ -123,6 +123,8 @@ class TestCSSManagerStylesheet(unittest.TestCase):
         self.assertIn('text-align: center', css)
         self.assertIn('margin: 0.6em 0 0.35em', css)
         self.assertIn('margin: 0.4em 0', css)
+        # 2026-08-23 修复：h3-h6 也需居中（CSS 与内联保持一致）
+        self.assertIn('h3, h4, h5, h6 {', css)
 
     def test_default_text_indent(self):
         """测试正文/注释默认顶格（2026-08-23 用户要求：不再全局缩进）"""
@@ -236,6 +238,98 @@ class TestHTMLConverterIntegration(unittest.TestCase):
         self.assertIn('text-indent: 0', css)
         self.assertIn('p.ptoe-indent {', css)
         self.assertIn('text-indent: 2em', css)
+
+
+class TestHeadingCentering(unittest.TestCase):
+    """标题居中硬化（2026-08-23）：所有 h1-h6 一律无条件内联 text-align:center，
+    不论是否带 ptoe-align-* 类（内联优先级高于类选择器）。
+    <p> 段落仍尊重 ptoe-align-*（正文对齐不受影响）。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.converter = htmlmanage.HTMLConverter(output_dir=self.tmpdir)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_h1_gets_inline_center(self):
+        """h1 无对齐类时应带内联 text-align:center"""
+        out = self.converter._render_fragment("<h1>标题</h1><p>正文</p>")
+        self.assertIn('<h1 id="h1" style="text-align:center">标题</h1>', out)
+
+    def test_h2_gets_inline_center(self):
+        """h2 无对齐类时应带内联 text-align:center"""
+        out = self.converter._render_fragment("<h2>章节</h2><p>正文</p>")
+        self.assertIn('<h2 id="h1" style="text-align:center">章节</h2>', out)
+
+    def test_h3_h6_get_inline_center(self):
+        """h3-h6 应带内联 text-align:center（2026-08-23 修复：之前只处理 h1/h2）"""
+        out = self.converter._render_fragment("<h3>三级</h3><h4>四级</h4><h5>五级</h5><h6>六级</h6>")
+        self.assertIn('<h3 id="h1" style="text-align:center">三级</h3>', out)
+        self.assertIn('<h4 id="h2" style="text-align:center">四级</h4>', out)
+        self.assertIn('<h5 id="h3" style="text-align:center">五级</h5>', out)
+        self.assertIn('<h6 id="h4" style="text-align:center">六级</h6>', out)
+
+    def test_h1_with_align_left_still_gets_inline_center(self):
+        """h1 带 ptoe-align-left 时仍应加内联居中（2026-08-23 修复：之前
+        豁免 ptoe-align-left 导致历史数据标题不居中）"""
+        out = self.converter._render_fragment('<h1 class="ptoe-align-left">标题</h1>')
+        self.assertIn('class="ptoe-align-left"', out)
+        self.assertIn('style="text-align:center"', out)
+        self.assertEqual(out.count('style="'), 1)
+
+    def test_h1_with_align_right_still_gets_inline_center(self):
+        """h1 带 ptoe-align-right 时仍应加内联居中"""
+        out = self.converter._render_fragment('<h1 class="ptoe-align-right">标题</h1>')
+        self.assertIn('class="ptoe-align-right"', out)
+        self.assertIn('style="text-align:center"', out)
+        self.assertEqual(out.count('style="'), 1)
+
+    def test_h1_with_align_center_gets_inline_center(self):
+        """h1 带 ptoe-align-center 时应加内联居中，无重复 style 属性"""
+        out = self.converter._render_fragment('<h1 class="ptoe-align-center">标题</h1>')
+        self.assertIn('class="ptoe-align-center"', out)
+        self.assertIn('style="text-align:center"', out)
+        self.assertEqual(out.count('style="'), 1)
+
+    def test_h2_with_align_center_gets_inline_center(self):
+        """h2 带 ptoe-align-center 时应加内联居中，无重复 style 属性"""
+        out = self.converter._render_fragment('<h2 class="ptoe-align-center">章节</h2>')
+        self.assertIn('class="ptoe-align-center"', out)
+        self.assertIn('style="text-align:center"', out)
+        self.assertEqual(out.count('style="'), 1)
+
+    def test_h3_with_align_left_still_gets_inline_center(self):
+        """h3 带 ptoe-align-left 时仍应加内联居中（抑制对所有级别失效）"""
+        out = self.converter._render_fragment('<h3 class="ptoe-align-left">三级</h3>')
+        self.assertIn('class="ptoe-align-left"', out)
+        self.assertIn('style="text-align:center"', out)
+        self.assertEqual(out.count('style="'), 1)
+
+    def test_h1_with_align_left_has_both_class_and_style(self):
+        """h1 带 ptoe-align-left → 输出同时含 class 与 style 属性（居中不被抑制）"""
+        out = self.converter._render_fragment('<h1 class="ptoe-align-left">标题</h1>')
+        self.assertIn('<h1 id="h1" class="ptoe-align-left" style="text-align:center">标题</h1>', out)
+
+    def test_h1_with_indent_style_merges_center(self):
+        """h1 带 data-pl（产生 style）时，居中应合并到已有 style 而非新增 style 属性"""
+        out = self.converter._render_fragment('<h1 data-pl="2">标题</h1>')
+        # 应只有一个 style 属性，且同时含 margin-left 和 text-align:center
+        self.assertIn('style="margin-left:2em;text-align:center"', out)
+        self.assertEqual(out.count('style="'), 1)
+
+    def test_h2_with_indent_style_merges_center(self):
+        """h2 带 data-spb（产生 style）时，居中应合并到已有 style"""
+        out = self.converter._render_fragment('<h2 data-spb="1">章节</h2>')
+        self.assertIn('style="margin-top:1.5em;text-align:center"', out)
+        self.assertEqual(out.count('style="'), 1)
+
+    def test_h3_with_indent_style_merges_center(self):
+        """h3 带 data-pl（产生 style）时，居中应合并到已有 style"""
+        out = self.converter._render_fragment('<h3 data-pl="1">三级</h3>')
+        self.assertIn('style="margin-left:1em;text-align:center"', out)
+        self.assertEqual(out.count('style="'), 1)
 
 
 if __name__ == '__main__':

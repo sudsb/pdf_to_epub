@@ -13,16 +13,19 @@ _UI_HTML 占位符；本模块只负责后端端点与 CLI 接线，不自行编
   GET  /api/ping        → 页面心跳（刷新 last_beat）
   GET  /api/convert/status → 转换进度快照（运行中/完成/日志/结果/待答弹窗询问）
   GET  /api/correct/status → 矫正进度快照（运行中/完成/日志）
+  GET  /api/tools/merge/status → 合并进度快照（运行中/完成/日志/结果）
   POST /api/config      → 校验并原子写配置
   POST /api/server/start→ 后台线程启动推理服务（llamamanage.runserver）
   POST /api/server/stop → 停止推理服务
-  POST /api/pick        → 文件/目录选择对话框（tkinter 在主线程弹出）
+  POST /api/pick        → 文件/目录选择对话框（tkinter 在主线程弹出；multiple 支持多选）
   POST /api/bye         → 页面关闭信标（置 gone_at）
   POST /api/convert/start → 子进程启动完整 PDF→EPUB 转换（流式日志）
   POST /api/convert/prompt → 回答子进程的弹窗询问（OCR 断点续传选择，写回 stdin）
   POST /api/convert/stop  → 停止正在运行的转换
   POST /api/correct/start → 子进程启动矫正界面（流式日志）
   POST /api/correct/stop  → 停止正在运行的矫正
+  POST /api/tools/merge/start → 后台线程合并多 EPUB（epubmergemanage.merge_epubs）
+  POST /api/tools/merge/stop  → 请求停止合并（当前章节完成后才会停止）
 
 全程中文错误信息，响应 shape 统一 {ok: bool, ...}。
 """
@@ -152,6 +155,16 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
 .convert-grid .form-row{margin-bottom:0}
 .convert-grid .form-label{width:90px}
 #convertLog{background:#1a1e24;color:#c8d3da;border-radius:var(--radius-sm);padding:12px 14px;font-family:"Cascadia Code","Consolas","Courier New","Microsoft YaHei",monospace;font-size:12px;line-height:1.7;max-height:300px;min-height:80px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
+/* 工具页专用 */
+.merge-file-list{border:1px solid var(--border);border-radius:var(--radius-sm);max-height:240px;overflow-y:auto;background:var(--card);margin-bottom:12px}
+.merge-file-row{display:flex;align-items:center;gap:6px;padding:6px 10px;border-bottom:1px solid #eef0f3;font-size:13px;font-family:"Cascadia Code","Consolas","Courier New","Microsoft YaHei",monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.merge-file-row:last-child{border-bottom:none}
+.mfi{color:var(--text-dim);flex-shrink:0}
+.mfn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:default}
+.mops{display:flex;gap:2px;flex-shrink:0}
+.mops .btn-small{padding:2px 6px;font-size:12px}
+.mops .del-btn{width:auto;padding:0 4px;font-size:14px;border:none;background:transparent;color:var(--text-dim);cursor:pointer;border-radius:4px;display:inline-flex;align-items:center;justify-content:center}
+.mops .del-btn:hover{background:var(--red-bg);color:var(--red)}
 @media(max-width:768px){.convert-grid{grid-template-columns:1fr}}
 </style>
 </head>
@@ -173,7 +186,8 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
     <div class="nav-item" data-page="vllm" onclick="switchPage('vllm')"><span class="nav-icon">▶</span> vLLM 参数</div>
     <div class="nav-item" data-page="proofread" onclick="switchPage('proofread')"><span class="nav-icon">✎</span> 校对参数</div>
     <div class="nav-item" data-page="shortcuts" onclick="switchPage('shortcuts')"><span class="nav-icon">⌨</span> 快捷键</div>
-    <div class="nav-item" data-page="rules" onclick="switchPage('rules')"><span class="nav-icon">☰</span> 格式规则</div>
+    <div class="nav-item" data-page="rules" onclick="switchPage('rules')"><span class="nav-icon">&#9776;</span> 格式规则</div>
+    <div class="nav-item" data-page="tools" onclick="switchPage('tools')"><span class="nav-icon">&#9872;</span> 工具</div>
   </nav>
   <div class="sidebar-overlay" onclick="toggleSidebar()"></div>
   <main class="content" id="contentArea">
@@ -363,6 +377,41 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
         <pre id="correctLog" style="margin-top:10px;">等待矫正任务...</pre>
       </div>
     </div>
+    <!-- 10. 工具 -->
+    <div class="page" id="page-tools">
+      <h2 class="page-title">工具</h2>
+      <p class="page-desc">辅助工具。当前可用：多 EPUB 合并。</p>
+      <div class="card">
+        <div class="card-title"><span class="ct-icon">&#128196;</span> 多 EPUB 合并</div>
+        <p class="page-desc" style="margin:0 0 12px;">将多个 EPUB 按顺序合并为一个，合并顺序 = 列表顺序。</p>
+        <div class="form-row">
+          <span class="form-label">EPUB 文件</span>
+          <div class="form-ctrl">
+            <div class="pick-row">
+              <button class="btn-small" onclick="pickMergeFiles()">添加文件</button>
+              <span class="form-hint" id="mergeFileCount">共 0 个文件</span>
+            </div>
+          </div>
+        </div>
+        <div id="mergeFileList" class="merge-file-list"><div class="empty-state">未添加任何文件，点击「添加文件」选择 EPUB。</div></div>
+        <div class="form-row"><span class="form-label">书名</span><div class="form-ctrl"><input type="text" id="mergeTitle" placeholder="可留空（自动使用第一个文件的标题）"></div></div>
+        <div class="form-row"><span class="form-label">作者</span><div class="form-ctrl"><input type="text" id="mergeAuthor" placeholder="可选"></div></div>
+        <div class="form-row"><span class="form-label">语言</span><div class="form-ctrl"><input type="text" id="mergeLang" value="zh-CN"></div></div>
+        <div class="form-row"><span class="form-label">输出路径</span><div class="form-ctrl"><input type="text" id="mergeOutPath" placeholder="留空则保存到第一个文件同目录"></div></div>
+        <div class="form-hint">输出路径留空时，默认保存到第一个 EPUB 所在目录。</div>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="ct-icon">&#9654;</span> 操作</div>
+        <div class="action-row">
+          <button class="btn-start" id="mergeStartBtn" onclick="startMerge()">开始合并</button>
+          <button class="btn-stop-convert" id="mergeStopBtn" onclick="stopMerge()" style="display:none;">停止</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="ct-icon">&#9998;</span> 运行日志</div>
+        <pre id="mergeLog" class="log-box">等待合并任务...</pre>
+      </div>
+    </div>
   </main>
 </div>
 <!-- 转换弹窗询问（OCR 断点续传等需要用户决策时显示；选择写回子进程） -->
@@ -381,7 +430,7 @@ function apiGet(u){return fetch(u).then(function(r){if(!r.ok)throw new Error("HT
 function apiPost(u,b){return fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:b!==undefined?JSON.stringify(b):undefined}).then(function(r){return r.json()}).catch(function(e){toast("请求失败: "+e.message,"fail");return null})}
 function fetchConfig(){return apiGet("/api/config").then(function(res){if(!res||!res.ok){toast("加载配置失败","fail");return}cfg=res.config||{};models=res.models||[];if(res.path){var el=document.getElementById("configPath");el.textContent=res.path;el.title=res.path}renderAll()})}
 function fetchStatus(){return apiGet("/api/status").then(function(res){if(!res||!res.ok)return;statusInfo=res;renderStatus(res)})}
-function toast(msg,type){type=type||"ok";var c=document.getElementById("toast"),el=document.createElement("div");el.className="toast-item t-"+type;el.textContent=msg;c.appendChild(el);requestAnimationFrame(function(){el.classList.add("show")});setTimeout(function(){el.classList.remove("show");setTimeout(function(){el.remove()},300)},3000)}
+function toast(msg,type,duration){type=type||"ok";duration=duration||(type==="fail"?5000:3000);var c=document.getElementById("toast"),el=document.createElement("div");el.className="toast-item t-"+type;el.textContent=msg;c.appendChild(el);requestAnimationFrame(function(){el.classList.add("show")});setTimeout(function(){el.classList.remove("show");setTimeout(function(){el.remove()},300)},duration)}
 function addLog(text,cls){logLines.push({text:text,cls:cls||"log-info"});if(logLines.length>100)logLines.shift();renderLog()}
 function renderLog(){var box=document.getElementById("logBox"),now=new Date(),ts=pad2(now.getHours())+":"+pad2(now.getMinutes())+":"+pad2(now.getSeconds());box.innerHTML=logLines.map(function(l){return '<span class="'+l.cls+'">['+ts+']</span> '+escH(l.text)}).join("\n");box.scrollTop=box.scrollHeight}
 function pad2(n){return n<10?"0"+n:""+n}
@@ -423,9 +472,9 @@ function collectExtraConfig(){
     };
   }catch(e){/* element missing -> skip */}
 }
-function saveConfig(){collectConfig();collectExtraConfig();var btn=document.getElementById("saveBtn");btn.disabled=true;btn.classList.add("saving");addLog("保存配置中...","log-info");apiPost("/api/config",cfg).then(function(res){btn.disabled=false;btn.classList.remove("saving");if(res&&res.ok){toast("配置已保存","ok");addLog("配置保存成功","log-ok");return fetchConfig()}else{var msg=res&&res.error?res.error:"未知错误";toast("保存失败: "+msg,"fail");addLog("保存失败: "+msg,"log-err")}})}
-function serverStart(){var model=cfg.selected_model||"";document.getElementById("btnStart").disabled=true;addLog("正在启动服务（模型: "+model+"）...","log-info");apiPost("/api/server/start",{model:model}).then(function(res){if(res&&res.ok){toast("服务启动请求已发送","ok");addLog("服务启动成功","log-ok")}else{var msg=res&&res.error?res.error:"启动失败";toast(msg,"fail");addLog("启动失败: "+msg,"log-err")}setTimeout(refreshStatus,2000)})}
-function serverStop(){document.getElementById("btnStop").disabled=true;addLog("正在停止服务...","log-info");apiPost("/api/server/stop").then(function(res){if(res&&res.ok){toast("服务已停止","ok");addLog("服务已停止","log-ok")}else{toast("停止失败","fail");addLog("停止失败","log-err")}setTimeout(refreshStatus,1000)})}
+function saveConfig(){collectConfig();collectExtraConfig();var btn=document.getElementById("saveBtn");btn.disabled=true;btn.classList.add("saving");addLog("保存配置中...","log-info");apiPost("/api/config",cfg).then(function(res){btn.disabled=false;btn.classList.remove("saving");if(res&&res.ok){var newModel=cfg.selected_model||"";toast("已切换模型："+newModel,"ok",5000);addLog("模型已切换: "+newModel,"log-ok");fetchStatus().then(function(s){if(s&&s.probe!=="none"){var hint="，当前服务仍在运行旧模型，重启后生效";toast("已切换模型："+newModel+hint,"ok",5500);addLog("服务仍运行旧模型，建议重启","log-warn")}else{toast("已切换模型："+newModel,"ok",5000);addLog("模型切换生效（无运行服务）","log-ok")}}).catch(function(){toast("已切换模型："+newModel,"ok",5000)})}else{var msg=res&&res.error?res.error:"未知错误";toast("保存失败: "+msg,"fail",5000);addLog("保存失败: "+msg,"log-err")}})}
+function serverStart(){var model=cfg.selected_model||"";document.getElementById("btnStart").disabled=true;document.getElementById("btnStart").textContent="启动中…";addLog("正在启动服务（模型: "+model+"）...","log-info");var startTime=Date.now();var pollInterval=setInterval(function(){apiGet("/api/status").then(function(res){if(!res||!res.ok)return;statusInfo=res;renderStatus(res);if(res.probe==="match"){clearInterval(pollInterval);var modelName=res.model_name||model;toast("模型已启动："+modelName,"ok",5000);addLog("服务已就绪: "+modelName,"log-ok");document.getElementById("btnStart").disabled=false;document.getElementById("btnStart").textContent="启动服务"}var now=Date.now();if(now-startTime>60000){clearInterval(pollInterval);toast("启动超时，请检查模型路径或端口配置","fail",5000);addLog("服务启动超时","log-err");document.getElementById("btnStart").disabled=false;document.getElementById("btnStart").textContent="启动服务"}},2000);setTimeout(function(){clearInterval(pollInterval);toast("启动超时，请检查模型路径或端口配置","fail",5000);addLog("服务启动超时","log-err");document.getElementById("btnStart").disabled=false;document.getElementById("btnStart").textContent="启动服务"},60000)});apiPost("/api/server/start",{model:model}).then(function(res){if(res&&res.ok){addLog("服务启动请求已发送","log-ok")}else{var msg=res&&res.error?res.error:"启动失败";toast(msg,"fail",5000);addLog("启动失败: "+msg,"log-err")}}).catch(function(e){toast("请求失败: "+e.message,"fail",5000);addLog("启动请求异常: "+e.message,"log-err");document.getElementById("btnStart").disabled=false;document.getElementById("btnStart").textContent="启动服务"})}
+function serverStop(){document.getElementById("btnStop").disabled=true;addLog("正在停止服务...","log-info");var stopStart=Date.now();apiPost("/api/server/stop").then(function(res){if(res&&res.ok){var pollStop=setInterval(function(){apiGet("/api/status").then(function(res){if(!res||!res.ok)return;statusInfo=res;renderStatus(res);if(res.probe==="none"||res.probe==="mismatch"){clearInterval(pollStop);toast("服务已停止","ok",5000);addLog("服务已停止","log-ok");document.getElementById("btnStop").disabled=false}else{if(Date.now()-stopStart>30000){clearInterval(pollStop);toast("停止超时，请重试","fail",5000);addLog("服务停止超时","log-err");document.getElementById("btnStop").disabled=false}}},2000);setTimeout(function(){clearInterval(pollStop);toast("停止超时，请重试","fail",5000);addLog("服务停止超时","log-err");document.getElementById("btnStop").disabled=false},30000)})}else{toast("停止失败","fail",5000);addLog("停止失败","log-err")}setTimeout(refreshStatus,1000)}).catch(function(e){toast("请求失败: "+e.message,"fail",5000);addLog("停止请求异常: "+e.message,"log-err");document.getElementById("btnStop").disabled=false})}
 function refreshStatus(){addLog("刷新服务状态...","log-info");fetchStatus()}
 function pickFile(inputId){apiPost("/api/pick",{kind:"file",title:"选择文件"}).then(function(res){if(res&&res.ok&&!res.cancelled&&res.path){document.getElementById(inputId).value=res.path;toast("已选择文件","ok")}else if(res&&res.cancelled){toast("已取消选择","warn")}})}
 function pickDir(inputId){apiPost("/api/pick",{kind:"dir",title:"选择目录"}).then(function(res){if(res&&res.ok&&!res.cancelled&&res.path){document.getElementById(inputId).value=res.path;toast("已选择目录","ok")}else if(res&&res.cancelled){toast("已取消选择","warn")}})}
@@ -454,8 +503,25 @@ function stopPollCorrect(){if(correctPollTimer){clearInterval(correctPollTimer);
 function pollCorrectStatus(){apiGet("/api/correct/status").then(function(res){if(!res||!res.ok)return;renderCorrectLog(res.lines||[]);if(res.running)return;stopPollCorrect();setCorrectBusy(false);if(res.done&&res.success===true){toast("\u77eb\u6b63\u5b8c\u6210","ok");addLog("\u77eb\u6b63\u5b8c\u6210","log-ok")}else if(res.done&&res.success===false){var errmsg=res.error||"\u77eb\u6b63\u5931\u8d25";toast(errmsg,"fail");addLog("\u77eb\u6b63\u5931\u8d25: "+errmsg,"log-err")}})}
 function renderCorrectLog(lines){var el=document.getElementById("correctLog");if(!lines.length)return;el.textContent=lines.join("\n");el.scrollTop=el.scrollHeight}
 function stopCorrect(){apiPost("/api/correct/stop").then(function(res){if(res&&res.ok){toast("\u5df2\u8bf7\u6c42\u505c\u6b62","warn");addLog("\u5df2\u8bf7\u6c42\u505c\u6b62\u77eb\u6b63","log-warn")}else{var msg=res&&res.error?res.error:"\u505c\u6b62\u5931\u8d25";toast(msg,"fail")}})}
+/* ===== 工具页：多 EPUB 合并 ===== */
+var mergePollTimer=null;
+var mergeFiles=[];
+function setMergeBusy(busy){var start=document.getElementById("mergeStartBtn"),stop=document.getElementById("mergeStopBtn");if(busy){start.disabled=true;start.classList.add("running");start.textContent="\u5408\u5e76\u4e2d\u2026";stop.style.display="";stop.disabled=false}else{start.disabled=false;start.classList.remove("running");start.textContent="\u5f00\u59cb\u5408\u5e76";stop.style.display="none";stop.disabled=true}}
+function basename(p){return p.split(/[\\\/]/).pop()}
+function renderMergeFileList(){var list=document.getElementById("mergeFileList"),cnt=document.getElementById("mergeFileCount");cnt.textContent="\u5171 "+mergeFiles.length+" \u4e2a\u6587\u4ef6";if(!mergeFiles.length){list.innerHTML='<div class="empty-state">\u672a\u6dfb\u52a0\u4efb\u4f55\u6587\u4ef6\uff0c\u70b9\u51fb\u300a\u6dfb\u52a0\u6587\u4ef6\u300b\u9009\u62e9 EPUB\u3002</div>';return}list.innerHTML="";mergeFiles.forEach(function(p,i){var row=document.createElement("div");row.className="merge-file-row";row.innerHTML='<span class="mfi">\u2192'+(i+1)+'</span><span class="mfn" title="'+escH(p)+'">'+escH(basename(p))+'</span><span class="mops"><button class="btn-small" onclick="moveMergeFile('+i+',-1)" title="\u4e0a\u79fb" '+(i===0?'disabled':'')+'>&#8593;</button><button class="btn-small" onclick="moveMergeFile('+i+',1)" title="\u4e0b\u79fb" '+(i===mergeFiles.length-1?'disabled':'')+'>&#8595;</button><button class="btn-small del-btn" onclick="removeMergeFile('+i+')" title="\u79fb\u9664"></button></span>';list.appendChild(row)})}
+function moveMergeFile(idx,dir){var n=idx+dir;if(n<0||n>=mergeFiles.length)return;var t=mergeFiles[idx];mergeFiles.splice(idx,1);mergeFiles.splice(n,0,t);renderMergeFileList()}
+function removeMergeFile(idx){mergeFiles.splice(idx,1);renderMergeFileList()}
+function pickMergeFiles(){apiPost("/api/pick",{kind:"file",filter:"epub",multiple:true,title:"\u9009\u62e9 EPUB \u6587\u4ef6"}).then(function(res){if(!res)return;if(res.ok&&!res.cancelled&&res.paths){res.paths.forEach(function(p){if(mergeFiles.indexOf(p)<0)mergeFiles.push(p)});renderMergeFileList();toast("\u5df2\u6dfb\u52a0 "+res.paths.length+" \u4e2a\u6587\u4ef6","ok")}else if(res&&res.cancelled){toast("\u5df2\u53d6\u6d88\u9009\u62e9","warn")}else if(res&&res.error){toast("选择失败: "+res.error,"fail")}})}
+function collectMergeParams(){var files=mergeFiles.slice();if(files.length<2)return{error:"\u8bf7\u9009\u62e9\u81f3\u5c11 2 \u4e2a EPUB \u6587\u4ef6"};return{paths:files,title:document.getElementById("mergeTitle").value.trim(),author:document.getElementById("mergeAuthor").value.trim(),lang:document.getElementById("mergeLang").value.trim()||"zh-CN",out_path:document.getElementById("mergeOutPath").value.trim()||null}}
+function startMerge(){var params=collectMergeParams();if(params.error){toast(params.error,"warn");return}setMergeBusy(true);var log=document.getElementById("mergeLog");log.textContent="";addLog("\u5f00\u59cb\u5408\u5e76: "+params.paths.length+" \u4e2a\u6587\u4ef6","log-info");apiPost("/api/tools/merge/start",params).then(function(res){if(res&&res.ok){toast("\u5408\u5e76\u5df2\u542f\u52a8","ok");addLog("\u5408\u5e76\u5df2\u542f\u52a8","log-ok");startPollMerge()}else{var msg=res&&res.error?res.error:"\u542f\u59cb\u5931\u8d25";toast(msg,"fail");addLog("\u542f\u59cb\u5931\u8d25: "+msg,"log-err");setMergeBusy(false)}})}
+function startPollMerge(){if(mergePollTimer)clearInterval(mergePollTimer);mergePollTimer=setInterval(pollMergeStatus,500)}
+function stopPollMerge(){if(mergePollTimer){clearInterval(mergePollTimer);mergePollTimer=null}}
+function pollMergeStatus(){apiGet("/api/tools/merge/status").then(function(res){if(!res||!res.ok)return;renderMergeLog(res.lines||[]);if(res.running)return;stopPollMerge();setMergeBusy(false);if(res.done&&res.success===true){var out=res.out_path||"";var msg="\u5408\u5e76\u5b8c\u6210";if(out)msg+="\uff1a"+out;toast(msg,"ok");addLog(msg,"log-ok")}else if(res.done&&res.success===false){var errmsg=res.error||"\u5408\u5e76\u5931\u8d25";toast(errmsg,"fail");addLog("\u5408\u5e76\u5931\u8d25: "+errmsg,"log-err")}})}
+function renderMergeLog(lines){var el=document.getElementById("mergeLog");if(!lines.length)return;el.textContent=lines.join("\n");el.scrollTop=el.scrollHeight}
+function stopMerge(){apiPost("/api/tools/merge/stop").then(function(res){if(res&&res.ok){toast(res.message||"\u5df2\u8bf7\u6c42\u505c\u6b62","warn");addLog("\u5df2\u8bf7\u6c42\u505c\u6b62\u5408\u5e76","log-warn")}else{var msg=res&&res.error?res.error:"\u505c\u6b62\u5931\u8d25";toast(msg,"fail")}})}
 setInterval(function(){fetch("/api/ping").catch(function(){})},30000);
-window.addEventListener("pagehide",function(){stopPollConvert();stopPollCorrect();navigator.sendBeacon("/api/bye")});
+window.addEventListener("pagehide",function(){stopPollConvert();stopPollCorrect();stopPollMerge();navigator.sendBeacon("/api/bye")});
+window.addEventListener("pageshow",function(){fetch("/api/ping").catch(function(){})});
 fetchConfig().then(function(){fetchStatus()});
 </script>
 </body>
@@ -470,6 +536,9 @@ _BAD_JSON = object()
 
 # 转换日志环形缓冲上限（行）：超出丢弃最旧行，避免内存无限增长
 _CONVERT_MAX_LINES = 2000
+
+# 合并日志环形缓冲上限（行）：与转换同步
+_MERGE_MAX_LINES = 2000
 
 # 转换子进程的弹窗询问协议标记（与 mian.py _PROMPT_MARKER 同值）：子进程在
 # 需要用户决策（OCR 断点续传选择）时打印 `__PTOE_PROMPT__ <json>` 单行，
@@ -563,6 +632,58 @@ def _correct_argv(
     if correct_timeout is not None:
         argv += ["--correct-timeout", str(correct_timeout)]
     return argv
+
+
+def _correct_server_info_path():
+    """懒 import correctmanage 调其 _server_info_path()，import 失败返回 None。
+
+    供 GUI 发现并恢复已存活的矫正界面（浏览器关闭但 correctmanage 服务仍在）。
+    """
+    try:
+        import correctmanage
+
+        return correctmanage._server_info_path()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _read_correct_server_info():
+    """读取矫正服务 sidecar JSON，校验 port/pid 合法性。
+
+    返回 {"port": int, "pid": int, "started": float} 或 None（文件缺失/损坏/
+    字段非法）。
+    """
+    p = _correct_server_info_path()
+    if p is None or not p.exists():
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            info = json.load(f)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(info, dict):
+        return None
+    port = info.get("port")
+    pid = info.get("pid")
+    if not isinstance(port, int) or not isinstance(pid, int):
+        return None
+    if not (0 < port < 65536):
+        return None
+    return info
+
+
+def _probe_correct_ui(port: int) -> bool:
+    """探测矫正界面是否存活：GET /api/ping，200 即 True。
+
+    超时 1.5 秒，任何异常返回 False。
+    """
+    try:
+        import requests
+
+        r = requests.get(f"http://127.0.0.1:{port}/api/ping", timeout=1.5)
+        return r.status_code == 200
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _convert_monitor(st: dict, proc) -> None:
@@ -685,27 +806,101 @@ def _convert_monitor(st: dict, proc) -> None:
             st["error"] = str(e)
 
 
-def _browser_gone(state: dict, *, idle_timeout: int) -> bool:
+def _merge_worker(st: dict, paths, title, author, lang, out_path) -> None:
+    """合并 EPUB 的后台监控线程。
+
+    st 为 state["merge"]（锁内读写）；调用 epubmergemanage.merge_epubs
+    （延迟导入，缺失时记录「合并模块未就绪」）。progress 回调把进度行
+    追加进环形缓冲；should_stop 读取 stop_event 以支持中止。
+    """
+    try:
+        import epubmergemanage  # noqa: F401  延迟导入：合并引擎由并行Agent构建
+    except Exception:
+        with st["lock"]:
+            st["lines"].append("合并模块未就绪")
+            st["running"] = False
+            st["done"] = True
+            st["success"] = False
+            st["error"] = "合并模块未就绪"
+        return
+    try:
+
+        def progress(msg: str) -> None:
+            with st["lock"]:
+                st["lines"].append(msg)
+                if len(st["lines"]) > _MERGE_MAX_LINES:
+                    del st["lines"][: len(st["lines"]) - _MERGE_MAX_LINES]
+
+        result = epubmergemanage.merge_epubs(
+            paths,
+            out_path=out_path or None,
+            title=title or "",
+            author=author or "",
+            lang=lang or "zh-CN",
+            progress=progress,
+            should_stop=st["stop_event"].is_set,
+        )
+        with st["lock"]:
+            st["running"] = False
+            st["done"] = True
+            if isinstance(result, dict) and result.get("ok"):
+                st["success"] = True
+                st["out_path"] = result.get("out_path")
+            else:
+                st["success"] = False
+                st["error"] = (
+                    (result or {}).get("error") or "合并失败"
+                    if isinstance(result, dict)
+                    else "合并失败"
+                )
+    except Exception as e:  # noqa: BLE001  监控线程异常不崩溃服务
+        with st["lock"]:
+            st["running"] = False
+            st["done"] = True
+            st["success"] = False
+            st["error"] = str(e)
+
+
+# 心跳失联场景（未收到信标，如浏览器被强杀/崩溃）需连续失联这么久才判定，
+# 避免电脑休眠唤醒后短暂失联导致误判。
+_STALE_CONFIRM_SECONDS = 3.0
+
+
+def _browser_gone(
+    state: dict,
+    *,
+    idle_timeout: int,
+    now: float | None = None,
+    stale_since: float | None = None,
+) -> tuple[bool, float | None]:
     """判断浏览器是否已关闭且应自动退出。
 
+    返回 (gone, stale_since)：gone=True 表示判定成立；stale_since 用于心跳
+    失联场景的连续确认（首次失联记时刻，持续 _STALE_CONFIRM_SECONDS 才认定）。
     - gone_at 有值（收到 /api/bye 页面关闭信标）：now - gone_at >= idle_timeout 判定；
-    - 否则距 last_beat（/api/ping 心跳）超过 idle_timeout*2 视为失联。
-    满足任一返回 True。
+    - 否则距 last_beat（/api/ping 心跳）超过 idle_timeout*2 视为失联，
+      需连续失联确认（防休眠唤醒误判）。
     """
-    now = time.time()
+    now = time.monotonic() if now is None else now
     gone_at = state.get("gone_at")
     if gone_at is not None:
-        return now - gone_at >= idle_timeout
-    last_beat = state.get("last_beat") or 0.0
-    return now - last_beat >= idle_timeout * 2
+        # 收到过 pagehide 信标（标签页被关闭）：信标为准，倒计时满即判定
+        return (now - gone_at >= idle_timeout), None
+    if now - state.get("last_beat", 0.0) >= idle_timeout * 2:
+        # 心跳失联（无信标，如浏览器被强杀）：需连续失联确认，防休眠唤醒误判
+        if stale_since is None:
+            return False, now
+        return (now - stale_since >= _STALE_CONFIRM_SECONDS), stale_since
+    return False, None
 
 
-def _pick_path(kind: str, title: str | None, filt: str | None = None) -> dict:
+def _pick_path(kind: str, title: str | None, filt: str | None = None, multiple: bool = False) -> dict:
     """弹 tkinter 文件/目录选择对话框（仅主线程调用）。
 
-    filt 仅对 kind=="file" 生效："pdf" 时限定 PDF 文件类型。
-    返回 {ok: True, path}（选中）| {ok: True, cancelled: True}（取消）|
-    {ok: False, error}（tkinter 不可用 / headless 无 display）。
+    filt 仅对 kind=="file" 生效："pdf" 限定 PDF，"epub" 限定 EPUB。
+    multiple=True 时多选，返回 {ok, paths:[...]}。
+    返回 {ok: True, path}（单选选中）| {ok: True, paths:[...]}（多选）|
+    {ok: True, cancelled: True}（取消）| {ok: False, error}（tkinter 不可用）。
     """
     try:
         import tkinter as tk
@@ -723,6 +918,15 @@ def _pick_path(kind: str, title: str | None, filt: str | None = None) -> dict:
         try:
             if kind == "dir":
                 path = filedialog.askdirectory(title=title or "选择文件夹")
+            elif multiple:
+                ftypes = {
+                    "pdf": [("PDF 文件", "*.pdf"), ("所有文件", "*.*")],
+                    "epub": [("EPUB 文件", "*.epub"), ("所有文件", "*.*")],
+                }.get(filt or "")
+                path = filedialog.askopenfilenames(
+                    title=title or "选择文件",
+                    filetypes=ftypes,
+                )
             elif filt == "pdf":
                 path = filedialog.askopenfilename(
                     title=title or "选择 PDF 文件",
@@ -738,6 +942,10 @@ def _pick_path(kind: str, title: str | None, filt: str | None = None) -> dict:
     except Exception:
         # headless 无 display：tkinter 抛 TclError
         return {"ok": False, "error": "无法弹出文件选择对话框"}
+    if multiple:
+        if not path:
+            return {"ok": True, "cancelled": True}
+        return {"ok": True, "paths": list(path)}
     if not path:
         return {"ok": True, "cancelled": True}
     return {"ok": True, "path": path}
@@ -759,6 +967,7 @@ def _drain_dialog_queue(state: dict) -> None:
                 str(req.get("kind") or "file"),
                 req.get("title"),
                 req.get("filter"),
+                req.get("multiple", False),
             )
         except Exception:  # noqa: BLE001
             req["result"] = {"ok": False, "error": "无法弹出文件选择对话框"}
@@ -916,10 +1125,11 @@ class _GuiHandler(BaseHTTPRequestHandler):
             self._send(500, self._json({"ok": False, "error": str(e)}))
 
     def _api_ping(self) -> None:
-        """GET /api/ping：页面心跳，刷新存活时刻。"""
+        """GET /api/ping：页面心跳：刷新存活时刻，并取消可能存在的关闭倒计时（标签页被恢复/刷新）。"""
         st = self.server.state
         with st["beat_lock"]:
-            st["last_beat"] = time.time()
+            st["last_beat"] = time.monotonic()
+            st["gone_at"] = None
         self._send(200, self._json({"ok": True}))
 
     def do_GET(self) -> None:
@@ -942,6 +1152,9 @@ class _GuiHandler(BaseHTTPRequestHandler):
         if path == "/api/correct/status":
             self._api_correct_status()
             return
+        if path == "/api/tools/merge/status":
+            self._api_tools_merge_status()
+            return
         self._send(404, self._json({"ok": False, "error": "未找到"}))
 
     # -- POST --
@@ -962,9 +1175,18 @@ class _GuiHandler(BaseHTTPRequestHandler):
                 return
             choices = body.get("model_choices", cfg.get("model_choices") or {})
             sel = body.get("selected_model", cfg.get("selected_model"))
-            if sel not in choices:
-                self._send(400, self._json({"ok": False, "error": f"未知模型：{sel}"}))
-                return
+            # Tolerate case-insensitive selected_model by mapping to canonical key
+            if isinstance(choices, dict) and isinstance(sel, str) and sel.strip() and sel not in choices:
+                matches = [k for k in choices.keys() if isinstance(k, str) and k.lower() == sel.lower()]
+                if len(matches) == 1:
+                    sel = matches[0]
+                    body["selected_model"] = sel
+                elif len(matches) > 1:
+                    self._send(400, self._json({"ok": False, "error": f"ambiguous model: '{sel}' matches {matches}, use exact key or remove duplicates"}))
+                    return
+                else:
+                    self._send(400, self._json({"ok": False, "error": f"未知模型：{sel}"}))
+                    return
             for key in ("llama_server", "models_dir"):
                 val = body.get(key, cfg.get(key))
                 if not isinstance(val, str):
@@ -1027,7 +1249,10 @@ class _GuiHandler(BaseHTTPRequestHandler):
             self._send(500, self._json({"ok": False, "error": str(e)}))
 
     def _api_pick(self, body) -> None:
-        """POST /api/pick：把文件/目录选择请求交给主线程弹框并等待结果。"""
+        """POST /api/pick：把文件/目录选择请求交给主线程弹框并等待结果。
+
+        multiple=true 时多选，返回 {ok, paths:[...]}；否则单选 {ok, path}。
+        """
         if not isinstance(body, dict):
             self._send(400, self._json({"ok": False, "error": "无效的 JSON"}))
             return
@@ -1035,14 +1260,19 @@ class _GuiHandler(BaseHTTPRequestHandler):
         if kind not in ("file", "dir"):
             self._send(400, self._json({"ok": False, "error": "kind 仅支持 file / dir"}))
             return
+        multiple = body.get("multiple", False)
+        if not isinstance(multiple, bool):
+            self._send(400, self._json({"ok": False, "error": "multiple 必须是布尔值"}))
+            return
         filt = body.get("filter")
-        if filt is not None and filt not in ("pdf",):
-            self._send(400, self._json({"ok": False, "error": "filter 仅支持 pdf"}))
+        if filt is not None and filt not in ("pdf", "epub"):
+            self._send(400, self._json({"ok": False, "error": "filter 仅支持 pdf / epub"}))
             return
         req = {
             "kind": kind,
             "title": body.get("title"),
             "filter": filt if kind == "file" else None,
+            "multiple": multiple,
             "done": threading.Event(),
             "result": None,
             "aborted": False,
@@ -1063,7 +1293,7 @@ class _GuiHandler(BaseHTTPRequestHandler):
         """POST /api/bye：页面关闭信标，记录关闭时刻。"""
         st = self.server.state
         with st["beat_lock"]:
-            st["gone_at"] = time.time()
+            st["gone_at"] = time.monotonic()
         self._send(200, self._json({"ok": True}))
 
     def _api_convert_start(self, body) -> None:
@@ -1150,10 +1380,14 @@ class _GuiHandler(BaseHTTPRequestHandler):
         )
         try:
             # 注入 PYTHONIOENCODING=utf-8：子进程 stdout 默认用系统编码（GBK），父进程按 utf-8 解码→乱码
+            # （冻结 exe 实测忽略该变量，真正的编码修复在 mian.main() 内按 tty 判断 reconfigure；
+            #   此处保留用于开发模式 python 子进程。PYTHONUNBUFFERED 关闭子进程块缓冲，
+            #   避免管道下日志成块延迟到达、界面显示不完整）
             # PTOE_UI_PROMPT=1 + stdin=PIPE：子进程需要用户决策（OCR 断点续传
             # 选择）时打印 __PTOE_PROMPT__ 标记，GUI 弹窗后写回 stdin
             env = dict(os.environ)
             env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUNBUFFERED"] = "1"
             env["PTOE_UI_PROMPT"] = "1"
             kwargs = {
                 "stdin": subprocess.PIPE,
@@ -1317,6 +1551,30 @@ class _GuiHandler(BaseHTTPRequestHandler):
             self._send(400, self._json({"ok": False, "error": "correct_timeout 必须 >= 1"}))
             return
         # 单飞：矫正或转换在运行则拒绝
+        # 已有存活的矫正界面（如浏览器被关闭但服务仍在等待）→ 返回地址供前端恢复
+        info = _read_correct_server_info()
+        if info is not None:
+            if _probe_correct_ui(info["port"]):
+                url = f"http://127.0.0.1:{info['port']}/"
+                self._send(
+                    200,
+                    self._json(
+                        {
+                            "ok": True,
+                            "already_running": True,
+                            "url": url,
+                            "message": "矫正已在运行，已重新打开界面",
+                        }
+                    ),
+                )
+                return
+            # 探测失败 = 记录已过期，清掉后照常启动
+            try:
+                p = _correct_server_info_path()
+                if p is not None and p.exists():
+                    p.unlink()
+            except Exception:  # noqa: BLE001
+                pass
         st = self.server.state
         cr = st["correct"]
         cv = st["convert"]
@@ -1348,6 +1606,7 @@ class _GuiHandler(BaseHTTPRequestHandler):
         try:
             env = dict(os.environ)
             env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUNBUFFERED"] = "1"
             kwargs = {
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.STDOUT,
@@ -1412,6 +1671,95 @@ class _GuiHandler(BaseHTTPRequestHandler):
             pass
         self._send(200, self._json({"ok": True, "message": "已请求停止"}))
 
+    # -- 工具：多 EPUB 合并 --
+
+    def _api_tools_merge_start(self, body) -> None:
+        """POST /api/tools/merge/start：后台线程合并多 EPUB。"""
+        if not isinstance(body, dict):
+            self._send(400, self._json({"ok": False, "error": "无效的 JSON"}))
+            return
+        # -- 参数校验（中文错误） --
+        paths = body.get("paths")
+        if not isinstance(paths, list) or len(paths) < 2:
+            self._send(400, self._json({"ok": False, "error": "请至少选择 2 个 EPUB 文件"}))
+            return
+        for p in paths:
+            if not isinstance(p, str) or not p:
+                self._send(400, self._json({"ok": False, "error": "路径列表包含非法项"}))
+                return
+            if not p.lower().endswith(".epub"):
+                self._send(400, self._json({"ok": False, "error": "仅支持 .epub 文件：" + p}))
+                return
+            if not os.path.isfile(p):
+                self._send(400, self._json({"ok": False, "error": "文件不存在：" + p}))
+                return
+        for key in ("title", "author", "lang", "out_path"):
+            val = body.get(key)
+            if val is not None and not isinstance(val, str):
+                self._send(400, self._json({"ok": False, "error": key + " 必须是字符串"}))
+                return
+        # -- 单飞：已有合并在运行则拒绝 --
+        st = self.server.state
+        mg = st["merge"]
+        with mg["lock"]:
+            if mg["running"]:
+                self._send(409, self._json({"ok": False, "error": "已有合并任务在运行"}))
+                return
+            mg["lines"] = []
+            mg["done"] = False
+            mg["success"] = False
+            mg["error"] = None
+            mg["out_path"] = None
+            mg["stop_event"].clear()
+            mg["running"] = True
+        threading.Thread(
+            target=_merge_worker,
+            args=(
+                mg,
+                paths,
+                body.get("title"),
+                body.get("author"),
+                body.get("lang"),
+                body.get("out_path"),
+            ),
+            daemon=True,
+        ).start()
+        self._send(200, self._json({"ok": True, "message": "合并已启动"}))
+
+    def _api_tools_merge_status(self) -> None:
+        """GET /api/tools/merge/status：合并进度快照。"""
+        mg = self.server.state["merge"]
+        with mg["lock"]:
+            self._send(
+                200,
+                self._json(
+                    {
+                        "ok": True,
+                        "running": mg["running"],
+                        "done": mg["done"],
+                        "success": mg["success"],
+                        "lines": mg["lines"][-500:],
+                        "error": mg["error"],
+                        "out_path": mg["out_path"],
+                    }
+                ),
+            )
+
+    def _api_tools_merge_stop(self) -> None:
+        """POST /api/tools/merge/stop：请求停止合并（当前章节完成后才会停止）。"""
+        mg = self.server.state["merge"]
+        with mg["lock"]:
+            if not mg["running"]:
+                self._send(400, self._json({"ok": False, "error": "没有正在运行的合并"}))
+                return
+            mg["stop_event"].set()
+        self._send(
+            200,
+            self._json(
+                {"ok": True, "message": "已请求停止（当前章节完成后才会停止）"}
+            ),
+        )
+
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
         body = self._read_body()
@@ -1448,6 +1796,12 @@ class _GuiHandler(BaseHTTPRequestHandler):
         if path == "/api/correct/stop":
             self._api_correct_stop()
             return
+        if path == "/api/tools/merge/start":
+            self._api_tools_merge_start(body)
+            return
+        if path == "/api/tools/merge/stop":
+            self._api_tools_merge_stop()
+            return
         self._send(404, self._json({"ok": False, "error": "未找到"}))
 
 
@@ -1475,7 +1829,7 @@ def gui_serve(
         "dlg_lock": threading.Lock(),
         "serve_lock": threading.Lock(),
         "gone_at": None,
-        "last_beat": time.time(),
+        "last_beat": time.monotonic(),
         "beat_lock": threading.Lock(),
         "last_error": None,
         "convert": {
@@ -1501,6 +1855,16 @@ def gui_serve(
             "error": None,
             "prompt": None,
         },
+        "merge": {
+            "lock": threading.Lock(),
+            "lines": [],
+            "running": False,
+            "done": False,
+            "success": False,
+            "error": None,
+            "out_path": None,
+            "stop_event": threading.Event(),
+        },
     }
     server = ThreadingHTTPServer((host, port), _GuiHandler)
     server.daemon_threads = True
@@ -1519,12 +1883,17 @@ def gui_serve(
     try:
         # 浏览器关闭监测：页面每 30s 发心跳（/api/ping）；关闭标签页时发
         # pagehide 信标（/api/bye）。信标确认关闭或心跳失联超过阈值后自动退出。
+        # 心跳失联需连续 _STALE_CONFIRM_SECONDS 确认，防休眠唤醒误判。
+        stale_since: float | None = None
         while not state["finished"].is_set():
             time.sleep(0.5)
             # 文件选择对话框只能在主线程弹出（tkinter 线程安全），逐轮取走
             # 队列里的请求弹框，阻塞直到用户选择/取消
             _drain_dialog_queue(state)
-            if _browser_gone(state, idle_timeout=idle_timeout):
+            gone, stale_since = _browser_gone(
+                state, idle_timeout=idle_timeout, stale_since=stale_since
+            )
+            if gone:
                 state["finished"].set()
                 break
     except KeyboardInterrupt:
@@ -1561,3 +1930,11 @@ def gui_serve(
                     proc.kill()
                 except Exception:  # noqa: BLE001
                     pass
+        # 兜底：合并任务仍在运行时请求停止（引擎自行检查 stop_event）
+        mg = state["merge"]
+        with mg["lock"]:
+            mg["stop_event"].set()
+            mg["running"] = False
+            mg["done"] = True
+            mg["success"] = False
+            mg["error"] = mg["error"] or "服务已关闭"
