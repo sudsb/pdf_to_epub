@@ -670,6 +670,48 @@ def _strip_ws(text):
     return "".join(out), pos
 
 
+_TRAILING_PAGE_NUM_RE = re.compile(
+    r"(?:"
+    # 分支A：明确页码样式，前可有空白/换行，末尾直接剥（无需独立成行）
+    r"[\n\r\s]*"
+    r"(?:"
+    r"第\s*\d+\s*页"  # 第 N 页
+    r"|"
+    r"[Pp][\s.]*\d{1,4}"  # P123 / p.123
+    r"|"
+    r"页码?\s*\d{1,4}"  # 页码123 / 页123
+    r"|"
+    r"No\.?\s*\d{1,4}"  # No.123 / No123
+    r"|"
+    r"[〔【\[（(［〈《「『]\s*\d{1,4}\s*[〕】\]）)］〉》」』]"  # 括号包裹：[121]/（121）等
+    r")"
+    r"|"
+    # 分支B：裸数字，必须独立成行（前有换行），避免误删正文末尾真实数字
+    r"[\n\r][\s\-—–·・.。、_]*\d{1,4}"
+    r")"
+    r"[\s。.!?！？]*$"
+)
+
+
+def _strip_trailing_page_number(text: str) -> str:
+    """剥掉重识别返回文字末尾的页码，再与原文本对比（2026-08-28 新增）。
+
+    仅当页码位于整段返回文字的最末尾（允许末尾有空白/句号）才清理，避免误删
+    正文。支持样式：
+      - 第 N 页
+      - 字符+数字：页123 / 页码123 / P123 / p.123 / No.123
+      - 括号包裹：[121] 【121】 〔121〕 （121）等（保持原样不归一）
+      - 裸数字 1-4 位：仅当独立成行（前有换行）或整段即页码，避免剥掉正文末尾真实数字
+    返回清理后的文本（原串无末尾页码则原样返回）。
+    """
+    if not text:
+        return text
+    # 整段仅 1-4 位数字（纯页码）
+    if re.fullmatch(r"\d{1,4}", text.strip()):
+        return ""
+    return _TRAILING_PAGE_NUM_RE.sub("", text)
+
+
 def diff_reocr_texts(current: str, new_text: str) -> list:
     """逐字对比 current 与 new_text 的文字内容，忽略全部空白差异。
 
@@ -1721,6 +1763,7 @@ _BRACKET_PAIR_RES = (
     re.compile(r"【([^【】]*)】"),
     re.compile(r"\[([^\[\]\n]{1,32})\]"),
     re.compile(r"［([^［］]*)］"),
+    re.compile(r"（([^()]*?)）"),  # 补充全角圆括号（123）→ 〔123〕
 )
 
 
@@ -5648,6 +5691,12 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                         return
                 running = bool(runserver(model_key, with_mmproj=has_mmproj))
                 if running:
+                    # Issue 1 fix: persist model choice so it survives UI restart
+                    try:
+                        from configmanage import set_proofread_param
+                        set_proofread_param("llm_model", model_key)
+                    except Exception:
+                        pass  # Best-effort; don't fail startup if config write fails
                     message = f"{eng_label} 已就绪"
                 else:
                     # 启动失败：区分「端口被其他模型占用」与「启动超时/失败」，给出可操作提示
@@ -5944,26 +5993,17 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
 
                     new_text = strip_think_blocks(new_text)
                     new_text = clean_bbox_text(new_text)
-                    # ULQ 杂符引注清理 + 括号对统一（【x】/[x]/［x］→〔x〕）
-                    new_text = _normalize_brackets(new_text)
                     # 2026-08-08：重识别结果先繁转简再与当前文本对比（与 /api/proofread 的 ⑫b 一致）
+                    # 2026-08-28：不处理括号归一，保留模型原始输出（什么括号就是什么括号）
                     new_text = ttos(new_text)
+                # 2026-08-23/28：模型可能把图片页脚的页码一并识别进来，先剥掉末尾页码
+                # （第 N 页 / 字符+数字：页123·P123·No.123 / 括号包裹 / 独立成行裸数字），
+                # 避免被当成正文差异标注；仅清理返回文字最末尾的页码，正文不受影响。
+                # 须在英文标点归一（_full_punct）之前执行，否则 "No.123" 的 "." 被转成
+                # "。" 后无法匹配页码样式。
+                new_text = _strip_trailing_page_number(new_text)
                 # 2026-08-09：再将英文标点归一为中文标点，避免半角/全角差异被当成纠错项
                 new_text = _full_punct(new_text)
-                # 2026-08-23：模型可能把图片页脚的页码一并识别进来，剥掉末尾
-                # 独立成行的页码（第 N 页 / 纯数字），避免被当成正文差异标注；
-                # 要求页码前有换行（独立成行），正文段落末尾的正常数字不受影响
-                # 2026-08-28：模型也可能把页码包在括号里输出（〔121〕/【121】/[121]/
-                # （121）等，经 _normalize_brackets 后多为 〔121〕），一并剥掉。
-                new_text = re.sub(
-                    r"[\n\r][\s\-—–·・.。、_]*(?:"
-                    r"(?:第\s*\d+\s*页|\d{1,4})"  # 裸页码：第121页 / 121
-                    r"|"
-                    r"[〔【\[（(［〈《「『][\s\-—–·・.。、_]*(?:第\s*\d+\s*页|\d{1,4})[\s\-—–·・.。、_]*[〕】\]）)］〉》」』]"  # 括号包裹页码：〔121〕
-                    r")[\s。]*$",
-                    "",
-                    new_text,
-                )
                 current_text = _proofread_plain_text(str(body.get("html") or ""))
                 # 与 new_text 同样做半角→全角标点归一：否则相同内容因标点宽度差异
                 # 被逐字判为差异，产生大量非预期位置的纠错标注（2026-08 修复）

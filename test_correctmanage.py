@@ -29,6 +29,7 @@ from correctmanage import (
     _proofread_plain_text,
     _full_punct,
     diff_reocr_texts,
+    _strip_trailing_page_number,
     _page_text,
     _headings_to_body,
     _build_embedded_images,
@@ -3658,6 +3659,215 @@ class TestReocr(unittest.TestCase):
             # 末尾括号页码被剥掉 → 文本与当前一致 → 无 diff
             self.assertEqual(res["text"], "当前文本内容")
             self.assertEqual(res["diff"], [], "末尾括号页码不应成为纠错项")
+        finally:
+            self._stop(server)
+
+    def test_reocr_strips_trailing_round_bracket_page_number(self):
+        """重识别剥离末尾圆括号页码（123）→ 不产生 diff（2026-08-28 新增）。"""
+        import json as _json
+        from unittest.mock import patch
+        import requests
+
+        self._patch_cfg()
+        self._patch_correct_attr("_full_bytes", lambda state, pn: ("image/png", b"fake"))
+        self._patch_llama_attr(
+            "_request_image_new",
+            lambda prompt, img, model_key="HY", thinking=False, timeout=600, **kw: {
+                "result": "当前文本内容\n（143）",
+                "error": None,
+            },
+        )
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/reocr",
+                data=_json.dumps({"page": 1, "model": "", "html": "<p>当前文本内容</p>"}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["text"], "当前文本内容")
+            self.assertEqual(res["diff"], [], "末尾圆括号页码（143）不应成为纠错项")
+        finally:
+            self._stop(server)
+
+    def test_reocr_strips_trailing_square_bracket_page_number(self):
+        """重识别剥离末尾方括号页码【123】→ 不产生 diff（2026-08-28 新增）。"""
+        import json as _json
+        from unittest.mock import patch
+        import requests
+
+        self._patch_cfg()
+        self._patch_correct_attr("_full_bytes", lambda state, pn: ("image/png", b"fake"))
+        self._patch_llama_attr(
+            "_request_image_new",
+            lambda prompt, img, model_key="HY", thinking=False, timeout=600, **kw: {
+                "result": "正文内容\n【123】",
+                "error": None,
+            },
+        )
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/reocr",
+                data=_json.dumps({"page": 1, "model": "", "html": "<p>正文内容</p>"}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["text"], "正文内容")
+            self.assertEqual(res["diff"], [], "末尾方括号页码【123】不应成为纠错项")
+        finally:
+            self._stop(server)
+
+    def test_strip_trailing_page_number(self):
+        # 纯函数：末尾页码清理（2026-08-28 新增）
+        # 字符+数字样式，无需独立成行
+        self.assertEqual(_strip_trailing_page_number("正文内容页123"), "正文内容")
+        self.assertEqual(_strip_trailing_page_number("正文内容页码123"), "正文内容")
+        self.assertEqual(_strip_trailing_page_number("正文内容P123"), "正文内容")
+        self.assertEqual(_strip_trailing_page_number("正文内容p.123"), "正文内容")
+        self.assertEqual(_strip_trailing_page_number("正文内容No.123"), "正文内容")
+        self.assertEqual(_strip_trailing_page_number("正文内容第3页"), "正文内容")
+        # 括号包裹
+        self.assertEqual(_strip_trailing_page_number("正文内容〔121〕"), "正文内容")
+        self.assertEqual(_strip_trailing_page_number("正文内容【123】"), "正文内容")
+        self.assertEqual(_strip_trailing_page_number("正文内容（143）"), "正文内容")
+        # 裸数字：独立成行才剥
+        self.assertEqual(_strip_trailing_page_number("正文内容\n123"), "正文内容")
+        self.assertEqual(_strip_trailing_page_number("123"), "")
+        self.assertEqual(_strip_trailing_page_number("  456  "), "")
+        # 正文末尾真实数字不误删
+        self.assertEqual(_strip_trailing_page_number("正文内容123"), "正文内容123")
+        self.assertEqual(_strip_trailing_page_number("价格 50"), "价格 50")
+        # 无末尾页码原样返回
+        self.assertEqual(_strip_trailing_page_number("正文内容"), "正文内容")
+        self.assertEqual(_strip_trailing_page_number(""), "")
+
+    def test_reocr_strips_trailing_char_digit_page_number(self):
+        # 模型把页脚页码以「字符+数字」样式输出（页123）→ 剥掉末尾页码（2026-08-28 新增）
+        import json as _json
+        import requests
+
+        self._patch_cfg()
+        self._patch_correct_attr("_full_bytes", lambda state, pn: ("image/png", b"fake"))
+        self._patch_llama_attr(
+            "_request_image_new",
+            lambda prompt, img, model_key="HY", thinking=False, timeout=600, **kw: {
+                "result": "当前文本内容页123",
+                "error": None,
+            },
+        )
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/reocr",
+                data=_json.dumps({"page": 1, "model": "", "html": "<p>当前文本内容</p>"}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["text"], "当前文本内容")
+            self.assertEqual(res["diff"], [], "末尾字符+数字页码不应成为纠错项")
+        finally:
+            self._stop(server)
+
+    def test_reocr_strips_trailing_p_page_number(self):
+        # 模型以 P123 样式输出页码 → 剥掉末尾页码（2026-08-28 新增）
+        import json as _json
+        import requests
+
+        self._patch_cfg()
+        self._patch_correct_attr("_full_bytes", lambda state, pn: ("image/png", b"fake"))
+        self._patch_llama_attr(
+            "_request_image_new",
+            lambda prompt, img, model_key="HY", thinking=False, timeout=600, **kw: {
+                "result": "当前文本内容P123",
+                "error": None,
+            },
+        )
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/reocr",
+                data=_json.dumps({"page": 1, "model": "", "html": "<p>当前文本内容</p>"}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["text"], "当前文本内容")
+            self.assertEqual(res["diff"], [], "末尾 P123 页码不应成为纠错项")
+        finally:
+            self._stop(server)
+
+    def test_reocr_strips_trailing_no_page_number(self):
+        # 模型以 No.123 样式输出页码 → 剥掉末尾页码（2026-08-28 新增）
+        import json as _json
+        import requests
+
+        self._patch_cfg()
+        self._patch_correct_attr("_full_bytes", lambda state, pn: ("image/png", b"fake"))
+        self._patch_llama_attr(
+            "_request_image_new",
+            lambda prompt, img, model_key="HY", thinking=False, timeout=600, **kw: {
+                "result": "当前文本内容No.123",
+                "error": None,
+            },
+        )
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/reocr",
+                data=_json.dumps({"page": 1, "model": "", "html": "<p>当前文本内容</p>"}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["text"], "当前文本内容")
+            self.assertEqual(res["diff"], [], "末尾 No.123 页码不应成为纠错项")
+        finally:
+            self._stop(server)
+
+    def test_reocr_strips_trailing_di_page_number_no_newline(self):
+        # 模型以「第3页」样式输出页码且未独立成行 → 仍剥掉末尾页码（2026-08-28 新增）
+        import json as _json
+        import requests
+
+        self._patch_cfg()
+        self._patch_correct_attr("_full_bytes", lambda state, pn: ("image/png", b"fake"))
+        self._patch_llama_attr(
+            "_request_image_new",
+            lambda prompt, img, model_key="HY", thinking=False, timeout=600, **kw: {
+                "result": "当前文本内容第3页",
+                "error": None,
+            },
+        )
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/reocr",
+                data=_json.dumps({"page": 1, "model": "", "html": "<p>当前文本内容</p>"}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["text"], "当前文本内容")
+            self.assertEqual(res["diff"], [], "末尾第3页页码不应成为纠错项")
+        finally:
+            self._stop(server)
+
+    def test_reocr_keeps_body_trailing_digit(self):
+        # 正文末尾真实数字（非独立成行）不应被误删（2026-08-28 新增）
+        import json as _json
+        import requests
+
+        self._patch_cfg()
+        self._patch_correct_attr("_full_bytes", lambda state, pn: ("image/png", b"fake"))
+        self._patch_llama_attr(
+            "_request_image_new",
+            lambda prompt, img, model_key="HY", thinking=False, timeout=600, **kw: {
+                "result": "当前文本内容123",
+                "error": None,
+            },
+        )
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/reocr",
+                data=_json.dumps({"page": 1, "model": "", "html": "<p>当前文本内容</p>"}),
+            ).json()
+            self.assertTrue(res["ok"])
+            # 末尾数字未独立成行 → 保留，并作为差异标注
+            self.assertEqual(res["text"], "当前文本内容123")
+            self.assertNotEqual(res["diff"], [], "正文末尾真实数字不应被当作页码剥掉")
         finally:
             self._stop(server)
 

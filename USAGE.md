@@ -5,7 +5,10 @@
 **前置要求：**
 - Windows（llama-server 路径是 Windows 风格）
 - Python ≥ 3.11 + [uv](https://docs.astral.sh/uv/)（项目用 `uv` 管理依赖）
-- 推理引擎二选一：**llama.cpp** 服务端 `llama-server.exe` + 多模态 OCR 模型（本项目用 **HunyuanOCR** 的 GGUF + mmproj），或 **vLLM-Omni**（`vllm serve`，默认端口 8000，适合有 GPU 的环境）
+- 推理引擎（可选）：
+  - **llama.cpp**：`llama-server.exe` + 多模态 GGUF 模型。用于 OCR 与深度校对；程序可按 config/运行时自动拉起/复用服务。
+  - **vLLM-Omni**：`vllm serve`（默认端口 8000），适合带 GPU 的环境。
+  - **PaddleOCR（本地）**：本地 PaddleOCR 引擎。可通过命令行 `--engine paddle` 临时在 PDF→EPUB 的 OCR 阶段启用（运行时覆盖，仅影响 OCR 阶段；不会写入 config.json）。文本矫正/深度校对仍走 llama-server/vLLM（大模型）。
 
 **同步依赖（首次或换机后）：**
 ```powershell
@@ -72,6 +75,7 @@ uv run python mian.py config set engine vllm           # 切换推理引擎（ll
 uv run python mian.py config set vllm_server <path>    # 设置 vLLM-Omni 可执行文件路径
 uv run python mian.py config set vllm_server_args.port 8000  # 修改 vLLM-Omni 端口（嵌套参数）
 ```
+注：若需临时使用 PaddleOCR，可在命令行加 `--engine paddle`（仅影响 OCR 阶段；config set engine 仍只接受 `llama|vllm`）。
 `config set` 接受 `llama_server` / `models_dir` / `selected_model` / `ocr_prompt` / `engine` / `vllm_server` 顶层键，以及点分路径 `llama_server_args.<参数>`（如 `config set llama_server_args.parallel 11`，同样可设置 `max_tokens`/`ngram_size`/`window_size` 等）与 `vllm_server_args.<参数>`（如 `config set vllm_server_args.port 8000`）；`selected_model` 会校验必须存在于 `model_choices`，`engine` 仅接受 `llama` / `vllm`。嵌套参数也可用 Python API 修改：
 ```python
 from configmanage import set_llama_server_arg, set_ocr_prompt

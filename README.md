@@ -21,8 +21,9 @@ A Windows-oriented CLI tool that converts PDFs to EPUB via local OCR and local m
 - Windows (llama-server paths are Windows-style)
 - Python ≥ 3.11 + [uv](https://docs.astral.sh/uv/)
 - Inference backend (choose one):
-  - **llama.cpp**: `llama-server.exe` + multimodal OCR model (GGUF + mmproj), e.g., HunyuanOCR
-  - **vLLM-Omni**: `vllm serve` (default port 8000), suitable for GPU environments
+  - **llama.cpp**: local llama-server.exe + multimodal GGUF model. 用于 OCR 与深度校对；程序可按 config/运行时自动拉起/复用服务。
+  - **vLLM-Omni**: `vllm serve`（默认端口 8000），适合带 GPU 的环境。
+  - **PaddleOCR (local)**: 本地 PaddleOCR 引擎。可通过 CLI 覆盖 `--engine paddle` 在 PDF→EPUB 的 OCR 阶段使用（运行时覆盖，只影响 OCR 阶段；不会写入 config.json）。文本矫正/深度校对仍走 llama-server/vLLM（大模型）。
 
 ### Install Dependencies
 
@@ -103,36 +104,218 @@ Done: D:\code-project\python\PToEA\data\Example Book\Example Book.epub
 
 ## CLI Reference
 
-### Main Commands
+下面命令行帮助由源码生成（mian.py -h 及各子命令 -h），以保证与运行时参数一致。
 
-| Command | Description |
-|---------|-------------|
-| `epub <pdf>` | Full OCR → EPUB pipeline |
-| `correct [<pdf>]` | Direct correction UI (no OCR) |
-| `resume <pdf>` | Resume interrupted OCR |
-| `stop [--engine llama\|vllm]` | Stop inference server |
-| `config show\|set <key> <value>` | View/modify config |
-| `model list\|show\|set\|add\|remove` | Manage model registry |
-| `gui [--host 127.0.0.1] [--port 0] [--no-browser] [--idle-timeout 120]` | Web-based config UI |
+```text
+usage: ptoe [-h] [-e ECHO] [--version] command ...
 
-### `epub` Options
+ptoe: PDF -> OCR -> EPUB conversion tool
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--dpi` | 0 | Render DPI level: 0=100, 1=150, 2=200, 3=300, 4=600 |
-| `--model` | config `selected_model` | Model key from `model_choices` |
-| `--engine` | config `engine` | `llama` or `vllm` (runtime only) |
-| `--workers` | model's `workers` or 3 | OCR concurrency |
-| `--timeout` | 600 | Per-request timeout (seconds) |
-| `--thinking` | off | Enable thinking mode (Qwen3 hidden CoT) |
-| `--correct` | off | Enable manual correction UI |
-| `--correct-timeout` | 600 | Browser-close auto-continue delay (seconds) |
-| `--title` | PDF filename | EPUB title metadata |
-| `--author` | (empty) | EPUB author metadata |
-| `--lang` | zh-CN | EPUB language |
-| `--out-dir` | `data/<pdf_stem>/` | OEBPS output directory |
-| `--epub-path` | `data/<pdf_stem>/<title>.epub` | Final EPUB path |
+positional arguments:
+  command
+    epub           Convert a PDF to an EPUB file
+    correct        直接启动手动矫正界面（不跑 OCR；可无文件启动）
+    resume         继续/管理上次中断的 OCR 转换（断点续传）
+    stop           停止推理服务（llama-server / vLLM-Omni）
+    model          Model registry commands (list/show/set/add/remove)
+    config         查看或修改配置（llama_server / models_dir / selected_model 等）
+    gui            启动 HTML 配置操作界面（浏览器）
 
+options:
+  -h, --help       show this help message and exit
+  -e, --echo ECHO  Echo text to stdout
+  --version        Print project version and exit
+```
+
+### epub
+
+```text
+usage: ptoe epub [-h] [--dpi {0,1,2,3,4}] [--model MODEL]
+                 [--engine {llama,vllm,paddle}] [--workers WORKERS]
+                 [--timeout TIMEOUT] [--thinking] [--title TITLE]
+                 [--author AUTHOR] [--lang LANG] [--out-dir OUT_DIR]
+                 [--epub-path EPUB_PATH] [--correct]
+                 [--correct-timeout CORRECT_TIMEOUT] [--resume | --restart]
+                 pdf
+
+PDF -> images -> OCR -> XHTML -> EPUB
+
+positional arguments:
+  pdf                   Path to the source PDF
+
+options:
+  -h, --help            show this help message and exit
+  --dpi {0,1,2,3,4}     DPI level 0-4: 0=100, 1=150, 2=200, 3=300, 4=600
+                        (default: 0=100)
+  --model MODEL         Model key in config.json model_choices (default: from
+                        config.json)
+  --engine {llama,vllm,paddle}
+                        推理引擎：llama（llama.cpp，默认）或 vllm（vLLM-Omni）；缺省用
+                        config.json 的 engine 键
+  --workers WORKERS     OCR worker threads (default: 模型推荐并发
+                        model_choices.<key>.workers，未配置时 3；视觉模型每张数千图像
+                        token，并发过高会让 KV 缓存溢出到 CPU 反而变慢；显存充足可调大如 6)
+  --timeout TIMEOUT     Per-request read timeout in seconds (default: 600)
+  --thinking            Pass the prompt through without appending the
+                        '按原文原格式输出' suffix
+  --title TITLE         EPUB title (default: auto from PDF metadata)
+  --author AUTHOR       EPUB author
+  --lang LANG           EPUB language code (default: zh-CN)
+  --out-dir OUT_DIR     Output directory for OEBPS/ and the EPUB (default:
+                        data/<pdf stem>/)
+  --epub-path EPUB_PATH
+                        Explicit output path for the .epub file
+  --correct             开启手动矫正：在浏览器中逐页对照原图与识别文字，可标记粗体/斜体/标题（默认关闭）
+  --correct-timeout CORRECT_TIMEOUT
+                        浏览器被关闭后自动继续后续流程的等待秒数（仅 --correct 生效；默认 600=10 分钟）
+  --resume              继续上次中断的 OCR（跳过询问：只识别未完成页；OCR 已完成则直接转换）
+  --restart             忽略已有 OCR 进度，重新识别全部页面（跳过询问）
+```
+
+### resume
+
+```text
+usage: ptoe resume [-h] [--dpi {0,1,2,3,4}] [--model MODEL]
+                   [--engine {llama,vllm,paddle}] [--workers WORKERS]
+                   [--timeout TIMEOUT] [--thinking] [--title TITLE]
+                   [--author AUTHOR] [--lang LANG] [--out-dir OUT_DIR]
+                   [--epub-path EPUB_PATH] [--correct]
+                   [--correct-timeout CORRECT_TIMEOUT] [--restart]
+                   pdf
+
+针对上次 OCR 中断/未完成的 PDF 继续处理：只识别未完成页（OCR 已全部完成则直接进入转换），交互询问或 --restart
+强制重来。无进度时询问是否从头完整转换。
+
+positional arguments:
+  pdf                   Path to the source PDF
+
+options:
+  -h, --help            show this help message and exit
+  --dpi {0,1,2,3,4}     DPI level 0-4: 0=100, 1=150, 2=200, 3=300, 4=600
+                        (default: 0=100)
+  --model MODEL         Model key in config.json model_choices (default: from
+                        config.json)
+  --engine {llama,vllm,paddle}
+                        推理引擎：llama（llama.cpp，默认）或 vllm（vLLM-Omni）；缺省用
+                        config.json 的 engine 键
+  --workers WORKERS     OCR worker threads (default: 模型推荐并发
+                        model_choices.<key>.workers，未配置时 3；显存充足可调大如 6)
+  --timeout TIMEOUT     Per-request read timeout in seconds (default: 600)
+  --thinking            Pass the prompt through without appending the
+                        '按原文原格式输出' suffix
+  --title TITLE         EPUB title (default: auto from PDF metadata)
+  --author AUTHOR       EPUB author
+  --lang LANG           EPUB language code (default: zh-CN)
+  --out-dir OUT_DIR     Output directory for OEBPS/ and the EPUB (default:
+                        data/<pdf stem>/)
+  --epub-path EPUB_PATH
+                        Explicit output path for the .epub file
+  --correct             开启手动矫正（默认关闭；同 epub --correct）
+  --correct-timeout CORRECT_TIMEOUT
+                        浏览器被关闭后自动继续后续流程的等待秒数（仅 --correct 生效；默认 600=10 分钟）
+  --restart             忽略已有进度，重新识别全部页面（跳过询问）
+```
+
+### correct
+
+```text
+usage: ptoe correct [-h] [--engine {llama,vllm,paddle}] [--title TITLE]
+                    [--author AUTHOR] [--lang LANG] [--out-dir OUT_DIR]
+                    [--epub-path EPUB_PATH]
+                    [--correct-timeout CORRECT_TIMEOUT]
+                    [pdf]
+
+直接打开手动矫正界面：不运行 OCR；页面文本优先取本地历史缓存最新版本（同一 PDF 上次矫正/暂存的内容），无历史则为空白页。点「完成并转换」时生成
+EPUB，可留在页面继续修改后再次点击。不带 PDF 参数时为无文件启动（空白界面，用于历史记录管理/手动录入）。
+
+positional arguments:
+  pdf                   Path to the source PDF（可省略：无文件直接启动，用于历史记录管理）
+
+options:
+  -h, --help            show this help message and exit
+  --engine {llama,vllm,paddle}
+                        推理引擎：llama（llama.cpp，默认）或 vllm（vLLM-Omni）；缺省用
+                        config.json 的 engine 键
+  --title TITLE         EPUB title (default: auto from PDF metadata)
+  --author AUTHOR       EPUB author
+  --lang LANG           EPUB language code (default: zh-CN)
+  --out-dir OUT_DIR     Output directory for OEBPS/ and the EPUB (default:
+                        data/<pdf stem>/)
+  --epub-path EPUB_PATH
+                        Explicit output path for the .epub file
+  --correct-timeout CORRECT_TIMEOUT
+                        浏览器被关闭后自动继续后续流程的等待秒数（默认 600=10 分钟）
+```
+
+### model
+
+```text
+usage: ptoe model [-h] action ...
+
+Manage available OCR model choices and the persistent selected model
+
+positional arguments:
+  action
+    list      List available model keys and details
+    show      Show current selected model key and detail
+    set       Set selected model key in config.json
+    add       Add a model choice (key + name + mmproj)
+    remove    Remove a model choice
+    rm        Alias for remove
+
+options:
+  -h, --help  show this help message and exit
+```
+
+### config
+
+```text
+usage: ptoe config [-h] action ...
+
+快捷查看或修改 config.json 中的配置项
+
+positional arguments:
+  action
+    set       修改配置项（key=value）
+
+options:
+  -h, --help  show this help message and exit
+```
+
+### gui
+
+```text
+usage: ptoe gui [-h] [--host HOST] [--port PORT] [--no-browser]
+                [--idle-timeout IDLE_TIMEOUT]
+
+启动本地 HTTP 服务并在浏览器中打开配置操作界面：查看/修改配置、启动/停止推理服务、选择文件路径等。浏览器关闭超过 idle-timeout
+秒后自动退出。
+
+options:
+  -h, --help            show this help message and exit
+  --host HOST           监听地址（默认 127.0.0.1）
+  --port PORT           监听端口（默认 0=自动分配）
+  --no-browser          不自动打开浏览器
+  --idle-timeout IDLE_TIMEOUT
+                        浏览器关闭后自动退出的等待秒数（默认 120）
+```
+
+### stop
+
+```text
+usage: ptoe stop [-h] [--engine {llama,vllm,paddle}]
+
+关闭正在运行的推理服务进程并释放端口：本进程启动的实例直接终止，上次运行遗留/外部启动的实例按配置端口兜底关闭（Windows
+netstat+taskkill）。
+
+options:
+  -h, --help            show this help message and exit
+  --engine {llama,vllm,paddle}
+                        推理引擎：llama（llama.cpp，默认）或 vllm（vLLM-Omni）；缺省用
+                        config.json 的 engine 键
+```
+
+Note: To keep documentation authoritative, re-run the capture step and paste the updated help blocks when the CLI changes.
 ### DPI Levels
 
 | Level | DPI | Image Tokens/Page (approx) | Speed (HY model) |
