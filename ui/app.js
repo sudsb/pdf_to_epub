@@ -5546,6 +5546,27 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
 // ---------- 初始化 ----------
 (async function init() {
   try {
+    // Defensive: hide known modal/backdrop elements at startup to avoid accidental blocking overlays
+    (function(){
+      const _modalIds = [
+        'modalBg','searchModalBg','exportModalBg','indentModalBg','finishModalBg',
+        'historyModalBg','helpModalBg','formatRulesModalBg','frRuleModalBg','frFmtPopupBg',
+        'imgPopup','errPopup','popup','contextMenu','proofreadMenu'
+      ];
+      for (const id of _modalIds) {
+        try {
+          const el = document.getElementById(id);
+          if (el && el.style && (el.style.display === 'flex' || el.style.display === 'block' || el.style.display === '')) {
+            el.style.display = 'none';
+          } else if (el) {
+            el.hidden = true;
+          }
+        } catch (e) {
+          // defensive: ignore DOM exceptions during early init
+        }
+      }
+    })();
+
     pages = (await fetchJSON('/api/pages')).pages;
   } catch (e) { document.body.textContent = '加载失败: ' + e; return; }
   heights.length = pages.length; heights.fill(0);

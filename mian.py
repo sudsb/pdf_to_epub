@@ -117,8 +117,13 @@ def _read_meta() -> tuple[str, str]:
 
 
 def _page_of(image) -> int:
-    """Extract the 1-based page number from an image path or filename."""
-    m = _PAGE_RE.search(str(image))
+    """Extract the 1-based page number from an image path, ImageItem, or filename.
+
+    Accepts either a path-like (str/Path) or an object with a `.path` attribute
+    (e.g. ImageItem). Uses the same _PAGE_RE regex over the stringified path.
+    """
+    candidate = getattr(image, "path", image)
+    m = _PAGE_RE.search(str(candidate))
     return int(m.group(1)) if m else 0
 
 
@@ -595,16 +600,38 @@ def pdf_to_epub(
                 on_result=_on_ocr_result,
             )
         else:
-            results = batch_infer(
-                todo_images,
-                [prompt] * len(todo_images),
-                model_key=model_key,
-                max_workers=eff_workers,
-                thinking=thinking,
-                timeout=timeout,
-                on_progress=_on_progress,
-                on_result=_on_ocr_result,
-            )
+            # Preload images into ImageQueue and pass ImageItem objects to batch_infer so
+            # each worker can call img.get_base64() and skip repeated disk reads/encoding.
+            try:
+                from pdfmanage import ImageQueue
+            except Exception:
+                # Fallback: if pdfmanage unavailable, call batch_infer with paths as before
+                results = batch_infer(
+                    todo_images,
+                    [prompt] * len(todo_images),
+                    model_key=model_key,
+                    max_workers=eff_workers,
+                    thinking=thinking,
+                    timeout=timeout,
+                    on_progress=_on_progress,
+                    on_result=_on_ocr_result,
+                )
+            else:
+                q = ImageQueue(store_in_memory=False)
+                items = [q.add(p, encode=False) for p in todo_images]
+                # Pre-encode concurrently to temp files/in-memory to reduce per-worker I/O
+                q.preload_all(max_workers=eff_workers or 4)
+                results = batch_infer(
+                    items,
+                    [prompt] * len(items),
+                    model_key=model_key,
+                    max_workers=eff_workers,
+                    thinking=thinking,
+                    timeout=timeout,
+                    on_progress=_on_progress,
+                    on_result=_on_ocr_result,
+                )
+
         timings["ocr"] = time.perf_counter() - t_batch
     else:
         results = []

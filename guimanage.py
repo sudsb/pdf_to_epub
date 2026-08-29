@@ -1184,18 +1184,18 @@ class _GuiHandler(BaseHTTPRequestHandler):
                 return
             choices = body.get("model_choices", cfg.get("model_choices") or {})
             sel = body.get("selected_model", cfg.get("selected_model"))
-            # Tolerate case-insensitive selected_model by mapping to canonical key
             if isinstance(choices, dict) and isinstance(sel, str) and sel.strip() and sel not in choices:
-                matches = [k for k in choices.keys() if isinstance(k, str) and k.lower() == sel.lower()]
-                if len(matches) == 1:
-                    sel = matches[0]
+                canonical, matches = configmanage.find_canonical_model_key(choices, sel)
+                if canonical is not None:
+                    sel = canonical
                     body["selected_model"] = sel
-                elif len(matches) > 1:
+                elif matches:
                     self._send(400, self._json({"ok": False, "error": f"ambiguous model: '{sel}' matches {matches}, use exact key or remove duplicates"}))
                     return
                 else:
                     self._send(400, self._json({"ok": False, "error": f"未知模型：{sel}"}))
                     return
+
             for key in ("llama_server", "models_dir"):
                 val = body.get(key, cfg.get(key))
                 if not isinstance(val, str):
