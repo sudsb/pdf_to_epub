@@ -2663,10 +2663,11 @@ function openContextMenu(x, y) {
   closeProofreadMenu();
   refreshCtxRulesSub(); // 每次打开刷新「添加规则」二级菜单（异步填充规则名列表）
   suppressPopupUntil = performance.now() + 300; // 右键后的 mouseup 不弹选中菜单
-  orientCtxSubs();
   ctxMenu.hidden = false;
+  // Ensure any inline display:none left from earlier defensive code is cleared so
+  // offsetWidth/offsetHeight reflect real CSS. (Defensive: harmless if already blank.)
+  try { ctxMenu.style.display = ''; } catch (e) {}
   const w = ctxMenu.offsetWidth || 172, h = ctxMenu.offsetHeight || 240;
-  const cx = Math.max(8, Math.min(x, window.innerWidth - w - 8)); // clamp 到视口 8px 边距
   const cy = Math.max(8, Math.min(y, window.innerHeight - h - 8));
   ctxMenu.style.left = cx + 'px';
   ctxMenu.style.top = cy + 'px';
@@ -5551,7 +5552,7 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
       const _modalIds = [
         'modalBg','searchModalBg','exportModalBg','indentModalBg','finishModalBg',
         'historyModalBg','helpModalBg','formatRulesModalBg','frRuleModalBg','frFmtPopupBg',
-        'imgPopup','errPopup','popup','contextMenu','proofreadMenu'
+        'imgPopup','errPopup','popup','proofreadMenu'
       ];
       for (const id of _modalIds) {
         try {
