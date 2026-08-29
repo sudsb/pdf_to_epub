@@ -46,6 +46,11 @@
       "name": "qwenvl/Qwen3VL-4B-Instruct-Q8_0.gguf",
       "mmproj": "qwenvl/mmproj-Qwen3VL-4B-Instruct-F16.gguf",
       "workers": 4
+    },
+    "qwen4": {
+      "name": "qwen3.5/Qwen3.5-4B-Q8_0.gguf",
+      "mmproj": "qwen3.5/4b_mmproj-F16.gguf",
+      "workers": 4
     }
   },
   "selected_model": "DOTS8",
@@ -69,7 +74,7 @@
     "auto_fix_score": 0.85,
     "enable_llm": true,
     "enable_legacy_rules": false,
-    "llm_model": "q34",
+    "llm_model": "qwen4",
     "llm_timeout": 3
   },
   "engine": "llama",
@@ -304,7 +309,7 @@
     "gray": true,
     "denoise": false,
     "sharpen": true,
-    "binarize": false,
+    "binarize": true,
     "workers": 8
   },
   "citationItalicEnabled": true
