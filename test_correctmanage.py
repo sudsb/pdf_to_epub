@@ -3729,6 +3729,10 @@ class TestReocr(unittest.TestCase):
         self.assertEqual(_strip_trailing_page_number("正文内容〔121〕"), "正文内容")
         self.assertEqual(_strip_trailing_page_number("正文内容【123】"), "正文内容")
         self.assertEqual(_strip_trailing_page_number("正文内容（143）"), "正文内容")
+        # 间隔号包裹
+        self.assertEqual(_strip_trailing_page_number("正文内容·171·"), "正文内容")
+        self.assertEqual(_strip_trailing_page_number("正文内容· 171 ·"), "正文内容")
+        self.assertEqual(_strip_trailing_page_number("正文内容・171・"), "正文内容")
         # 裸数字：独立成行才剥
         self.assertEqual(_strip_trailing_page_number("正文内容\n123"), "正文内容")
         self.assertEqual(_strip_trailing_page_number("123"), "")
@@ -3868,6 +3872,32 @@ class TestReocr(unittest.TestCase):
             # 末尾数字未独立成行 → 保留，并作为差异标注
             self.assertEqual(res["text"], "当前文本内容123")
             self.assertNotEqual(res["diff"], [], "正文末尾真实数字不应被当作页码剥掉")
+        finally:
+            self._stop(server)
+
+    def test_reocr_strips_trailing_middle_dot_page_number(self):
+        # 模型以间隔号包裹样式输出页码（·171·）→ 剥掉末尾页码（2026-08-28 新增）
+        import json as _json
+        import requests
+
+        self._patch_cfg()
+        self._patch_correct_attr("_full_bytes", lambda state, pn: ("image/png", b"fake"))
+        self._patch_llama_attr(
+            "_request_image_new",
+            lambda prompt, img, model_key="HY", thinking=False, timeout=600, **kw: {
+                "result": "当前文本内容·171·",
+                "error": None,
+            },
+        )
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/reocr",
+                data=_json.dumps({"page": 1, "model": "", "html": "<p>当前文本内容</p>"}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["text"], "当前文本内容")
+            self.assertEqual(res["diff"], [], "末尾 ·171· 页码不应成为纠错项")
         finally:
             self._stop(server)
 
