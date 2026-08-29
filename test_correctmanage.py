@@ -7241,6 +7241,72 @@ class TestHistoryRenameEndpoint(unittest.TestCase):
         # display_name 为空 → 回退到 history_name（load 后为 PDF 文件名）
         self.assertEqual(title_b, "B.pdf")
 
+    def test_rename_then_stage_save_keeps_display_name(self):
+        """重命名当前编辑的书后 保存/暂存，新写入的版本文件必须保留重命名后的名称。
+
+        回归：此前 _write_history_version/_overwrite_history 不携带 display_name，
+        rename 后 save/stage 会新写一个版本文件且丢了 display_name → 回退到原名。
+        """
+        import json as _json
+        import requests
+        import shutil
+        import correctmanage as _cm
+
+        hist_dir = Path(tempfile.mkdtemp(prefix="test_rename_persist_"))
+        _orig_dir = _cm._history_dir
+        _cm._history_dir = lambda: hist_dir
+        self.addCleanup(lambda: setattr(_cm, "_history_dir", _orig_dir))
+        self.addCleanup(lambda: shutil.rmtree(hist_dir, ignore_errors=True))
+
+        # 当前编辑中的书：前缀为 manual_book，name 为原始 PDF 名
+        state = {
+            "pages": {}, "finished": __import__("threading").Event(),
+            "preview_cache": {}, "pdf_path": None, "img_dir": None,
+            "preview_dpi": 110, "preview_quality": 82,
+            "last_heartbeat": 0.0, "gone_at": None, "idle_timeout": 600.0,
+            "auto_finished": False,
+            "on_convert": None, "convert_lock": __import__("threading").Lock(),
+            "history_prefix": "manual_book", "history_name": "原书.pdf",
+            "history_lock": __import__("threading").Lock(),
+        }
+        base, server = self._start_server(hist_dir, state)
+
+        # 预置一个已存在的历史版本（同组）
+        vid = "manual_book_20260101000000_0001"
+        self._create_version_file(hist_dir, vid, "C:/books/A.pdf", "原书.pdf", {"1": "<p>页1</p>"})
+
+        # 在历史记录中把当前这本书重命名
+        r = self._post_rename(base, vid, "新书名")
+        self.assertTrue(r["ok"])
+        # 当前 session 的 display_name 也应被同步更新（前缀一致）
+        self.assertEqual(state.get("display_name"), "新书名")
+
+        # 暂存：生成一个新版本文件，必须携带重命名后的名称
+        st = requests.post(
+            base + "/api/stage",
+            data=_json.dumps({"pages": [{"page": 1, "html": "<p>改</p>"}], "name": "原书.pdf"}),
+        ).json()
+        self.assertTrue(st["ok"])
+
+        new_files = sorted(
+            p for p in hist_dir.glob("manual_book_*.json")
+            if p != (hist_dir / f"{vid}.json")
+        )
+        self.assertTrue(new_files, "暂存应生成新的版本文件")
+        data = _json.loads(new_files[-1].read_text(encoding="utf-8"))
+        self.assertEqual(data.get("display_name"), "新书名", "暂存后的新版本应保留重命名名称")
+
+        # 保存：覆盖现有版本文件，同样应保留重命名名称
+        sv = requests.post(
+            base + "/api/save",
+            data=_json.dumps({"pages": [{"page": 1, "html": "<p>再改</p>"}], "name": "原书.pdf"}),
+        ).json()
+        self.assertTrue(sv["ok"])
+        # 保存覆盖最新版本文件
+        latest = sorted(hist_dir.glob("manual_book_*.json"), key=lambda p: p.stat().st_mtime_ns)[-1]
+        saved_data = _json.loads(latest.read_text(encoding="utf-8"))
+        self.assertEqual(saved_data.get("display_name"), "新书名", "保存覆盖后应保留重命名名称")
+
 
 if __name__ == "__main__":
     unittest.main()

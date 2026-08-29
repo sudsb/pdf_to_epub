@@ -323,6 +323,16 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
     <div class="page" id="page-convert">
       <h2 class="page-title">PDF → EPUB 转换</h2>
       <p class="page-desc">选择 PDF 文件并设置参数，一键启动完整的转换流程。</p>
+      <!-- 矫正界面 -->
+      <div class="card">
+        <div class="card-title"><span class="ct-icon">&#9998;</span> 矫正界面</div>
+        <p class="page-desc" style="margin:0 0 12px;">启动矫正界面，在浏览器中手动校对 OCR 结果后生成 EPUB。</p>
+        <div class="action-row">
+          <button class="btn-start" id="crStartBtn" onclick="startCorrect()">启动矫正</button>
+          <button class="btn-stop-convert" id="crStopBtn" onclick="stopCorrect()" style="display:none;">停止</button>
+        </div>
+        <pre id="correctLog" style="margin-top:10px;">等待矫正任务...</pre>
+      </div>
       <!-- 源文件 -->
       <div class="card">
         <div class="card-title"><span class="ct-icon">&#128196;</span> 源文件</div>
@@ -337,7 +347,7 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
           </div>
         </div>
       </div>
-      <!-- 转换参数 -->
+<!-- 转换参数 -->
       <div class="card">
         <div class="card-title"><span class="ct-icon">&#9881;</span> 转换参数</div>
         <div class="convert-grid">
@@ -350,8 +360,10 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
           <div class="form-row"><span class="form-label">标题</span><div class="form-ctrl"><input type="text" id="cvtTitle" placeholder="可留空（自动提取）"></div></div>
           <div class="form-row"><span class="form-label">作者</span><div class="form-ctrl"><input type="text" id="cvtAuthor" placeholder="可留空"></div></div>
           <div class="form-row"><span class="form-label">语言</span><div class="form-ctrl"><input type="text" id="cvtLang" value="zh-CN"></div></div>
-          <div class="form-row"><span class="form-label">输出目录</span><div class="form-ctrl"><div class="pick-row"><input type="text" id="cvtOutDir" placeholder="留空则使用默认目录"><button class="btn-small" onclick="pickOutDir()">选择目录…</button></div><div class="form-hint">留空时输出到 data/&lt;pdf名&gt;/</div></div></div>
+          <div class="form-row"><span class="form-label">输出目录</span><div class="form-ctrl"><div class="pick-row"><input type="text" id="cvtOutDir" placeholder="留空则使用默认目录"><button class="btn-small" onclick="pickOutDir()">选择目录&#8230;</button></div><div class="form-hint">留空时输出到 data/<pdf名>/</div></div></div>
+          <div class="form-row"><span class="form-label">排除页</span><div class="form-ctrl"><input type="text" id="cvtExclude" placeholder="如 1-15,17,20（可选）"><div class="form-hint">跳过对指定序号图片的识别，多个用逗号分隔，支持区间。</div></div></div>
         </div>
+      </div>
       </div>
       <!-- 操作 -->
       <div class="card">
@@ -365,16 +377,6 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
       <div class="card">
         <div class="card-title"><span class="ct-icon">&#9998;</span> 运行日志</div>
         <pre id="convertLog">等待转换任务...</pre>
-      </div>
-      <!-- 矫正界面 -->
-      <div class="card">
-        <div class="card-title"><span class="ct-icon">&#9998;</span> 矫正界面</div>
-        <p class="page-desc" style="margin:0 0 12px;">启动矫正界面，在浏览器中手动校对 OCR 结果后生成 EPUB。</p>
-        <div class="action-row">
-          <button class="btn-start" id="crStartBtn" onclick="startCorrect()">启动矫正</button>
-          <button class="btn-stop-convert" id="crStopBtn" onclick="stopCorrect()" style="display:none;">停止</button>
-        </div>
-        <pre id="correctLog" style="margin-top:10px;">等待矫正任务...</pre>
       </div>
     </div>
     <!-- 10. 工具 -->
@@ -471,6 +473,10 @@ function collectExtraConfig(){
       workers: parseInt(document.getElementById("cfgImgWorkers").value,10)||0
     };
   }catch(e){/* element missing -> skip */}
+  try{
+    var ex=document.getElementById("cvtExclude").value.trim();
+    cfg.exclude_pages = ex ? ex.split(",").map(function(s){return s.trim()}).filter(Boolean) : [];
+  }catch(e){/* element missing -> skip */}
 }
 function saveConfig(){collectConfig();collectExtraConfig();var btn=document.getElementById("saveBtn");btn.disabled=true;btn.classList.add("saving");addLog("保存配置中...","log-info");apiPost("/api/config",cfg).then(function(res){btn.disabled=false;btn.classList.remove("saving");if(res&&res.ok){var newModel=cfg.selected_model||"";toast("已切换模型："+newModel,"ok",5000);addLog("模型已切换: "+newModel,"log-ok");fetchStatus().then(function(s){if(s&&s.probe!=="none"){var hint="，当前服务仍在运行旧模型，重启后生效";toast("已切换模型："+newModel+hint,"ok",5500);addLog("服务仍运行旧模型，建议重启","log-warn")}else{toast("已切换模型："+newModel,"ok",5000);addLog("模型切换生效（无运行服务）","log-ok")}}).catch(function(){toast("已切换模型："+newModel,"ok",5000)})}else{var msg=res&&res.error?res.error:"未知错误";toast("保存失败: "+msg,"fail",5000);addLog("保存失败: "+msg,"log-err")}})}
 function serverStart(){var model=cfg.selected_model||"";document.getElementById("btnStart").disabled=true;document.getElementById("btnStart").textContent="启动中…";addLog("正在启动服务（模型: "+model+"）...","log-info");var startTime=Date.now();var pollInterval=setInterval(function(){apiGet("/api/status").then(function(res){if(!res||!res.ok)return;statusInfo=res;renderStatus(res);if(res.probe==="match"){clearInterval(pollInterval);var modelName=res.model_name||model;toast("模型已启动："+modelName,"ok",5000);addLog("服务已就绪: "+modelName,"log-ok");document.getElementById("btnStart").disabled=false;document.getElementById("btnStart").textContent="启动服务"}var now=Date.now();if(now-startTime>60000){clearInterval(pollInterval);toast("启动超时，请检查模型路径或端口配置","fail",5000);addLog("服务启动超时","log-err");document.getElementById("btnStart").disabled=false;document.getElementById("btnStart").textContent="启动服务"}},2000);setTimeout(function(){clearInterval(pollInterval);toast("启动超时，请检查模型路径或端口配置","fail",5000);addLog("服务启动超时","log-err");document.getElementById("btnStart").disabled=false;document.getElementById("btnStart").textContent="启动服务"},60000)});apiPost("/api/server/start",{model:model}).then(function(res){if(res&&res.ok){addLog("服务启动请求已发送","log-ok")}else{var msg=res&&res.error?res.error:"启动失败";toast(msg,"fail",5000);addLog("启动失败: "+msg,"log-err")}}).catch(function(e){toast("请求失败: "+e.message,"fail",5000);addLog("启动请求异常: "+e.message,"log-err");document.getElementById("btnStart").disabled=false;document.getElementById("btnStart").textContent="启动服务"})}
@@ -480,12 +486,12 @@ function pickFile(inputId){apiPost("/api/pick",{kind:"file",title:"选择文件"
 function pickDir(inputId){apiPost("/api/pick",{kind:"dir",title:"选择目录"}).then(function(res){if(res&&res.ok&&!res.cancelled&&res.path){document.getElementById(inputId).value=res.path;toast("已选择目录","ok")}else if(res&&res.cancelled){toast("已取消选择","warn")}})}
 /* ===== 转换页 ===== */
 var convertPollTimer=null;
-function renderConvert(){var sel=document.getElementById("cvtModel");sel.innerHTML="";models.forEach(function(m){var o=document.createElement("option");o.value=m.key;o.textContent=m.key+" - "+m.name;sel.appendChild(o)});sel.value=cfg.selected_model||"";applyModelWorkers();var pdf=document.getElementById("cvtPdf");if(pdf.value){var hint=document.getElementById("cvtPdfHint");if(!pdf.value.toLowerCase().endsWith(".pdf")){hint.textContent="\u26a0 \u6587\u4ef6\u540e\u7f00\u4e0d\u662f .pdf";hint.style.color="var(--red)"}else{hint.textContent="";hint.style.color=""}}}
+function renderConvert(){document.getElementById("cvtExclude").value=(cfg.exclude_pages||[]).join(",")||"";var sel=document.getElementById("cvtModel");sel.innerHTML="";models.forEach(function(m){var o=document.createElement("option");o.value=m.key;o.textContent=m.key+" - "+m.name;sel.appendChild(o)});sel.value=cfg.selected_model||"";applyModelWorkers();var pdf=document.getElementById("cvtPdf");if(pdf.value){var hint=document.getElementById("cvtPdfHint");if(!pdf.value.toLowerCase().endsWith(".pdf")){hint.textContent="\u26a0 \u6587\u4ef6\u540e\u7f00\u4e0d\u662f .pdf";hint.style.color="var(--red)"}else{hint.textContent="";hint.style.color=""}}}
 function applyModelWorkers(){var sel=document.getElementById("cvtModel"),wEl=document.getElementById("cvtWorkers");if(!sel||!wEl)return;var key=sel.value,info=(cfg.model_choices||{})[key]||{},w=parseInt(info.workers,10);if(!isNaN(w)&&w>=1&&w<=64)wEl.value=w}
 function onCvtModelChange(){applyModelWorkers()}
 function pickPdf(){apiPost("/api/pick",{kind:"file",filter:"pdf",title:"\u9009\u62e9 PDF \u6587\u4ef6"}).then(function(res){if(res&&res.ok&&!res.cancelled&&res.path){document.getElementById("cvtPdf").value=res.path;var hint=document.getElementById("cvtPdfHint");if(!res.path.toLowerCase().endsWith(".pdf")){hint.textContent="\u26a0 \u6587\u4ef6\u540e\u7f00\u4e0d\u662f .pdf";hint.style.color="var(--red)"}else{hint.textContent=""}}else if(res&&res.cancelled){toast("\u5df2\u53d6\u6d88\u9009\u62e9","warn")}})}
 function pickOutDir(){apiPost("/api/pick",{kind:"dir",title:"\u9009\u62e9\u8f93\u51fa\u76ee\u5f55"}).then(function(res){if(res&&res.ok&&!res.cancelled&&res.path){document.getElementById("cvtOutDir").value=res.path;toast("\u5df2\u9009\u62e9\u76ee\u5f55","ok")}else if(res&&res.cancelled){toast("\u5df2\u53d6\u6d88\u9009\u62e9","warn")}})}
-function collectConvertParams(){var pdf=document.getElementById("cvtPdf").value.trim();if(!pdf)return{error:"\u8bf7\u5148\u9009\u62e9 PDF \u6587\u4ef6"};if(!pdf.toLowerCase().endsWith(".pdf"))return{error:"\u6587\u4ef6\u540e\u7f00\u4e0d\u662f .pdf\uff0c\u8bf7\u9009\u62e9\u6b63\u786e\u7684 PDF"};var engine=document.getElementById("cvtEngine").value;var workers=parseInt(document.getElementById("cvtWorkers").value,10);var timeout=parseInt(document.getElementById("cvtTimeout").value,10);if(isNaN(workers)||workers<1){var _k=document.getElementById("cvtModel").value,_m=(cfg.model_choices||{})[_k]||{},_w=parseInt(_m.workers,10);workers=isNaN(_w)||_w<1?3:_w}if(isNaN(timeout)||timeout<30)timeout=600;return{pdf:pdf,dpi:parseInt(document.getElementById("cvtDpi").value,10),model:document.getElementById("cvtModel").value,engine:engine,workers:workers,timeout:timeout,thinking:document.getElementById("cvtThinking").checked,title:document.getElementById("cvtTitle").value.trim(),author:document.getElementById("cvtAuthor").value.trim(),lang:document.getElementById("cvtLang").value.trim()||"zh-CN",out_dir:document.getElementById("cvtOutDir").value.trim(),epub_path:""}}
+function collectConvertParams(){var pdf=document.getElementById("cvtPdf").value.trim();if(!pdf)return{error:"\u8bf7\u5148\u9009\u62e9 PDF \u6587\u4ef6"};if(!pdf.toLowerCase().endsWith(".pdf"))return{error:"\u6587\u4ef6\u540e\u7f00\u4e0d\u662f .pdf\uff0c\u8bf7\u9009\u62e9\u6b63\u786e\u7684 PDF"};var engine=document.getElementById("cvtEngine").value;var workers=parseInt(document.getElementById("cvtWorkers").value,10);var timeout=parseInt(document.getElementById("cvtTimeout").value,10);if(isNaN(workers)||workers<1){var _k=document.getElementById("cvtModel").value,_m=(cfg.model_choices||{})[_k]||{},_w=parseInt(_m.workers,10);workers=isNaN(_w)||_w<1?3:_w}if(isNaN(timeout)||timeout<30)timeout=600;return{pdf:pdf,dpi:parseInt(document.getElementById("cvtDpi").value,10),model:document.getElementById("cvtModel").value,engine:engine,workers:workers,timeout:timeout,thinking:document.getElementById("cvtThinking").checked,title:document.getElementById("cvtTitle").value.trim(),author:document.getElementById("cvtAuthor").value.trim(),lang:document.getElementById("cvtLang").value.trim()||"zh-CN",out_dir:document.getElementById("cvtOutDir").value.trim(),epub_path:"",exclude:document.getElementById("cvtExclude").value.trim()}}
 function setConvertBusy(busy){var start=document.getElementById("cvtStartBtn"),stop=document.getElementById("cvtStopBtn");if(busy){start.disabled=true;start.classList.add("running");start.textContent="\u8f6c\u6362\u4e2d\u2026";stop.style.display="";stop.disabled=false}else{start.disabled=false;start.classList.remove("running");start.textContent="\u5f00\u59cb\u8f6c\u6362";stop.style.display="none";stop.disabled=true}}
 function startConvert(){var params=collectConvertParams();if(params.error){toast(params.error,"warn");return}setConvertBusy(true);var log=document.getElementById("convertLog");log.textContent="";addLog("\u542f\u52a8\u8f6c\u6362: "+params.pdf,"log-info");apiPost("/api/convert/start",params).then(function(res){if(res&&res.ok){toast("\u8f6c\u6362\u5df2\u542f\u52a8","ok");addLog("\u8f6c\u6362\u5df2\u542f\u52a8","log-ok");startPollConvert()}else{var msg=res&&res.error?res.error:"\u542f\u52a8\u5931\u8d25";toast(msg,"fail");addLog("\u542f\u52a8\u5931\u8d25: "+msg,"log-err");setConvertBusy(false)}})}
 function startPollConvert(){if(convertPollTimer)clearInterval(convertPollTimer);convertPollTimer=setInterval(pollConvertStatus,500)}
@@ -564,6 +570,7 @@ def _convert_argv(
     lang: str | None = None,
     out_dir: str | None = None,
     epub_path: str | None = None,
+    exclude: str | None = None,
 ) -> list[str]:
     """组装「epub」子命令的 argv（冻结 exe 直接跑自身，开发环境跑 mian.py）。
 
@@ -596,6 +603,8 @@ def _convert_argv(
         argv += ["--out-dir", out_dir]
     if epub_path:
         argv += ["--epub-path", epub_path]
+    if exclude:
+        argv += ["--exclude", exclude]
     return argv
 
 
@@ -1348,6 +1357,10 @@ class _GuiHandler(BaseHTTPRequestHandler):
             if val is not None and not isinstance(val, str):
                 self._send(400, self._json({"ok": False, "error": f"{key} 必须是字符串"}))
                 return
+        exclude = body.get("exclude")
+        if exclude is not None and not isinstance(exclude, str):
+            self._send(400, self._json({"ok": False, "error": "exclude 必须是字符串"}))
+            return
         lang = body.get("lang") or "zh-CN"
         # -- 单飞：已有转换在运行则拒绝 --
         st = self.server.state
@@ -1377,6 +1390,7 @@ class _GuiHandler(BaseHTTPRequestHandler):
             lang=lang,
             out_dir=body.get("out_dir"),
             epub_path=body.get("epub_path"),
+            exclude=exclude,
         )
         try:
             # 注入 PYTHONIOENCODING=utf-8：子进程 stdout 默认用系统编码（GBK），父进程按 utf-8 解码→乱码

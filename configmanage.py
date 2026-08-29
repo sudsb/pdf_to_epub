@@ -224,6 +224,10 @@ DEFAULT_CONFIG = {
         "binarize": False,
         "workers": 0
     },
+    # OCR 排除页码：列表形式，如 [1, 2, 5, 10-15]（解析后展开为单个页码）。
+    # 从 config.json 读取时由 parse_exclude_spec 处理字符串/列表兼容；
+    # CLI --exclude 优先于配置文件。
+    "exclude_pages": [],
     # 可拓展其余各manage/key conf
 }
 

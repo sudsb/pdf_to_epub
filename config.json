@@ -74,7 +74,7 @@
     "auto_fix_score": 0.85,
     "enable_llm": true,
     "enable_legacy_rules": false,
-    "llm_model": "qwen4",
+    "llm_model": "glm16",
     "llm_timeout": 3
   },
   "engine": "llama",
@@ -141,15 +141,6 @@
       "conditions": [
         {
           "type": "regex",
-          "pattern": "[\\s\\S]*",
-          "scope": "page",
-          "formats": [
-            "p"
-          ],
-          "target": "match"
-        },
-        {
-          "type": "regex",
           "pattern": "([\\s\\S]*)([\\(（]\\s*.+\\s*年\\s*.*?[日月]\\s*[\\）)])([\\s\\S]*?)(毛\\s*泽\\s*东[\\s\\S]*刊\\s*印[\\s\\S]*?)?(注[\\s]*释)([\\s\\S]*)",
           "scope": "page",
           "formats": [],
@@ -164,7 +155,6 @@
               "p"
             ],
             [
-              "align_left",
               "p"
             ],
             [
@@ -188,15 +178,6 @@
       "name": "标",
       "mode": "all",
       "conditions": [
-        {
-          "type": "regex",
-          "pattern": "[\\s\\S]*",
-          "scope": "page",
-          "formats": [
-            "p"
-          ],
-          "target": "match"
-        },
         {
           "type": "regex",
           "pattern": "([\\s\\S]*)([\\(（]\\s*.+\\s*年\\s*.*?[日月]\\s*[\\）)])([\\s\\S]*?)",
@@ -226,15 +207,6 @@
       "conditions": [
         {
           "type": "regex",
-          "pattern": "[\\s\\S]*",
-          "scope": "page",
-          "formats": [
-            "p"
-          ],
-          "target": "match"
-        },
-        {
-          "type": "regex",
           "pattern": "([\\s\\S]*)(注\\s*释)([\\s\\S]*)",
           "scope": "page",
           "formats": [],
@@ -259,15 +231,6 @@
       "name": "注释",
       "mode": "all",
       "conditions": [
-        {
-          "type": "regex",
-          "pattern": "[\\s\\S]*",
-          "scope": "page",
-          "formats": [
-            "p"
-          ],
-          "target": "match"
-        },
         {
           "type": "regex",
           "pattern": "[\\s\\S]*",
@@ -312,5 +275,6 @@
     "binarize": true,
     "workers": 8
   },
-  "citationItalicEnabled": true
+  "citationItalicEnabled": true,
+  "exclude_pages": []
 }

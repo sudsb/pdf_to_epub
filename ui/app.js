@@ -573,13 +573,28 @@ function insertImage(row, i) {
 // 把 dataUrl 图片插入到第 i 页文字光标处（整页图插入 / 外部插入 / 裁剪插入共用）。
 // modeOverride 可选：显式指定插入模式（full/fit/inline），缺省读 imgModeSel 下拉框。
 function viewportPage() {
-  // 当前视口顶部可见的页行索引：滚动到第 N 页时（即使未聚焦），插入目标页 = N。
-  // 复用 updateViewport 的二分查找逻辑（prefixTop + scrollY），但不依赖任何行存活。
+  // 1) 优先用已挂载行的真实渲染位置（getBoundingClientRect），免受 heights[] 脏数据
+  //    影响——虚拟列表只有可见行挂载，挂载行的实际位置即当前视图的真实布局。
+  const rows = host.querySelectorAll('.page-row');
+  if (rows.length > 0) {
+    const viewportTop = window.scrollY;
+    let bestIdx = -1, bestTop = -Infinity;
+    for (const row of rows) {
+      const rect = row.getBoundingClientRect();
+      const rowTopAbs = rect.top + window.scrollY;
+      if (rowTopAbs <= viewportTop && rowTopAbs > bestTop) {
+        bestTop = rowTopAbs;
+        bestIdx = Number(row.dataset.i);
+      }
+    }
+    if (bestIdx >= 0) return bestIdx;
+  }
+  // 2) 兜底：无挂载行时用二分，去掉 -60 偏移，返回“包含视口顶部的那一页”
   const hostTop = host.getBoundingClientRect().top + window.scrollY;
-  const y = Math.max(0, window.scrollY - hostTop - 60);
+  const y = Math.max(0, window.scrollY - hostTop);
   let lo = 0, hi = pages.length;
   while (lo < hi) { const mid = (lo + hi) >> 1; if (prefixTop(mid) < y) lo = mid + 1; else hi = mid; }
-  return lo < pages.length ? lo : 0;
+  return lo > 0 ? lo - 1 : 0;
 }
 function insertImageDataUrl(dataUrl, size, i, modeOverride) {
   let ed = null;

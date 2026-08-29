@@ -34,6 +34,62 @@ REQUEST_TIMEOUT = 600
 
 _PAGE_RE = re.compile(r"(\d+)(?:\.\w+)?$")
 
+
+def parse_exclude_spec(spec) -> set[int]:
+    """解析排除页码规格，返回页码集合（1-based）。
+
+    支持格式：
+    - 字符串 "1-15,17,20" -> {1..15, 17, 20}
+    - 字符串 "1-15, 17, 20" （允许空白）
+    - 列表 [1, 2, 5] -> {1, 2, 5}
+    - 空/None/"" -> 空集合
+    - 无效 token 会被忽略并打印警告（不崩溃）。
+    """
+    excluded: set[int] = set()
+    if spec is None:
+        return excluded
+    if isinstance(spec, (list, tuple, set)):
+        for v in spec:
+            try:
+                excluded.add(int(v))
+            except (TypeError, ValueError):
+                print(f"      ! 排除页码忽略无效项: {v!r}", file=sys.stderr)
+        return excluded
+    if isinstance(spec, str):
+        s = spec.strip()
+        if not s:
+            return excluded
+        for token in s.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if "-" in token:
+                parts = token.split("-", 1)
+                try:
+                    start = int(parts[0].strip())
+                    end = int(parts[1].strip())
+                except (ValueError, IndexError):
+                    print(f"      ! 排除页码忽略无效区间: {token!r}", file=sys.stderr)
+                    continue
+                if start > end:
+                    start, end = end, start
+                for n in range(start, end + 1):
+                    if n >= 1:
+                        excluded.add(n)
+            else:
+                try:
+                    n = int(token)
+                    if n >= 1:
+                        excluded.add(n)
+                except ValueError:
+                    print(f"      ! 排除页码忽略无效项: {token!r}", file=sys.stderr)
+        return excluded
+    # 未知类型：尝试转为字符串再解析
+    try:
+        return parse_exclude_spec(str(spec))
+    except Exception:
+        return excluded
+
 # 5 档 DPI：档位 -> 实际分辨率。档位越高图片 token 越多（约线性）、识别越精细但越慢。
 DPI_LEVELS = {0: 100, 1: 150, 2: 200, 3: 300, 4: 600}
 
@@ -336,6 +392,7 @@ def pdf_to_epub(
     correct: bool = False,
     correct_idle_timeout: int = 600,
     resume: str | None = None,
+    exclude=None,
 ) -> dict:
     """Convert a PDF to EPUB by chaining the pipeline modules.
 
@@ -354,12 +411,18 @@ def pdf_to_epub(
     t_start = time.perf_counter()
     timings: dict[str, float] = {}  # 各流程阶段用时（结束时统一输出）
 
+    # 文件日志
+    from logmanage import logger
+
+    logger.info(f"pdf_to_epub start: pdf={pdf}, dpi={dpi}, model={model_key}, workers={max_workers}")
+
     print(f"[1/4] Splitting PDF to images (dpi={dpi}) ...", end="", flush=True)
     t0 = time.perf_counter()
     img_dir, img_paths = split_pdf_to_images(pdf, dpi=dpi, fmt="png")
     timings["split"] = time.perf_counter() - t0
     print(f" done in {timings['split']:.1f}s")
     print(f"      {len(img_paths)} page(s) -> {img_dir}")
+    logger.info(f"split done: pages={len(img_paths)}, dir={img_dir}, elapsed={timings['split']:.1f}s")
 
     print(
         f"[2/4] OCR via llama-server (model='{model_key}', workers={max_workers if max_workers else 'auto'}) ...",
@@ -369,6 +432,18 @@ def pdf_to_epub(
     t0 = time.perf_counter()
     total_pages = len(img_paths)
     t_ocr = time.perf_counter()
+
+    # 解析排除页码：CLI --exclude 优先，其次配置文件 exclude_pages
+    from configmanage import get_config
+
+    cfg = get_config(show_dialogs=False)
+    exclude_spec = exclude if exclude is not None else cfg.get("exclude_pages")
+    excluded_pages = parse_exclude_spec(exclude_spec)
+    if excluded_pages:
+        # 只保留在有效页码范围内的排除页
+        excluded_pages = {p for p in excluded_pages if 1 <= p <= total_pages}
+        print(f"      ! 排除 {len(excluded_pages)} 页 OCR：{sorted(excluded_pages)}")
+        logger.info(f"exclude pages: {sorted(excluded_pages)} (count={len(excluded_pages)})")
 
     # --- OCR 断点续传：检查上次进度，决定 全新/继续/直接转换/重来 ------------------
     progress = _load_ocr_progress(img_dir)
@@ -416,7 +491,7 @@ def pdf_to_epub(
                 f"      ! 有 {total_pages - len(cached)} 页无缓存结果，将一并重新识别"
             )
 
-    todo_images = [p for p in img_paths if _page_of(p) not in cached]
+    todo_images = [p for p in img_paths if _page_of(p) not in cached and _page_of(p) not in excluded_pages]
 
     # 进度文件初始化：每页完成后写盘，中断不丢已完成页
     if progress is None:
@@ -447,8 +522,10 @@ def pdf_to_epub(
 
     if todo_images and not use_paddle:
         t_model = time.perf_counter()
+        logger.info(f"starting server: model={model_key}, workers={eff_workers}")
         _ensure_server(model_key, workers=eff_workers)
         timings["model"] = time.perf_counter() - t_model
+        logger.info(f"server ready: model={model_key}, elapsed={timings['model']:.1f}s")
 
     def _on_progress(done: int, total: int) -> None:
         """每完成一页 OCR 输出一行进度：已完成页数 + 百分比 + 已用时间（总 + 本步骤）。"""
@@ -478,6 +555,11 @@ def pdf_to_epub(
             "result": (res.get("result") or "") if ok else None,
             "error": res.get("error") if not ok else None,
         }
+        if ok:
+            text_len = len(res.get("result") or "")
+            logger.debug(f"page {page_no} OCR ok: chars={text_len}")
+        else:
+            logger.error(f"page {page_no} OCR failed: {res.get('error')}")
         _saved_count += 1
         now = time.monotonic()
         if _saved_count >= len(todo_images) or now - _last_save_ts >= 2.0:
@@ -535,16 +617,23 @@ def pdf_to_epub(
     }
     for r in results:
         merged[_page_of(r.get("img"))] = r
+    # 排除页强制置空：即使缓存/本次识别有内容也覆盖为空，保持页码一致
+    for p in excluded_pages:
+        if 1 <= p <= total_pages:
+            merged[p] = {"result": "", "error": None}
     print(f" done in {time.perf_counter() - t0:.1f}s")
     # OCR 全部完成：进度标记为 ocr_done 并保留文件（EPUB 生成成功后才删除）
     progress["status"] = "ocr_done"
     _save_ocr_progress(img_dir, progress)
     pages = []
+    error_count = 0
     for page_no in sorted(merged):
         r = merged[page_no]
         if r.get("error"):
             print(f"      ! page {page_no} OCR failed: {r['error']}")
+            error_count += 1
         pages.append({"page": page_no, "text": r.get("result") or ""})
+    logger.info(f"ocr done: total_pages={total_pages}, todo={len(todo_images)}, excluded={len(excluded_pages)}, errors={error_count}, elapsed={timings.get('ocr', 0):.1f}s")
 
     print(f"[3/4] Structuring text ({len(pages)} page(s)) ...", end="", flush=True)
     t0 = time.perf_counter()
@@ -559,6 +648,7 @@ def pdf_to_epub(
     }
     timings["structure"] = time.perf_counter() - t0
     print(f" done in {timings['structure']:.1f}s")
+    logger.info(f"structure done: elapsed={timings['structure']:.1f}s")
 
     root = Path(out_dir) if out_dir else img_dir
 
@@ -604,6 +694,7 @@ def pdf_to_epub(
         )
         timings["correct"] = time.perf_counter() - t0
         print(f"      矫正完成 in {timings['correct']:.1f}s")
+        logger.info(f"correct done: elapsed={timings['correct']:.1f}s")
         if last_convert.get("result") is not None:
             # 浏览器端已「完成并转换」过（可多次），直接用最近一次转换结果
             result = last_convert["result"]
@@ -617,6 +708,7 @@ def pdf_to_epub(
         t_hist = time.perf_counter()
         _save_ocr_history(pdf, structured)
         timings["history"] = time.perf_counter() - t_hist
+        logger.info(f"history done: elapsed={timings['history']:.1f}s")
         print("[4/4] Rendering XHTML and packing EPUB ...", end="", flush=True)
         t0 = time.perf_counter()
         result = HTMLConverter(
@@ -624,6 +716,7 @@ def pdf_to_epub(
         ).convert_document(structured)
         timings["render"] = time.perf_counter() - t0
         print(f" done in {timings['render']:.1f}s")
+        logger.info(f"render done: elapsed={timings['render']:.1f}s")
 
     timings["total"] = time.perf_counter() - t_start
     _print_timing_summary(timings, ocr_pages=len(todo_images))
@@ -634,8 +727,10 @@ def pdf_to_epub(
 
     if result.get("epub"):
         print(f"Done: {result['epub']}")
+        logger.info(f"pdf_to_epub success: epub={result['epub']}, total_elapsed={timings['total']:.1f}s")
     elif result.get("epub_error"):
         print(f"EPUB packaging failed: {result['epub_error']}", file=sys.stderr)
+        logger.error(f"pdf_to_epub failed: epub_error={result['epub_error']}, total_elapsed={timings['total']:.1f}s")
     return result
 
 
@@ -1088,6 +1183,12 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
+    # 初始化文件日志（仅文件，不影响控制台 print）
+    from logmanage import setup_logging, logger
+
+    setup_logging()
+    logger.info(f"=== ptoe start: {sys.argv} ===")
+
     name, version = _read_meta()
     # Load persistent config early so the CLI default for --model follows the
     # user's selected_model in config.json. get_config() is robust and will
@@ -1175,6 +1276,11 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=600,
         help="浏览器被关闭后自动继续后续流程的等待秒数（仅 --correct 生效；默认 600=10 分钟）",
+    )
+    epub_p.add_argument(
+        "--exclude",
+        default=None,
+        help="跳过指定页码的 OCR 识别（如 1-15,17,20），优先于配置文件 exclude_pages",
     )
     _resume_group = epub_p.add_mutually_exclusive_group()
     _resume_group.add_argument(
@@ -1298,6 +1404,11 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=600,
         help="浏览器被关闭后自动继续后续流程的等待秒数（仅 --correct 生效；默认 600=10 分钟）",
+    )
+    resume_p.add_argument(
+        "--exclude",
+        default=None,
+        help="跳过指定页码的 OCR 识别（如 1-15,17,20），优先于配置文件 exclude_pages",
     )
     resume_p.add_argument(
         "--restart",
@@ -1655,6 +1766,7 @@ def main(argv: list[str] | None = None) -> int:
                 resume=(
                     "resume" if args.resume else ("restart" if args.restart else None)
                 ),
+                exclude=args.exclude,
             )
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)
@@ -1680,6 +1792,7 @@ def main(argv: list[str] | None = None) -> int:
                 correct=args.correct,
                 correct_idle_timeout=args.correct_timeout,
                 resume="restart" if args.restart else "resume",
+                exclude=args.exclude,
             )
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)

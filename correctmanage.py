@@ -3559,6 +3559,8 @@ def _write_history_version(state: dict[str, Any]) -> bool:
             "name": state.get("history_name")
             or Path(state.get("pdf_path") or "").name
             or "手动录入",
+            # 重命名功能的结果：保存/暂存/完成时保留，避免新版本回退到原始名
+            "display_name": state.get("display_name"),
             "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
             "pages": {str(k): v for k, v in state["pages"].items()},
             # 文字纠错状态（errors/original/dismissed key 均为 str(页码)）
@@ -3604,6 +3606,8 @@ def _overwrite_history(state: dict[str, Any]) -> bool:
             "name": state.get("history_name")
             or Path(state.get("pdf_path") or "").name
             or "手动录入",
+            # 重命名功能的结果：保存/暂存/完成时保留，避免新版本回退到原始名
+            "display_name": state.get("display_name"),
             "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
             "pages": {str(k): v for k, v in state["pages"].items()},
             # 文字纠错状态（errors/original/dismissed key 均为 str(页码)）
@@ -5427,6 +5431,11 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 sig = "|".join(
                     f"{fp.name}:{fp.stat().st_mtime_ns}:{fp.stat().st_size}" for fp in fps
                 )
+                # 若重命名的是当前编辑中的书（前缀一致），同步更新会话内
+                # state.display_name，使随后的保存/暂存/完成沿用它而非回退到原名
+                st = self.server.state
+                if st.get("history_prefix") == prefix:
+                    st["display_name"] = new_name
                 # 只要取第一个版本的显示名作为组名变更的凭证
                 first_items = _history_entries(prefix)
                 first_display = first_items[0].get("display_name", first_items[0].get("name", "")) if first_items else new_name
