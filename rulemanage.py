@@ -49,6 +49,7 @@ VALID_FORMAT_OPS = {
     "indent",
     "first_indent",
     "hang_indent",
+    "strip_ws",
 }
 
 # 空元素（void elements）——无闭合标签、无子节点
@@ -1049,6 +1050,17 @@ def apply_block_format(
             b.attrs["class"] = " ".join(classes)
             b.attrs["data-ind"] = mode
             b.attrs["data-indv"] = "2"
+    elif op == "strip_ws":
+        # 去空：遍历块内所有文本节点，移除空白字符但保留换行 \n
+        for b in blocks:
+            def walk_text_nodes(node: Node):
+                if isinstance(node, TextNode):
+                    # 移除所有空白字符（空格、制表符、全角空格等），保留 \n
+                    node.text = re.sub(r'[^\S\n]+', '', node.text)
+                elif isinstance(node, ElementNode):
+                    for child in node.children:
+                        walk_text_nodes(child)
+            walk_text_nodes(b)
     else:
         return False
 

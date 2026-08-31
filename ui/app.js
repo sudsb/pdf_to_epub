@@ -39,6 +39,7 @@ const OP_TIP = {
   marker_join:'段落标记（段首合上段，段尾合下段）',
   marker_page:'换页标记（从此处之后的内容显示在新的一页）',
   proofread_accept: '采纳纠错（替换为候选字）', proofread_ignore: '忽略纠错（消除标注）',
+  strip_ws: '去空（去除段落内全部空白，保留换行）',
 };
 const DEFAULTS = {
   bold:'Ctrl+B', italic:'Ctrl+I', heading:'Ctrl+1', p:'Ctrl+0',
@@ -1325,8 +1326,8 @@ function applyIndentMode(ed, mode) {
     });
 }
 
-function applyFormatBrushToSelection(format) {
-   const ed = currentEditable();
+function captureFormatFromSelection() {
+  const ed = currentEditable();
   if (!ed) return null;
   const sel = window.getSelection();
   if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
@@ -1351,6 +1352,23 @@ function applyOp(op) { const ed = currentEditable(); if (!ed) return;
    if (op === 'heading') { cycleHeading(ed); return; }
    if (op.indexOf('align_') === 0) { applyAlign(ed, op.slice(6)); return; }
    if (op === 'flush' || op === 'indent') { applyIndentMode(ed, op); return; }
+   if (op === 'strip_ws') {
+     const row = ed.closest('.page-row');
+     const i = row ? Number(row.dataset.i) : -1;
+     histRun('去空', [i], function () {
+       applyToSelectedBlocks(ed, function(block) {
+         const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, null, false);
+         const nodes = [];
+         while (walker.nextNode()) nodes.push(walker.currentNode);
+         for (const node of nodes) {
+           node.data = node.data.replace(/[^\S\n]+/g, '');
+         }
+       });
+       syncContent(ed);
+       if (row) { markDirty(i); scheduleRemeasure(i); }
+     });
+     return;
+   }
    const row = ed.closest('.page-row');
    const i = row ? Number(row.dataset.i) : -1;
    histRun(OP_TIP[op] || op, [i], function () {
@@ -3883,7 +3901,7 @@ const FORMAT_RULE_OPTS = [
   ['heading4','标题4'], ['heading5','标题5'], ['heading6','标题6'],
   ['p','正文'], ['merge','合并段落'], ['note','注释'], ['citation','引用'],
   ['flush','顶格'], ['indent','缩进'], ['first_indent','首行缩进'], ['hang_indent','悬挂缩进'],
-  ['remove','清除格式'],
+  ['remove','清除格式'], ['strip_ws','去空'],
 ];
 let formatRules = [];
 let formatRuleEditingId = null;
@@ -4773,6 +4791,24 @@ function applySingleFormat(op, ed) {
   if (op.indexOf('heading') === 0) {
     const tag = 'h' + op.slice(7);
     applyToSelectedBlocks(ed, function (block) { _convertBlockTag(block, tag); });
+  }
+  if (op === 'strip_ws') {
+    const row = ed.closest('.page-row');
+    const i = row ? Number(row.dataset.i) : -1;
+    histRun('去空', [i], function () {
+      applyToSelectedBlocks(ed, function(block) {
+        // 逐个文本节点去除空白字符（保留换行 \n）
+        const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, null, false);
+        const nodes = [];
+        while (walker.nextNode()) nodes.push(walker.currentNode);
+        for (const node of nodes) {
+          node.data = node.data.replace(/[^\S\n]+/g, '');
+        }
+      });
+      syncContent(ed);
+      if (row) { markDirty(i); scheduleRemeasure(i); }
+    });
+    return;
   }
 }
 

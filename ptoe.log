@@ -601,3 +601,5 @@ INFO|2026-08-31 11:20:06|history done: elapsed=0.1s
 INFO|2026-08-31 11:20:07|render done: elapsed=0.9s
 INFO|2026-08-31 11:20:07|pdf_to_epub success: epub=D:\code-project\python\PToEA\data\《毛泽东思想万岁》武汉钢二司编 第二卷\毛泽东思想万岁（1943—1949）.epub, total_elapsed=1487.9s
 INFO|2026-08-31 11:20:35|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', 'E:/MYBooks/books/毛泽东思想/《毛泽东思想万岁》武汉钢二司编 第二卷.pdf', '--lang', 'zh-CN'] ===
+INFO|2026-08-31 14:55:55|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-08-31 14:56:07|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', '--lang', 'zh-CN'] ===
