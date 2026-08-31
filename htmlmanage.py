@@ -220,13 +220,14 @@ def _inject_block_class(tag_name: str, attrs: str, cls: str) -> str:
 
 def transform_note_labels(html: str) -> str:
     """
-    将 HTML 中加粗的「注释」二字（含可选冒号）替换为「注　　释：」，
+    将 HTML 中加粗的「注释」二字（含可选冒号）替换为「<strong>注　　释：</strong>」，
     并给包含该文本的最近块级祖先（p/h1-h6/div）注入 ptoe-note-label class，
-    使其顶格显示（CSS 取消 text-indent）。
+    使其顶格显示（CSS 取消 text-indent）。加粗样式保留（用户只想加粗显示时也不丢失）。
 
     处理逻辑：
     1. 找到所有 <strong>注释</strong> / <b>注释</b>（含可选冒号、标签内空白）
-    2. 替换为「注　　释：」（冒号去重：标签内/外若已有冒号，只输出一个）
+    2. 替换为「<strong>注　　释：</strong>」（冒号去重：标签内/外若已有冒号，只输出
+       一个；仍保留 <strong> 加粗）
     3. 给包含替换结果的最近块级祖先（p/h1-h6/div）注入 ptoe-note-label class
        （同一块内多处匹配只加一次 class；已有 class 则追加、去重）
 
@@ -235,9 +236,10 @@ def transform_note_labels(html: str) -> str:
     if not html or "注释" not in html:
         return html
 
-    # 第一步：替换加粗注释标签
+    # 第一步：替换加粗注释标签（保留加粗：用户只想让「注释」加粗显示时，
+    # 转换后的「注释：」仍包在 <strong> 里，不丢失加粗样式）
     def _replace_bold_note(match: re.Match) -> str:
-        return _NOTE_REPLACEMENT
+        return f"<strong>{_NOTE_REPLACEMENT}</strong>"
 
     # 先替换所有匹配
     new_html = _BOLD_NOTE_RE.sub(_replace_bold_note, html)

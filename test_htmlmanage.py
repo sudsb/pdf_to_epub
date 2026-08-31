@@ -18,11 +18,21 @@ class TestTransformNoteLabels(unittest.TestCase):
     """transform_note_labels 单测"""
 
     def test_basic_replacement(self):
-        """基本替换：<strong>注释</strong> -> 注　　释："""
+        """基本替换：<strong>注释</strong> -> <strong>注　　释：</strong>（加粗保留）"""
         html = '<p><strong>注释</strong>这是内容</p>'
         result = htmlmanage.transform_note_labels(html)
         self.assertIn('注释\uFF1A', result)
+        # 转换后的「注释：」仍保留加粗
+        self.assertIn('<strong>注释\uFF1A</strong>', result)
         self.assertNotIn('<strong>注释</strong>', result)
+
+    def test_bold_preserved_inside_comment_block(self):
+        """注释块（ptoe-note）内加粗「注释」转换后仍保留加粗 + 注入顶格 class"""
+        html = '<p class="ptoe-note"><strong>注释</strong>内容</p>'
+        result = htmlmanage.transform_note_labels(html)
+        self.assertIn('<strong>注释\uFF1A</strong>', result)
+        self.assertIn('ptoe-note', result)
+        self.assertIn('ptoe-note-label', result)
 
     def test_b_tag_replacement(self):
         """<b> 标签也应被替换"""

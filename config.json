@@ -5,7 +5,7 @@
     "HY": {
       "name": "huiyuan/HunyuanOCR.BF16.gguf",
       "mmproj": "huiyuan/HunyuanOCR.mmproj-bf16.gguf",
-      "workers": 4
+      "workers": 5
     },
     "QWEN.8": {
       "name": "qwen3.5/Qwen3.5-0.8B-Q8_0.gguf",
@@ -15,22 +15,22 @@
     "QWEN2": {
       "name": "qwen3.5/Qwen3.5-2B-Q8_0.gguf",
       "mmproj": "qwen3.5/2b_mmproj-F16.gguf",
-      "workers": 4
+      "workers": 5
     },
     "PD": {
       "name": "paddleocr/PaddleOCR-VL-1.6-GGUF.gguf",
       "mmproj": "paddleocr/PaddleOCR-VL-1.6-GGUF-mmproj.gguf",
-      "workers": 4
+      "workers": 5
     },
     "ULQ8": {
       "name": "Unlimited/Unlimited-OCR-Q8_0.gguf",
       "mmproj": "Unlimited/mmproj-Unlimited-OCR-F16.gguf",
-      "workers": 4
+      "workers": 5
     },
     "DOTS8": {
       "name": "dots/dots.ocr.Q8_0.gguf",
       "mmproj": "dots/dots.ocr.mmproj-Q8_0.gguf",
-      "workers": 4
+      "workers": 5
     },
     "glm8": {
       "name": "glm/GLM-OCR-Q8_0.gguf",
@@ -40,17 +40,17 @@
     "glm16": {
       "name": "glm/GLM-OCR-f16.gguf",
       "mmproj": "glm/mmproj-GLM-OCR-Q8_0.gguf",
-      "workers": 4
+      "workers": 5
     },
     "q34": {
       "name": "qwenvl/Qwen3VL-4B-Instruct-Q8_0.gguf",
       "mmproj": "qwenvl/mmproj-Qwen3VL-4B-Instruct-F16.gguf",
-      "workers": 4
+      "workers": 5
     },
     "qwen4": {
       "name": "qwen3.5/Qwen3.5-4B-Q8_0.gguf",
       "mmproj": "qwen3.5/4b_mmproj-F16.gguf",
-      "workers": 4
+      "workers": 5
     }
   },
   "selected_model": "DOTS8",
@@ -74,7 +74,7 @@
     "auto_fix_score": 0.85,
     "enable_llm": true,
     "enable_legacy_rules": false,
-    "llm_model": "glm16",
+    "llm_model": "glm8",
     "llm_timeout": 3
   },
   "engine": "llama",
@@ -137,7 +137,7 @@
     {
       "id": "8411f14d397b4fc2ad4481207e10c3f5",
       "name": "标注",
-      "mode": "all",
+      "mode": "first",
       "conditions": [
         {
           "type": "regex",
@@ -151,8 +151,7 @@
               "heading1"
             ],
             [
-              "align_center",
-              "p"
+              "align_center"
             ],
             [
               "p"

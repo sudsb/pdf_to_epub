@@ -252,10 +252,11 @@ def validate_and_patch_config(cfg):
     merge(out, DEFAULT_CONFIG)
     # 校验selected_model
     choices = out.get("model_choices", {})
-    sel = out.get("selected_model")
-    if sel not in choices:
+    # Preserve an explicitly provided selected_model even if it's not present in
+    # model_choices. Only assign a default when selected_model is missing/None.
+    sel = out.get("selected_model", None)
+    if sel is None:
         out["selected_model"] = next(iter(choices)) if choices else None
-    # llama_server/models_dir等类型检查＋回退
     if not isinstance(out.get("llama_server"), str):
         out["llama_server"] = DEFAULT_CONFIG["llama_server"]
     if not isinstance(out.get("models_dir"), str):
@@ -322,37 +323,101 @@ def get_config(*, show_dialogs: bool = True):
     return newcfg
 
 
-def update_config(key, value):
-    """更新单个配置字段，并持久化（线程安全）。
+def find_canonical_model_key(choices: dict, key: str):
+    """Return (canonical_key, matches).
 
-    注意：不要在持有 _CFG_LOCK 时调用 get_config()，因为 get_config
-    本身会尝试获取同一锁（导致死锁）。直接读取/写入配置文件并
-    使用 validate_and_patch_config 做校验。
+    - If `key` exactly equals an existing key in `choices`, return (key, [key]).
+    - Else, perform a case-insensitive match among string keys and return (canonical_key, [matches])
+      when there's exactly one case-insensitive match.
+    - If multiple case-insensitive matches exist, return (None, matches).
+    - If no matches, return (None, []).
+
+    This helper centralizes case-insensitive model key resolution so callers (GUI/API/CLI)
+    can uniformly map user-provided values to stored canonical keys.
     """
+    if not isinstance(choices, dict) or not isinstance(key, str) or not key.strip():
+        return None, []
+    # exact match wins
+    if key in choices:
+        return key, [key]
+    # case-insensitive matches
+    matches = [k for k in choices.keys() if isinstance(k, str) and k.lower() == key.lower()]
+    if len(matches) == 1:
+        return matches[0], matches
+    return None, matches
+
+def update_config(key, value):
+    """Update a single top-level config key and persist atomically with minimized lock hold.
+
+    Strategy (optimistic update):
+    1. Read config from disk without holding _CFG_LOCK (fallback to DEFAULT_CONFIG).
+    2. Apply the requested change and run validate_and_patch_config() outside the lock.
+       Validation is allowed to be more expensive but must not hold the global _CFG_LOCK.
+    3. Acquire _CFG_LOCK briefly, re-read the on-disk config, re-apply the requested change to the
+       fresh config (to avoid races), validate again, then persist via _atomic_write_json().
+
+    Special-case: model_choices is treated as caller-authoritative and written without merging
+    DEFAULT_CONFIG entries back in (preserves existing behavior).
+    """
+    # 1) optimistic read (no lock)
+    try:
+        if os.path.exists(_CONFIG_PATH):
+            with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg_disk = json.load(f)
+        else:
+            cfg_disk = DEFAULT_CONFIG.copy()
+    except Exception as e:
+        print(f"[config] Error reading config for update_config (optimistic): {e}")
+        cfg_disk = DEFAULT_CONFIG.copy()
+
+    # 2) special-case model_choices: caller-provided dict is authoritative
+    if key == "model_choices" and isinstance(value, dict):
+        with _CFG_LOCK:
+            try:
+                if os.path.exists(_CONFIG_PATH):
+                    with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                        latest = json.load(f)
+                else:
+                    latest = DEFAULT_CONFIG.copy()
+                latest[key] = value
+                _atomic_write_json(_CONFIG_PATH, latest)
+                return latest
+            except Exception as e:
+                print(f"[config] Error updating model_choices: {e}")
+                latest = DEFAULT_CONFIG.copy()
+                with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+                    json.dump(latest, f, ensure_ascii=False, indent=2)
+                return latest
+
+    # 3) apply change + validate outside lock
+    try:
+        cfg_candidate = cfg_disk.copy()
+        cfg_candidate[key] = value
+        cfg_candidate = validate_and_patch_config(cfg_candidate)
+    except Exception as e:
+        print(f"[config] Error validating candidate config: {e}")
+        cfg_candidate = DEFAULT_CONFIG.copy()
+        cfg_candidate[key] = value
+
+    # 4) brief critical section: re-read, re-apply change, validate, write
     with _CFG_LOCK:
         try:
             if os.path.exists(_CONFIG_PATH):
                 with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
+                    latest = json.load(f)
             else:
-                cfg = DEFAULT_CONFIG.copy()
-            # Special-case model_choices: respect the caller-provided dict as the
-            # authoritative set of available models and do not merge DEFAULT_CONFIG
-            # entries back in. This allows users to remove built-in defaults.
-            if key == "model_choices" and isinstance(value, dict):
-                cfg[key] = value
-                _atomic_write_json(_CONFIG_PATH, cfg)
-                return cfg
-            cfg[key] = value
-            cfg = validate_and_patch_config(cfg)
-            _atomic_write_json(_CONFIG_PATH, cfg)
-            return cfg
+                latest = DEFAULT_CONFIG.copy()
+            latest[key] = value
+            latest = validate_and_patch_config(latest)
+            _atomic_write_json(_CONFIG_PATH, latest)
+            return latest
         except Exception as e:
-            print(f"[config] Error updating config, fallback to default: {e}")
-            cfg = DEFAULT_CONFIG.copy()
+            print(f"[config] Error updating config under lock, fallback to default: {e}")
+            latest = DEFAULT_CONFIG.copy()
             with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
-            return cfg
+                json.dump(latest, f, ensure_ascii=False, indent=2)
+            return latest
+
 
 
 def set_ocr_prompt(prompt: str) -> dict:

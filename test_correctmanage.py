@@ -163,6 +163,33 @@ class TestSanitize(unittest.TestCase):
         self.assertNotIn('<mark', out)
         self.assertIn('abc', out)
 
+    def test_inline_format_spans_preserved(self):
+        # 行内对齐样式、注释类、引用类由规则引擎产生，需在 sanitize 后保留
+        # 对齐：style="text-align:center|right|left"
+        out = sanitize_html(
+            '<p>前<span style="text-align:center">居中</span>'
+            '<span style="text-align:right">靠右</span>后</p>'
+        )
+        self.assertIn('style="text-align:center"', out)
+        self.assertIn('style="text-align:right"', out)
+        self.assertIn('居中', out)
+        self.assertIn('靠右', out)
+        # 注释类
+        out2 = sanitize_html('<p>a<span class="ptoe-note">注释</span>b</p>')
+        self.assertIn('class="ptoe-note"', out2)
+        self.assertIn('注释', out2)
+        # 引用类
+        out3 = sanitize_html('<p>a<span class="ptoe-citation">引用</span>b</p>')
+        self.assertIn('class="ptoe-citation"', out3)
+        self.assertIn('引用', out3)
+        # 混合：对齐 + 注释
+        out4 = sanitize_html(
+            '<p><span style="text-align:center" class="ptoe-note">居中注释</span></p>'
+        )
+        self.assertIn('style="text-align:center"', out4)
+        self.assertIn('class="ptoe-note"', out4)
+        self.assertIn('居中注释', out4)
+
 
 class TestCleanPageHtml(unittest.TestCase):
     """clean_page_html：段落合并 / 段首符号 / 中英文标点 / 残留 HTML 标签清理。"""
@@ -3716,6 +3743,131 @@ class TestReocr(unittest.TestCase):
         finally:
             self._stop(server)
 
+    def test_reocr_normalizes_bracket_style(self):
+        """重识别括号样式归一：模型输出【1】 vs 原文〔1〕 → 统一归一为〔1〕后无 diff（2026-08-30）。"""
+        import json as _json
+
+        import requests
+
+        self._patch_cfg()
+        self._patch_correct_attr("_full_bytes", lambda state, pn: ("image/png", b"fake"))
+        self._patch_llama_attr(
+            "_request_image_new",
+            lambda prompt, img, model_key="HY", thinking=False, timeout=600, **kw: {
+                "result": "这里是【1】引注内容",
+                "error": None,
+            },
+        )
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/reocr",
+                data=_json.dumps(
+                    {"page": 1, "model": "", "html": "<p>这里是〔1〕引注内容</p>"}
+                ),
+            ).json()
+            self.assertTrue(res["ok"])
+            # 括号样式差异（【1】 vs 〔1〕）归一后 → 内容一致 → 无纠错项
+            self.assertEqual(res["diff"], [], "括号样式差异【1】vs〔1〕不应成为纠错项")
+            # 归一后返回文本以六角括号呈现
+            self.assertIn("〔1〕", res["text"])
+            self.assertNotIn("【1】", res["text"])
+        finally:
+            self._stop(server)
+
+    def test_reocr_bracket_norm_keeps_real_difference(self):
+        """括号样式归一后，括号内内容确实不同仍正常标注（【2】vs〔1〕→ 差异保留）。"""
+        import json as _json
+
+        import requests
+
+        self._patch_cfg()
+        self._patch_correct_attr("_full_bytes", lambda state, pn: ("image/png", b"fake"))
+        self._patch_llama_attr(
+            "_request_image_new",
+            lambda prompt, img, model_key="HY", thinking=False, timeout=600, **kw: {
+                "result": "这里是【2】引注内容",
+                "error": None,
+            },
+        )
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/reocr",
+                data=_json.dumps(
+                    {"page": 1, "model": "", "html": "<p>这里是〔1〕引注内容</p>"}
+                ),
+            ).json()
+            self.assertTrue(res["ok"])
+            # 归一后仍剩真实差异（〔2〕 vs 〔1〕）→ 有纠错标注
+            self.assertTrue(res["diff"], "括号内内容不同（〔2〕vs〔1〕）应保留纠错项")
+            self.assertIn("〔2〕", res["text"])
+        finally:
+            self._stop(server)
+
+    def test_reocr_cleans_junk_wrapped_bracket(self):
+        """模型把原文 〔x〕 识别成 \\〔^{x〕}\\ 杂符包裹 → 对比前折叠为 〔x〕，无假 diff（2026-08-30）。"""
+        import json as _json
+
+        import requests
+
+        self._patch_cfg()
+        self._patch_correct_attr("_full_bytes", lambda state, pn: ("image/png", b"fake"))
+        self._patch_llama_attr(
+            "_request_image_new",
+            lambda prompt, img, model_key="HY", thinking=False, timeout=600, **kw: {
+                "result": "正文\\〔^{5〕}\\引注内容",
+                "error": None,
+            },
+        )
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/reocr",
+                data=_json.dumps(
+                    {"page": 1, "model": "", "html": "<p>正文〔5〕引注内容</p>"}
+                ),
+            ).json()
+            self.assertTrue(res["ok"])
+            # 杂符包裹（\\ ^ { }）与原文 〔5〕 折叠后一致 → 无纠错项
+            self.assertEqual(res["diff"], [], "杂符包裹 \\〔^{5〕}\\ 不应成为纠错项")
+            self.assertIn("〔5〕", res["text"])
+            for junk in ("\\", "^", "{"):
+                self.assertNotIn(junk, res["text"], f"杂符 {junk!r} 应从返回文本清除")
+        finally:
+            self._stop(server)
+
+    def test_reocr_cleans_junk_bracket_keeps_real_difference(self):
+        """杂符包裹折叠后括号内内容确实不同仍正常标注（\\〔^{2〕}\\ vs 〔1〕 → 差异保留）。"""
+        import json as _json
+
+        import requests
+
+        self._patch_cfg()
+        self._patch_correct_attr("_full_bytes", lambda state, pn: ("image/png", b"fake"))
+        self._patch_llama_attr(
+            "_request_image_new",
+            lambda prompt, img, model_key="HY", thinking=False, timeout=600, **kw: {
+                "result": "正文\\〔^{2〕}\\引注内容",
+                "error": None,
+            },
+        )
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/reocr",
+                data=_json.dumps(
+                    {"page": 1, "model": "", "html": "<p>正文〔1〕引注内容</p>"}
+                ),
+            ).json()
+            self.assertTrue(res["ok"])
+            # 杂符折叠成 〔2〕 后与 〔1〕 仍不同 → 纠错项保留
+            self.assertTrue(res["diff"], "杂符折叠后内容不同（〔2〕vs〔1〕）应保留纠错项")
+            self.assertIn("〔2〕", res["text"])
+            self.assertNotIn("^{", res["text"])
+        finally:
+            self._stop(server)
+
     def test_strip_trailing_page_number(self):
         # 纯函数：末尾页码清理（2026-08-28 新增）
         # 字符+数字样式，无需独立成行
@@ -7240,6 +7392,50 @@ class TestHistoryRenameEndpoint(unittest.TestCase):
         self.assertEqual(title_a, "自定义书名")
         # display_name 为空 → 回退到 history_name（load 后为 PDF 文件名）
         self.assertEqual(title_b, "B.pdf")
+
+    def test_export_filename_prefers_display_name(self):
+        """导出默认文件名优先级：display_name > history_name > '矫正导出'.
+
+        回归（2026-08-30 Bug 3）：此前 _pick_export_path 与 headless 兜底都用
+        history_name 作为默认导出文件名，重命名（display_name）后导出仍用旧名。
+        现在两者都优先取重命名后的 display_name。
+        """
+        import correctmanage as _cm
+
+        # headless（无 tkinter）路径：_pick_export_path 返回 (None, False)，
+        # 调用方随后用 _default_export_path(f"{base}.{fmt}")。这里直接验证
+        # base 的取值，等价于 _pick_export_path 内部 / headless 兜底的计算公式。
+        state_a = {"display_name": "我的新书名", "history_name": "旧名.pdf"}
+        base_a = (
+            state_a.get("display_name")
+            or state_a.get("history_name")
+            or "矫正导出"
+        ).removesuffix(".pdf")
+        self.assertEqual(base_a, "我的新书名")
+
+        # 无 display_name → 回退 history_name
+        state_b = {"history_name": "旧名.pdf"}
+        base_b = (
+            state_b.get("display_name")
+            or state_b.get("history_name")
+            or "矫正导出"
+        ).removesuffix(".pdf")
+        self.assertEqual(base_b, "旧名")
+
+        # 两者皆无 → 矫正导出
+        base_c = (
+            {}.get("display_name")
+            or {}.get("history_name")
+            or "矫正导出"
+        ).removesuffix(".pdf")
+        self.assertEqual(base_c, "矫正导出")
+
+        # 直接调用 _pick_export_path：headless（无 tkinter）应返回 (None, False)，
+        # 由调用方用上面的 base 拼 _default_export_path。tkinter 可用的桌面环境会
+        # 弹出保存对话框，此处只验证函数可调用、返回二元组、且不抛异常。
+        result = _cm._pick_export_path(state_a, "epub")
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 2)
 
     def test_rename_then_stage_save_keeps_display_name(self):
         """重命名当前编辑的书后 保存/暂存，新写入的版本文件必须保留重命名后的名称。

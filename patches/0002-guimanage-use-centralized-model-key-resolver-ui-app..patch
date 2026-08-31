@@ -1,0 +1,145 @@
+From 5f44d33835eb9ee75e73e6fd19c44ea7b354bd40 Mon Sep 17 00:00:00 2001
+From: ptoe-bot <devnull@example.local>
+Date: Sat, 29 Aug 2026 20:43:28 +0800
+Subject: [PATCH 2/2] guimanage: use centralized model key resolver; ui/app.js:
+ defensive hide of modals on init; mian: preload ImageQueue before batch_infer
+ and accept ImageItem pages
+
+---
+ guimanage.py | 10 +++++-----
+ mian.py      | 51 +++++++++++++++++++++++++++++++++++++++------------
+ ui/app.js    | 21 +++++++++++++++++++++
+ 3 files changed, 65 insertions(+), 17 deletions(-)
+
+diff --git a/guimanage.py b/guimanage.py
+index 82a2beb..2debc8a 100644
+--- a/guimanage.py
++++ b/guimanage.py
+@@ -1184,18 +1184,18 @@ class _GuiHandler(BaseHTTPRequestHandler):
+                 return
+             choices = body.get("model_choices", cfg.get("model_choices") or {})
+             sel = body.get("selected_model", cfg.get("selected_model"))
+-            # Tolerate case-insensitive selected_model by mapping to canonical key
+             if isinstance(choices, dict) and isinstance(sel, str) and sel.strip() and sel not in choices:
+-                matches = [k for k in choices.keys() if isinstance(k, str) and k.lower() == sel.lower()]
+-                if len(matches) == 1:
+-                    sel = matches[0]
++                canonical, matches = configmanage.find_canonical_model_key(choices, sel)
++                if canonical is not None:
++                    sel = canonical
+                     body["selected_model"] = sel
+-                elif len(matches) > 1:
++                elif matches:
+                     self._send(400, self._json({"ok": False, "error": f"ambiguous model: '{sel}' matches {matches}, use exact key or remove duplicates"}))
+                     return
+                 else:
+                     self._send(400, self._json({"ok": False, "error": f"未知模型：{sel}"}))
+                     return
++
+             for key in ("llama_server", "models_dir"):
+                 val = body.get(key, cfg.get(key))
+                 if not isinstance(val, str):
+diff --git a/mian.py b/mian.py
+index 2943d26..8886d9a 100644
+--- a/mian.py
++++ b/mian.py
+@@ -117,8 +117,13 @@ def _read_meta() -> tuple[str, str]:
+ 
+ 
+ def _page_of(image) -> int:
+-    """Extract the 1-based page number from an image path or filename."""
+-    m = _PAGE_RE.search(str(image))
++    """Extract the 1-based page number from an image path, ImageItem, or filename.
++
++    Accepts either a path-like (str/Path) or an object with a `.path` attribute
++    (e.g. ImageItem). Uses the same _PAGE_RE regex over the stringified path.
++    """
++    candidate = getattr(image, "path", image)
++    m = _PAGE_RE.search(str(candidate))
+     return int(m.group(1)) if m else 0
+ 
+ 
+@@ -595,16 +600,38 @@ def pdf_to_epub(
+                 on_result=_on_ocr_result,
+             )
+         else:
+-            results = batch_infer(
+-                todo_images,
+-                [prompt] * len(todo_images),
+-                model_key=model_key,
+-                max_workers=eff_workers,
+-                thinking=thinking,
+-                timeout=timeout,
+-                on_progress=_on_progress,
+-                on_result=_on_ocr_result,
+-            )
++            # Preload images into ImageQueue and pass ImageItem objects to batch_infer so
++            # each worker can call img.get_base64() and skip repeated disk reads/encoding.
++            try:
++                from pdfmanage import ImageQueue
++            except Exception:
++                # Fallback: if pdfmanage unavailable, call batch_infer with paths as before
++                results = batch_infer(
++                    todo_images,
++                    [prompt] * len(todo_images),
++                    model_key=model_key,
++                    max_workers=eff_workers,
++                    thinking=thinking,
++                    timeout=timeout,
++                    on_progress=_on_progress,
++                    on_result=_on_ocr_result,
++                )
++            else:
++                q = ImageQueue(store_in_memory=False)
++                items = [q.add(p, encode=False) for p in todo_images]
++                # Pre-encode concurrently to temp files/in-memory to reduce per-worker I/O
++                q.preload_all(max_workers=eff_workers or 4)
++                results = batch_infer(
++                    items,
++                    [prompt] * len(items),
++                    model_key=model_key,
++                    max_workers=eff_workers,
++                    thinking=thinking,
++                    timeout=timeout,
++                    on_progress=_on_progress,
++                    on_result=_on_ocr_result,
++                )
++
+         timings["ocr"] = time.perf_counter() - t_batch
+     else:
+         results = []
+diff --git a/ui/app.js b/ui/app.js
+index 5cae9ab..5ade7e5 100644
+--- a/ui/app.js
++++ b/ui/app.js
+@@ -5546,6 +5546,27 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
+ // ---------- 初始化 ----------
+ (async function init() {
+   try {
++    // Defensive: hide known modal/backdrop elements at startup to avoid accidental blocking overlays
++    (function(){
++      const _modalIds = [
++        'modalBg','searchModalBg','exportModalBg','indentModalBg','finishModalBg',
++        'historyModalBg','helpModalBg','formatRulesModalBg','frRuleModalBg','frFmtPopupBg',
++        'imgPopup','errPopup','popup','contextMenu','proofreadMenu'
++      ];
++      for (const id of _modalIds) {
++        try {
++          const el = document.getElementById(id);
++          if (el && el.style && (el.style.display === 'flex' || el.style.display === 'block' || el.style.display === '')) {
++            el.style.display = 'none';
++          } else if (el) {
++            el.hidden = true;
++          }
++        } catch (e) {
++          // defensive: ignore DOM exceptions during early init
++        }
++      }
++    })();
++
+     pages = (await fetchJSON('/api/pages')).pages;
+   } catch (e) { document.body.textContent = '加载失败: ' + e; return; }
+   heights.length = pages.length; heights.fill(0);
+-- 
+2.54.0.windows.1
+
