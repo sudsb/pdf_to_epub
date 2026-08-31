@@ -2668,6 +2668,7 @@ function openContextMenu(x, y) {
   // offsetWidth/offsetHeight reflect real CSS. (Defensive: harmless if already blank.)
   try { ctxMenu.style.display = ''; } catch (e) {}
   const w = ctxMenu.offsetWidth || 172, h = ctxMenu.offsetHeight || 240;
+  const cx = Math.max(8, Math.min(x, window.innerWidth - w - 8));
   const cy = Math.max(8, Math.min(y, window.innerHeight - h - 8));
   ctxMenu.style.left = cx + 'px';
   ctxMenu.style.top = cy + 'px';

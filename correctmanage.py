@@ -119,6 +119,10 @@ _NOTE_CLASS = "ptoe-note"
 
 
 _ALIGN_CLASSES = {"ptoe-align-center", "ptoe-align-left", "ptoe-align-right"}
+# 行内对齐样式正则：style="text-align:left|center|right"（含空格容忍）
+_ALIGN_STYLE_RE = re.compile(r"text-align\s*:\s*(left|center|right)\s*(?:;|$)")
+# 行内格式类白名单：note/citation 等由规则引擎产生的行内 span 类
+_INLINE_FORMAT_CLASSES = {"ptoe-note", "ptoe-citation"}
 
 _BLOCK_TAG_RE = re.compile(r"</?(p|h[1-6])([^>]*)>", flags=re.IGNORECASE)
 
@@ -1065,6 +1069,28 @@ class _Sanitizer(HTMLParser):
                 cls_html = f' class="{cls}"' if cls else ""
                 self.buf.append(f'<span data-ptoe-marker="{v}"{cls_html}>')
                 self.stack.append("span")
+            else:
+                # 保留行内格式 span：对齐样式、注释类、引用类
+                # 这些由规则引擎产生，需在 sanitize 后保留以便前端渲染
+                style = attrs_d.get("style", "")
+                cls_attr = attrs_d.get("class", "")
+                keep = False
+                keep_attrs = []
+                if _ALIGN_STYLE_RE.search(style):
+                    # 规则引擎用内联样式实现多对齐共存：style="text-align:center"
+                    keep = True
+                    keep_attrs.append(f'style="{_html.escape(style, quote=True)}"')
+                cls_list = (cls_attr or "").split()
+                for c in cls_list:
+                    if c in _INLINE_FORMAT_CLASSES:
+                        keep = True
+                        keep_attrs.append(f'class="{_html.escape(c, quote=True)}"')
+                        break  # 只保留第一个匹配的格式类
+                if keep:
+                    attrs_html = " ".join(keep_attrs)
+                    self.buf.append(f"<span {attrs_html}>")
+                    self.stack.append("span")
+                # 其余 span 丢弃，仅保留文本内容
         elif tag == "img":
             # 插入的图片：仅保留 src（data URI 或相对路径）、alt 与显示模式 class
             # （含尺寸 class ptoe-img-w25/50/75/100）
@@ -1786,6 +1812,30 @@ def _normalize_brackets(text: str) -> str:
     return _normalize_bracket_pairs(_clean_ulq_bracket_junk(text))
 
 
+def _clean_bracket_junk_html(html: str) -> str:
+    """对 HTML 片段做杂符括号清理（token 级，只动文本节点）。
+
+    部分大模型会把原文的 〔x〕 引注识别成 \\〔^{x〕}\\ 这类杂符包裹格式
+    （\\ ^ { } 等无效字符夹着括号），这些字符进入矫正界面/对比前必须清除。
+    逐 token 处理：`<...>` 与标记 span 原样保留（绝不能拆标签，否则会破坏
+    img 属性/标记结构），仅对文本 token 做 _normalize_brackets
+    （杂符清理 + 括号对统一，见 _ULQ_JUNK_BRACKET_RE）。
+    """
+    if not html or re.search(r"[\\^~`|·{}]", html) is None:
+        return html
+    if _TOKEN_RE.search(html) is None:
+        return _normalize_brackets(html)
+    out = []
+    for tok in _TOKEN_RE.split(html):
+        if not tok:
+            continue
+        if tok.startswith("<"):
+            out.append(tok)
+        else:
+            out.append(_normalize_brackets(tok))
+    return "".join(out)
+
+
 def _full_punct(text: str) -> str:
     """将文本中的英文标点替换为中文标点（含引号配对轮换）。无 CJK 上下文时原样返回。
 
@@ -2318,9 +2368,13 @@ def _page_text(raw: str, *, normalize_headings: bool = True) -> str:
     只在写入历史时做一次（_save_ocr_history 走默认 True）。
     """
     if re.search(r"</?(?:p|div|h[1-6]|span)([^>]*)>", raw, flags=re.IGNORECASE):
+        # 2026-08-30：历史/已存 HTML 内容 serve 前做杂符括号清理（token 级，
+        # 只动文本节点）——历史版本可能保存过 \\〔^{x〕}\\ 之类大模型杂符包裹，
+        # 不清理则界面正文与 reocr 的 current_text 基准不一致、diff 偏移错位。
+        cleaned = _clean_bracket_junk_html(raw)
         if normalize_headings:
-            return _headings_to_body(raw)
-        return raw
+            return _headings_to_body(cleaned)
+        return cleaned
     return initial_html(raw)
 
 
@@ -2330,10 +2384,15 @@ def initial_html(text: str) -> str:
     HTML 会把文本节点里的换行折叠成空格（导致“内容拥挤到一整段”），
     所以必须按行生成块级元素，才能在编辑区保留原始段落/行结构。
     清洗器会把 <div> 归一化为 <p>，保证往返（保存→清洗）不丢结构。
+
+    2026-08-30：进入矫正界面前先做杂符括号清理（_normalize_brackets）——
+    部分大模型把原文 〔x〕 引注识别成 \\〔^{x〕}\\ 的杂符包裹格式，这些
+    无效字符须在界面可见/保存前清除（与 reocr 对比前清理保持一致，否则
+    界面正文与 reocr 的 current_text 基准不一致，diff 偏移会错位）。
     """
     out = []
     for line in str(text).split("\n"):
-        line = line.strip()
+        line = _normalize_brackets(line.strip())
         if line:
             out.append(f"<div>{_html.escape(line, quote=False)}</div>")
     return "".join(out)
@@ -4433,7 +4492,12 @@ def _pick_export_path(
     """
     ext = {"txt": "txt", "epub": "epub", "docx": "docx", "md": "md"}.get(fmt, "docx")
     label = "Markdown 文件" if fmt == "md" else f"{ext.upper()} 文件"
-    base = (state.get("history_name") or "").removesuffix(".pdf")
+    # 默认文件名优先用重命名后的 display_name，回退 history_name（2026-08-30）
+    base = (
+        state.get("display_name")
+        or state.get("history_name")
+        or ""
+    ).removesuffix(".pdf")
     base = (base or "矫正导出").strip() or "矫正导出"
     initial = f"{base}.{ext}"
     try:
@@ -5288,7 +5352,15 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     # 2026-08-15 修复：历史内容按原样返回（不再归一 <h1>-<h6>）——
                     # 其中可能含用户手动设置的标题，归一会导致「保存后重开，
                     # 已设置的标题格式丢失」；OCR 自动标题的归一只在写入历史时做一次。
-                    {"page": int(k), "html": _ensure_marker_classes(str(v))}
+                    # 2026-08-30：serve 前做杂符括号清理（token 级）——历史版本
+                    # 可能保存过 \\〔^{x〕}\\ 之类大模型杂符包裹，须在界面可见/再次
+                    # 矫正前清除（与 reocr 对比基准保持一致）。
+                    {
+                        "page": int(k),
+                        "html": _ensure_marker_classes(
+                            _clean_bracket_junk_html(str(v))
+                        ),
+                    }
                     for k, v in loaded["pages"].items()
                 ]
                 out.sort(key=lambda x: x["page"])
@@ -5304,7 +5376,10 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                             # 2026-08-15 修复：历史版本内容按原样同步（不再归一标题）——
                             # 用户手动设置的 <h1>-<h6> 必须保留，否则「保存后重开，
                             # 已设置的标题格式丢失」；OCR 自动标题的归一只在写入历史时做一次
-                            st["pages"][int(k)] = sanitize_html(str(v))
+                            # 2026-08-30：同步前做杂符括号清理（与 serve 路径一致）
+                            st["pages"][int(k)] = sanitize_html(
+                                _clean_bracket_junk_html(str(v))
+                            )
                         except (TypeError, ValueError):
                             continue
                 if pdf and Path(pdf).is_file() and st.get("pdf_path") != pdf:
@@ -6005,7 +6080,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     new_text = strip_think_blocks(new_text)
                     new_text = clean_bbox_text(new_text)
                     # 2026-08-08：重识别结果先繁转简再与当前文本对比（与 /api/proofread 的 ⑫b 一致）
-                    # 2026-08-28：不处理括号归一，保留模型原始输出（什么括号就是什么括号）
+                    # 2026-08-30：识别结果中的括号对（【x】/[x]/［x］ 等）在对比前统一
+                    # 归一为 〔x〕（与 clean 流程一致），避免括号样式差异被当作纠错项；
+                    # 括号内内容原样保留（此前 2026-08-28 是「不处理、保留原始输出」）
                     new_text = ttos(new_text)
                 # 2026-08-23/28：模型可能把图片页脚的页码一并识别进来，先剥掉末尾页码
                 # （第 N 页 / 字符+数字：页123·P123·No.123 / 括号包裹 / 独立成行裸数字），
@@ -6015,10 +6092,20 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 new_text = _strip_trailing_page_number(new_text)
                 # 2026-08-09：再将英文标点归一为中文标点，避免半角/全角差异被当成纠错项
                 new_text = _full_punct(new_text)
+                # 2026-08-30：对比前做杂符括号清理 + 括号对统一（〔x〕）——
+                # 部分大模型把原文 〔x〕 引注识别成 \\〔^{x〕}\\ 的杂符包裹格式
+                # （\\ ^ { } 等无效字符夹着括号），须先折叠为 〔x〕 再与原文比较，
+                # 否则杂符被逐字判为纠错项。括号对归一为逐字符 1:1 替换；
+                # 杂符清理改变长度但只作用在模型返回文本侧（后文 current_text
+                # 已由进入矫正界面时的清理保证无杂符，见 _page_text/initial_html）。
+                new_text = _normalize_brackets(new_text)
                 current_text = _proofread_plain_text(str(body.get("html") or ""))
                 # 与 new_text 同样做半角→全角标点归一：否则相同内容因标点宽度差异
                 # 被逐字判为差异，产生大量非预期位置的纠错标注（2026-08 修复）
                 current_text = _full_punct(current_text)
+                # 与 new_text 做同等括号归一：否则「原文是〔1〕、模型输出【1】」这种
+                # 纯粹样式差异会被逐字判为差异（2026-08-30）
+                current_text = _normalize_brackets(current_text)
                 diff = diff_reocr_texts(current_text, new_text)
                 self._send(
                     200,
@@ -6139,9 +6226,12 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                         return
                     if out_path is None:
                         # headless 兜底：当前目录 + 默认文件名（重名自动加序号）
-                        base = (st.get("history_name") or "矫正导出").removesuffix(
-                            ".pdf"
-                        )
+                        # 默认名优先用重命名后的 display_name，回退 history_name（2026-08-30）
+                        base = (
+                            st.get("display_name")
+                            or st.get("history_name")
+                            or "矫正导出"
+                        ).removesuffix(".pdf")
                         base = (base or "矫正导出").strip() or "矫正导出"
                         out_path = _default_export_path(f"{base}.{fmt}")
                 out = Path(out_path)

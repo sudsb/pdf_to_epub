@@ -252,10 +252,11 @@ def validate_and_patch_config(cfg):
     merge(out, DEFAULT_CONFIG)
     # 校验selected_model
     choices = out.get("model_choices", {})
-    sel = out.get("selected_model")
-    if sel not in choices:
+    # Preserve an explicitly provided selected_model even if it's not present in
+    # model_choices. Only assign a default when selected_model is missing/None.
+    sel = out.get("selected_model", None)
+    if sel is None:
         out["selected_model"] = next(iter(choices)) if choices else None
-    # llama_server/models_dir等类型检查＋回退
     if not isinstance(out.get("llama_server"), str):
         out["llama_server"] = DEFAULT_CONFIG["llama_server"]
     if not isinstance(out.get("models_dir"), str):

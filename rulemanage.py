@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import html
 import re
+import threading
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
@@ -113,15 +115,125 @@ def parse_regex_pattern(pattern: str) -> tuple[str, str]:
     return pattern, ""
 
 
-# 编译正则缓存（同一规则的正则在 eval_condition 与 find_matches 中各编译一次）
-_REGEX_CACHE: dict[str, re.Pattern] = {}
+# 编译正则缓存（同一规则的正则在 eval_condition 与 find_matches 中各编译一次）。
+# 有界 LRU（OrderedDict + 锁）：频繁使用场景下不再反复整体 clear 后重新编译，
+# 也不会无限增长；多线程 serve（ThreadingHTTPServer）下读写经锁保护。
+_REGEX_CACHE: "OrderedDict[str, re.Pattern]" = OrderedDict()
+_REGEX_CACHE_LOCK = threading.Lock()
+_REGEX_CACHE_MAX = 256
+
+# 灾难性回溯（ReDoS）启发式：量词内再套量词，如 (a+)+、(a*)*、(a?){2}、(?:ab+)+。
+# 这类模式对超长文本可能指数级回溯，挂死同步 serve 线程（UI 冻结），直接拦截。
+# 普通形态（(a){2}、(ab+)、(\\d{4})year 等）正确不误伤。
+# 改进（2026-08）：仅当「捕获组内包含 非通配符 原子上的量词」且「该组外紧跟 +/* 量词」
+# 才判定为嵌套量词灾难性回溯，否则放行。原启发式把 (.*?)?、([\\s\\S]*?)? 等
+# 通配/可选形态一并误杀（如 `([\\s\\S]*)(日期)([\\s\\S]*?)(可选)?(注释)([\\s\\S]*)` 这类
+# 合法规则被拒绝，报「无效或存在潜在性能风险」）。通配符（. / [\\s\\S] / 字符类）上的量词
+# 不会引发指数级重划分，反向量词 ?（可选）也不产生重划分，故扫描放行。
+# 说明：原单次正则（含负向回顾断言）在部分解释器报错「multiple repeat」，故改为显式扫描，
+# 行为更可控：(.+)+、([\\s\\S]+)+、(.*?)+ 等指数级重划分仍判危险；(.*?)?、([\\s\\S]*?)? 等可选通配放行。
+_DANGEROUS_PATTERN_MAX_LEN = 512
+
+# 内层量词前一位若是这些字符（通配/类/自身量词/转义）则不视为危险原子
+_WILD_PREV = set(".[]*+?\\")
+
+
+def _inner_has_concrete_quant(pat: str, start: int, end: int) -> bool:
+    """判断 [start, end) 区间内是否含「具体原子上的量词」（危险内层）。"""
+    i = start
+    while i < end:
+        c = pat[i]
+        if c == "\\":
+            # 转义原子（\\d \\s \\w 等），其后紧跟量词即危险（\\d+、\\w+）
+            if i + 2 < end and pat[i + 2] in "+*?":
+                return True
+            i += 2
+            continue
+        if c == "[":
+            # 字符类：其后紧跟量词时，含 \\s/\\S（通配）则安全，[abc]+ 等具体则危险
+            j = i + 1
+            inner = ""
+            while j < end and pat[j] != "]":
+                if pat[j] == "\\":
+                    inner += pat[j:j + 2]
+                    j += 2
+                else:
+                    inner += pat[j]
+                    j += 1
+            if j + 1 < end and pat[j + 1] in "+*?":
+                if "\\s" not in inner and "\\S" not in inner:
+                    return True
+            i = j + 1 if j < end else end
+            continue
+        if c in "+*?":
+            # 量词：前一个有效字符若是具体原子则危险
+            prev = pat[i - 1] if i > start else ""
+            if prev and prev not in _WILD_PREV:
+                return True
+            i += 1
+            continue
+        i += 1
+    return False
+
+
+def _has_nested_quantifier(pat: str) -> bool:
+    """组内具体原子量词 + 外层 +/* 才判危险（可选 ? 不引发重划分）。"""
+    n = len(pat)
+    stack: list[int] = []
+    i = 0
+    while i < n:
+        c = pat[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "[":
+            j = i + 1
+            while j < n and pat[j] != "]":
+                if pat[j] == "\\":
+                    j += 2
+                else:
+                    j += 1
+            i = j + 1 if j < n else n
+            continue
+        if c == "(":
+            stack.append(i)
+            i += 1
+            continue
+        if c == ")":
+            if stack:
+                open_idx = stack.pop()
+                # 仅当 ) 后紧跟 + 或 *（可选 ? 不引发重划分）才检查内部结构
+                if i + 1 < n and pat[i + 1] in ("+", "*"):
+                    if _inner_has_concrete_quant(pat, open_idx + 1, i):
+                        return True
+            i += 1
+            continue
+        i += 1
+    return False
+
+
+def _is_dangerous(pattern: str) -> bool:
+    """启发式检测可能灾难性回溯的正则（嵌套量词形态）；超长模式一并拦截。"""
+    if len(pattern) > _DANGEROUS_PATTERN_MAX_LEN:
+        return True
+    return _has_nested_quantifier(pattern)
 
 
 def _compile_cached(raw: str) -> re.Pattern:
-    """带缓存的正则编译（与 eval_condition / find_matches 共享，命中时省一次编译）。"""
-    pat = _REGEX_CACHE.get(raw)
-    if pat is None:
+    """带缓存的线程安全正则编译（eval_condition / find_matches / target 共享）。
+
+    缓存有界：超过 _REGEX_CACHE_MAX 时按 LRU 淘汰最旧条目（原先整体 clear，
+    频繁使用场景下每次请求都重新编译）。命中时 move_to_end 保持访问序。
+    危险模式（嵌套量词）编译前拦截，抛 re.error 由调用方按既有 try/except 处理。
+    """
+    with _REGEX_CACHE_LOCK:
+        pat = _REGEX_CACHE.get(raw)
+        if pat is not None:
+            _REGEX_CACHE.move_to_end(raw)
+            return pat
         pattern, flags = parse_regex_pattern(raw)
+        if _is_dangerous(pattern):
+            raise re.error(f"表达式 {raw!r} 含嵌套量词（灾难性回溯风险），已拒绝执行")
         fl = 0
         if "i" in flags:
             fl |= re.IGNORECASE
@@ -130,10 +242,10 @@ def _compile_cached(raw: str) -> re.Pattern:
         if "s" in flags:
             fl |= re.DOTALL
         pat = re.compile(pattern, fl)
-        if len(_REGEX_CACHE) > 256:
-            _REGEX_CACHE.clear()
+        if len(_REGEX_CACHE) >= _REGEX_CACHE_MAX:
+            _REGEX_CACHE.popitem(last=False)
         _REGEX_CACHE[raw] = pat
-    return pat
+        return pat
 
 
 # =============================================================================
@@ -570,16 +682,24 @@ def eval_format_rule(rule: Rule, page_text: str, selection: tuple[int, int] | No
                 if rule.mode == "first":
                     break
             elif cond.type in ("regex", "contains", "prefix", "suffix") and cond.formats:
-                # 有模式的条件：放入 pattern_conds，后续按匹配位置应用
-                out.pattern_conds.append(cond)
-                # 兼容性：同时填充 fmt_entries（用于测试兼容）
-                fmts = [op for op in cond.formats if op != "none"]
-                page_scope = (cond.scope == "page")
-                out.fmt_entries.append({"fmts": fmts, "page_scope": page_scope})
+                if cond.pattern:
+                    # 有模式的条件：放入 pattern_conds，后续按匹配位置应用
+                    out.pattern_conds.append(cond)
+                else:
+                    # 无条件规则（空 pattern）：整体范围应用（selection/page）
+                    # 选区工具（如「中标」）无选区时不应用——否则「应用全部规则」
+                    # 会退化为整页范围，把全页段落都改成该工具的格式。
+                    if cond.scope == "selection" and not selection:
+                        continue
+                    fmts = [op for op in cond.formats if op != "none"]
+                    page_scope = (cond.scope == "page")
+                    out.fmt_entries.append({"fmts": fmts, "page_scope": page_scope})
                 if rule.mode == "first":
                     break
             else:
-                # 无条件或 selection scope：放入 fmt_entries
+                # 无条件或 selection scope：放入 fmt_entries（选区工具无选区不应用，同上）
+                if cond.scope == "selection" and not selection:
+                    continue
                 fmts = [op for op in cond.formats if op != "none"]
                 page_scope = (cond.scope == "page")
                 out.fmt_entries.append({"fmts": fmts, "page_scope": page_scope})
@@ -608,7 +728,7 @@ def _replace_node_in_parent(old_node: Node, new_nodes: list[Node]) -> None:
 
 def apply_inline_format(nodes_info: list[TextNodeInfo], start_off: int, end_off: int, op: str) -> bool:
     """
-    在指定偏移范围内应用行内格式（bold/italic/no_bold/remove）。
+    在指定偏移范围内应用行内格式（bold/italic/no_bold/remove/align）。
     通过拆分/包裹文本节点实现。
     返回是否成功应用。
     """
@@ -627,6 +747,10 @@ def apply_inline_format(nodes_info: list[TextNodeInfo], start_off: int, end_off:
     elif op == "note":
         # note 作为行内格式：包裹在 <span class="ptoe-note"> 中
         return _wrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "span", {"class": "ptoe-note"})
+    elif op.startswith("align_"):
+        # align_* 作为行内格式：用内联样式包裹，允许多个不同对齐在同一块内
+        pos = op[6:]  # left/center/right
+        return _wrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "span", {"style": f"text-align:{pos}"})
     elif op == "no_bold":
         return _unwrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "strong")
     elif op == "remove":
@@ -638,7 +762,7 @@ def apply_inline_format(nodes_info: list[TextNodeInfo], start_off: int, end_off:
 
 
 def _wrap_inline(nodes_info: list[TextNodeInfo], start_node: TextNode, start_idx: int, end_node: TextNode, end_idx: int, tag: str, attrs: dict[str, str] | None = None) -> bool:
-    """在范围内包裹标签。"""
+    """在范围内包裹标签。支持跨多个文本节点的范围。"""
     # 处理单文本节点情况
     if start_node is end_node:
         text = start_node.text
@@ -653,17 +777,71 @@ def _wrap_inline(nodes_info: list[TextNodeInfo], start_node: TextNode, start_idx
         new_children = []
         if before_text:
             new_children.append(TextNode(before_text))
-        wrapper = ElementNode(tag, attrs or {})
-        wrapper.children.append(TextNode(middle_text))
+        wrapper = ElementNode(tag, attrs or {}, [TextNode(middle_text)])
         new_children.append(wrapper)
         if after_text:
             new_children.append(TextNode(after_text))
         _replace_node_in_parent(start_node, new_children)
         return True
 
-    # 跨节点情况：简化处理，仅包裹起始节点的剩余部分和结束节点的前半部分
-    # 实际应用中，范围通常在单个块内，且块内文本节点通常只有一个
-    return False
+    # 跨节点情况：收集所有与 [start_off, end_off) 重叠的文本节点，逐个包裹重叠段
+    # 先算出绝对偏移区间
+    # 从 nodes_info 找到 start_node 和 end_node 的绝对偏移
+    start_abs = None
+    end_abs = None
+    for info in nodes_info:
+        if info.node is start_node:
+            start_abs = info.start + start_idx
+        if info.node is end_node:
+            end_abs = info.start + end_idx
+        if start_abs is not None and end_abs is not None:
+            break
+    if start_abs is None or end_abs is None or start_abs >= end_abs:
+        return False
+
+    # 找出所有重叠的节点（按文档顺序）
+    overlapping: list[tuple[TextNode, int, int]] = []  # (node, node_rel_start, node_rel_end)
+    for info in nodes_info:
+        node_start = info.start
+        node_end = info.end
+        # 检查是否与 [start_abs, end_abs) 相交
+        if node_end <= start_abs or node_start >= end_abs:
+            continue
+        # 相交：计算节点内相对偏移
+        rel_start = max(0, start_abs - node_start)
+        rel_end = min(len(info.node.text), end_abs - node_start)
+        if rel_start < rel_end:
+            overlapping.append((info.node, rel_start, rel_end))
+
+    if not overlapping:
+        return False
+
+    # 倒序处理（从后往前），避免前面的替换影响后面节点的索引/父节点查找
+    # 注意：每次替换后 nodes_info 会在 _apply_op 中刷新，但这里我们在单次 _wrap_inline 内部
+    # 处理多个节点，所以需要小心。策略：收集所有要处理的节点及其相对偏移，
+    # 然后对每个节点单独调用单节点包裹逻辑（复用上方逻辑）。
+    success = False
+    for node, rel_start, rel_end in reversed(overlapping):
+        text = node.text
+        before_text = text[:rel_start]
+        middle_text = text[rel_start:rel_end]
+        after_text = text[rel_end:]
+        if not middle_text:
+            continue
+        parent = node.parent
+        if not parent:
+            continue
+        new_children = []
+        if before_text:
+            new_children.append(TextNode(before_text))
+        wrapper = ElementNode(tag, attrs or {}, [TextNode(middle_text)])
+        new_children.append(wrapper)
+        if after_text:
+            new_children.append(TextNode(after_text))
+        _replace_node_in_parent(node, new_children)
+        success = True
+
+    return success
 
 
 def _unwrap_inline(nodes_info: list[TextNodeInfo], start_node: TextNode, start_idx: int, end_node: TextNode, end_idx: int, tag: str) -> bool:
@@ -701,10 +879,19 @@ def _unwrap_inline(nodes_info: list[TextNodeInfo], start_node: TextNode, start_i
     return True
 
 
-def apply_block_format(root: ElementNode, nodes_info: list[TextNodeInfo], start_off: int, end_off: int, op: str) -> bool:
+def apply_block_format(
+    root: ElementNode,
+    nodes_info: list[TextNodeInfo],
+    start_off: int,
+    end_off: int,
+    op: str,
+    block_conflicts: dict[int, set[str]] | None = None,
+    ignore_block_conflicts: bool = False,
+) -> bool:
     """
     在指定偏移范围所在的块级元素上应用块级格式。
     op: p, heading1-6, note, citation, align_left/center/right, merge
+    ignore_block_conflicts: 用于 match_formats，允许同块多匹配各自独立应用格式
     """
     rng = range_from_offsets(nodes_info, start_off, end_off)
     if not rng:
@@ -804,29 +991,38 @@ def apply_block_format(root: ElementNode, nodes_info: list[TextNodeInfo], start_
                 break
         cur_block = nxt
 
+    # per-block first-wins 冲突（2026-08）：同一块内先到先得，不同块互不影响。
+    # 原实现用全局 applied_ops/_seen_groups 跟踪，导致「匹配对象分别设置了独立格式」
+    # 时，第二个匹配块因同组已全局命中而被错误跳过（如两段各设 heading1 只剩一段）。
+    # match_formats (ignore_block_conflicts=True) 例外：同块多匹配各自独立应用。
+    og = op_group(op)
+    if not ignore_block_conflicts and block_conflicts is not None and og is not None:
+        # per-block first-wins：仅跳过已命中同一冲突组的块，不因个别块冲突而放弃整段
+        # （不同块互不影响——原 any() 检查会让多块区间中一个冲突块拖垮其余合法块）。
+        filtered = [b for b in blocks if og not in block_conflicts.get(id(b), ())]
+        if not filtered:
+            return False
+        blocks = filtered
+
     if op == "p":
         for b in blocks:
             b.tag = "p"
-        return True
     elif op.startswith("heading"):
         level = op[7:]  # "1"-"6"
         for b in blocks:
             b.tag = f"h{level}"
-        return True
     elif op == "note":
         for b in blocks:
             classes = b.attrs.get("class", "").split()
             if "ptoe-note" not in classes:
                 classes.append("ptoe-note")
             b.attrs["class"] = " ".join(classes)
-        return True
     elif op == "citation":
         for b in blocks:
             classes = b.attrs.get("class", "").split()
             if "ptoe-citation" not in classes:
                 classes.append("ptoe-citation")
             b.attrs["class"] = " ".join(classes)
-        return True
     elif op.startswith("align_"):
         pos = op[6:]  # left/center/right
         for b in blocks:
@@ -834,7 +1030,6 @@ def apply_block_format(root: ElementNode, nodes_info: list[TextNodeInfo], start_
             classes = [c for c in classes if not c.startswith("ptoe-align-")]
             classes.append(f"ptoe-align-{pos}")
             b.attrs["class"] = " ".join(classes)
-        return True
     elif op in ("flush", "indent"):
         # 顶格/缩进互斥：先剥掉两者再追加目标类
         target = "ptoe-flush" if op == "flush" else "ptoe-indent"
@@ -844,7 +1039,6 @@ def apply_block_format(root: ElementNode, nodes_info: list[TextNodeInfo], start_
             if target not in classes:
                 classes.append(target)
             b.attrs["class"] = " ".join(classes)
-        return True
     elif op in ("first_indent", "hang_indent"):
         # 首行/悬挂缩进（2026-08-23）：写 data-ind/data-indv 属性，导出 EPUB 时由
         # htmlmanage._indent_style_attrs 转内联样式；与顶格/缩进类互斥（indent_mode 组）
@@ -855,8 +1049,13 @@ def apply_block_format(root: ElementNode, nodes_info: list[TextNodeInfo], start_
             b.attrs["class"] = " ".join(classes)
             b.attrs["data-ind"] = mode
             b.attrs["data-indv"] = "2"
-        return True
-    return False
+    else:
+        return False
+
+    if not ignore_block_conflicts and block_conflicts is not None and og is not None:
+        for b in blocks:
+            block_conflicts.setdefault(id(b), set()).add(og)
+    return True
 
 
 # =============================================================================
@@ -912,8 +1111,28 @@ def apply_rules(
             if not target_rules:
                 return html, f"规则不存在: {rule_id}"
 
+        # 正则模式预检：灾难性回溯（嵌套量词）等危险模式直接拦截，返回中文错误提示
+        # （经 /api/format_rules/apply → 400 → 前端错误 toast），避免同步 serve 线程
+        # 被指数级回溯挂死（UI 冻结）。语法错误的正则也在此显式报错而非静默无操作。
+        for r in target_rules:
+            for c in r.conditions:
+                if c.type == "regex" and c.pattern:
+                    try:
+                        _compile_cached(c.pattern)
+                    except re.error as e:
+                        return html, f"正则表达式无效或存在潜在性能风险：{e}"
+                if c.between_end_pattern:
+                    try:
+                        _compile_cached(c.between_end_pattern)
+                    except re.error as e:
+                        return html, f"正则表达式无效或存在潜在性能风险：{e}"
+
         # 应用规则（按列表顺序，跨规则累计 applied_ops 实现 first-wins）
         applied_ops: list[str] = []
+        # 按块维度的 first-wins 冲突记录（id(block) -> {group}）：
+        # 同一块内同名/同组格式先到先得，不同块互不影响——修复「匹配对象分别设置了独立
+        # 格式之后不能正常应用」的问题。
+        block_conflicts: dict[int, set[str]] = {}
 
         for rule in target_rules:
             # 求值
@@ -921,25 +1140,25 @@ def apply_rules(
 
             # 1. target_conds (before/after/between)
             for cond in eval_result.target_conds:
-                _apply_target_formats(root, nodes_info, cond, page_text, selection, applied_ops)
+                _apply_target_formats(root, nodes_info, cond, page_text, selection, applied_ops, block_conflicts)
 
             # 2. group_conds (regex + group_formats)
             for cond in eval_result.group_conds:
-                _apply_group_formats(root, nodes_info, cond, page_text, selection, applied_ops)
+                _apply_group_formats(root, nodes_info, cond, page_text, selection, applied_ops, block_conflicts)
 
             # 3. match_conds (regex + match_formats)
             for cond in eval_result.match_conds:
-                _apply_match_formats(root, nodes_info, cond, page_text, selection, applied_ops)
+                _apply_match_formats(root, nodes_info, cond, page_text, selection, applied_ops, block_conflicts)
 
             # 4. pattern_conds (contains/prefix/suffix/regex with formats)
             for cond in eval_result.pattern_conds:
-                _apply_pattern_conds(root, nodes_info, cond, page_text, selection, applied_ops)
+                _apply_pattern_conds(root, nodes_info, cond, page_text, selection, applied_ops, block_conflicts)
 
             # 5. fmt_entries (普通格式：无条件或 selection scope)
             for entry in eval_result.fmt_entries:
                 fmts = entry["fmts"]
                 page_scope = entry["page_scope"]
-                _apply_fmt_entry(root, nodes_info, fmts, page_scope, page_text, selection, applied_ops)
+                _apply_fmt_entry(root, nodes_info, fmts, page_scope, page_text, selection, applied_ops, block_conflicts)
 
         # 序列化结果
         new_html = serialize_html(root)
@@ -949,6 +1168,87 @@ def apply_rules(
         return html, f"应用格式规则失败: {e}"
 
 
+# 行内格式操作白名单（不同应用路径对 note 的处理不同：
+# pattern/target/fmt_entry 视 note 为块级（改 span.ptoe-note 类），
+# match/group 视 note 为行内（_wrap_inline 包 span.ptoe-note））
+# align_* 已移至块级：text-align 对 inline span 无效，改用 ptoe-align-* 类
+_INLINE_LEAF_OPS = {"bold", "italic", "no_bold", "remove"}
+
+_INLINE_LEAF_OPS_M = {"bold", "italic", "no_bold", "remove", "note"}
+
+
+def _selection_bounds(
+    cond: Condition, selection: tuple[int, int] | None, page_len: int
+) -> tuple[int, int] | None:
+    """scope=selection 且存在合法选区时，返回钳制到页面范围的选区区间；否则 None。"""
+    if cond.scope == "selection" and selection:
+        s, e = selection
+        return max(0, min(s, page_len)), max(0, min(e, page_len))
+    return None
+
+
+def _apply_op(
+    root: ElementNode,
+    nodes_info: list[TextNodeInfo],
+    start_off: int,
+    end_off: int,
+    op: str,
+    inline_ops: set[str] = _INLINE_LEAF_OPS,
+    block_conflicts: dict[int, set[str]] | None = None,
+    ignore_block_conflicts: bool = False,
+) -> bool:
+    """应用单个格式操作；成功后就地刷新 nodes_info。
+
+    绝对文本偏移在行内包裹/块级改标签/合并等操作下不变（文本内容从未变化），
+    变的只是"节点→偏移”映射。不在每次成功修改后刷新 nodes_info，后续匹配会
+    命中已脱离树的旧节点（parent.children.index 抛 ValueError 被静默吞掉），
+    症状：同一节点内多个匹配只有最后一个被格式化（匹配对象混乱）。
+    """
+    if op in inline_ops:
+        ok = apply_inline_format(nodes_info, start_off, end_off, op)
+    else:
+        ok = apply_block_format(root, nodes_info, start_off, end_off, op, block_conflicts, ignore_block_conflicts)
+    if ok:
+        nodes_info[:] = collect_text_nodes(root)[1]
+    return ok
+
+
+def _pattern_match_ranges(cond: Condition, page_text: str) -> list[tuple[int, int]]:
+    """返回条件全部匹配区间（contains/prefix/suffix/regex 统一为 (start,end) 对）。
+
+    替代原先 _apply_pattern_conds 内重复定义的局部 Match 类（同名遮蔽 re.Match，
+    pyrefly 报错），并统一 selection 过滤语义。
+    """
+    if cond.type == "regex":
+        return [m.span() for m in find_matches(cond, page_text)]
+    if cond.type == "contains":
+        if not cond.pattern:
+            return []
+        out: list[tuple[int, int]] = []
+        start = 0
+        while True:
+            idx = page_text.find(cond.pattern, start)
+            if idx == -1:
+                break
+            out.append((idx, idx + len(cond.pattern)))
+            start = idx + 1
+        return out
+    if cond.type == "prefix":
+        if not cond.pattern:
+            return []
+        if page_text.startswith(cond.pattern):
+            return [(0, len(cond.pattern))]
+        return []
+    if cond.type == "suffix":
+        if not cond.pattern:
+            return []
+        if page_text.endswith(cond.pattern):
+            start = len(page_text) - len(cond.pattern)
+            return [(start, len(page_text))]
+        return []
+    return []
+
+
 def _apply_target_formats(
     root: ElementNode,
     nodes_info: list[TextNodeInfo],
@@ -956,11 +1256,16 @@ def _apply_target_formats(
     page_text: str,
     selection: tuple[int, int] | None,
     applied_ops: list[str],
+    block_conflicts: dict[int, set[str]] | None = None,
 ) -> None:
-    """应用 target=before/after/between 的格式。"""
+    """应用 target=before/after/between 的格式（匹配须在选区内，范围钳制到选区）。"""
     if cond.type != "regex" or not cond.pattern:
         return
     matches = find_matches(cond, page_text)
+    sel = _selection_bounds(cond, selection, len(page_text))
+    if sel:
+        s, e = sel
+        matches = [m for m in matches if m.start() >= s and m.end() <= e]
     if not matches:
         return
     match = matches[0]  # 取第一个匹配
@@ -982,32 +1287,26 @@ def _apply_target_formats(
         except re.error:
             return
 
+    if sel:
+        s, e = sel
+        range_start = max(range_start, s)
+        range_end = min(range_end, e)
     if range_start < 0 or range_end <= range_start:
         return
 
     fmts = [op for op in cond.formats if op != "none"]
-    # O(1) 冲突检查（first-wins 语义不变）：原线性扫描 O(n²)，现集合查询 O(1)
-    _seen_groups = {g for g in (op_group(o) for o in applied_ops) if g is not None}
+    # 块级冲突改由 apply_block_format 按块 first-wins 处理（不同块互不影响）；
+    # 此处仅保留 remove 与任意已应用操作冲突的全局语义。
     _has_remove = "remove" in applied_ops
     for op in fmts:
-        og = op_group(op)
-        # first-wins 冲突（ops_conflict 语义）：同名不冲突；remove 与任意已应用操作冲突
-        if op not in applied_ops:
-            if op == "remove" and applied_ops:
-                continue
-            if _has_remove:
-                continue
-            if og is not None and og in _seen_groups:
-                continue
-        if op in {"bold", "italic", "no_bold", "remove"}:
-            apply_inline_format(nodes_info, range_start, range_end, op)
-        else:
-            apply_block_format(root, nodes_info, range_start, range_end, op)
+        if op == "remove" and applied_ops:
+            continue
+        if _has_remove:
+            continue
+        _apply_op(root, nodes_info, range_start, range_end, op, _INLINE_LEAF_OPS, block_conflicts)
         applied_ops.append(op)
         if op == "remove":
             _has_remove = True
-        elif og is not None:
-            _seen_groups.add(og)
 
 
 def _apply_group_formats(
@@ -1017,13 +1316,27 @@ def _apply_group_formats(
     page_text: str,
     selection: tuple[int, int] | None,
     applied_ops: list[str],
+    block_conflicts: dict[int, set[str]] | None = None,
 ) -> None:
-    """应用 regex + group_formats（捕获组独立格式）。"""
+    """应用 regex + group_formats（捕获组独立格式）。
+
+    按绝对文本偏移逐捕获组应用格式（match.regs），同一匹配内按起始偏移倒序
+    （高偏移先应用，低偏移不受影响）；每个操作成功后就地刷新 nodes_info
+    （_apply_op），保证同节点多匹配、跨匹配的偏移始终有效。
+
+    原先的“pretty 路径”（temp_root 重新解析拼接 HTML 替换文本节点）在新节点
+    替换后不再刷新节点索引，同节点多匹配时后续匹配命中已脱离树的旧节点，
+    前序匹配及其前后文本整体丢失（只剩最后一个匹配生效），已删除。
+    """
     if cond.type != "regex" or not cond.pattern or not cond.group_formats:
         return
     matches = find_matches(cond, page_text)
-    # O(1) 冲突检查（first-wins 语义不变）
-    _seen_groups_g = {g for g in (op_group(o) for o in applied_ops) if g is not None}
+    sel = _selection_bounds(cond, selection, len(page_text))
+    if sel:
+        s, e = sel
+        matches = [m for m in matches if m.start() >= s and m.end() <= e]
+    # 块级冲突改由 apply_block_format 按块 first-wins 处理（不同匹配块互不影响）；
+    # 此处不再做全局格式组过滤，保证「匹配对象分别设置了独立格式」都能正常应用。
     # 倒序应用，保证偏移有效
     for match in reversed(matches):
         # 收集该匹配的所有组格式操作
@@ -1036,103 +1349,32 @@ def _apply_group_formats(
                 group_start, group_end = match.regs[gi + 1]
             else:
                 continue
-            # 过滤冲突的格式（O(1) 集合检查）
-            filtered_fmts = []
+            # 修剪区间两端孤立的换行符（<p> 块间 \n 是 root 直属 TextNode，
+            # find_block_ancestor 返回 None，end_block=None 会导致块收集遍历
+            # 后续全部兄弟块，格式错误扩散到不属于该组的块上）
+            while group_start < group_end and page_text[group_start] in '\n\r':
+                group_start += 1
+            while group_end > group_start and page_text[group_end - 1] in '\n\r':
+                group_end -= 1
+            if group_start >= group_end:
+                continue  # 修剪后范围为空，跳过
+            if fmts:
+                group_ops.append((group_start, group_end, fmts))
+
+        # 组区间按起始偏移倒序应用（文本内容不变，绝对偏移恒有效）
+        for group_start, group_end, fmts in sorted(
+            group_ops, key=lambda x: x[0], reverse=True
+        ):
             for op in fmts:
-                og = op_group(op)
-                if og is not None and og in _seen_groups_g:
-                    continue
-                filtered_fmts.append(op)
-            if filtered_fmts:
-                group_ops.append((group_start, group_end, filtered_fmts))
-        
-        if not group_ops:
-            continue
-        
-        # 找到包含该匹配的文本节点
-        match_start, match_end = match.span()
-        rng = range_from_offsets(nodes_info, match_start, match_end)
-        if not rng:
-            continue
-        start_node, start_idx, end_node, end_idx = rng
-        
-        # 如果匹配跨越多个文本节点，简化处理：仅处理单文本节点情况
-        if start_node is not end_node:
-            # 退回到逐个应用（可能不准确但避免崩溃）
-            for group_start, group_end, fmts in group_ops:
-                for op in fmts:
-                    if op in {"bold", "italic", "no_bold", "remove"}:
-                        apply_inline_format(nodes_info, group_start, group_end, op)
-                    else:
-                        apply_block_format(root, nodes_info, group_start, group_end, op)
-                    applied_ops.append(op)
-                    og2 = op_group(op)
-                    if og2 is not None:
-                        _seen_groups_g.add(og2)
-            continue
-        
-        text_node = start_node
-        text = text_node.text
-        # 匹配在文本节点内的相对位置
-        rel_match_start = start_idx
-        rel_match_end = end_idx
-        
-        # 构建匹配文本的 HTML 结构
-        # 将匹配文本按组分割并应用格式
-        parts = []
-        last_pos = 0
-        for group_start, group_end, fmts in sorted(group_ops, key=lambda x: x[0]):
-            # 组在匹配文本中的相对位置
-            rel_start = group_start - match_start
-            rel_end = group_end - match_start
-            # 添加组前的文本
-            if rel_start > last_pos:
-                parts.append(text[rel_match_start + last_pos:rel_match_start + rel_start])
-            # 添加组文本（应用格式）
-            group_text = text[rel_match_start + rel_start:rel_match_start + rel_end]
-            formatted = group_text
-            for op in fmts:
-                if op == "bold":
-                    formatted = f"<strong>{formatted}</strong>"
-                elif op == "italic":
-                    formatted = f"<em>{formatted}</em>"
-                elif op == "no_bold":
-                    # no_bold 需要特殊处理：移除 strong 标签
-                    pass
-            parts.append(formatted)
-            last_pos = rel_end
-        # 添加剩余文本
-        match_len = match_end - match_start
-        if last_pos < match_len:
-            parts.append(text[rel_match_start + last_pos:rel_match_start + match_len])
-        
-        # 解析构建的 HTML 并替换文本节点
-        new_html = "".join(parts)
-        # 使用临时根节点解析，不自动包裹在 <p> 中
-        temp_root = ElementNode("temp")
-        parser = MiniDOMParser()
-        parser.root = temp_root
-        parser.stack = [temp_root]
-        parser.feed(new_html)
-        # 将新节点的子节点移动到父节点
-        parent = text_node.parent
-        if parent:
-            try:
-                idx = parent.children.index(text_node)
-                parent.children[idx:idx+1] = temp_root.children
-                for c in temp_root.children:
-                    c.parent = parent
-            except ValueError:
-                # text_node 不在父节点中，可能已被替换
-                pass
-        
-        # 更新 applied_ops
-        for _, _, fmts in group_ops:
-            for op in fmts:
+                # match_formats 和 group_formats 例外：同块多范围各自独立应用格式
+                # align_* 例外（2026-08）：组区间可能因块内部分覆盖（如 `## 注释`
+                # 块中「注释」是组5 而 `## ` 前缀落入组4 区间）把相邻组的目标块拉进
+                # 本组对齐。对齐是块级属性，同块应按偏移倒序先到先得——高偏移组
+                # （更靠近块尾/更特异）先应用并记录冲突，低偏移组在同块被跳过，
+                # 避免「注释」等尾部标签被前一组右对齐污染。
+                ignore_cf = not op.startswith("align_")
+                _apply_op(root, nodes_info, group_start, group_end, op, _INLINE_LEAF_OPS_M, block_conflicts, ignore_cf)
                 applied_ops.append(op)
-                og3 = op_group(op)
-                if og3 is not None:
-                    _seen_groups_g.add(og3)
 
 
 def _apply_match_formats(
@@ -1142,15 +1384,13 @@ def _apply_match_formats(
     page_text: str,
     selection: tuple[int, int] | None,
     applied_ops: list[str],
+    block_conflicts: dict[int, set[str]] | None = None,
 ) -> None:
     """应用 regex + match_formats（逐匹配独立格式）。"""
     if cond.type != "regex" or not cond.pattern or not cond.match_formats:
         return
     matches = find_matches(cond, page_text)
-    # O(1) 冲突检查（first-wins 语义不变）
-    _seen_ops_m = set(applied_ops)
-    _seen_groups_m = {g for g in (op_group(o) for o in applied_ops) if g is not None}
-    # 收集所有匹配的格式操作
+    # 收集所有匹配的格式操作（match_formats[mi] 对应第 mi 个匹配，索引必须先于选区过滤）
     all_ops = []  # [(match_start, match_end, fmts)]
     for mi, match in enumerate(matches):
         if mi >= len(cond.match_formats):
@@ -1159,42 +1399,35 @@ def _apply_match_formats(
         if not fmts:
             continue
         match_start, match_end = match.span()
-        # 过滤冲突的格式（O(1) 集合检查）
-        filtered_fmts = []
-        for op in fmts:
-            og = op_group(op)
-            if og is not None and og in _seen_groups_m:
-                continue
-            filtered_fmts.append(op)
-        if filtered_fmts:
-            all_ops.append((match_start, match_end, filtered_fmts))
-    
+        # 修剪区间两端孤立的换行符（与 _apply_group_formats 同理）
+        while match_start < match_end and page_text[match_start] in '\n\r':
+            match_start += 1
+        while match_end > match_start and page_text[match_end - 1] in '\n\r':
+            match_end -= 1
+        if match_start >= match_end:
+            continue
+        all_ops.append((match_start, match_end, fmts))
+
+    # 选区过滤（仅保留落在选区内的匹配；保持 match_formats 与匹配的对应关系）
+    sel = _selection_bounds(cond, selection, len(page_text))
+    if sel:
+        s, e = sel
+        all_ops = [(ms, me, fmts) for ms, me, fmts in all_ops if ms >= s and me <= e]
+
     if not all_ops:
         return
-    
+
     # 按起始偏移倒序排序，保证偏移有效
     all_ops.sort(key=lambda x: x[0], reverse=True)
-    
-    # 只在真正修改树之后才重新收集文本节点（失败/跳过不改变偏移）
-    _, nodes_info = collect_text_nodes(root)
+
     for match_start, match_end, fmts in all_ops:
         for op in fmts:
-            if op in _seen_ops_m:
-                continue
-            og = op_group(op)
-            if og is not None and og in _seen_groups_m:
-                continue
-            ok = False
-            if op in {"bold", "italic", "no_bold", "remove", "note"}:
-                ok = apply_inline_format(nodes_info, match_start, match_end, op)
-            else:
-                ok = apply_block_format(root, nodes_info, match_start, match_end, op)
+            # 成功修改后就地刷新 nodes_info（_apply_op 内部处理）；
+            # match_formats 例外：同块多匹配各自独立应用，不触发 per-block first-wins。
+            # align_* 例外（2026-08）：同块对齐按偏移倒序先到先得，见 _apply_group_formats。
+            ignore_cf = not op.startswith("align_")
+            _apply_op(root, nodes_info, match_start, match_end, op, _INLINE_LEAF_OPS_M, block_conflicts, ignore_cf)
             applied_ops.append(op)
-            _seen_ops_m.add(op)
-            if og is not None:
-                _seen_groups_m.add(og)
-            if ok:
-                _, nodes_info = collect_text_nodes(root)
 
 
 def _apply_pattern_conds(
@@ -1204,86 +1437,66 @@ def _apply_pattern_conds(
     page_text: str,
     selection: tuple[int, int] | None,
     applied_ops: list[str],
+    block_conflicts: dict[int, set[str]] | None = None,
 ) -> None:
-    """应用 contains/prefix/suffix/regex 条件的格式（按匹配位置应用）。"""
+    """应用 contains/prefix/suffix/regex 条件的格式（按匹配位置应用）。
+
+    行内格式（bold/italic/no_bold/remove）逐匹配应用（scope=selection 时仅选区内的匹配）；
+    块级格式（note/heading/对齐/合并等）在 scope=selection 时作用于整个选区区间
+    （选中块统一格式化），否则作用于每个匹配所在块。
+    每个操作成功后就地刷新 nodes_info（_apply_op），保证同节点多匹配、跨条件应用时
+    偏移→节点映射始终有效（修复多匹配只剩最后一个生效的 bug）。
+    """
     if not cond.formats:
         return
     fmts = [op for op in cond.formats if op != "none"]
     if not fmts:
         return
-    
-    # 根据条件类型查找匹配
-    if cond.type == "regex":
-        matches = find_matches(cond, page_text)
-    elif cond.type == "contains":
-        # 查找所有出现位置
-        matches = []
-        start = 0
-        pattern = cond.pattern
-        while True:
-            idx = page_text.find(pattern, start)
-            if idx == -1:
-                break
-            # 创建一个类似 match 对象
-            class Match:
-                def __init__(self, start, end):
-                    self._start = start
-                    self._end = end
-                def span(self):
-                    return (self._start, self._end)
-            matches.append(Match(idx, idx + len(pattern)))
-            start = idx + 1
-    elif cond.type == "prefix":
-        if page_text.startswith(cond.pattern):
-            class Match:
-                def __init__(self, start, end):
-                    self._start = start
-                    self._end = end
-                def span(self):
-                    return (self._start, self._end)
-            matches = [Match(0, len(cond.pattern))]
-        else:
-            matches = []
-    elif cond.type == "suffix":
-        if page_text.endswith(cond.pattern):
-            start = len(page_text) - len(cond.pattern)
-            class Match:
-                def __init__(self, start, end):
-                    self._start = start
-                    self._end = end
-                def span(self):
-                    return (self._start, self._end)
-            matches = [Match(start, len(page_text))]
-        else:
-            matches = []
-    else:
-        matches = []
-    
-    # O(1) 冲突检查（first-wins）；倒序应用保证偏移有效
-    _seen_groups_p = {g for g in (op_group(o) for o in applied_ops) if g is not None}
+
+    # 行内格式（对齐已移至块级：ptoe-align-* 类，text-align 对 inline span 无效）
+    inline_ops = {"bold", "italic", "no_bold", "remove"}
+    inline_fmts = [op for op in fmts if op in inline_ops]
+    block_fmts = [op for op in fmts if op not in inline_ops]
+
+    # 块级冲突改由 apply_block_format 按块 first-wins 处理（不同块互不影响）；
+    # 此处仅保留 remove 与任意已应用操作冲突的全局语义。
     _has_remove_p = "remove" in applied_ops
-    _seen_ops_p = set(applied_ops)
-    for match in reversed(matches):
-        match_start, match_end = match.span()
-        for op in fmts:
-            if op not in _seen_ops_p:
+
+    sel = _selection_bounds(cond, selection, len(page_text))
+
+    # 行内格式：逐匹配应用（仅限选区内匹配）；倒序保证偏移有效
+    if inline_fmts:
+        ranges = _pattern_match_ranges(cond, page_text)
+        if sel:
+            s, e = sel
+            ranges = [(ms, me) for ms, me in ranges if ms >= s and me <= e]
+        for match_start, match_end in reversed(ranges):
+            for op in inline_fmts:
                 if op == "remove" and applied_ops:
                     continue
                 if _has_remove_p:
                     continue
-                og = op_group(op)
-                if og is not None and og in _seen_groups_p:
+                _apply_op(root, nodes_info, match_start, match_end, op, inline_ops)
+                applied_ops.append(op)
+                if op == "remove":
+                    _has_remove_p = True
+
+    # 块级格式：scope=selection → 整个选区（全部选中块）；否则 per 匹配所在块
+    if block_fmts:
+        if sel:
+            ranges = [sel]
+        else:
+            ranges = _pattern_match_ranges(cond, page_text)
+        for match_start, match_end in reversed(ranges):
+            for op in block_fmts:
+                if op == "remove" and applied_ops:
                     continue
-            if op in {"bold", "italic", "no_bold", "remove"}:
-                apply_inline_format(nodes_info, match_start, match_end, op)
-            else:
-                apply_block_format(root, nodes_info, match_start, match_end, op)
-            applied_ops.append(op)
-            _seen_ops_p.add(op)
-            if op == "remove":
-                _has_remove_p = True
-            elif (og2 := op_group(op)) is not None:
-                _seen_groups_p.add(og2)
+                if _has_remove_p:
+                    continue
+                _apply_op(root, nodes_info, match_start, match_end, op, inline_ops, block_conflicts)
+                applied_ops.append(op)
+                if op == "remove":
+                    _has_remove_p = True
 
 
 def _apply_fmt_entry(
@@ -1294,6 +1507,7 @@ def _apply_fmt_entry(
     page_text: str,
     selection: tuple[int, int] | None,
     applied_ops: list[str],
+    block_conflicts: dict[int, set[str]] | None = None,
 ) -> None:
     """应用普通格式条目。"""
     if not fmts:
@@ -1308,29 +1522,18 @@ def _apply_fmt_entry(
         # 无选区且非 page scope：不应用（前端 paragraph scope 退回整页，这里同理）
         range_start, range_end = 0, len(page_text)
 
-    # O(1) 冲突检查（first-wins）
-    _seen_groups_f = {g for g in (op_group(o) for o in applied_ops) if g is not None}
+    # 块级冲突改由 apply_block_format 按块 first-wins 处理（不同块互不影响）；
+    # 此处仅保留 remove 与任意已应用操作冲突的全局语义。
     _has_remove_f = "remove" in applied_ops
-    _seen_ops_f = set(applied_ops)
     for op in fmts:
-        if op not in _seen_ops_f:
-            if op == "remove" and applied_ops:
-                continue
-            if _has_remove_f:
-                continue
-            og = op_group(op)
-            if og is not None and og in _seen_groups_f:
-                continue
-        if op in {"bold", "italic", "no_bold", "remove"}:
-            apply_inline_format(nodes_info, range_start, range_end, op)
-        else:
-            apply_block_format(root, nodes_info, range_start, range_end, op)
+        if op == "remove" and applied_ops:
+            continue
+        if _has_remove_f:
+            continue
+        _apply_op(root, nodes_info, range_start, range_end, op, _INLINE_LEAF_OPS, block_conflicts)
         applied_ops.append(op)
-        _seen_ops_f.add(op)
         if op == "remove":
             _has_remove_f = True
-        elif (og2 := op_group(op)) is not None:
-            _seen_groups_f.add(og2)
 
 
 # =============================================================================
