@@ -3133,7 +3133,7 @@ class TestLlmServerControl(unittest.TestCase):
         calls = []
         self._patch_llama_attr(
             "runserver",
-            lambda model_key, with_mmproj=True: calls.append((model_key, with_mmproj)) or True,
+            lambda model_key, with_mmproj=True, parallel=1: calls.append((model_key, with_mmproj, parallel)) or True,
         )
         server, base = self._start()
         try:
@@ -3141,7 +3141,7 @@ class TestLlmServerControl(unittest.TestCase):
             self.assertTrue(res["ok"])
             self.assertTrue(res["running"])
             self.assertEqual(res["message"], "llama-server 已就绪")
-            self.assertEqual(calls, [("HY", False)], "空 model → 回退 selected_model，且不附加 --mmproj")
+            self.assertEqual(calls, [("HY", False, 1)], "空 model → 回退 selected_model，且不附加 --mmproj")
         finally:
             self._stop(server)
 
@@ -3154,13 +3154,13 @@ class TestLlmServerControl(unittest.TestCase):
         calls = []
         self._patch_llama_attr(
             "runserver",
-            lambda model_key, with_mmproj=True: calls.append((model_key, with_mmproj)) or True,
+            lambda model_key, with_mmproj=True, parallel=1: calls.append((model_key, with_mmproj, parallel)) or True,
         )
         server, base = self._start()
         try:
             res = requests.post(base + "/api/llm_start", data=_json.dumps({"model": "QWEN.8"})).json()
             self.assertTrue(res["ok"])
-            self.assertEqual(calls, [("QWEN.8", False)], "body.model 应优先于配置")
+            self.assertEqual(calls, [("QWEN.8", False, 1)], "body.model 应优先于配置")
         finally:
             self._stop(server)
 
@@ -3173,7 +3173,7 @@ class TestLlmServerControl(unittest.TestCase):
         calls = []
         self._patch_llama_attr(
             "runserver",
-            lambda model_key, with_mmproj=True: calls.append((model_key, with_mmproj)) or True,
+            lambda model_key, with_mmproj=True, parallel=1: calls.append((model_key, with_mmproj, parallel)) or True,
         )
         server, base = self._start()
         try:
@@ -3215,7 +3215,7 @@ class TestLlmServerControl(unittest.TestCase):
         calls = []
         self._patch_llama_attr(
             "runserver",
-            lambda model_key, with_mmproj=True: calls.append((model_key, with_mmproj)) or True,
+            lambda model_key, with_mmproj=True, parallel=1: calls.append((model_key, with_mmproj, parallel)) or True,
         )
         server, base = self._start()
         try:
@@ -3223,7 +3223,7 @@ class TestLlmServerControl(unittest.TestCase):
             self.assertTrue(res["ok"])
             self.assertTrue(res["running"])
             self.assertTrue(res["image_model"], "带 mmproj 的模型应标记 image_model=True")
-            self.assertEqual(calls, [("VLM", True)], "带 mmproj 的模型应以图像模式启动")
+            self.assertEqual(calls, [("VLM", True, 1)], "带 mmproj 的模型应以图像模式启动")
         finally:
             self._stop(server)
 
@@ -3242,14 +3242,14 @@ class TestLlmServerControl(unittest.TestCase):
         calls = []
         self._patch_llama_attr(
             "runserver",
-            lambda model_key, with_mmproj=True: calls.append((model_key, with_mmproj)) or True,
+            lambda model_key, with_mmproj=True, parallel=1: calls.append((model_key, with_mmproj, parallel)) or True,
         )
         server, base = self._start()
         try:
             res = requests.post(base + "/api/llm_start", data=_json.dumps({"model": "HY"})).json()
             self.assertTrue(res["ok"])
             self.assertFalse(res["image_model"], "无 mmproj 的模型应标记 image_model=False")
-            self.assertEqual(calls, [("HY", False)], "无 mmproj 的模型应以纯文本模式启动")
+            self.assertEqual(calls, [("HY", False, 1)], "无 mmproj 的模型应以纯文本模式启动")
         finally:
             self._stop(server)
 
@@ -4171,6 +4171,170 @@ class TestReocr(unittest.TestCase):
             self.assertIn("与所选模型 HY 不符", res["error"])
         finally:
             self._stop(server)
+
+
+    def test_reocr_text_only_server_blocked(self):
+        """所选模型有 mmproj 但当前服务为纯文本模式（mmproj_ok=False）→ 拦截并返回明确错误，不调用 _request_image_new。"""
+        import json as _json
+        import requests
+
+        self._patch_cfg(model_choices={
+            "HY": {"name": "HY.gguf", "mmproj": "HY-mmproj.gguf"},
+            "QWEN.8": {"name": "qwen3.5.gguf"},
+        })
+        self._patch_correct_attr("_full_bytes", lambda state, pn: ("image/png", b"fake"))
+        # probe_server 返回 match（模型名一致），但 probe_mmproj 返回 False（纯文本模式）
+        self._patch_llama_attr("_probe_server", lambda name: "match")
+        self._patch_llama_attr("_probe_mmproj", lambda: False)
+        request_called = {"count": 0}
+        def mock_request(*a, **kw):
+            request_called["count"] += 1
+            return {"result": "text", "error": None}
+        self._patch_llama_attr("_request_image_new", mock_request)
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/reocr",
+                data=_json.dumps({"page": 1, "model": "", "html": "<p>test</p>"}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("纯文本模式", res["error"])
+            self.assertEqual(request_called["count"], 0, "_request_image_new 不应被调用")
+        finally:
+            self._stop(server)
+
+    def test_reocr_text_only_server_returns_peg_hint(self):
+        """_friendly_llm_error 对 peg-native format 返回专用提示（含「多模态」/「纯文本」），而非通用 500 提示。"""
+        from correctmanage import _friendly_llm_error
+        err = "HTTP 500 Internal Server Error: The model produced output that does not match the expected peg-native format"
+        hint = _friendly_llm_error(err)
+        self.assertIn("peg-native", hint.lower())
+        self.assertTrue(
+            "多模态" in hint or "纯文本" in hint or "mmproj" in hint,
+            f"应包含多模态/纯文本/mmproj 关键字，实际: {hint}"
+        )
+        # 确保不是通用的上下文不足提示
+        self.assertNotIn("上下文（--ctx-size）不足", hint)
+
+    def test_probe_mmproj_parses_props(self):
+        """llamamanage._probe_mmproj 解析 /props modalities.vision：True/False/缺失→None。"""
+        import llamamanage
+        from unittest.mock import patch, MagicMock
+
+        # 钉死引擎为 llama，避免尝试导入 vllmmanage
+        self._patch_llama_attr("_active_engine", lambda: "llama")
+
+        # Case 1: modalities.vision = True
+        resp1 = MagicMock()
+        resp1.status_code = 200
+        resp1.json.return_value = {"modalities": {"vision": True}}
+        with patch.object(llamamanage._SESSION, "get", return_value=resp1):
+            self.assertTrue(llamamanage._probe_mmproj())
+
+        # Case 2: modalities.vision = False
+        resp2 = MagicMock()
+        resp2.status_code = 200
+        resp2.json.return_value = {"modalities": {"vision": False}}
+        with patch.object(llamamanage._SESSION, "get", return_value=resp2):
+            self.assertFalse(llamamanage._probe_mmproj())
+
+        # Case 3: modalities 缺失 → None
+        resp3 = MagicMock()
+        resp3.status_code = 200
+        resp3.json.return_value = {"modalities": {}}
+        with patch.object(llamamanage._SESSION, "get", return_value=resp3):
+            self.assertIsNone(llamamanage._probe_mmproj())
+
+        # Case 4: 非 200 → None
+        resp4 = MagicMock()
+        resp4.status_code = 503
+        with patch.object(llamamanage._SESSION, "get", return_value=resp4):
+            self.assertIsNone(llamamanage._probe_mmproj())
+
+
+class TestReocrImage(unittest.TestCase):
+    """_reocr_image：重识别页图超大时有界降采样（防 llama-server 500 / 上下文撑爆）。"""
+
+    def _make_pdf(self, width_pt=595.0, height_pt=842.0):
+        import fitz  # PyMuPDF 懒加载（与 production 一致）
+
+        doc = fitz.open()
+        page = doc.new_page(width=width_pt, height=height_pt)
+        page.insert_text((72, 72), "test OCR page")
+        tmp = tempfile.mkdtemp()
+        pdf = os.path.join(tmp, "t.pdf")
+        doc.save(pdf)
+        doc.close()
+        return pdf
+
+    def test_bounds_oversized_page(self):
+        from unittest import mock
+
+        import correctmanage as cm
+
+        pdf = self._make_pdf(width_pt=2380, height_pt=3368)  # ~A3，远超阈值
+        lock = getattr(cm.threading, "Lock", None)
+        state = {
+            "pdf_path": pdf,
+            "preview_doc": None,
+            "preview_doc_lock": lock() if lock else None,
+            "img_dir": None,
+        }
+        # 证明走的是有界渲染而非 _full_bytes 回退
+        with mock.patch.object(cm, "_full_bytes", return_value=("image/png", b"X" * 100)):
+            try:
+                res = cm._reocr_image(state, 1)
+            finally:
+                if state.get("preview_doc") is not None:
+                    state["preview_doc"].close()
+        self.assertIsNotNone(res)
+        ctype, data = res
+        self.assertEqual(ctype, "image/jpeg")
+        import fitz
+
+        pix = fitz.Pixmap(data)
+        limit = cm._REOCR_MAX_SIDE
+        self.assertLessEqual(pix.width, limit + 1)
+        self.assertLessEqual(pix.height, limit + 1)
+
+    def test_small_page_rendered_at_bounded_resolution(self):
+        from unittest import mock
+
+        import correctmanage as cm
+
+        pdf = self._make_pdf(width_pt=595.0, height_pt=842.0)  # A4
+        lock = getattr(cm.threading, "Lock", None)
+        state = {
+            "pdf_path": pdf,
+            "preview_doc": None,
+            "preview_doc_lock": lock() if lock else None,
+            "img_dir": None,
+        }
+        try:
+            res = cm._reocr_image(state, 1)
+        finally:
+            if state.get("preview_doc") is not None:
+                state["preview_doc"].close()
+        self.assertIsNotNone(res)
+        ctype, data = res
+        self.assertEqual(ctype, "image/jpeg")
+        import fitz
+
+        pix = fitz.Pixmap(data)
+        # A4 最大边被统一上送到 ≈ _REOCR_MAX_SIDE（有界分辨率，不超限）
+        self.assertLessEqual(pix.height, cm._REOCR_MAX_SIDE + 1)
+        self.assertGreater(pix.height, cm._REOCR_MAX_SIDE * 0.9)
+        self.assertGreaterEqual(pix.width, 1000)
+
+    def test_falls_back_to_full_bytes_when_no_pdf(self):
+        from unittest import mock
+
+        import correctmanage as cm
+
+        state = {"pdf_path": None, "preview_doc": None, "preview_doc_lock": None, "img_dir": None}
+        with mock.patch.object(cm, "_full_bytes", return_value=("image/png", b"RAWFALLBACK")):
+            res = cm._reocr_image(state, 1)
+        self.assertEqual(res, ("image/png", b"RAWFALLBACK"))
 
 
 class TestFullPunct(unittest.TestCase):

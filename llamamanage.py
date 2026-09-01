@@ -333,6 +333,34 @@ def _probe_server(model_name: str) -> str:
     return "mismatch"
 
 
+def _probe_mmproj() -> bool | None:
+    """探测 127.0.0.1:8080 上 llama-server 是否为多模态（已加载 --mmproj 视觉投影）。
+
+    通过 /props 端点的 modalities.vision 判断：True = 已加载视觉投影（可收图）；
+    False = 纯文本模式（未附加 --mmproj，收图会报 500 peg-native format）；
+    None = 无法探测（服务不可达 / /props 不可用 / 字段缺失）。
+    供 /api/reocr 在发送图片前拦截「纯文本服务收图」的场景。
+    """
+    if _active_engine() == "vllm":
+        return _vllm_module()._probe_mmproj()  # vllmmanage 同签名，见文件2
+    try:
+        resp = _SESSION.get("http://127.0.0.1:8080/props", timeout=2)
+        if resp.status_code != 200:
+            return None
+        j = resp.json()
+        if not isinstance(j, dict):
+            return None
+        mods = j.get("modalities")
+        if not isinstance(mods, dict):
+            return None
+        vis = mods.get("vision")
+        if isinstance(vis, bool):
+            return vis
+        return None
+    except Exception:
+        return None
+
+
 # 全部全局配置通过 configmanage 统一获取
 
 
@@ -493,6 +521,26 @@ def runserver(model_key: str = "HY", with_mmproj: bool = True, parallel: int | N
     if parallel is not None and parallel >= 1 and parallel < par:
         par = int(parallel)
     args += ["--parallel", str(par)]
+
+    # --ctx-size：显式限定服务端上下文长度（n_ctx）。llama.cpp 不传时默认
+    # "-c 0 = 从模型加载" —— 若模型原生上下文很大（GLM-OCR 等视觉模型可达数
+    # 万 token），KV cache 会按原生上下文预分配，显存飙升（实测同模型直接启动
+    # 传 --ctx-size 8192 仅 2G，PToEA 不传却占 6G）。矫正/重识别单页请求用不
+    # 到超大上下文，按 llama_server_args.ctx_size（默认 8192）限定即可（2026-09-01）。
+    try:
+        csz = sargs.get("ctx_size")
+        if csz not in (None, ""):
+            cz = int(csz)
+            if 256 <= cz <= 65536:
+                if _server_supports_arg(exe, "--ctx-size"):
+                    args += ["--ctx-size", str(cz)]
+                    print(f"Using ctx_size from config: {cz}")
+                else:
+                    print("llama-server 构建不支持 --ctx-size 启动参数，已跳过")
+            else:
+                print(f"llama_server_args.ctx_size {cz} out of range (256-65536), ignoring")
+    except Exception as e:
+        print(f"Invalid llama_server_args.ctx_size: {e}")
 
     # Additional numeric startup parameters supported via config.json llama_server_args:
     # - max_tokens: integer (defaults to 8192) -> also controls per-request max_tokens used by HTTP calls
@@ -1001,6 +1049,25 @@ def _batch_infer_impl(
     return results
 
 
+def _sniff_image_mime(data: bytes) -> str:
+    """按魔数嗅探图片 MIME，无法识别时回退 image/jpeg。
+
+    用于 img_bytes 分支且调用方未提供 content_type 时，避免把 PNG/WebP 等
+    字节错标为 JPEG 导致模型端解图失败（500）。
+    """
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:2] == b"BM":
+        return "image/bmp"
+    return "image/jpeg"
+
+
 def _request_image_new(
     prompt: str,
     img,
@@ -1010,6 +1077,7 @@ def _request_image_new(
     timeout: int = REQUEST_TIMEOUT,
     model_name: str | None = None,
     img_bytes: bytes | None = None,
+    content_type: str | None = None,
 ):
     """New request_image implementation (duck-typed) that wraps existing behavior.
     This function is appended and then assigned to the public name to safely
@@ -1020,6 +1088,9 @@ def _request_image_new(
     为 None 时按旧行为自行解析（单张/外部调用兜底）。
     img_bytes：可选内存图片字节（如 _full_bytes 返回的原始数据），提供时跳过
     磁盘临时文件，直接 base64 编码后发送，减少 /api/reocr 等场景的 I/O 开销。
+    content_type：img_bytes 对应的图片 MIME（如 'image/png'/'image/jpeg'），
+    提供时优先用它声明 data URI；缺失时按魔数嗅探，避免把 PNG 字节错标为
+    JPEG 导致 llama-server 解图失败（返回 500）。
     """
     if _active_engine() == "vllm":
         return _vllm_module()._request_image_new(
@@ -1031,13 +1102,14 @@ def _request_image_new(
             timeout=timeout,
             model_name=model_name,
             img_bytes=img_bytes,
+            content_type=content_type,
         )
     try:
         _mime = "image/png"
         # Use in-memory bytes if provided (skip temp file disk I/O)
         if img_bytes is not None:
             img_base64 = base64.b64encode(img_bytes).decode("ascii")
-            _mime = "image/jpeg"
+            _mime = content_type or _sniff_image_mime(img_bytes)
         else:
             img_base64 = None
             if img_is_base64 and isinstance(img, str):
@@ -1102,7 +1174,33 @@ def _request_image_new(
         headers = {"Content-Type": "application/json"}
         # 复用会话连接（keep-alive），避免每页新建 TCP 连接
         resp = _SESSION.post(url, json=data, headers=headers, timeout=timeout)
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except Exception as e:  # noqa: BLE001
+            # 4xx/5xx：把 llama-server 返回的响应体（常含真实错误原因，如模板/上下文/加载
+            # 问题）透出，而不是只报「500 Server Error」这句笼统话——否则用户与诊断都
+            # 无法定位真正原因（2026-09-01）。测试 mock 的 raise_for_status 是 no-op，
+            # 不会误入此分支。
+            detail = ""
+            try:
+                j = resp.json()
+                err = j.get("error") if isinstance(j, dict) else None
+                if isinstance(err, dict):
+                    msg = err.get("message") or err
+                else:
+                    msg = err
+                detail = str(msg)
+            except Exception:
+                pass
+            if not detail:
+                text = getattr(resp, "text", "")
+                detail = (text or "").strip() if isinstance(text, str) else ""
+            sc = getattr(resp, "status_code", "?")
+            reason = getattr(resp, "reason", "")
+            return {
+                "result": None,
+                "error": f"HTTP {sc} {reason}: {detail or e}",
+            }
         result = resp.json()
         if result.get("choices"):
             choice = result["choices"][0]

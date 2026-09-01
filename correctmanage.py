@@ -179,6 +179,23 @@ _LLM_BAD_REQUEST_MARKERS = (
     "400 Bad Request",
     "Bad Request for url",
 )
+# 2026-09-01：llama-server 推理期内部错误返回 500（模板处理失败 / 上下文不足 /
+# 模型加载异常 / mmproj 与模型不匹配等）。此前 _request_image_new 用
+# raise_for_status() 只透出笼统的「500 Server Error」，无法定位原因；现已在
+# llamamanage 层透出响应体，这里给出可操作的引导提示（并保留原详情）。
+_LLM_SERVER_ERROR_MARKERS = (
+    "500 Server Error",
+    "500 Internal Server Error",
+    "HTTP 500",
+)
+# 2026-09-01：llama-server 多模态（vision）推理失败——模型收图但无法产出符合
+# 预期的视觉投影输出（如 mmproj 与主模型不匹配/版本不兼容/纯文本服务误收图）。
+# 报 500，但需要比通用 server-error 更明确的定位提示。
+_LLM_PEG_MARKERS = (
+    "peg-native format",
+    "expected peg-native",
+    "does not match the expected peg",
+)
 
 
 # 格式规则允许的格式操作（与前端 applySingleFormat 一一对应；none=无，不处理文本）
@@ -386,6 +403,10 @@ def _friendly_llm_error(err: str) -> str:
         return _llm_bad_request_hint()
     if any(k in err for k in _LLM_CONN_ERROR_MARKERS):
         return _llm_conn_error_hint()
+    if any(k in err for k in _LLM_PEG_MARKERS):
+        return _llm_peg_native_hint(err)
+    if any(k in err for k in _LLM_SERVER_ERROR_MARKERS):
+        return _llm_server_error_hint(err)
     return err
 
 
@@ -441,6 +462,44 @@ def _llm_bad_request_hint() -> str:
         "（请稍后重试），或当前服务加载的模型与所选模型不符"
         "（请先停止服务，再启动所选模型后重试）。"
     )
+
+
+def _llm_server_error_hint(detail: str = "") -> str:
+    """按当前推理引擎归属返回 500 服务端错误的可操作提示（保留原详情）。"""
+    extra = f"（服务端详情：{detail}）" if detail.strip() else ""
+    try:
+        engine = _active_engine_label()
+    except Exception:
+        engine = "模型服务"
+    if engine == "vLLM-Omni":
+        return (
+            f"{engine} 返回 500 内部错误。常见原因：上下文长度不足、模型/mmproj 加载"
+            f"异常或 GPU 显存不足。建议：降低识别精度/缩小页面图像，或重启服务后重试。"
+        ) + extra
+    return (
+        f"{engine} 返回 500 内部错误。常见原因：上下文（--ctx-size）不足、模型与图像"
+        f"投影（mmproj）不匹配、模型文件未完整加载，或 GPU 显存不足。建议：检查服务"
+        f"日志定位具体原因，必要时停服务后重启加载所选模型再重试。"
+    ) + extra
+
+
+def _llm_peg_native_hint(detail: str = "") -> str:
+    """llama.cpp 多模态（vision）推理失败 'peg-native format' 的可操作提示。"""
+    extra = f"（服务端详情：{detail}）" if (detail or "").strip() else ""
+    engine = "vLLM-Omni" if _active_engine_label() == "vLLM-Omni" else "llama-server"
+    if engine == "vLLM-Omni":
+        return (
+            "vLLM-Omni 多模态推理失败：模型未能产出符合预期的视觉投影输出。"
+            "常见原因：mmproj 与主模型不匹配、模型未配置图像能力，或加载的模型"
+            "并非视觉模型。建议：检查所选模型是否支持图像输入，或更换为视觉 OCR 模型后重试。"
+        ) + extra
+    return (
+        "llama-server 多模态（vision）推理失败：当前服务未能产出符合预期的视觉投影"
+        "输出（peg-native format）。常见原因：① 当前运行的是纯文本模式（未加载 mmproj"
+        "视觉投影，例如为句子校正启动的服务），收图必然失败——请先「停止服务」，再"
+        "「启动服务」加载所选视觉模型后重试；② mmproj 与主模型不匹配 / llama-server 版本不兼容"
+        "——请核对 mmproj 文件名与模型匹配，必要时升级或更换 llama-server / mmproj 后重试。"
+    ) + extra
 
 
 def _strip_trailing_commas(s: str) -> str:
@@ -2956,6 +3015,42 @@ def _full_bytes(state: dict[str, Any], page_no: int) -> tuple[str, bytes] | None
         except Exception:
             pass
     return None
+
+
+# 重识别（reocr）页图的最大边长（px）。足够中文 OCR 的默认值，同时把图像 token
+# 与 KV 压在 llama-server max_pixels（默认≈3.2M px）与 ctx-size（2026-09-01 VRAM
+# 修复后 8192）预算内——高 DPI 分割图 / 原图回退(220 DPI) 的大图（A4@220≈4.68M px）
+# 会超限或撑爆上下文，致 500（2026-09-01）。
+_REOCR_MAX_SIDE = 1560
+
+
+def _reocr_image(state: dict[str, Any], page_no: int) -> tuple[str, bytes] | None:
+    """取重识别用的页图，超大页有界降采样。
+
+    按 PDF 页面矩形计算一个有界 DPI，使最大边≈_REOCR_MAX_SIDE px：低于阈值的页
+    不受影响、放大到阈值（窄小页面也得到足够分辨率），高于阈值的页被压下去，避免
+    llama-server 因图像过大返回 500。复用已打开的 preview_doc（持 preview_doc_lock，
+    不重开 PDF）。PDF 不可用时回退 _full_bytes（尽量有图可发）。
+    """
+    try:
+        doc = _preview_doc(state)
+        lock = state.get("preview_doc_lock")
+        if (
+            doc is not None
+            and not getattr(doc, "is_closed", False)
+            and 1 <= page_no <= doc.page_count
+        ):
+            with lock if lock is not None else nullcontext():
+                r = doc[page_no - 1].rect
+            max_dim = max(r.width, r.height)
+            if max_dim > 0:
+                dpi = (_REOCR_MAX_SIDE * 72.0) / max_dim
+                res = _render_jpeg(state, page_no, dpi)
+                if res is not None:
+                    return res
+    except Exception:
+        pass
+    return _full_bytes(state, page_no)
 
 
 def _build_embedded_images(state: dict[str, Any]) -> dict[str, str]:
@@ -5776,7 +5871,11 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                             "application/json; charset=utf-8",
                         )
                         return
-                running = bool(runserver(model_key, with_mmproj=has_mmproj))
+                # 矫正/重识别为单请求顺序处理（用户逐页点击，一次一个请求），并发
+                # 槽位取 1 即可——llama-server 的 KV cache ≈ n_ctx × parallel，默认
+                # 取 config 的 parallel(6)×max_tokens(8192) 会把 KV 预分配撑到数 GB，
+                # 显著超过直接启动（--parallel 1）的显存占用（2026-09-01 修复）。
+                running = bool(runserver(model_key, with_mmproj=has_mmproj, parallel=1))
                 if running:
                     # Issue 1 fix: persist model choice so it survives UI restart
                     try:
@@ -6029,6 +6128,28 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                         "application/json; charset=utf-8",
                     )
                     return
+                # 2026-09-01：所选模型是视觉模型（配置了 mmproj），但当前运行的
+                # llama-server 若为纯文本模式（未加载 --mmproj），收图会报 500
+                # 「peg-native format」。发送前先探测一次多模态能力，命中则给出
+                # 明确指引，避免把难懂的 500 直接抛给用户。
+                sel_has_mmproj = bool((model_choices.get(model_key) or {}).get("mmproj"))
+                mmproj_ok = llamamanage._probe_mmproj()
+                if sel_has_mmproj and mmproj_ok is False:
+                    self._send(
+                        200,
+                        self._json(
+                            {
+                                "ok": False,
+                                "error": (
+                                    f"当前服务为纯文本模式（未加载 mmproj 视觉投影），"
+                                    f"无法对模型 {model_key} 执行重识别。"
+                                    "请先点击「停止服务」，再点击「启动服务」加载所选视觉模型后重试。"
+                                ),
+                            }
+                        ),
+                        "application/json; charset=utf-8",
+                    )
+                    return
                 try:
                     page_no = int(body.get("page"))
                 except (TypeError, ValueError):
@@ -6038,7 +6159,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                         "application/json; charset=utf-8",
                     )
                     return
-                img = _full_bytes(state, page_no)
+                img = _reocr_image(state, page_no)
                 if img is None:
                     self._send(
                         404,
@@ -6059,14 +6180,127 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     thinking=False,
                     timeout=llamamanage.REQUEST_TIMEOUT,
                     img_bytes=img_bytes,
+                    # 2026-08-31：把真实 MIME 传给 _request_image_new——页图为 PNG 时
+                    # 若数据 URI 错标 image/jpeg，llama-server 解图失败返回 500
+                    # （曾致「重识别失败:500 Server Error」）
+                    content_type=content_type,
                 )
+                # 2026-09-01：自动修复——若命中 peg-native format（多模态推理失败，常因
+                # 纯文本模式服务误收图），且所选模型配置了 mmproj，先探测服务端多模态能力，
+                # 仅当确认为纯文本模式（probe_mmproj=False）时才自动重启视觉服务并重试一次。
+                # 若探测为视觉模式或探测不明，则判定为单页图片异常（过大/损坏/MIME异常），
+                # 不重启服务，直接返回单页失败提示（含图片大小便于自查）。
+                err_str = str(res.get("error") or "")
+                auto_heal_attempted = False
+                if (
+                    res.get("error")
+                    and sel_has_mmproj
+                    and llamamanage._active_engine() == "llama"
+                    and any(k in err_str for k in _LLM_PEG_MARKERS)
+                ):
+                    # 先探测：当前服务是否真正加载了 mmproj（视觉投影）
+                    mmproj_probe = llamamanage._probe_mmproj()
+                    if mmproj_probe is False:
+                        # 确认为纯文本模式：执行自动重启并重试
+                        try:
+                            llamamanage.stopserver()
+                            time.sleep(0.5)
+                            ok = llamamanage.runserver(model_key, with_mmproj=True)
+                            if ok:
+                                auto_heal_attempted = True
+                                res = llamamanage._request_image_new(
+                                    ocr_prompt,
+                                    "",
+                                    model_key=model_key,
+                                    thinking=False,
+                                    timeout=llamamanage.REQUEST_TIMEOUT,
+                                    img_bytes=img_bytes,
+                                    content_type=content_type,
+                                )
+                                err_str = str(res.get("error") or "")
+                        except Exception:
+                            # 自动修复过程出错：静默忽略，走统一错误处理
+                            pass
+                    else:
+                        # 探测为视觉模式 或 探测不明：判定为单页图片异常，不重启服务
+                        # 先尝试按页降分辨率重试一次，再决定是否返回错误
+                        img_size = len(img_bytes) if img_bytes else 0
+                        retry_bytes = None
+                        retry_ct = None
+                        try:
+                            # 以当前 _REOCR_MAX_SIDE 的一半为目标最大边，重新渲染更小的 JPEG
+                            # 复用 preview_doc 与锁，避免重开 PDF
+                            doc = _preview_doc(state)
+                            lock = state.get("preview_doc_lock")
+                            if (
+                                doc is not None
+                                and not getattr(doc, "is_closed", False)
+                                and 1 <= page_no <= doc.page_count
+                            ):
+                                import fitz
+                                with lock if lock is not None else nullcontext():
+                                    r = doc[page_no - 1].rect
+                                max_dim = max(r.width, r.height)
+                                if max_dim > 0:
+                                    # 目标最大边 = _REOCR_MAX_SIDE // 2 (约 780px)，足够 OCR 且 token 大幅减少
+                                    target_side = _REOCR_MAX_SIDE // 2
+                                    dpi = (target_side * 72.0) / max_dim
+                                    quality = int(state.get("preview_quality", 70))
+                                    with lock if lock is not None else nullcontext():
+                                        pix = doc[page_no - 1].get_pixmap(
+                                            matrix=fitz.Matrix(dpi / 72.0, dpi / 72.0),
+                                            alpha=False,
+                                        )
+                                        retry_bytes = pix.tobytes("jpeg", jpg_quality=quality)
+                                        retry_ct = "image/jpeg"
+                        except Exception:
+                            # 任何渲染异常静默回退，走原错误分支
+                            retry_bytes = None
+                            retry_ct = None
+
+                        if retry_bytes and len(retry_bytes) < img_size:
+                            # 用降采样图再次请求
+                            res2 = llamamanage._request_image_new(
+                                ocr_prompt,
+                                "",
+                                model_key=model_key,
+                                thinking=False,
+                                timeout=llamamanage.REQUEST_TIMEOUT,
+                                img_bytes=retry_bytes,
+                                content_type=retry_ct,
+                            )
+                            if not res2.get("error"):
+                                # 重试成功：用新结果继续走正常流程
+                                res = res2
+                                err_str = ""
+                            else:
+                                # 重试仍失败：更新错误信息并落入下方统一错误处理
+                                err_str = str(res2.get("error") or err_str)
+                        if res.get("error"):
+                            # 无重试或重试失败：构造友好提示并返回
+                            friendly = _friendly_llm_error(err_str)
+                            if retry_bytes:
+                                friendly += f"（该页图片可能过大/损坏/MIME异常，原始 {img_size} 字节→降采样 {len(retry_bytes)} 字节重试仍失败，已跳过自动重启；可尝试对该页单独降低分辨率或检查原图）"
+                            else:
+                                friendly += f"（该页图片可能过大/损坏/MIME异常，大小 {img_size} 字节，已跳过自动重启；可尝试对该页单独降低分辨率或检查原图）"
+                            self._send(
+                                200,
+                                self._json({"ok": False, "error": friendly}),
+                                "application/json; charset=utf-8",
+                            )
+                            return
+                        # 重试成功：已用降采样图取得结果，落入下方成功分支
                 if res.get("error"):
+                    friendly = _friendly_llm_error(err_str)
+                    # 若经历过自动修复尝试（上述分支已执行），在提示中追加说明
+                    if auto_heal_attempted:
+                        friendly += " （已尝试自动重启视觉服务仍失败，请手动点击「停止服务」再「启动服务」后重试）"
                     self._send(
                         200,
                         self._json(
                             {
                                 "ok": False,
-                                "error": _friendly_llm_error(str(res.get("error"))),
+                                "error": friendly,
                             }
                         ),
                         "application/json; charset=utf-8",
