@@ -5,52 +5,52 @@
     "HY": {
       "name": "huiyuan/HunyuanOCR.BF16.gguf",
       "mmproj": "huiyuan/HunyuanOCR.mmproj-bf16.gguf",
-      "workers": 5
+      "workers": 4
     },
     "QWEN.8": {
-      "name": "qwen3.5/Qwen3.5-0.8B-Q8_0.gguf",
+      "name": "qwen3.5/Qwen3.5-0.8B-BF16.gguf",
       "mmproj": "qwen3.5/0.8b_mmproj-F16.gguf",
-      "workers": 6
+      "workers": 4
     },
     "QWEN2": {
-      "name": "qwen3.5/Qwen3.5-2B-Q8_0.gguf",
+      "name": "qwen3.5/Qwen3.5-2B-BF16.gguf",
       "mmproj": "qwen3.5/2b_mmproj-F16.gguf",
-      "workers": 5
+      "workers": 4
     },
     "PD": {
       "name": "paddleocr/PaddleOCR-VL-1.6-GGUF.gguf",
       "mmproj": "paddleocr/PaddleOCR-VL-1.6-GGUF-mmproj.gguf",
-      "workers": 5
+      "workers": 4
     },
     "ULQ8": {
       "name": "Unlimited/Unlimited-OCR-Q8_0.gguf",
       "mmproj": "Unlimited/mmproj-Unlimited-OCR-F16.gguf",
-      "workers": 5
+      "workers": 4
     },
     "DOTS8": {
       "name": "dots/dots.ocr.Q8_0.gguf",
       "mmproj": "dots/dots.ocr.mmproj-Q8_0.gguf",
-      "workers": 5
+      "workers": 4
     },
     "glm8": {
       "name": "glm/GLM-OCR-Q8_0.gguf",
-      "mmproj": "glm/mmproj-GLM-OCR-Q8_0.gguf",
-      "workers": 5
+      "mmproj": "glm/GLM-OCR.mmproj-f16.gguf",
+      "workers": 4
     },
     "glm16": {
       "name": "glm/GLM-OCR-f16.gguf",
-      "mmproj": "glm/mmproj-GLM-OCR-Q8_0.gguf",
-      "workers": 5
+      "mmproj": "glm/GLM-OCR.mmproj-f16.gguf",
+      "workers": 4
     },
     "q34": {
       "name": "qwenvl/Qwen3VL-4B-Instruct-Q8_0.gguf",
       "mmproj": "qwenvl/mmproj-Qwen3VL-4B-Instruct-F16.gguf",
-      "workers": 5
+      "workers": 4
     },
     "qwen4": {
       "name": "qwen3.5/Qwen3.5-4B-Q8_0.gguf",
       "mmproj": "qwen3.5/4b_mmproj-F16.gguf",
-      "workers": 5
+      "workers": 4
     }
   },
   "selected_model": "DOTS8",
@@ -60,11 +60,12 @@
     "port": "8080",
     "temperature": "0",
     "repeat_penalty": "1.1",
-    "parallel": "6",
+    "parallel": "4",
     "cache_type_k": "q8_0",
     "cache_type_v": "q8_0",
     "log_verbosity": "0",
-    "max_tokens": "8192"
+    "max_tokens": "8192",
+    "ctx_size": "8192"
   },
   "proofread": {
     "similarity_min": 0.67,
@@ -74,7 +75,7 @@
     "auto_fix_score": 0.85,
     "enable_llm": true,
     "enable_legacy_rules": false,
-    "llm_model": "glm8",
+    "llm_model": "glm16",
     "llm_timeout": 3
   },
   "engine": "llama",

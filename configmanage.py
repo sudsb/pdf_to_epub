@@ -172,9 +172,15 @@ DEFAULT_CONFIG = {
         # ngram_size/window_size 已移除：纯启动参数，部分 llama-server 构建不支持
         # （如 llama13 会因 --ngram-size/--window-size 直接退出），且对 OCR 无增益。
         # flash_attn 可选："0"/false 禁用、空/缺省自动、非 0（如 "1"/"on"）强制开启
-        # GPU 下的 Flash Attention（新构建默认 auto：CUDA 支持时自动开启；
+        # GPU 下的 Flash Attention（新构建默认 auto：CUDA 支持时自动启用；
         # 老构建自动附加裸 --flash-attn）。
         "max_tokens": "8192",   # per-request max token cap (also passed to llama-server via --max-tokens)
+        # ctx_size：显式限定服务端上下文 n_ctx（--ctx-size）。llama.cpp 缺省
+        # "-c 0 = 从模型加载"，GLM-OCR 等视觉模型原生上下文可达数万 token，
+        # KV cache 按原生上下文预分配会撑爆显存（实测同模型直接启动
+        # --ctx-size 8192 仅占 2G，PToEA 不传却占 6G）。单页 OCR/矫正用不到
+        # 超大上下文，默认 8192 即可（2026-09-01）。
+        "ctx_size": "8192",
     },
     # 推理引擎选择：'llama'（llama.cpp，默认）| 'vllm'（vLLM-Omni）
     "engine": "llama",

@@ -1237,7 +1237,10 @@ class _GuiHandler(BaseHTTPRequestHandler):
             try:
                 import llamamanage
 
-                llamamanage.runserver(model, with_mmproj=True)
+                # 手动启动（服务管理/单用途）无已知批量并发，槽位取 1 即可——否则
+                # 默认按 config parallel(6)×max_tokens(8192) 预分配 KV cache 撑大显存
+                # （2026-09-01 修复，同 correctmanage /api/llm_start）。
+                llamamanage.runserver(model, with_mmproj=True, parallel=1)
             except Exception as e:  # noqa: BLE001
                 st["last_error"] = str(e)
                 traceback.print_exc()

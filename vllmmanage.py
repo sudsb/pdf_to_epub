@@ -35,6 +35,7 @@ from llamamanage import (
     _kill_port_owner,
     _model_id_matches,
     _resolve_workers,
+    _sniff_image_mime,
     MAX_TOKENS,
     REQUEST_TIMEOUT,
 )
@@ -108,6 +109,11 @@ def _probe_server(model_name: str) -> str:
     except Exception:
         pass
     return "mismatch"
+
+
+def _probe_mmproj() -> bool | None:
+    """vLLM 侧多模态探测占位：当前按文本服务处理，返回 None（未知）。"""
+    return None
 
 
 def run(model_key: str = "HY"):
@@ -309,6 +315,7 @@ def _request_image_new(
     model_name: Optional[str] = None,
     base_url: Optional[str] = None,
     img_bytes: Optional[bytes] = None,
+    content_type: Optional[str] = None,
 ):
     """多模态图片识别（OCR）。与 llamamanage 同签名；请求体附加
     "modalities": ["text"] 跳过音频生成阶段（vLLM-Omni 默认输出文本+音频）。
@@ -317,13 +324,14 @@ def _request_image_new(
     避免每页都调 _vll_args()（读 config.json + 抢全局锁）。两者都传入时
     完全跳过配置读取；否则按旧行为自行解析（单张/外部调用兜底）。
     img_bytes：可选内存图片字节，提供时跳过磁盘临时文件直接编码发送。
+    content_type：img_bytes 对应 MIME，缺失时按魔数嗅探兜底。
     """
     try:
         _mime = "image/png"
         # Use in-memory bytes if provided (skip temp file disk I/O)
         if img_bytes is not None:
             img_base64 = base64.b64encode(img_bytes).decode("utf-8")
-            _mime = "image/jpeg"
+            _mime = content_type or _sniff_image_mime(img_bytes)
         else:
             img_base64 = None
             if img_is_base64 and isinstance(img, str):
@@ -373,7 +381,32 @@ def _request_image_new(
         }
         headers = {"Content-Type": "application/json"}
         resp = _SESSION.post(url, json=data, headers=headers, timeout=timeout)
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except Exception as e:  # noqa: BLE001
+            # 与 llamamanage 对齐：透出服务端响应体（常含真实错误原因），而不是只报
+            # 一句笼统的「5xx Server Error」，便于定位/提示（2026-09-01）。测试 mock
+            # 的 raise_for_status 是 no-op，不会误入此分支。
+            detail = ""
+            try:
+                j = resp.json()
+                err = j.get("error") if isinstance(j, dict) else None
+                if isinstance(err, dict):
+                    msg = err.get("message") or err
+                else:
+                    msg = err
+                detail = str(msg)
+            except Exception:
+                pass
+            if not detail:
+                text = getattr(resp, "text", "")
+                detail = (text or "").strip() if isinstance(text, str) else ""
+            sc = getattr(resp, "status_code", "?")
+            reason = getattr(resp, "reason", "")
+            return {
+                "result": None,
+                "error": f"HTTP {sc} {reason}: {detail or e}",
+            }
         result = resp.json()
         if "choices" in result and result["choices"]:
             choice = result["choices"][0]
