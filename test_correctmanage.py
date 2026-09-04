@@ -29,6 +29,8 @@ from correctmanage import (
     _proofread_plain_text,
     _full_punct,
     diff_reocr_texts,
+    _normalize_textcircled,
+    _normalize_brackets,
     _strip_trailing_page_number,
     _page_text,
     _headings_to_body,
@@ -3398,6 +3400,58 @@ class TestReocr(unittest.TestCase):
             for c in d["candidates"]:
                 self.assertIsInstance(c, str, "candidates 元素必须是字符串")
 
+    def test_textcircled_with_dollar_wrapping(self):
+        """$\textcircled{1}$ → ①（2026-09-02）。"""
+        self.assertEqual(_normalize_textcircled("$\\textcircled{1}$"), "①")
+
+    def test_textcircled_without_dollar(self):
+        """\\textcircled{5} → ⑤（无 $ 包裹）。"""
+        self.assertEqual(_normalize_textcircled("正文\\textcircled{5}引注"), "正文⑤引注")
+
+    def test_textcircled_large_number(self):
+        """\\textcircled{21}（超出 20）→ 〔21〕回退。"""
+        self.assertEqual(_normalize_textcircled("条目\\textcircled{21}"), "条目〔21〕")
+
+    def test_textcircled_mixed_in_text(self):
+        """多个 textcircled 同时出现。"""
+        self.assertEqual(
+            _normalize_textcircled("\\textcircled{1}段\\textcircled{2}段"),
+            "①段②段",
+        )
+
+    def test_textcircled_no_crash_on_non_digit(self):
+        """\\textcircled{abc} 非数字形式 → 原样保留。"""
+        self.assertEqual(_normalize_textcircled("\\textcircled{abc}"), "\\textcircled{abc}")
+
+    def test_textcircled_empty_or_none(self):
+        """空字符串 / 无 textcircled → 原样。"""
+        self.assertEqual(_normalize_textcircled(""), "")
+        self.assertEqual(_normalize_textcircled("无特殊内容"), "无特殊内容")
+
+    # ---- _normalize_brackets 括号归一（2026-09-02） ----
+
+    def test_normalize_brackets_keeps_fullwidth_parens(self):
+        """全角圆括号（x）是正常正文标点，绝不能归一为〔x〕（用户报「（x）被改成〔x〕」）。"""
+        self.assertEqual(_normalize_brackets("（x）"), "（x）")
+        self.assertEqual(_normalize_brackets("引注（数字）内容"), "引注（数字）内容")
+        self.assertEqual(_normalize_brackets("参见（第3页）"), "参见（第3页）")
+
+    def test_normalize_brackets_keeps_halfwidth_parens(self):
+        """半角括号 (x) 不在归一范围，原样保留。"""
+        self.assertEqual(_normalize_brackets("(x)"), "(x)")
+        self.assertEqual(_normalize_brackets("(123)"), "(123)")
+
+    def test_normalize_brackets_norm_square_and_fullwidth_square(self):
+        """方括号/方头括号数字引注（OCR 误识别形状）仍归一为〔x〕。"""
+        self.assertEqual(_normalize_brackets("【1】"), "〔1〕")
+        self.assertEqual(_normalize_brackets("[1]"), "〔1〕")
+        self.assertEqual(_normalize_brackets("［2］"), "〔2〕")
+
+    def test_normalize_brackets_cleans_junk_wrapped_digit(self):
+        """杂符包裹 \\〔^{x〕}\\ 折叠为〔x〕（归一仍可用）。"""
+        self.assertEqual(_normalize_brackets("\\〔^{5〕}\\"), "〔5〕")
+        self.assertEqual(_normalize_brackets("正文\\〔^{5〕}\\引注"), "正文〔5〕引注")
+
     # ---- /api/reocr 端点测试 ----
 
     def _start(self):
@@ -3865,6 +3919,70 @@ class TestReocr(unittest.TestCase):
             self.assertTrue(res["diff"], "杂符折叠后内容不同（〔2〕vs〔1〕）应保留纠错项")
             self.assertIn("〔2〕", res["text"])
             self.assertNotIn("^{", res["text"])
+        finally:
+            self._stop(server)
+
+    def test_reocr_textcircled_latex_to_circled_number(self):
+        """模型把 ① 识别为 $\textcircled{1}$ LaTeX → 还原为 ①，不出现 $\\textcircled〔1〕$（2026-09-02）。"""
+        import json as _json
+
+        import requests
+
+        self._patch_cfg()
+        self._patch_correct_attr("_full_bytes", lambda state, pn: ("image/png", b"fake"))
+        self._patch_llama_attr(
+            "_request_image_new",
+            lambda prompt, img, model_key="HY", thinking=False, timeout=600, **kw: {
+                "result": "$\\textcircled{1}$正文内容",
+                "error": None,
+            },
+        )
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/reocr",
+                data=_json.dumps(
+                    {"page": 1, "model": "", "html": "<p>①正文内容</p>"}
+                ),
+            ).json()
+            self.assertTrue(res["ok"])
+            # \textcircled{1} → ①，与原文一致 → 无 diff
+            self.assertEqual(res["diff"], [], "textcircled{1} 应还原为 ① 后与原文一致")
+            self.assertIn("①", res["text"])
+            # 关键断言：不应残留 LaTeX 形式
+            self.assertNotIn("textcircled", res["text"], "不应残留 \\textcircled LaTeX 形式")
+            self.assertNotIn("$", res["text"], "不应残留 $ 符号")
+            self.assertNotIn("{", res["text"], "不应残留 { 花括号")
+        finally:
+            self._stop(server)
+
+    def test_reocr_textcircled_no_dollar_wrapping(self):
+        """模型输出 \\textcircled{5}（无 $ 包裹）同样应还原为 ⑤（2026-09-02）。"""
+        import json as _json
+
+        import requests
+
+        self._patch_cfg()
+        self._patch_correct_attr("_full_bytes", lambda state, pn: ("image/png", b"fake"))
+        self._patch_llama_attr(
+            "_request_image_new",
+            lambda prompt, img, model_key="HY", thinking=False, timeout=600, **kw: {
+                "result": "正文\\textcircled{5}引注",
+                "error": None,
+            },
+        )
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/reocr",
+                data=_json.dumps(
+                    {"page": 1, "model": "", "html": "<p>正文⑤引注</p>"}
+                ),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["diff"], [], "textcircled{5} 还原 ⑤ 后与原文一致")
+            self.assertIn("⑤", res["text"])
+            self.assertNotIn("textcircled", res["text"])
         finally:
             self._stop(server)
 

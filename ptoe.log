@@ -630,3 +630,12 @@ INFO|2026-09-01 14:00:54|=== ptoe start: ['mian.py', 'gui'] ===
 INFO|2026-09-01 14:01:01|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', '--lang', 'zh-CN'] ===
 INFO|2026-09-01 15:12:49|=== ptoe start: ['mian.py', 'gui'] ===
 INFO|2026-09-01 15:12:57|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', '--lang', 'zh-CN'] ===
+INFO|2026-09-02 13:56:33|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-09-02 13:57:03|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', '--lang', 'zh-CN'] ===
+INFO|2026-09-03 16:58:57|=== ptoe start: ['python.exe -m unittest', 'test_stringmanage', 'test_pdfmanage', 'test_llamamanage', 'test_vllmmanage', 'test_mian', 'test_guimanage'] ===
+INFO|2026-09-03 16:58:57|=== ptoe start: ['python.exe -m unittest', 'test_stringmanage', 'test_pdfmanage', 'test_llamamanage', 'test_vllmmanage', 'test_mian', 'test_guimanage'] ===
+INFO|2026-09-03 16:59:16|=== ptoe start: ['python.exe -m unittest', 'test_stringmanage', 'test_pdfmanage', 'test_llamamanage', 'test_vllmmanage', 'test_mian', 'test_guimanage'] ===
+INFO|2026-09-03 16:59:16|=== ptoe start: ['python.exe -m unittest', 'test_stringmanage', 'test_pdfmanage', 'test_llamamanage', 'test_vllmmanage', 'test_mian', 'test_guimanage'] ===
+INFO|2026-09-03 16:59:53|=== ptoe start: ['python.exe -m unittest', 'test_stringmanage', 'test_llamamanage', 'test_guimanage'] ===
+INFO|2026-09-03 16:59:53|=== ptoe start: ['python.exe -m unittest', 'test_stringmanage', 'test_llamamanage', 'test_guimanage'] ===
+INFO|2026-09-03 17:26:59|=== ptoe start: ['mian.py', 'gui'] ===

@@ -1847,17 +1847,58 @@ _ULQ_JUNK_BRACKET_RE = re.compile(
     r"[\\^~`|·{}]+"
     r"[\[\]{}()（）【】［］〔〕〈〉《》「」『』\\^~`|·\s]{0,8}"
 )
+# 括号对归一仅处理「方/方头括号 + 数字引注」这类的 OCR 误识别形状（【x】/[x]/［x］
+# 及杂符包裹），统一为 〔x〕。**绝不能把全角圆括号（x）也归一为〔x〕** —— （x）是
+# 正常的正文标点（2026-09-02 用户报「原文（x）被改成〔x〕」），其可能是字母/文字/数字，
+# 必须原样保留。杂符包裹由 _ULQ_JUNK_BRACKET_RE 单独处理（要求数字两侧有 \ ^ { } 等
+# 真正垃圾字符才折叠），不靠这里的（...）模式。
 _BRACKET_PAIR_RES = (
     re.compile(r"【([^【】]*)】"),
     re.compile(r"\[([^\[\]\n]{1,32})\]"),
     re.compile(r"［([^［］]*)］"),
-    re.compile(r"（([^()]*?)）"),  # 补充全角圆括号（123）→ 〔123〕
 )
 
 
 def _clean_ulq_bracket_junk(text: str) -> str:
     """把 ULQ 输出的杂符包裹引注（如 （^{[1]】}、^{[2]}）折叠为〔n〕。"""
     return _ULQ_JUNK_BRACKET_RE.sub(r"〔\1〕", text)
+
+
+# LaTeX 圈码（2026-08-02）：部分视觉模型会把原文的 ① 等圈码识别成 LaTeX 形式
+# $\textcircled{1}$ / \textcircled{1} / $\textcircled{12}$。若先做括号归一，
+# {1} 的 { } 会被 _ULQ_JUNK_BRACKET_RE 折叠为 〔1〕，留下残缺的 $\textcircled〔1〕$。
+# 故须在括号归一之前把 \textcircled{n} 还原为 ①②…（1-20），超出范围回退 〔n〕，
+# 再交给 _normalize_brackets（此时无 { } 残留，不再误伤）。
+_TEXT_CIRCLED_RE = re.compile(
+    r"\$?\s*\\textcircled\s*\{\s*(\d{1,3})\s*\}\s*\$?"
+)
+
+# ① ① ~ ⑳ （U+2460 .. U+2473），索引 n-1
+_CIRCLED_MAP = [
+    "\u2460", "\u2461", "\u2462", "\u2463", "\u2464",
+    "\u2465", "\u2466", "\u2467", "\u2468", "\u2469",
+    "\u246a", "\u246b", "\u246c", "\u246d", "\u246e",
+    "\u246f", "\u2470", "\u2471", "\u2472", "\u2473",
+]
+
+
+def _circled_digit(n: int) -> str:
+    """把圈码编号还原为 ①…⑳；超出 20 回退 〔n〕。"""
+    if 1 <= n <= 20:
+        return _CIRCLED_MAP[n - 1]
+    return f"〔{n}〕"
+
+
+def _normalize_textcircled(text: str) -> str:
+    """把 LaTeX 形式的 \textcircled{n}（可带 $ 包裹）还原为 ① 等圈码。
+
+    仅处理 1-3 位数字（圈码常见范围），其他形状（如 \textcircled{abc}）原样保留。
+    """
+    if not text or "textcircled" not in text:
+        return text
+    return _TEXT_CIRCLED_RE.sub(
+        lambda m: _circled_digit(int(m.group(1))), text
+    )
 
 
 def _normalize_bracket_pairs(text: str) -> str:
@@ -6327,6 +6368,10 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 new_text = _strip_trailing_page_number(new_text)
                 # 2026-08-09：再将英文标点归一为中文标点，避免半角/全角差异被当成纠错项
                 new_text = _full_punct(new_text)
+                # 2026-08-02：先把模型输出的 LaTeX 圈码 \textcircled{n}（可带 $ 包裹）
+                # 还原为 ① 等，否则后续 {1} 的 { } 会被杂符括号清理误折叠为〔1〕，
+                # 留下残缺的 $\textcircled〔1〕$（用户报「① 变 $\textcircled〔1〕$」）。
+                new_text = _normalize_textcircled(new_text)
                 # 2026-08-30：对比前做杂符括号清理 + 括号对统一（〔x〕）——
                 # 部分大模型把原文 〔x〕 引注识别成 \\〔^{x〕}\\ 的杂符包裹格式
                 # （\\ ^ { } 等无效字符夹着括号），须先折叠为 〔x〕 再与原文比较，
@@ -6798,7 +6843,16 @@ def correct_pages(
     # 记录服务信息 sidecar，供 GUI 配置中心发现并恢复已存活的矫正界面
     _write_server_info(server.server_address[1])
     if open_browser:
-        webbrowser.open(url)
+        try:
+            from configmanage import get_config as _get_cfg_for_browser
+            _browser_path = (_get_cfg_for_browser(show_dialogs=False) or {}).get("browser", "")
+            if _browser_path:
+                import subprocess as _br_subprocess
+                _br_subprocess.Popen([_browser_path, url])
+            else:
+                webbrowser.open(url)
+        except Exception:
+            webbrowser.open(url)
     try:
         # 浏览器关闭监测：页面每 30s 发心跳；关闭标签页时发 pagehide 信标。
         # 信标确认关闭或心跳失联超过 idle_timeout 秒后，自动继续后续流程。

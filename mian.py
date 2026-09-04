@@ -1078,16 +1078,16 @@ def _menu_correct() -> None:
 
 
 def _menu_config() -> None:
-    """菜单项 3：查看/修改配置（engine / llama_server / models_dir / selected_model）。"""
+    """菜单项 3：查看/修改配置（engine / llama_server / models_dir / selected_model / browser）。"""
     from configmanage import get_config, update_config
 
     cfg = get_config()
-    for k in ("engine", "llama_server", "models_dir", "selected_model"):
+    for k in ("engine", "llama_server", "models_dir", "selected_model", "browser"):
         print(f"  {k}: {cfg.get(k, '')}")
     key = _ask(
-        "要修改的键（engine/llama_server/models_dir/selected_model，留空跳过）："
+        "要修改的键（engine/llama_server/models_dir/selected_model/browser，留空跳过）："
     )
-    if key not in ("engine", "llama_server", "models_dir", "selected_model"):
+    if key not in ("engine", "llama_server", "models_dir", "selected_model", "browser"):
         print("已跳过（键名无效或为空）。")
         return
     if key == "selected_model":
@@ -1510,7 +1510,7 @@ def main(argv: list[str] | None = None) -> int:
     config_set_p = config_sub.add_parser("set", help="修改配置项（key=value）")
     config_set_p.add_argument(
         "key",
-        help="配置键名（llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / llama_server_args.<参数> / vllm_server_args.<参数> / proofread.<param>）",
+        help="配置键名（llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / browser / llama_server_args.<参数> / vllm_server_args.<参数> / proofread.<param>）",
     )
     config_set_p.add_argument("value", help="配置值")
 
@@ -1672,6 +1672,7 @@ def main(argv: list[str] | None = None) -> int:
             for k in ("engine", "llama_server", "models_dir", "selected_model"):
                 print(f"  {k}: {cfg.get(k, '')}")
             print(f"  vllm_server: {cfg.get('vllm_server', '')}")
+            print(f"  browser: {cfg.get('browser', '')}")
             sel = cfg.get("selected_model")
             print("  model_choices:")
             for mk, mv in (cfg.get("model_choices", {}) or {}).items():
@@ -1721,9 +1722,10 @@ def main(argv: list[str] | None = None) -> int:
                 "ocr_prompt",
                 "engine",
                 "vllm_server",
+                "browser",
             ):
                 print(
-                    "Error: 可修改的键名仅限 llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / llama_server_args.<参数名> / vllm_server_args.<参数名> / proofread.<param>",
+                    "Error: 可修改的键名仅限 llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / browser / llama_server_args.<参数名> / vllm_server_args.<参数名> / proofread.<param>",
                     file=sys.stderr,
                 )
                 return 1

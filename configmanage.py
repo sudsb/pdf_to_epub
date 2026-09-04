@@ -234,6 +234,10 @@ DEFAULT_CONFIG = {
     # 从 config.json 读取时由 parse_exclude_spec 处理字符串/列表兼容；
     # CLI --exclude 优先于配置文件。
     "exclude_pages": [],
+    # 自定义浏览器可执行文件路径（空字符串=使用系统默认浏览器）。
+    # 如 "C:/Program Files/Google/Chrome/Application/chrome.exe"。
+    # 矫正界面和配置中心启动时使用此浏览器打开。
+    "browser": "",
     # 可拓展其余各manage/key conf
 }
 
