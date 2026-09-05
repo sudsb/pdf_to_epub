@@ -30,6 +30,14 @@ uv run --with pyinstaller pyinstaller --noconfirm --clean `
   --collect-all pymupdf `
   --collect-all cv2 `
   --collect-all zhconv `
+  --collect-all webview `
+  --collect-all pythonnet `
+  --hidden-import webview.platforms.edgechromium `
+  --hidden-import webview.platforms.winforms `
+  --hidden-import webview.platforms.wpf `
+  --hidden-import clr `
+  --hidden-import System `
+  --hidden-import System.Windows.Forms `
   mian.py
 
 if ($LASTEXITCODE -ne 0) {

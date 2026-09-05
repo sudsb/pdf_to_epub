@@ -1847,17 +1847,58 @@ _ULQ_JUNK_BRACKET_RE = re.compile(
     r"[\\^~`|·{}]+"
     r"[\[\]{}()（）【】［］〔〕〈〉《》「」『』\\^~`|·\s]{0,8}"
 )
+# 括号对归一仅处理「方/方头括号 + 数字引注」这类的 OCR 误识别形状（【x】/[x]/［x］
+# 及杂符包裹），统一为 〔x〕。**绝不能把全角圆括号（x）也归一为〔x〕** —— （x）是
+# 正常的正文标点（2026-09-02 用户报「原文（x）被改成〔x〕」），其可能是字母/文字/数字，
+# 必须原样保留。杂符包裹由 _ULQ_JUNK_BRACKET_RE 单独处理（要求数字两侧有 \ ^ { } 等
+# 真正垃圾字符才折叠），不靠这里的（...）模式。
 _BRACKET_PAIR_RES = (
     re.compile(r"【([^【】]*)】"),
     re.compile(r"\[([^\[\]\n]{1,32})\]"),
     re.compile(r"［([^［］]*)］"),
-    re.compile(r"（([^()]*?)）"),  # 补充全角圆括号（123）→ 〔123〕
 )
 
 
 def _clean_ulq_bracket_junk(text: str) -> str:
     """把 ULQ 输出的杂符包裹引注（如 （^{[1]】}、^{[2]}）折叠为〔n〕。"""
     return _ULQ_JUNK_BRACKET_RE.sub(r"〔\1〕", text)
+
+
+# LaTeX 圈码（2026-08-02）：部分视觉模型会把原文的 ① 等圈码识别成 LaTeX 形式
+# $\textcircled{1}$ / \textcircled{1} / $\textcircled{12}$。若先做括号归一，
+# {1} 的 { } 会被 _ULQ_JUNK_BRACKET_RE 折叠为 〔1〕，留下残缺的 $\textcircled〔1〕$。
+# 故须在括号归一之前把 \textcircled{n} 还原为 ①②…（1-20），超出范围回退 〔n〕，
+# 再交给 _normalize_brackets（此时无 { } 残留，不再误伤）。
+_TEXT_CIRCLED_RE = re.compile(
+    r"\$?\s*\\textcircled\s*\{\s*(\d{1,3})\s*\}\s*\$?"
+)
+
+# ① ① ~ ⑳ （U+2460 .. U+2473），索引 n-1
+_CIRCLED_MAP = [
+    "\u2460", "\u2461", "\u2462", "\u2463", "\u2464",
+    "\u2465", "\u2466", "\u2467", "\u2468", "\u2469",
+    "\u246a", "\u246b", "\u246c", "\u246d", "\u246e",
+    "\u246f", "\u2470", "\u2471", "\u2472", "\u2473",
+]
+
+
+def _circled_digit(n: int) -> str:
+    """把圈码编号还原为 ①…⑳；超出 20 回退 〔n〕。"""
+    if 1 <= n <= 20:
+        return _CIRCLED_MAP[n - 1]
+    return f"〔{n}〕"
+
+
+def _normalize_textcircled(text: str) -> str:
+    """把 LaTeX 形式的 \textcircled{n}（可带 $ 包裹）还原为 ① 等圈码。
+
+    仅处理 1-3 位数字（圈码常见范围），其他形状（如 \textcircled{abc}）原样保留。
+    """
+    if not text or "textcircled" not in text:
+        return text
+    return _TEXT_CIRCLED_RE.sub(
+        lambda m: _circled_digit(int(m.group(1))), text
+    )
 
 
 def _normalize_bracket_pairs(text: str) -> str:
@@ -4988,6 +5029,26 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
         if path == "/":
             self._send(200, _UI_HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
+        if path == "/tabhost":
+            # 标签页宿主页面：由 tabmanage 提供 HTML（含冻结 exe 兜底）
+            try:
+                import tabmanage  # noqa: PLC0415
+
+                html_bytes = tabmanage.tab_host_html()
+            except Exception:
+                html_bytes = b"<meta charset='utf-8'><body>\xe7\x95\x8c\xe9\x9d\xa2\xe5\x8a\xa0\xe8\xbd\xbd\xe5\xa4\xb1\xe8\xb4\xa5</body>"
+            self._send(200, html_bytes, "text/html; charset=utf-8")
+            return
+        if path == "/api/tabs":
+            # 标签栏数据：tabs 列表 + position
+            try:
+                import tabmanage  # noqa: PLC0415
+
+                payload = tabmanage.tabs_payload()
+            except Exception:
+                payload = {"ok": True, "tabs": [], "position": "top"}
+            self._send(200, self._json(payload), "application/json; charset=utf-8")
+            return
         if path == "/ui/app.js":
             # 矫正界面外部脚本（2026-08-23 从内联 <script> 抽出，便于 node --check）
             js_path = _ui_js_path()
@@ -5244,6 +5305,30 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
+        if path == "/api/tabs":
+            # 标签栏配置持久化：仅支持 position 字段
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b"{}"
+                body = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._send(400, self._json({"ok": False, "error": "无效的 JSON"}), "application/json; charset=utf-8")
+                return
+            if not isinstance(body, dict):
+                self._send(400, self._json({"ok": False, "error": "请求体必须为 JSON 对象"}), "application/json; charset=utf-8")
+                return
+            try:
+                import tabmanage  # noqa: PLC0415
+
+                ok, err = tabmanage.handle_tabs_post(body)
+            except Exception as e:
+                self._send(500, self._json({"ok": False, "error": str(e)}), "application/json; charset=utf-8")
+                return
+            if not ok:
+                self._send(400, self._json({"ok": False, "error": err}), "application/json; charset=utf-8")
+            else:
+                self._send(200, self._json({"ok": True}), "application/json; charset=utf-8")
+            return
         if path == "/api/heartbeat":
             self._touch_heartbeat()
             self._send(204, b"", "text/plain")
@@ -6327,6 +6412,10 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 new_text = _strip_trailing_page_number(new_text)
                 # 2026-08-09：再将英文标点归一为中文标点，避免半角/全角差异被当成纠错项
                 new_text = _full_punct(new_text)
+                # 2026-08-02：先把模型输出的 LaTeX 圈码 \textcircled{n}（可带 $ 包裹）
+                # 还原为 ① 等，否则后续 {1} 的 { } 会被杂符括号清理误折叠为〔1〕，
+                # 留下残缺的 $\textcircled〔1〕$（用户报「① 变 $\textcircled〔1〕$」）。
+                new_text = _normalize_textcircled(new_text)
                 # 2026-08-30：对比前做杂符括号清理 + 括号对统一（〔x〕）——
                 # 部分大模型把原文 〔x〕 引注识别成 \\〔^{x〕}\\ 的杂符包裹格式
                 # （\\ ^ { } 等无效字符夹着括号），须先折叠为 〔x〕 再与原文比较，
@@ -6657,6 +6746,133 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 
+_CORRECT_WINDOW_TITLE = "ptoe 文字矫正"
+
+
+def _open_display(url: str, title: str) -> tuple[str, object | None]:
+    """默认用 pywebview 内嵌窗口加载界面；config.json gui_display='browser' 时改用浏览器。
+
+    返回 (role, win) 元组：
+    - role: "browser" | "owner" | "guest"
+      * "browser": 浏览器模式或 pywebview 不可用，已回退 _open_browser，win 为 None
+      * "owner": 当前进程为标签页宿主（owner），win 为 pywebview Window 对象
+      * "guest": 当前进程作为 guest 加入已有合并窗口，不创建窗口，win 为 None
+    - win: pywebview Window 对象（仅 owner 时非 None），调用方需在 webview.start() 前注册
+      window.events.closed；browser/guest 模式为 None（调用方在主线程跑监视循环）。
+
+    pywebview 窗口默认最大化（config.json window_maximized=true，缺省）。
+    """
+    try:
+        from configmanage import get_config as _get_cfg
+
+        _mode = (_get_cfg(show_dialogs=False) or {}).get("gui_display", "pywebview")
+        _maximized = (_get_cfg(show_dialogs=False) or {}).get("window_maximized", True)
+        # 兼容字符串 "false"/"0"
+        if isinstance(_maximized, str):
+            _maximized = _maximized.lower() not in ("false", "0")
+        _maximized = bool(_maximized)
+    except Exception:  # noqa: BLE001
+        _mode = "pywebview"
+        _maximized = True
+    if _mode == "browser":
+        _open_browser(url)
+        return "browser", None
+    try:
+        import tabmanage  # noqa: PLC0415
+
+        _role = tabmanage.register_tab(title, url, base_url=url)
+    except Exception:  # noqa: BLE001  tabmanage 异常不阻塞，回退浏览器
+        _open_browser(url)
+        return "browser", None
+    if _role == "guest":
+        # guest 模式：不创建窗口，静默加入已有合并窗口
+        return "guest", None
+    try:
+        import webview as _webview  # noqa: PLC0415
+
+        _win = _webview.create_window(title, url + "/tabhost", maximized=_maximized)
+    except Exception:  # noqa: BLE001  pywebview 不可用/初始化失败 → 浏览器兜底
+        try:
+            import tabmanage as _tm  # noqa: PLC0415
+
+            _tm.reset_session()
+        except Exception:
+            pass
+        _open_browser(url)
+        return "browser", None
+    return "owner", _win
+
+
+def _open_browser(url: str) -> None:
+    """打开外部浏览器访问矫正界面。
+
+    优先使用 config.json 的 browser 键指定的浏览器路径，否则用系统默认浏览器。
+    browser 模式（gui_display='browser'）或 pywebview 不可用/启动失败时使用。
+    """
+    import subprocess  # noqa: PLC0415 — 仅在需要时导入
+
+    _br_path = ""
+    try:
+        from configmanage import get_config as _get_cfg
+
+        _br_path = (_get_cfg(show_dialogs=False) or {}).get("browser", "")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if _br_path:
+            subprocess.Popen([_br_path, url])
+        else:
+            webbrowser.open(url)
+    except Exception:  # noqa: BLE001  打不开浏览器不阻断服务
+        webbrowser.open(url)
+
+
+def _serve_loop(
+    state: dict[str, Any],
+    *,
+    watch_gone: bool,
+    tab_key: str | None = None,
+    tab_base: str | None = None,
+) -> None:
+    """correct_pages 的监视主循环：逐轮处理保存对话框并监测界面关闭。
+
+    watch_gone=False（pywebview 窗口模式）：窗口关闭由 window.events.closed
+    置 finished，不依赖心跳/信标判定。
+
+    tab_key/tab_base：guest 模式下传入（标签标题、可选的期望 owner 基址；
+    缺省 None 时以会话内 owner_base 为准），每 ~2s 探测一次
+    tabmanage.guest_session_ok()；若返回 False 则置 state["tab_lost"]=True 并 break，
+    由 correct_pages 外层负责接管重建窗口。
+    """
+    stale_since: float | None = None
+    _last_probe = 0.0
+    while not state["finished"].is_set():
+        if state["finished"].wait(0.5):
+            break
+        _drain_dialog_queue(state)
+        if watch_gone:
+            gone, stale_since = _browser_gone(state, stale_since=stale_since)
+            if gone:
+                state["auto_finished"] = True
+                state["finished"].set()
+                break
+        # guest 模式：定期探测会话是否仍有效（owner 存活且自身标签在列表中）
+        if tab_key is not None:
+            now = time.monotonic()
+            if now - _last_probe >= 2.0:
+                _last_probe = now
+                try:
+                    import tabmanage as _tm  # noqa: PLC0415
+
+                    if not _tm.guest_session_ok(tab_key, tab_base):
+                        state["tab_lost"] = True
+                        break
+                except Exception:
+                    # tabmanage 异常视为会话丢失，触发接管
+                    state["tab_lost"] = True
+                    break
+
+
 def correct_pages(
     pages: list[dict[str, Any]],
     *,
@@ -6797,23 +7013,53 @@ def correct_pages(
     print(f"      矫正界面已启动: {url}（对比原图与识别文字，完成后点「完成并转换」）")
     # 记录服务信息 sidecar，供 GUI 配置中心发现并恢复已存活的矫正界面
     _write_server_info(server.server_address[1])
+    _win = None
+    _role = None
     if open_browser:
-        webbrowser.open(url)
+        _role, _win = _open_display(url, _CORRECT_WINDOW_TITLE)
+        if _role in ("owner", "guest"):
+            pass  # 合并窗口角色已由 tabmanage 决定（owner 建窗 / guest 静默加入）
+        if _win is not None:
+            _win.events.closed += lambda: state["finished"].set()
+
+    def _start_tabbed_window() -> None:
+        # 供 owner 首次进入与 guest 接管后复用：主线程 webview.start
+        nonlocal _win, _role
+        _role, _win = _open_display(url, _CORRECT_WINDOW_TITLE)
+        if _win is not None:
+            _win.events.closed += lambda: state["finished"].set()
+            try:
+                import webview as _webview  # noqa: PLC0415
+                _webview.start(func=lambda: _serve_loop(state, watch_gone=False))
+            except Exception:  # noqa: BLE001
+                print("pywebview 启动失败，改用浏览器打开界面")
+                _open_browser(url)
+                _serve_loop(state, watch_gone=True)
+        else:
+            _serve_loop(state, watch_gone=True)
+
     try:
-        # 浏览器关闭监测：页面每 30s 发心跳；关闭标签页时发 pagehide 信标。
-        # 信标确认关闭或心跳失联超过 idle_timeout 秒后，自动继续后续流程。
-        stale_since: float | None = None
-        while not state["finished"].is_set():
-            if state["finished"].wait(0.5):
-                break  # 浏览器被判定关闭，自动继续（「完成并转换」不再关闭服务）
-            # 导出保存对话框只能在主线程弹出（tkinter 线程安全），
-            # 逐轮取走队列里的请求弹框，阻塞直到用户选择/取消
-            _drain_dialog_queue(state)
-            gone, stale_since = _browser_gone(state, stale_since=stale_since)
-            if gone:
-                state["auto_finished"] = True
-                state["finished"].set()
-                break
+        if _win is not None:
+            # pywebview 模式（owner）：GUI 事件循环阻塞主线程；监视/对话框循环在
+            # webview.start(func=...) 的独立线程运行。窗口关闭 → events.closed
+            # 置 finished → func 循环退出 → start() 返回。
+            try:
+                import webview as _webview  # noqa: PLC0415
+                _webview.start(func=lambda: _serve_loop(state, watch_gone=False))
+            except Exception:  # noqa: BLE001
+                print("pywebview 启动失败，改用浏览器打开界面")
+                _open_browser(url)
+                _serve_loop(state, watch_gone=True)
+        elif _role == "guest":
+            # 加入已有合并窗口：不建窗，监视会话；宿主关闭/本标签移除 → 接管
+            _serve_loop(state, watch_gone=False,
+                        tab_key=_CORRECT_WINDOW_TITLE, tab_base=None)
+            if state.get("tab_lost"):
+                import tabmanage as _tm  # noqa: PLC0415
+                _tm.reset_session()   # 清旧会话，重新注册即成为 owner
+                _start_tabbed_window()
+        else:
+            _serve_loop(state, watch_gone=True)
         if state.get("auto_finished"):
             idle = float(state.get("idle_timeout") or 600)
             secs = int(idle)
@@ -6824,6 +7070,13 @@ def correct_pages(
     except KeyboardInterrupt:
         print("\n      手动矫正被中断，放弃本次矫正结果，继续原流程")
     finally:
+        # 仅当我们是 owner 时才清会话；guest Ctrl+C 不应删除 owner 的会话
+        if _role == "owner":
+            try:
+                import tabmanage as _tm  # noqa: PLC0415
+                _tm.reset_session()
+            except Exception:
+                pass
         # 清除服务信息 sidecar（仅当前进程 pid 匹配时删除）
         _clear_server_info()
         server.shutdown()
@@ -7351,6 +7604,9 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <h4 style="margin:8px 0 4px;">提示延迟</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">鼠标悬停按钮超过设定时间（毫秒）才显示提示文字，提示中会附带对应快捷键；0 = 立即显示。</p>
       <label style="font-size:13px;">提示延迟（毫秒） <input type="number" id="tipDelayInput" min="0" max="5000" step="100" style="width:90px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
+      <h4 style="margin:16px 0 4px;">纠错悬浮窗</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">鼠标悬停校正文本超过设定时间（毫秒）自动弹出采纳/忽略菜单；0 = 悬停即弹出。</p>
+      <label style="font-size:13px;">悬停弹出延迟（毫秒） <input type="number" id="errHoverDelayInput" min="0" max="10000" step="100" style="width:90px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
       <h4 style="margin:16px 0 4px;">编辑器字号</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">调整编辑区显示字号（视图偏好，不写入保存内容）。</p>
       <label style="font-size:13px;">字号（px） <input type="number" id="editorFontSizeInput" min="10" max="28" step="1" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>

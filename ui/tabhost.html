@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>ptoe 标签页宿主</title>
+<style>
+/* ============ 基础重置 ============ */
+*, *::before, *::after { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; background: #fff; color: #1f2937; }
+
+/* ============ 布局容器 ============ */
+#host { display: flex; flex-direction: column; height: 100vh; width: 100vw; }
+#host[data-position="bottom"] { flex-direction: column-reverse; }
+
+/* ============ 标签栏 ============ */
+#tabBar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 32px;
+  padding: 4px 8px;
+  background: #f9fafb;
+  border-bottom: 1px solid #e5e7eb;
+  flex-shrink: 0;
+  user-select: none;
+}
+#host[data-position="bottom"] #tabBar { border-bottom: none; border-top: 1px solid #e5e7eb; }
+
+/* 标签项 */
+.tab {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  min-width: 48px;
+  max-width: 120px;
+  padding: 0 10px;
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1;
+  border-radius: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.tab:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+.tab[data-active="true"] { background: #2563eb; color: #fff; }
+.tab[data-active="false"] { background: #e5e7eb; color: #374151; }
+.tab[data-active="false"]:hover { background: #d1d5db; }
+
+/* 位置切换按钮 */
+#posToggle {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 8px;
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1;
+  color: #4b5563;
+  background: transparent;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+#posToggle:hover { background: #e5e7eb; color: #1f2937; border-color: #9ca3af; }
+#posToggle:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+
+/* ============ 内容区 ============ */
+#content {
+  position: relative;
+  flex: 1 1 auto;
+  width: 100%;
+  overflow: hidden;
+}
+.iframeWrap {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: none;
+}
+.iframeWrap[data-active="true"] { display: block; }
+.iframeWrap iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: #fff;
+}
+
+/* ============ 加载态（可选，极简） ============ */
+#loading {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  color: #6b7280;
+  background: #fff;
+  z-index: 100;
+  pointer-events: none;
+}
+#loading.hidden { display: none; }
+</style>
+</head>
+<body>
+<div id="host" data-position="top">
+  <div id="tabBar" role="tablist" aria-label="应用标签页">
+    <!-- tabs injected here -->
+    <button id="posToggle" type="button" title="切换标签栏位置（顶部/底部），自动保存">顶栏</button>
+  </div>
+  <div id="content" role="tabpanel">
+    <!-- iframes injected here -->
+  </div>
+</div>
+<div id="loading">界面加载中…</div>
+
+<script>
+(() => {
+  // ============ 状态 ============
+  const state = {
+    tabs: [],           // [{title, url, iframe, tabEl, wrapEl}]
+    activeIndex: 0,     // 当前激活标签索引
+    position: "top",    // "top" | "bottom"
+    polling: true,
+    pollTimer: null,
+    lastTabsSig: "",    // 用于去重判断
+  };
+
+  // ============ DOM 引用 ============
+  const host = document.getElementById("host");
+  const tabBar = document.getElementById("tabBar");
+  const content = document.getElementById("content");
+  const posToggle = document.getElementById("posToggle");
+  const loading = document.getElementById("loading");
+
+  // ============ 工具函数 ============
+  function sigOfTabs(tabs) {
+    return tabs.map(t => t.title + "|" + t.url).join(",");
+  }
+
+  function createIframe(url) {
+    const wrap = document.createElement("div");
+    wrap.className = "iframeWrap";
+    wrap.dataset.active = "false";
+    const iframe = document.createElement("iframe");
+    iframe.src = url;
+    iframe.setAttribute("title", "ptoe 子应用");
+    wrap.appendChild(iframe);
+    content.appendChild(wrap);
+    return { wrap, iframe };
+  }
+
+  function destroyIframe(wrap) {
+    if (wrap && wrap.parentNode) {
+      const iframe = wrap.querySelector("iframe");
+      if (iframe) {
+        iframe.src = "about:blank"; // 释放资源
+      }
+      wrap.remove();
+    }
+  }
+
+  function createTabEl(tabData, index) {
+    const el = document.createElement("button");
+    el.type = "button";
+    el.className = "tab";
+    el.role = "tab";
+    el.setAttribute("aria-selected", "false");
+    el.setAttribute("data-active", "false");
+    el.textContent = tabData.title;
+    el.dataset.index = index;
+    return el;
+  }
+
+  function updateTabEl(el, tabData, isActive) {
+    el.textContent = tabData.title;
+    el.dataset.active = isActive ? "true" : "false";
+    el.setAttribute("aria-selected", isActive ? "true" : "false");
+  }
+
+  function applyPosition(pos) {
+    state.position = pos;
+    host.dataset.position = pos;
+    posToggle.textContent = pos === "top" ? "顶栏" : "底栏";
+    posToggle.title = pos === "top"
+      ? "当前为顶栏，点击切换到底栏（自动保存）"
+      : "当前为底栏，点击切换到顶栏（自动保存）";
+  }
+
+  function setActive(index) {
+    if (index < 0 || index >= state.tabs.length) return;
+    state.tabs.forEach((t, i) => {
+      const active = i === index;
+      if (t.tabEl) updateTabEl(t.tabEl, { title: t.title }, active);
+      if (t.wrapEl) t.wrapEl.dataset.active = active ? "true" : "false";
+    });
+    state.activeIndex = index;
+  }
+
+  // ============ 标签栏同步（diff + 保留 iframe） ============
+  function syncTabs(serverTabs) {
+    const newSig = sigOfTabs(serverTabs);
+    if (newSig === state.lastTabsSig && state.tabs.length === serverTabs.length) {
+      // 仅标题可能变化，逐个更新 label
+      serverTabs.forEach((st, i) => {
+        if (state.tabs[i] && state.tabs[i].title !== st.title) {
+          state.tabs[i].title = st.title;
+          if (state.tabs[i].tabEl) updateTabEl(state.tabs[i].tabEl, st, i === state.activeIndex);
+        }
+      });
+      return;
+    }
+    state.lastTabsSig = newSig;
+
+    // 标记现有项是否在新列表中
+    const oldTabs = state.tabs;
+    const newTabs = [];
+    const usedOld = new Array(oldTabs.length).fill(false);
+
+    // 1) 尝试按 url+title 匹配复用
+    serverTabs.forEach((st, newIdx) => {
+      let matchIdx = -1;
+      for (let i = 0; i < oldTabs.length; i++) {
+        if (!usedOld[i] && oldTabs[i].url === st.url && oldTabs[i].title === st.title) {
+          matchIdx = i; break;
+        }
+      }
+      if (matchIdx >= 0) {
+        // 复用现有
+        usedOld[matchIdx] = true;
+        const ot = oldTabs[matchIdx];
+        ot.title = st.title; // 同步标题
+        newTabs.push(ot);
+      } else {
+        // 新建
+        const { wrap, iframe } = createIframe(st.url);
+        const tabEl = createTabEl(st, newIdx);
+        tabEl.addEventListener("click", () => setActive(newIdx));
+        tabBar.insertBefore(tabEl, posToggle);
+        newTabs.push({ title: st.title, url: st.url, iframe, wrapEl: wrap, tabEl });
+      }
+    });
+
+    // 2) 销毁未复用的旧项
+    oldTabs.forEach((ot, i) => {
+      if (!usedOld[i]) {
+        if (ot.tabEl) ot.tabEl.remove();
+        destroyIframe(ot.wrapEl);
+      }
+    });
+
+    // 3) 更新索引与激活态
+    state.tabs = newTabs;
+    newTabs.forEach((t, i) => {
+      if (t.tabEl) t.tabEl.dataset.index = i;
+    });
+
+    // 处理激活索引：如果当前激活项被移除，回退到第一个
+    if (state.activeIndex >= state.tabs.length) {
+      state.activeIndex = 0;
+    }
+    setActive(state.activeIndex);
+  }
+
+  // ============ 位置切换（乐观更新 + 失败回滚） ============
+  async function togglePosition() {
+    const newPos = state.position === "top" ? "bottom" : "top";
+    const prevPos = state.position;
+    applyPosition(newPos); // 乐观应用
+
+    try {
+      const res = await fetch("/api/tabs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ position: newPos }),
+      });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      if (!data.ok) throw new Error("server not ok");
+    } catch (e) {
+      // 静默回滚，下次轮询会再次尝试同步服务端持久化的 position
+      applyPosition(prevPos);
+      // 不 toast、不 alert，按需求静默
+    }
+  }
+  posToggle.addEventListener("click", togglePosition);
+
+  // ============ 轮询 /api/tabs ============
+  async function pollTabs() {
+    if (!state.polling) return;
+    try {
+      const res = await fetch("/api/tabs", { cache: "no-store" });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      if (!data.ok) throw new Error("server not ok");
+
+      const { tabs, position } = data;
+      if (!Array.isArray(tabs) || tabs.length === 0) {
+        // 无标签页：保持现状，仅首次加载时隐藏 loading
+        loading.classList.add("hidden");
+        return;
+      }
+
+      // 首次加载：应用 position（先于首次渲染）
+      if (state.tabs.length === 0 && typeof position === "string") {
+        applyPosition(position);
+      }
+
+      syncTabs(tabs);
+      loading.classList.add("hidden");
+    } catch (e) {
+      // 网络/服务端异常：保持现有 UI，不报错
+      loading.classList.add("hidden");
+    } finally {
+      if (state.polling) {
+        state.pollTimer = setTimeout(pollTabs, 1200);
+      }
+    }
+  }
+
+  // ============ 防止页面级滚动 ============
+  // iframe 内部自己处理滚动，宿主页只需 overflow:hidden（CSS 已设置）
+  // 额外阻止 wheel/touch 在 host 上冒泡导致整页抖动
+  ["wheel", "touchmove"].forEach(ev => {
+    window.addEventListener(ev, e => {
+      if (e.target === document.body || e.target === host || e.target === content) {
+        e.preventDefault();
+      }
+    }, { passive: false });
+  });
+
+  // ============ 启动 ============
+  pollTabs();
+})();
+</script>
+</body>
+</html>

@@ -39,7 +39,20 @@ def createdic(name: str, base_dir: Path | str | None = None) -> Path:
     If data/NAME exists, append an incremental suffix: NAME_1, NAME_2, ... and
     return the Path of the created directory.
     """
-    base = Path(base_dir) if base_dir is not None else app_base_dir()
+    if base_dir is not None:
+        base = Path(base_dir)
+    else:
+        # When frozen (PyInstaller), prefer the same path form as sys.executable
+        # (do not call .resolve()) so code/tests that compare against a
+        # tempfile-generated path (which may be returned in 8.3 short-name
+        # form on some Windows environments) observe the same string style.
+        # app_base_dir() continues to return the resolved script/exe parent
+        # for callers that expect a resolved path.
+        if getattr(sys, "frozen", False):
+            base = Path(sys.executable).parent
+        else:
+            base = app_base_dir()
+
     data_dir = base / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
 

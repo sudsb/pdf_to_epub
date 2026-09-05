@@ -60,13 +60,13 @@ Test-Path E:/model
 ```
 两者都要 `True`，且 `E:/model` 下有对应的 `.gguf` 模型文件和 `.mmproj` 多模态投影文件。
 
-`ocr_prompt`：OCR 提示词（与 `llamamanage.OCR_PROMPT` 同值，可用下面的 `config set ocr_prompt` 修改）；`llama_server_args`：llama-server 启动参数（host/port/temperature/repeat_penalty/parallel/cache_type_k/cache_type_v/log_verbosity 等，新增支持 `max_tokens`/`ngram_size`/`window_size` 用于输出上限与防重复策略；缺失键跳过、回退 llama-server 内置默认；可选 `n_gpu_layers` 键覆盖 GPU 自动检测；可选 `flash_attn` 键：`"0"`/`false` 禁用、缺省自动、`"1"`/`"on"` 强制开启 GPU 下的 Flash Attention）。**这两个键缺省时程序会在首次运行 `get_config()` 时自动补全并写入默认值**，无需手动添加.
+`ocr_prompt`：OCR 提示词（与 `llamamanage.OCR_PROMPT` 同值，可用下面的 `config set ocr_prompt` 修改）；`llama_server_args`：llama-server 启动参数（host/port/temperature/repeat_penalty/parallel/cache_type_k/cache_type_v/log_verbosity 等，新增支持 `max_tokens`/`ngram_size`/`window_size` 用于输出上限与防重复策略；缺失键跳过、回退 llama-server 内置默认；可选 `n_gpu_layers` 键覆盖 GPU 自动检测；可选 `flash_attn` 键：`"0"`/`false` 禁用、缺省自动、`"1"`/`"on"` 强制开启 GPU 下的 Flash Attention）。**这两个键缺省时程序会在首次运行 `get_config()` 时自动补全并写入默认值**，无需手动添加. `gui_display`：界面加载方式，`pywebview`（默认，内置窗口）或 `browser`（系统浏览器，可用 `browser` 键指定具体浏览器路径）。窗口相关键：`window_maximized`（默认 `true`，pywebview 窗口启动即最大化）与 `tabs_position`（`top`/`bottom`，默认 `top`，多页标签栏的位置；在标签页上切换位置会立即生效并自动保存回配置）。**pywebview 模式下，若「配置中心」与「文字矫正」同时运行，二者会合并为同一个多标签窗口**：先启动者为**主窗口（owner）**，后启动者作为标签页并入；主窗口被关闭/退出后，剩余的应用会自动接管并重建窗口。`browser` 模式不合并，各应用各自在浏览器中打开。
 
 **各模型可配置推荐 OCR 并发**（`model_choices.<key>.workers`，可选）：未显式指定 `--workers` 时按此值运行，缺省 3。依据模型大小/量化选值——大模型（如 HY BF16）显存压力大，并发过高会让多槽位 KV 缓存溢出到 CPU、单张耗时反而大涨，建议 2-3；小模型（如 QWEN.8 0.8B）可 6+。GUI 设置页「模型管理」表格可直接调整（含「并发」列）。
 
 **用命令行查看/修改配置（不用手改 JSON）：**
 ```powershell
-uv run python mian.py config show                      # 查看当前配置（全部键：路径/模型/提示词/启动参数）
+uv run python mian.py config set gui_display browser   # 界面加载方式：pywebview（默认，内置窗口）｜ browser（系统浏览器）
 uv run python mian.py config set llama_server <path>   # 修改 llama-server.exe 路径
 uv run python mian.py config set models_dir <path>     # 修改模型目录
 uv run python mian.py config set selected_model <key>  # 切换默认模型（键必须是 model_choices 里已有的）
@@ -74,9 +74,11 @@ uv run python mian.py config set ocr_prompt <text>     # 修改 OCR 提示词
 uv run python mian.py config set engine vllm           # 切换推理引擎（llama | vllm）
 uv run python mian.py config set vllm_server <path>    # 设置 vLLM-Omni 可执行文件路径
 uv run python mian.py config set vllm_server_args.port 8000  # 修改 vLLM-Omni 端口（嵌套参数）
+uv run python mian.py config set tabs_position bottom      # 标签栏位置：top（顶栏，默认）｜ bottom（底栏）
+uv run python mian.py config set window_maximized true     # pywebview 窗口默认最大化：true（默认）｜ false
 ```
 注：若需临时使用 PaddleOCR，可在命令行加 `--engine paddle`（仅影响 OCR 阶段；config set engine 仍只接受 `llama|vllm`）。
-`config set` 接受 `llama_server` / `models_dir` / `selected_model` / `ocr_prompt` / `engine` / `vllm_server` 顶层键，以及点分路径 `llama_server_args.<参数>`（如 `config set llama_server_args.parallel 11`，同样可设置 `max_tokens`/`ngram_size`/`window_size` 等）与 `vllm_server_args.<参数>`（如 `config set vllm_server_args.port 8000`）；`selected_model` 会校验必须存在于 `model_choices`，`engine` 仅接受 `llama` / `vllm`。嵌套参数也可用 Python API 修改：
+`config set` 接受 `llama_server` / `models_dir` / `selected_model` / `ocr_prompt` / `engine` / `vllm_server` / `gui_display` / `tabs_position` / `window_maximized` 顶层键（`gui_display` 仅接受 `pywebview` / `browser`，控制 gui 与矫正界面的加载方式；`tabs_position` 仅接受 `top` / `bottom`，`window_maximized` 仅接受 `true` / `false`，后两者仅控制 pywebview 窗口行为），以及点分路径 `llama_server_args.<参数>`（如 `config set llama_server_args.parallel 11`，同样可设置 `max_tokens`/`ngram_size`/`window_size` 等）与 `vllm_server_args.<参数>`（如 `config set vllm_server_args.port 8000`）；`selected_model` 会校验必须存在于 `model_choices`，`engine` 仅接受 `llama` / `vllm`。嵌套参数也可用 Python API 修改：
 ```python
 from configmanage import set_llama_server_arg, set_ocr_prompt
 set_llama_server_arg("parallel", "11")   # 修改嵌套键并原子写盘
@@ -115,8 +117,8 @@ Done: D:\code-project\python\PToEA\data\主席与毛远新同志谈话纪要\主
 | `--engine` | config.json 的 `engine`（默认 llama） | 推理引擎：`llama`（llama.cpp）或 `vllm`（vLLM-Omni）。仅本次运行生效，不写入 config.json |
 | `--workers` | 模型推荐（`model_choices.<key>.workers`，未配置时 3） | OCR 并发线程数。运行时服务端 `--parallel` 自动取 min(配置, 并发)——槽位不多于实际并发，避免 KV cache 按槽位预分配浪费显存（溢出到 CPU 反而变慢）。显存充足可显式调大（如 6） |
 | `--timeout` | 600 | 单次识别请求读超时（秒）。300dpi 下 4 并发总耗时可能超 1 分钟，别改小 || `--thinking` | 关 | 开启思维链模式（此时不附加"按原文原格式输出"指令） |
-| `--correct` | 关 | 开启手动矫正：在浏览器中逐页对照原图与识别文字，可标记粗体/斜体/标题（详见第六节）。默认关闭，不改变既有流程 |
-| `--correct-timeout` | 600 | （仅 `--correct` 生效）浏览器被关闭后自动继续后续流程的等待秒数，默认 600=10 分钟 |
+| `--correct` | 关 | 开启手动矫正：在矫正界面中逐页对照原图与识别文字（默认 pywebview 内置窗口，gui_display=browser 时用浏览器），可标记粗体/斜体/标题（详见第六节）。默认关闭，不改变既有流程 |
+| `--correct-timeout` | 600 | （仅 `--correct` 生效）界面（窗口/浏览器标签页）关闭后自动继续后续流程的等待秒数，默认 600=10 分钟 |
 | `--title` / `--author` | PDF 文件名 / 空 | EPUB 元数据 |
 | `--lang` | zh-CN | EPUB 语言 |
 | `--out-dir` | `data/<pdf名>/` | XHTML/OEBPS 输出目录 |
@@ -144,13 +146,13 @@ Get-ChildItem "data/主席与毛远新同志谈话纪要"   # 含 1.png...12.png
 
 ## 六、手动矫正（可选，默认关闭）
 
-OCR 完成后、生成 EPUB 前，可以在浏览器中逐页对照**原图**与**识别文字**，人工修正识别误差，并选中文字标记格式（粗体、斜体、一级/二级/三级标题等）。默认流程**不开启**；只有加 `--correct` 才进入矫正：
+OCR 完成后、生成 EPUB 前，可以在矫正界面中逐页对照**原图**与**识别文字**（默认 pywebview 内置窗口，可在配置中改为浏览器），人工修正识别误差，并选中文字标记格式（粗体、斜体、一级/二级/三级标题等）。默认流程**不开启**；只有加 `--correct` 才进入矫正：
 
 ```powershell
 uv run python mian.py epub "E:\MYBooks\books\毛泽东\主席与毛远新同志谈话纪要.pdf" --correct
 ```
 
-1. 程序自动启动本地服务（127.0.0.1 随机端口）并在默认浏览器打开界面；
+1. 程序自动启动本地服务（127.0.0.1 随机端口）并打开矫正界面（默认 pywebview 内置窗口「ptoe 文字矫正」；config.json 的 `gui_display=browser` 时改用浏览器打开）；**若「配置中心」也已启动**，两者会合并为同一个多标签窗口（顶/底标签栏切换，见上文配置说明）；
 2. 界面**左侧为原图**（低分辨率预览，**点击图片**可切换为原图；没有分割图片时自动用 PDF 高分辨率渲染，保证原图始终可看），**右侧为可编辑的识别文字**，一页一图一文；文字按行显示，保留原始段落结构（不会挤成一整段）。1000+ 页的大书采用虚拟列表，只渲染屏幕附近的行，滚动流畅不卡顿（编辑后页面也不会跳动）；
 3. 直接修改错字；**选中文字会自动弹出快捷菜单**，可设粗体/斜体/一级~六级标题；也可点「**快捷键**」把每个操作绑定到自己顺手的组合键（一个快捷键绑定一个操作，保存在浏览器里）；
 4. **全文标记**（插入到光标处）：当前文章到此结束，之后的内容属于**新的一篇文章**，生成 EPUB 时自动**开新的一页**；
@@ -161,7 +163,7 @@ uv run python mian.py epub "E:\MYBooks\books\毛泽东\主席与毛远新同志�
    - **因分页被折断的注释**：注释的后半段（通常在下一页开头）**放一个段落标记**即可与前半段**合并成一条**，再整体插入正文；
    - 插入正文的注释自动用**中文括号（ ）**包裹并使用**注释小字**（注释内部括号统一为中文括号；注释本身已带括号、视为已在正文中时只改字号不再加括号）；
 7. 点「**暂存**」把当前修改**暂时保存到本地历史缓存**（`data/correction_history/`，按 PDF 哈希，**每次生成一个新版本**）；「**保存**」**不新建版本**，直接**覆盖当前缓存**（同一份内容反复保存只更新同一个文件，历史列表不会被保存刷屏）；
-8. 点「**完成并转换**」**不会关闭界面**：每次点击都重新转换（弹窗提示**转换完成/未完成**并询问是否关闭当前页面，浏览器禁止脚本自动关闭时请手动关闭标签页），可留在页面继续修改后**再次点击**。
+8. 点「**完成并转换**」**不会关闭界面**：每次点击都重新转换（弹窗提示**转换完成/未完成**并询问是否关闭当前页面，浏览器禁止脚本自动关闭时请手动关闭标签页（pywebview 窗口模式直接关闭窗口即可）），可留在页面继续修改后**再次点击**。
 
 **更多工具（2026-08）：**
 - **文本清理**（工具栏「清理」）：一键合并 OCR 拆散的小段落（**已设标题或带格式/标记/图片的段落不参与合并**；以句号、感叹号、问号或闭合括号/书名号 `（）】」』》〉` 结尾的完整段落也不合并）、清除段首 `#`/`*` 及残留的 `**` 加粗符号、归一化中英文标点（汉字旁的半角标点转全角，字母/数字间的全角标点转半角）、移除残留的 HTML 标签；
@@ -306,7 +308,7 @@ set_format_rules(rules)
 - **撤回/前进**：工具栏「操作」组 ↶/↷ 按钮，或快捷键 **Ctrl+Z 撤回**、**Ctrl+Y / Ctrl+Shift+Z 前进**，可对最近 **10 次**以内的操作连续撤回和前进（连续打字合并为一步，格式/标记/对齐/搜索替换/智能清理/繁简转换/插入图片各算一步）；撤回后可再前进，产生新操作后前进记录清空。
 - **导出 TXT/DOCX**：工具栏「**导出**」按钮弹出窗口选择格式（导出为 DOCX / 导出为 TXT），随后由**系统保存对话框**选择存放位置和文件名（对话框置顶显示，不会被浏览器窗口遮挡）；导出内容包含当前全部页面（**含尚未保存的修改**）；TXT 为带 BOM 的 UTF-8（Windows 记事本可直接打开），DOCX 中标题（1-6 级）为加粗加大并带大纲级别，正文中的换行保留。
 
-**关闭浏览器也能继续**：界面会每 30 秒向本地服务发一次心跳，关闭标签页/浏览器时发关闭信标；程序检测到浏览器已关闭超过 `--correct-timeout` 秒（默认 10 分钟）后，会自动继续后续流程（保留最后一次保存/暂存/完成的内容）。电脑休眠/恢复不会误判。
+**关闭界面也能继续**：pywebview 窗口模式下关闭窗口即视为结束；浏览器模式下界面每 30 秒向本地服务发一次心跳，关闭标签页/浏览器时发关闭信标。程序检测到界面已关闭超过 `--correct-timeout` 秒（默认 10 分钟）后，会自动继续后续流程（保留最后一次保存/暂存/完成的内容）。电脑休眠/恢复不会误判。
 
 中途 Ctrl+C 可放弃矫正、按原识别结果继续。矫正提交的内容只放行白名单标签（段落/标题/粗体/斜体/注释），script、style、属性等一律被清洗。
 
@@ -420,6 +422,6 @@ powershell -ExecutionPolicy Bypass -File .\pack.ps1
   0) 退出
   ```
   退出时停在「按回车键继续…」，控制台窗口不会一闪而过。
-- **命令行用法与原 CLI 一致**：`ptoe.exe epub <pdf> [--dpi 0] [--model <key>] ...`、`ptoe.exe correct [<pdf>]`、`ptoe.exe config show`、`ptoe.exe stop [--engine llama|vllm]` 等；无参数但 stdin 非交互（管道）时仍打印 `nothing to do`。
+- **命令行用法与原 CLI 一致**：`ptoe.exe epub <pdf> [--dpi 0] [--model <key>] ...`、`ptoe.exe correct [<pdf>]`、`ptoe.exe config set engine llama`、`ptoe.exe stop [--engine llama|vllm]` 等；无参数但 stdin 非交互（管道）时仍打印 `nothing to do`。
 - **首次运行**：保证 exe 所在目录（双击时 CWD 即 exe 目录）有 `config.json`，且 `llama_server` / `models_dir` 指向有效路径（见第二节）。
 - 依赖说明：脚本用 `uv run --with pyinstaller`，首次构建自动拉取 pyinstaller，**不写入** `pyproject.toml` / `uv.lock`。

@@ -39,8 +39,7 @@ Dependencies: `pymupdf`, `requests`, `zhconv` only.
 The program auto-creates/repairs `config.json` on first run, but **if `llama_server` or `models_dir` point to non-existent paths, a tkinter file dialog will block startup**. Configure first:
 
 ```powershell
-# Check current config
-uv run python mian.py config show
+# View config: open config.json directly, or run `gui` (the `config` command only has `set`)
 
 # Set llama-server path
 uv run python mian.py config set llama_server "E:/xox/Tools/llama-c/llama-server.exe"
@@ -60,6 +59,9 @@ Or edit `config.json` directly. Key structure:
 ```jsonc
 {
   "engine": "llama",
+  "gui_display": "pywebview",
+  "tabs_position": "top",
+  "window_maximized": true,
   "llama_server": "E:/xox/Tools/llama-c/llama-server.exe",
   "models_dir": "E:/model",
   "model_choices": {
@@ -119,7 +121,7 @@ positional arguments:
     stop           停止推理服务（llama-server / vLLM-Omni）
     model          Model registry commands (list/show/set/add/remove)
     config         查看或修改配置（llama_server / models_dir / selected_model 等）
-    gui            启动 HTML 配置操作界面（浏览器）
+    gui            启动 HTML 配置操作界面（默认 pywebview 内置窗口，可切换浏览器）
 
 options:
   -h, --help       show this help message and exit
@@ -288,16 +290,16 @@ options:
 usage: ptoe gui [-h] [--host HOST] [--port PORT] [--no-browser]
                 [--idle-timeout IDLE_TIMEOUT]
 
-启动本地 HTTP 服务并在浏览器中打开配置操作界面：查看/修改配置、启动/停止推理服务、选择文件路径等。浏览器关闭超过 idle-timeout
-秒后自动退出。
+启动本地 HTTP 服务并在 pywebview 内置窗口中打开配置操作界面（config.json 的 gui_display=browser 时改用浏览器打开）：查看/修改配置、启动/停止推理服务、选择文件路径等。界面关闭超过 idle-timeout
+秒后自动退出；pywebview 窗口直接关闭即退出。pywebview 不可用时自动回退浏览器。pywebview 窗口默认**最大化**（config `window_maximized=false` 可关闭）；若「文字矫正」界面（`correct`/`epub --correct`）也已启动，两者合并为**同一个多标签窗口**（顶/底紧凑标签栏，`config set tabs_position bottom` 切换并自动保存；先启动者为主窗口，主窗口关闭后其余应用自动接管重建窗口）。
 
 options:
   -h, --help            show this help message and exit
   --host HOST           监听地址（默认 127.0.0.1）
   --port PORT           监听端口（默认 0=自动分配）
-  --no-browser          不自动打开浏览器
+  --no-browser          不自动打开界面（窗口/浏览器均不打开）
   --idle-timeout IDLE_TIMEOUT
-                        浏览器关闭后自动退出的等待秒数（默认 120）
+                        界面关闭后自动退出的等待秒数（默认 120）
 ```
 
 ### stop
@@ -330,7 +332,7 @@ Higher DPI = more accurate but slower. Level 0 is recommended for most cases.
 
 ## Manual Correction (`--correct`)
 
-When enabled, a local HTTP server starts and opens a browser UI:
+When enabled, a local HTTP server starts and opens the correction UI (a pywebview window by default; `gui_display=browser` uses the system browser):
 
 - **Left**: Page image preview (click to toggle full-res)
 - **Right**: Editable OCR text (one `<div>` per line)
@@ -338,7 +340,7 @@ When enabled, a local HTTP server starts and opens a browser UI:
 - **Virtual List**: Handles 1000+ pages smoothly
 - **Undo/Redo**: Ctrl+Z / Ctrl+Y (10 steps)
 - **History**: Versioned cache at `data/correction_history/` (20 versions per PDF)
-- **Auto-continue**: Closing browser tab continues pipeline after `--correct-timeout` (default 600s)
+- **Auto-continue**: Closing the window/tab continues the pipeline after `--correct-timeout` (default 600s)
 
 ### Direct Correction (No OCR)
 
@@ -376,7 +378,7 @@ uv run python mian.py model remove OLD              # Remove model
 uv run python mian.py gui [--host 127.0.0.1] [--port 0] [--no-browser] [--idle-timeout 120]
 ```
 
-Browser-based interface for:
+pywebview-window interface by default (config `gui_display=browser` switches to the system browser) for:
 - View/edit config & launch parameters
 - Start/stop inference server
 - Launch conversion with progress monitoring

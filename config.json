@@ -75,7 +75,7 @@
     "auto_fix_score": 0.85,
     "enable_llm": true,
     "enable_legacy_rules": false,
-    "llm_model": "glm16",
+    "llm_model": "HY",
     "llm_timeout": 3
   },
   "engine": "llama",
@@ -276,5 +276,9 @@
     "workers": 8
   },
   "citationItalicEnabled": true,
-  "exclude_pages": []
+  "exclude_pages": [],
+  "browser": "D:/min/min.exe",
+  "gui_display": "pywebview",
+  "tabs_position": "bottom",
+  "window_maximized": true
 }
