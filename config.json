@@ -277,5 +277,8 @@
   },
   "citationItalicEnabled": true,
   "exclude_pages": [],
-  "browser": "D:/min/min.exe"
+  "browser": "D:/min/min.exe",
+  "gui_display": "pywebview",
+  "tabs_position": "bottom",
+  "window_maximized": true
 }

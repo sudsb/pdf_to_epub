@@ -10,10 +10,14 @@ Covers:
 
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import configmanage
+import correctmanage
 import htmlmanage
 import mian
 import pdfmanage
@@ -1311,6 +1315,93 @@ class TestBrowserGoneMonitor(unittest.TestCase):
             server.shutdown()
             server.server_close()
             shutil.rmtree(hist_dir, ignore_errors=True)
+
+
+class TestOpenDisplay(unittest.TestCase):
+    """_open_display 助手函数测试（monkeypatch configmanage.get_config + webview/webbrowser）。"""
+
+    def setUp(self):
+        self._orig_get_config = configmanage.get_config
+        self._orig_modules = dict(sys.modules)
+
+    def tearDown(self):
+        configmanage.get_config = self._orig_get_config
+        sys.modules.clear()
+        sys.modules.update(self._orig_modules)
+
+    def test_open_display_browser_mode(self):
+        """gui_display='browser' → 调用 _open_browser，返回 ("browser", None)。"""
+        calls = []
+
+        def fake_get_config(show_dialogs=True):
+            return {"gui_display": "browser", "browser": ""}
+
+        configmanage.get_config = fake_get_config
+        correctmanage._open_browser = lambda url: calls.append(url)
+
+        role, win = correctmanage._open_display("http://test/", "Test Title")
+        self.assertEqual(role, "browser")
+        self.assertIsNone(win)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0], "http://test/")
+
+    def test_open_display_pywebview_success(self):
+        """gui_display='pywebview' + webview 可用 → 返回 ("owner", window)，不调用 _open_browser。"""
+        calls = []
+        sentinel = object()
+
+        def fake_get_config(show_dialogs=True):
+            return {"gui_display": "pywebview", "browser": "", "window_maximized": True}
+
+        fake_webview = mock.MagicMock()
+        fake_webview.create_window.return_value = sentinel
+        sys.modules["webview"] = fake_webview
+
+        configmanage.get_config = fake_get_config
+        correctmanage._open_browser = lambda url: calls.append(url)
+
+        role, win = correctmanage._open_display("http://test", "Test Title")
+        self.assertEqual(role, "owner")
+        self.assertIs(win, sentinel)
+        fake_webview.create_window.assert_called_once_with("Test Title", "http://test/tabhost", maximized=True)
+        self.assertEqual(len(calls), 0)
+
+    def test_open_display_pywebview_create_raises(self):
+        """webview.create_window 抛异常 → 回退 _open_browser，返回 ("browser", None)。"""
+        calls = []
+
+        def fake_get_config(show_dialogs=True):
+            return {"gui_display": "pywebview", "browser": "", "window_maximized": True}
+
+        fake_webview = mock.MagicMock()
+        fake_webview.create_window.side_effect = RuntimeError("init failed")
+        sys.modules["webview"] = fake_webview
+
+        configmanage.get_config = fake_get_config
+        correctmanage._open_browser = lambda url: calls.append(url)
+
+        role, win = correctmanage._open_display("http://test/", "Test Title")
+        self.assertEqual(role, "browser")
+        self.assertIsNone(win)
+        self.assertEqual(len(calls), 1)
+
+    def test_open_display_pywebview_import_fails(self):
+        """import webview 失败 → 回退 _open_browser，返回 ("browser", None)。"""
+        calls = []
+
+        def fake_get_config(show_dialogs=True):
+            return {"gui_display": "pywebview", "browser": "", "window_maximized": True}
+
+        # 设置 webview 模块为 None 导致 ImportError
+        sys.modules["webview"] = None
+
+        configmanage.get_config = fake_get_config
+        correctmanage._open_browser = lambda url: calls.append(url)
+
+        role, win = correctmanage._open_display("http://test/", "Test Title")
+        self.assertEqual(role, "browser")
+        self.assertIsNone(win)
+        self.assertEqual(len(calls), 1)
 
 
 class TestConvertTextHtml(unittest.TestCase):

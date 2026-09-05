@@ -238,6 +238,12 @@ DEFAULT_CONFIG = {
     # 如 "C:/Program Files/Google/Chrome/Application/chrome.exe"。
     # 矫正界面和配置中心启动时使用此浏览器打开。
     "browser": "",
+    # 界面加载方式：pywebview=内置窗口（默认），browser=系统/自定义浏览器。
+    "gui_display": "pywebview",
+    # 标签栏位置：top=顶部（默认），bottom=底部。合并窗口模式下生效。
+    "tabs_position": "top",
+    # pywebview 窗口默认最大化：true=启动时最大化（默认），false=不最大化。
+    "window_maximized": True,
     # 可拓展其余各manage/key conf
 }
 

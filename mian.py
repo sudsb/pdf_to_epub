@@ -1078,16 +1078,16 @@ def _menu_correct() -> None:
 
 
 def _menu_config() -> None:
-    """菜单项 3：查看/修改配置（engine / llama_server / models_dir / selected_model / browser）。"""
+    """菜单项 3：查看/修改配置（engine / llama_server / models_dir / selected_model / browser / gui_display / window_maximized / tabs_position）。"""
     from configmanage import get_config, update_config
 
     cfg = get_config()
-    for k in ("engine", "llama_server", "models_dir", "selected_model", "browser"):
+    for k in ("engine", "llama_server", "models_dir", "selected_model", "browser", "gui_display", "window_maximized", "tabs_position"):
         print(f"  {k}: {cfg.get(k, '')}")
     key = _ask(
-        "要修改的键（engine/llama_server/models_dir/selected_model/browser，留空跳过）："
+        "要修改的键（engine/llama_server/models_dir/selected_model/browser/gui_display/window_maximized/tabs_position，留空跳过）："
     )
-    if key not in ("engine", "llama_server", "models_dir", "selected_model", "browser"):
+    if key not in ("engine", "llama_server", "models_dir", "selected_model", "browser", "gui_display", "window_maximized", "tabs_position"):
         print("已跳过（键名无效或为空）。")
         return
     if key == "selected_model":
@@ -1096,6 +1096,12 @@ def _menu_config() -> None:
         )
     elif key == "engine":
         value = _ask(f"{key} 的新值（llama / vllm）：")
+    elif key == "gui_display":
+        value = _ask(f"{key} 的新值（pywebview / browser）：")
+    elif key == "tabs_position":
+        value = _ask(f"{key} 的新值（top / bottom）：")
+    elif key == "window_maximized":
+        value = _ask(f"{key} 的新值（true / false）：")
     else:
         value = _ask(f"{key} 的新值：")
     if not value:
@@ -1109,6 +1115,18 @@ def _menu_config() -> None:
     if key == "engine" and value not in ("llama", "vllm"):
         print("错误：engine 仅支持 llama / vllm")
         return
+    if key == "gui_display" and value not in ("pywebview", "browser"):
+        print("错误：gui_display 仅支持 pywebview / browser")
+        return
+    if key == "tabs_position" and value not in ("top", "bottom"):
+        print("错误：tabs_position 仅支持 top / bottom")
+        return
+    if key == "window_maximized":
+        v = value.strip().lower()
+        if v not in ("true", "false", "1", "0"):
+            print("错误：window_maximized 仅支持 true / false")
+            return
+        value = "true" if v in ("true", "1") else "false"
     update_config(key, value)
     print(f"{key} = {value}")
     _pause()
@@ -1510,21 +1528,22 @@ def main(argv: list[str] | None = None) -> int:
     config_set_p = config_sub.add_parser("set", help="修改配置项（key=value）")
     config_set_p.add_argument(
         "key",
-        help="配置键名（llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / browser / llama_server_args.<参数> / vllm_server_args.<参数> / proofread.<param>）",
+        help="配置键名（llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / browser / gui_display / window_maximized / tabs_position / llama_server_args.<参数> / vllm_server_args.<参数> / proofread.<param>）",
     )
     config_set_p.add_argument("value", help="配置值")
 
     gui_p = sub.add_parser(
         "gui",
         help="启动 HTML 配置操作界面（浏览器）",
-        description="启动本地 HTTP 服务并在浏览器中打开配置操作界面：查看/修改配置、"
-        "启动/停止推理服务、选择文件路径等。浏览器关闭超过 idle-timeout 秒后自动退出。",
+        description="启动本地 HTTP 服务并打开浏览器（config.json browser 键指定浏览器，"
+        "未配置用系统默认浏览器）查看/修改配置、启动/停止推理服务、选择文件路径等。"
+        "窗口关闭超过 idle-timeout 秒后自动退出。",
     )
     gui_p.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
     gui_p.add_argument(
         "--port", type=int, default=0, help="监听端口（默认 0=自动分配）"
     )
-    gui_p.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    gui_p.add_argument("--no-browser", action="store_true", help="不自动打开窗口（pywebview 或浏览器）")
     gui_p.add_argument(
         "--idle-timeout",
         type=int,
@@ -1723,9 +1742,12 @@ def main(argv: list[str] | None = None) -> int:
                 "engine",
                 "vllm_server",
                 "browser",
+                "gui_display",
+                "window_maximized",
+                "tabs_position",
             ):
                 print(
-                    "Error: 可修改的键名仅限 llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / browser / llama_server_args.<参数名> / vllm_server_args.<参数名> / proofread.<param>",
+                    "Error: 可修改的键名仅限 llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / browser / gui_display / window_maximized / tabs_position / llama_server_args.<参数名> / vllm_server_args.<参数名> / proofread.<param>",
                     file=sys.stderr,
                 )
                 return 1
@@ -1738,6 +1760,20 @@ def main(argv: list[str] | None = None) -> int:
             if key == "engine" and value not in ("llama", "vllm"):
                 print("Error: engine 仅支持 llama / vllm", file=sys.stderr)
                 return 1
+            if key == "gui_display" and value not in ("pywebview", "browser"):
+                print("Error: gui_display 仅支持 pywebview / browser", file=sys.stderr)
+                return 1
+            if key == "tabs_position" and value not in ("top", "bottom"):
+                print("Error: tabs_position 仅支持 top / bottom", file=sys.stderr)
+                return 1
+            if key == "window_maximized":
+                # 接受 true/false/True/False/1/0 字符串与布尔值，统一存为小写字符串
+                v = str(value).strip().lower()
+                if v not in ("true", "false", "1", "0"):
+                    print("Error: window_maximized 仅支持 true / false", file=sys.stderr)
+                    return 1
+                # 归一化存储为 "true"/"false" 字符串（与其他 bool-ish 键风格一致）
+                value = "true" if v in ("true", "1") else "false"
             update_config(key, value)
             print(f"{key} = {value}")
             return 0

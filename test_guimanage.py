@@ -429,6 +429,461 @@ class TestBrowserGoneGuard(GuiServerTestBase):
         self.assertIsNone(stale)
 
 
+class TestOpenDisplay(unittest.TestCase):
+    """_open_display 助手函数测试（monkeypatch configmanage.get_config + webview/webbrowser）。"""
+
+    def setUp(self):
+        self._orig_get_config = configmanage.get_config
+        self._orig_modules = dict(sys.modules)
+
+    def tearDown(self):
+        configmanage.get_config = self._orig_get_config
+        sys.modules.clear()
+        sys.modules.update(self._orig_modules)
+
+    def test_open_display_browser_mode(self):
+        """gui_display='browser' → 调用 _open_browser，返回 ("browser", None)。"""
+        calls = []
+
+        def fake_get_config(show_dialogs=True):
+            return {"gui_display": "browser", "browser": ""}
+
+        configmanage.get_config = fake_get_config
+        guimanage._open_browser = lambda url: calls.append(url)
+
+        role, win = guimanage._open_display("http://test/", "Test Title")
+        self.assertEqual(role, "browser")
+        self.assertIsNone(win)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0], "http://test/")
+
+    def test_open_display_pywebview_success(self):
+        """gui_display='pywebview' + webview 可用 → 返回 ("owner", window)，不调用 _open_browser。"""
+        calls = []
+        sentinel = object()
+
+        def fake_get_config(show_dialogs=True):
+            return {"gui_display": "pywebview", "browser": "", "window_maximized": True}
+
+        fake_webview = mock.MagicMock()
+        fake_webview.create_window.return_value = sentinel
+        sys.modules["webview"] = fake_webview
+
+        configmanage.get_config = fake_get_config
+        guimanage._open_browser = lambda url: calls.append(url)
+
+        role, win = guimanage._open_display("http://test", "Test Title")
+        self.assertEqual(role, "owner")
+        self.assertIs(win, sentinel)
+        fake_webview.create_window.assert_called_once_with("Test Title", "http://test/tabhost", maximized=True)
+        self.assertEqual(len(calls), 0)
+
+    def test_open_display_pywebview_create_raises(self):
+        """webview.create_window 抛异常 → 回退 _open_browser，返回 ("browser", None)。"""
+        calls = []
+
+        def fake_get_config(show_dialogs=True):
+            return {"gui_display": "pywebview", "browser": "", "window_maximized": True}
+
+        fake_webview = mock.MagicMock()
+        fake_webview.create_window.side_effect = RuntimeError("init failed")
+        sys.modules["webview"] = fake_webview
+
+        configmanage.get_config = fake_get_config
+        guimanage._open_browser = lambda url: calls.append(url)
+
+        role, win = guimanage._open_display("http://test/", "Test Title")
+        self.assertEqual(role, "browser")
+        self.assertIsNone(win)
+        self.assertEqual(len(calls), 1)
+
+    def test_open_display_pywebview_import_fails(self):
+        """import webview 失败 → 回退 _open_browser，返回 ("browser", None)。"""
+        calls = []
+
+        def fake_get_config(show_dialogs=True):
+            return {"gui_display": "pywebview", "browser": "", "window_maximized": True}
+
+        # 设置 webview 模块为 None 导致 ImportError
+        sys.modules["webview"] = None
+
+        configmanage.get_config = fake_get_config
+        guimanage._open_browser = lambda url: calls.append(url)
+
+        role, win = guimanage._open_display("http://test/", "Test Title")
+        self.assertEqual(role, "browser")
+        self.assertIsNone(win)
+        self.assertEqual(len(calls), 1)
+
+
+class TestGuiConfigPost(unittest.TestCase):
+    """POST /api/config 新增 gui_display 校验测试。"""
+
+    def setUp(self):
+        fd, self._cfg_path = tempfile.mkstemp(prefix="test_gui_cfg_", suffix=".json")
+        os.close(fd)
+        with open(self._cfg_path, "w", encoding="utf-8") as f:
+            json.dump(_minimal_config(), f, ensure_ascii=False)
+        self._orig_cfg_path = configmanage._CONFIG_PATH
+        configmanage._CONFIG_PATH = self._cfg_path
+
+        self._state = {
+            "finished": threading.Event(),
+            "dlg_queue": queue.Queue(),
+            "dlg_lock": threading.Lock(),
+            "serve_lock": threading.Lock(),
+            "gone_at": None,
+            "last_beat": time.monotonic(),
+            "beat_lock": threading.Lock(),
+            "last_error": None,
+            "convert": {"lock": threading.Lock(), "proc": None, "lines": [], "running": False, "done": False, "success": False, "exit_code": None, "epub_path": None, "error": None, "prompt": None},
+            "correct": {"lock": threading.Lock(), "proc": None, "lines": [], "running": False, "done": False, "success": False, "exit_code": None, "error": None, "prompt": None},
+            "merge": {"lock": threading.Lock(), "lines": [], "running": False, "done": False, "success": False, "error": None, "out_path": None, "stop_event": threading.Event()},
+        }
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), guimanage._GuiHandler)
+        self._server.daemon_threads = True
+        self._server.state = self._state
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        self._port = self._server.server_address[1]
+        self._base = f"http://127.0.0.1:{self._port}"
+
+    def tearDown(self):
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+        configmanage._CONFIG_PATH = self._orig_cfg_path
+        try:
+            os.unlink(self._cfg_path)
+        except OSError:
+            pass
+
+    def _post(self, path, body):
+        import urllib.request
+        import urllib.error
+
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(self._base + path, data=data, method="POST", headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status, resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8")
+
+    def test_post_config_gui_display_invalid(self):
+        """POST /api/config gui_display='evil' → 400 中文错误。"""
+        status, body = self._post("/api/config", {"gui_display": "evil"})
+        self.assertEqual(status, 400)
+        data = json.loads(body)
+        self.assertFalse(data["ok"])
+        self.assertIn("gui_display 仅支持 pywebview / browser", data["error"])
+
+    def test_post_config_gui_display_browser(self):
+        """POST /api/config gui_display='browser' → 200。"""
+        status, body = self._post("/api/config", {"gui_display": "browser"})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        # 磁盘持久化验证
+        with open(self._cfg_path, "r", encoding="utf-8") as f:
+            on_disk = json.load(f)
+        self.assertEqual(on_disk["gui_display"], "browser")
+
+
+class TestTabEndpoints(GuiServerTestBase):
+    """标签页会话与 /api/tabs 端点测试。"""
+
+    def setUp(self):
+        super().setUp()
+        # monkeypatch tabmanage.TAB_SESSION_PATH 到临时文件
+        import tabmanage
+
+        self._orig_session_path = tabmanage.TAB_SESSION_PATH
+        fd, self._tmp_session = tempfile.mkstemp(prefix="test_tab_session_", suffix=".json")
+        os.close(fd)
+        tabmanage.TAB_SESSION_PATH = self._tmp_session
+        # 也要 patch 模块内的 _tab_session_path() 返回值
+        self._orig_tab_session_path = tabmanage._tab_session_path
+        tabmanage._tab_session_path = lambda: self._tmp_session
+
+    def tearDown(self):
+        import tabmanage
+
+        tabmanage.TAB_SESSION_PATH = self._orig_session_path
+        tabmanage._tab_session_path = self._orig_tab_session_path
+        try:
+            os.unlink(self._tmp_session)
+        except OSError:
+            pass
+        super().tearDown()
+
+    def test_register_tab_first_is_owner(self):
+        """首次 register_tab → owner，会话文件创建。"""
+        import tabmanage
+
+        with mock.patch.object(tabmanage, "_owner_alive", return_value=False):
+            role = tabmanage.register_tab("配置中心", "http://127.0.0.1:55044/", "http://127.0.0.1:55044/")
+        self.assertEqual(role, "owner")
+        self.assertTrue(os.path.exists(self._tmp_session))
+        with open(self._tmp_session, "r", encoding="utf-8") as f:
+            session = json.load(f)
+        self.assertEqual(session["owner_pid"], os.getpid())
+        self.assertEqual(session["owner_base"], "http://127.0.0.1:55044/")
+        self.assertEqual(len(session["tabs"]), 1)
+        self.assertEqual(session["tabs"][0]["title"], "配置中心")
+
+    def test_register_tab_second_is_guest(self):
+        """owner 存活时第二次 register_tab → guest，tabs 列表有 2 项。"""
+        import tabmanage
+
+        with mock.patch.object(tabmanage, "_owner_alive", return_value=True):
+            # 先注册 owner
+            role1 = tabmanage.register_tab("配置中心", "http://127.0.0.1:55044/", "http://127.0.0.1:55044/")
+            self.assertEqual(role1, "owner")
+            # 再注册 guest（相同 owner_base，owner 存活）
+            role2 = tabmanage.register_tab("文字矫正", "http://127.0.0.1:55045/", "http://127.0.0.1:55045/")
+            self.assertEqual(role2, "guest")
+        with open(self._tmp_session, "r", encoding="utf-8") as f:
+            session = json.load(f)
+        self.assertEqual(len(session["tabs"]), 2)
+        titles = [t["title"] for t in session["tabs"]]
+        self.assertIn("配置中心", titles)
+        self.assertIn("文字矫正", titles)
+
+    def test_register_tab_dedupe_by_title(self):
+        """同 title 再次注册 → 去重更新 url，tabs 数量不变。"""
+        import tabmanage
+
+        with mock.patch.object(tabmanage, "_owner_alive", return_value=True):
+            tabmanage.register_tab("配置中心", "http://127.0.0.1:55044/", "http://127.0.0.1:55044/")
+            role = tabmanage.register_tab("配置中心", "http://127.0.0.1:55044/new/", "http://127.0.0.1:55044/")
+            self.assertEqual(role, "guest")
+        with open(self._tmp_session, "r", encoding="utf-8") as f:
+            session = json.load(f)
+        self.assertEqual(len(session["tabs"]), 1)
+        self.assertEqual(session["tabs"][0]["url"], "http://127.0.0.1:55044/new/")
+
+    def test_register_tab_owner_dead_becomes_owner(self):
+        """owner 探测失败（重试后仍失败）→ 新进程成为 owner，会话替换。"""
+        import tabmanage
+
+        with mock.patch.object(tabmanage, "_owner_alive", return_value=False):
+            role = tabmanage.register_tab("配置中心", "http://127.0.0.1:55044/", "http://127.0.0.1:55044/")
+            self.assertEqual(role, "owner")
+        with open(self._tmp_session, "r", encoding="utf-8") as f:
+            session = json.load(f)
+        self.assertEqual(session["owner_pid"], os.getpid())
+
+    def test_register_tab_owner_dead_with_existing_session_replaces(self):
+        """已有会话但 owner 确认死亡（重试后仍失败）→ 接管为 owner，会话替换。"""
+        import tabmanage
+
+        with mock.patch.object(tabmanage.time, "sleep") as _sleep, mock.patch.object(
+            tabmanage, "_owner_alive", return_value=False
+        ) as _probe:
+            # 先建 owner 会话（仅 mock sleep，保留真实 time.time 以便 JSON 序列化）
+            tabmanage.register_tab("配置中心", "http://127.0.0.1:55044/", "http://127.0.0.1:55044/")
+            # 新进程加入：owner 探测失败 → sleep 重试 → 仍失败 → 接管
+            _sleep.reset_mock()
+            _probe.reset_mock()
+            role = tabmanage.register_tab("文字矫正", "http://127.0.0.1:55045/", "http://127.0.0.1:55045/")
+            self.assertEqual(role, "owner")
+            # 探测两次、中间 sleep 一次（重试时序）
+            self.assertEqual(_probe.call_count, 2)
+            self.assertEqual(_sleep.call_count, 1)
+        with open(self._tmp_session, "r", encoding="utf-8") as f:
+            session = json.load(f)
+        self.assertEqual(session["owner_pid"], os.getpid())
+        self.assertEqual(session["owner_base"], "http://127.0.0.1:55045/")
+        self.assertEqual(len(session["tabs"]), 1)
+
+    def test_register_tab_retry_rescues_transient_probe_failure(self):
+        """owner 探测首个瞬态失败、重试后存活 → 仍为 guest，会话不被替换（防误抢占）。"""
+        import tabmanage
+
+        with mock.patch.object(tabmanage.time, "sleep") as _sleep, mock.patch.object(
+            tabmanage, "_owner_alive", side_effect=[False, True]
+        ):
+            # 先建 owner 会话
+            role1 = tabmanage.register_tab("配置中心", "http://127.0.0.1:55044/", "http://127.0.0.1:55044/")
+            self.assertEqual(role1, "owner")
+            # 再模拟新进程：首次探测瞬态失败，重试恢复
+            _sleep.reset_mock()
+            role2 = tabmanage.register_tab("文字矫正", "http://127.0.0.1:55045/", "http://127.0.0.1:55045/")
+            self.assertEqual(role2, "guest")
+            self.assertEqual(_sleep.call_count, 1)
+            # 会话未被替换：owner_base 仍为原 owner、两标签都在
+            with open(self._tmp_session, "r", encoding="utf-8") as f:
+                session = json.load(f)
+        self.assertEqual(session["owner_base"], "http://127.0.0.1:55044/")
+        self.assertEqual(len(session["tabs"]), 2)
+        titles = [t["title"] for t in session["tabs"]]
+        self.assertIn("配置中心", titles)
+        self.assertIn("文字矫正", titles)
+
+    def test_register_tab_no_session_skips_probe(self):
+        """无会话时直接成为 owner，不调用 owner 探测。"""
+        import tabmanage
+
+        with mock.patch.object(tabmanage, "_owner_alive") as _probe:
+            role = tabmanage.register_tab("配置中心", "http://127.0.0.1:55044/", "http://127.0.0.1:55044/")
+            self.assertEqual(role, "owner")
+            _probe.assert_not_called()
+
+    def test_reset_session_removes_file(self):
+        """reset_session 删除会话文件。"""
+        import tabmanage
+
+        tabmanage.reset_session()
+        self.assertFalse(os.path.exists(self._tmp_session))
+
+    def test_guest_session_ok_true_false(self):
+        """guest_session_ok：owner 存活+标题在列表 → True；否则 False。"""
+        import tabmanage
+
+        # 先建会话
+        with mock.patch.object(tabmanage, "_owner_alive", return_value=True):
+            tabmanage.register_tab("配置中心", "http://127.0.0.1:55044/", "http://127.0.0.1:55044/")
+        # owner 存活且标题存在
+        with mock.patch.object(tabmanage, "_owner_alive", return_value=True):
+            self.assertTrue(tabmanage.guest_session_ok("配置中心", "http://127.0.0.1:55044/"))
+        # owner 存活但标题不存在
+        with mock.patch.object(tabmanage, "_owner_alive", return_value=True):
+            self.assertFalse(tabmanage.guest_session_ok("不存在", "http://127.0.0.1:55044/"))
+        # owner 不存活
+        with mock.patch.object(tabmanage, "_owner_alive", return_value=False):
+            self.assertFalse(tabmanage.guest_session_ok("配置中心", "http://127.0.0.1:55044/"))
+
+    def test_guest_session_ok_default_uses_session_owner(self):
+        """owner_base 缺省时以会话内 owner_base 探测；显式不一致 → False（rebase 守卫）。"""
+        import tabmanage
+
+        with mock.patch.object(tabmanage, "_owner_alive", return_value=True):
+            tabmanage.register_tab("配置中心", "http://127.0.0.1:55044/", "http://127.0.0.1:55044/")
+        # 缺省 owner_base：按会话内 owner 探测，标题存在 → True
+        with mock.patch.object(tabmanage, "_owner_alive", return_value=True) as probe:
+            self.assertTrue(tabmanage.guest_session_ok("配置中心"))
+            probe.assert_called_once_with("http://127.0.0.1:55044/")
+        # 显式传入与会话不一致的 owner_base → False（调用方不传自身 url，只传 None/确切 owner）
+        with mock.patch.object(tabmanage, "_owner_alive", return_value=True):
+            self.assertFalse(tabmanage.guest_session_ok("配置中心", "http://127.0.0.1:9999/"))
+        # 会话内 owner 不存活 → False
+        with mock.patch.object(tabmanage, "_owner_alive", return_value=False):
+            self.assertFalse(tabmanage.guest_session_ok("配置中心"))
+
+    def test_tab_host_html_returns_bytes(self):
+        """/tabhost 返回 200 + HTML（monkeypatch tab_host_html 返回存根）。"""
+        import tabmanage
+        import guimanage
+
+        orig_tab_host_html = tabmanage.tab_host_html
+        tabmanage.tab_host_html = lambda: b"<html>tabhost stub</html>"
+        try:
+            status, ctype, body = self._get("/tabhost")
+            self.assertEqual(status, 200)
+            self.assertIn("text/html", ctype)
+            self.assertIn(b"tabhost stub", body)
+        finally:
+            tabmanage.tab_host_html = orig_tab_host_html
+
+    def test_api_tabs_get(self):
+        """GET /api/tabs 返回 tabs 列表 + position。"""
+        import tabmanage
+
+        # 先注册两个标签
+        with mock.patch.object(tabmanage, "_owner_alive", return_value=True):
+            tabmanage.register_tab("配置中心", "http://127.0.0.1:55044/", "http://127.0.0.1:55044/")
+            tabmanage.register_tab("文字矫正", "http://127.0.0.1:55045/", "http://127.0.0.1:55045/")
+        status, _, body = self._get("/api/tabs")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(len(data["tabs"]), 2)
+        self.assertIn("position", data)
+        self.assertIn(data["position"], ("top", "bottom"))
+
+    def test_api_tabs_post_position_bottom_ok(self):
+        """POST /api/tabs position=bottom → 200 且 config 写入。"""
+        import configmanage
+
+        # monkeypatch config 路径到临时文件
+        fd, tmp_cfg = tempfile.mkstemp(prefix="test_tab_cfg_", suffix=".json")
+        os.close(fd)
+        with open(tmp_cfg, "w", encoding="utf-8") as f:
+            json.dump(_minimal_config(), f, ensure_ascii=False)
+        orig_cfg_path = configmanage._CONFIG_PATH
+        configmanage._CONFIG_PATH = tmp_cfg
+        try:
+            status, body = self._post("/api/tabs", {"position": "bottom"})
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertTrue(data["ok"])
+            # 验证磁盘持久化
+            with open(tmp_cfg, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            self.assertEqual(cfg.get("tabs_position"), "bottom")
+        finally:
+            configmanage._CONFIG_PATH = orig_cfg_path
+            try:
+                os.unlink(tmp_cfg)
+            except OSError:
+                pass
+
+    def test_api_tabs_post_invalid_position_400(self):
+        """POST /api/tabs position=side → 400 中文错误。"""
+        status, body = self._post("/api/tabs", {"position": "side"})
+        self.assertEqual(status, 400)
+        data = json.loads(body)
+        self.assertFalse(data["ok"])
+        self.assertIn("tabs_position 仅支持 top / bottom", data["error"])
+
+    def test_serve_loop_guest_session_lost_breaks(self):
+        """guest 模式：会话有效时持续运行、会话丢失（guest_session_ok=False）时
+        置 tab_lost 退出，绝不落入无探测的第二循环。
+
+        回归：_serve_loop 曾被重复粘贴循环体（第二段无 guest 探测），tab_lost
+        break 后落入第二段死循环 → guest 永不返回、接管失效；旧代码下本测试挂起。
+        """
+        import threading
+
+        import guimanage
+        import tabmanage
+
+        state = {
+            "finished": threading.Event(),
+            "tab_lost": False,
+            "dlg_queue": None,
+        }
+        calls = {"n": 0}
+
+        def _probe_ok_then_lost(_title: str, _base: str) -> bool:
+            calls["n"] += 1
+            return calls["n"] == 1  # 第一次 ok，第二次 False → 触发接管
+
+        orig_sleep = guimanage.time.sleep
+        orig_drain = guimanage._drain_dialog_queue
+        orig_monotonic = guimanage.time.monotonic
+        orig_gso = tabmanage.guest_session_ok
+        guimanage.time.sleep = lambda _s: None  # 加速循环（0.5s 步进置空）
+        guimanage._drain_dialog_queue = lambda _st: None
+        guimanage.time.monotonic = mock.Mock(side_effect=[0.0, 2.0, 4.0, 4.0])
+        tabmanage.guest_session_ok = _probe_ok_then_lost
+        try:
+            guimanage._serve_loop(
+                state, 600, watch_gone=False,
+                tab_key="文字矫正", tab_base=None,
+            )
+        finally:
+            guimanage.time.sleep = orig_sleep
+            guimanage._drain_dialog_queue = orig_drain
+            guimanage.time.monotonic = orig_monotonic
+            tabmanage.guest_session_ok = orig_gso
+        # 会话丢失 → tab_lost 置位退出；finished 不置（窗口仍开着，仅触发接管）
+        self.assertTrue(state["tab_lost"])
+        self.assertFalse(state["finished"].is_set())
+        self.assertEqual(calls["n"], 2)
+
+
 class TestGuiConvert(GuiServerTestBase):
     """转换流程端点测试（假 Popen，不真跑子进程）。"""
 

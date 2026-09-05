@@ -38,6 +38,7 @@ import sys
 import threading
 import time
 import traceback
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # 占位符：集成阶段由编排者替换成真实 UI 文件内容（不得删除该占位行）
@@ -231,6 +232,7 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
         <div class="form-row"><span class="form-label">llama-server 路径</span><div class="form-ctrl"><div class="pick-row"><input type="text" id="cfgLlamaServer" placeholder="llama-server.exe 路径"><button class="btn-small" onclick="pickFile('cfgLlamaServer')">选择文件</button></div></div></div>
         <div class="form-row"><span class="form-label">模型目录</span><div class="form-ctrl"><div class="pick-row"><input type="text" id="cfgModelsDir" placeholder="模型文件所在目录"><button class="btn-small" onclick="pickDir('cfgModelsDir')">选择目录</button></div></div></div>
         <div class="form-row"><span class="form-label">自定义浏览器</span><div class="form-ctrl"><div class="pick-row"><input type="text" id="cfgBrowser" placeholder="留空使用系统默认浏览器"><button class="btn-small" onclick="pickFile('cfgBrowser')">选择文件</button></div><div class="form-hint">可执行文件路径，如 Chrome / Edge / Firefox。留空则使用系统默认浏览器。</div></div></div>
+        <div class="form-row"><span class="form-label">界面加载方式</span><div class="form-ctrl"><select id="cfgGuiDisplay"><option value="pywebview">内置窗口（pywebview）</option><option value="browser">系统浏览器</option></select></div><div class="form-hint">默认以内置窗口显示配置界面；改为浏览器后下次启动在浏览器中打开。</div></div>
       </div>
       <div class="card">
         <div class="card-title"><span class="ct-icon">&#9733;</span> 模型与引擎</div>
@@ -444,8 +446,8 @@ function setEngine(eng){cfg.engine=eng;document.querySelectorAll(".engine-switch
 function updateEngineHint(){var eng=cfg.engine||"llama",port=eng==="llama"?(cfg.llama_server_args||{}).port||"8080":(cfg.vllm_server_args||{}).port||"8000";document.getElementById("engineHint").textContent="当前引擎: "+eng+" | 默认端口: "+port}
 function renderStatus(s){var badgeEl=document.getElementById("stRunning"),navBadge=document.getElementById("navStatusBadge"),label,cls;if(s.probe==="match"){label="运行中";cls="badge-green";navBadge.textContent="运行中";navBadge.className="nav-badge running"}else if(s.probe==="mismatch"){label="模型不匹配";cls="badge-yellow";navBadge.textContent="异常";navBadge.className="nav-badge stopped"}else{label="未运行";cls=s.busy?"badge-yellow":"badge-gray";navBadge.textContent=s.busy?"启动中":"未运行";navBadge.className="nav-badge "+(s.busy?"running":"stopped")}badgeEl.innerHTML='<span class="badge '+cls+'">'+label+"</span>";if(s.busy&&s.probe==="none")badgeEl.innerHTML+=' <span style="font-size:11px;color:var(--yellow);margin-left:6px;">启动中...</span>';document.getElementById("stModel").textContent=s.model_name||s.model_key||"--";document.getElementById("stPort").textContent=s.port||"--";document.getElementById("stEngine").textContent=s.engine||cfg.engine||"llama";if(s.engine){document.querySelectorAll(".engine-switch button").forEach(function(b){b.classList.toggle("active",b.dataset.eng===s.engine)});cfg.engine=s.engine}updateEngineHint();document.getElementById("btnStart").disabled=s.probe==="match"||s.busy;document.getElementById("btnStop").disabled=s.probe==="none"&&!s.busy;if(s.last_error&&s.last_error!==_lastShownError){_lastShownError=s.last_error;addLog("服务错误: "+s.last_error,"log-err")}}
 function renderAll(){renderBasic();renderModels();renderArgs("llamaArgs",cfg.llama_server_args);renderArgs("vllmArgs",cfg.vllm_server_args);renderProofread();renderShortcuts();renderRules();renderConvert();document.querySelectorAll(".engine-switch button").forEach(function(b){b.classList.toggle("active",b.dataset.eng===(cfg.engine||"llama"))});updateEngineHint()}
-function renderBasic(){document.getElementById("cfgLlamaServer").value=cfg.llama_server||"";document.getElementById("cfgModelsDir").value=cfg.models_dir||"";document.getElementById("cfgBrowser").value=cfg.browser||"";document.getElementById("cfgOcrPrompt").value=cfg.ocr_prompt||"";var sel=document.getElementById("cfgSelectedModel");sel.innerHTML="";models.forEach(function(m){var o=document.createElement("option");o.value=m.key;o.textContent=m.key+" - "+m.name;sel.appendChild(o)});sel.value=cfg.selected_model||"";document.querySelectorAll('input[name="cfgEngine"]').forEach(function(r){r.checked=r.value===(cfg.engine||"llama")});try{document.getElementById("cfgFontBody").value=(cfg.fonts&&cfg.fonts.body)||"";document.getElementById("cfgFontHeading").value=(cfg.fonts&&cfg.fonts.heading)||"";document.getElementById("cfgFontNote").value=(cfg.fonts&&cfg.fonts.note)||"";document.getElementById("cfgFontCitation").value=(cfg.fonts&&cfg.fonts.citation)||""}catch(e){}try{var ip=cfg.image_preprocess||{};document.getElementById("cfgImgPreEnabled").checked=!!ip.enabled;document.getElementById("cfgImgGray").checked=!!ip.gray;document.getElementById("cfgImgDenoise").checked=!!ip.denoise;document.getElementById("cfgImgSharpen").checked=!!ip.sharpen;document.getElementById("cfgImgBinarize").checked=!!ip.binarize;document.getElementById("cfgImgWorkers").value=(ip.workers!=null?ip.workers:"")}catch(e){}
- }
+function renderBasic(){document.getElementById("cfgLlamaServer").value=cfg.llama_server||"";document.getElementById("cfgModelsDir").value=cfg.models_dir||"";document.getElementById("cfgBrowser").value=cfg.browser||"";document.getElementById("cfgGuiDisplay").value=(cfg.gui_display||"pywebview");document.getElementById("cfgOcrPrompt").value=cfg.ocr_prompt||"";var sel=document.getElementById("cfgSelectedModel");sel.innerHTML="";models.forEach(function(m){var o=document.createElement("option");o.value=m.key;o.textContent=m.key+" - "+m.name;sel.appendChild(o)});sel.value=cfg.selected_model||"";document.querySelectorAll('input[name="cfgEngine"]').forEach(function(r){r.checked=r.value===(cfg.engine||"llama")});try{document.getElementById("cfgFontBody").value=(cfg.fonts&&cfg.fonts.body)||"";document.getElementById("cfgFontHeading").value=(cfg.fonts&&cfg.fonts.heading)||"";document.getElementById("cfgFontNote").value=(cfg.fonts&&cfg.fonts.note)||"";document.getElementById("cfgFontCitation").value=(cfg.fonts&&cfg.fonts.citation)||""}catch(e){}try{var ip=cfg.image_preprocess||{};document.getElementById("cfgImgPreEnabled").checked=!!ip.enabled;document.getElementById("cfgImgGray").checked=!!ip.gray;document.getElementById("cfgImgDenoise").checked=!!ip.denoise;document.getElementById("cfgImgSharpen").checked=!!ip.sharpen;document.getElementById("cfgImgBinarize").checked=!!ip.binarize;document.getElementById("cfgImgWorkers").value=(ip.workers!=null?ip.workers:"")}catch(e){}
+}
 function renderModels(){var tbody=document.getElementById("modelTbody");tbody.innerHTML="";var keys=Object.keys(cfg.model_choices||{});if(!keys.length){tbody.innerHTML='<tr><td colspan="7" class="empty-state">暂无模型，点击上方「添加模型」</td></tr>';return}keys.forEach(function(key){var m=cfg.model_choices[key],info=models.find(function(x){return x.key===key}),nameOk=info?info.name_exists:false,mmOk=info?info.mmproj_exists:false,tr=document.createElement("tr");tr.innerHTML='<td><input type="text" value="'+escH(key)+'" data-field="key" style="font-weight:600;background:#f8f9fb;"></td><td><input type="text" value="'+escH(m.name||"")+'" data-field="name"></td><td><input type="text" value="'+escH(m.mmproj||"")+'" data-field="mmproj"></td><td><input type="number" min="1" max="64" value="'+(m.workers!=null?m.workers:"")+'" data-field="workers" style="width:52px;"></td><td class="'+(nameOk?"file-ok":"file-miss")+'">'+(nameOk?"\u2713":"\u2717")+'</td><td class="'+(mmOk?"file-ok":"file-miss")+'">'+(mmOk?"\u2713":"\u2717")+'</td><td class="del-cell"><button class="del-btn" title="删除模型">\u2715</button></td>';tr.querySelector(".del-btn").onclick=function(){if(confirm("确定删除模型「"+key+"」？")){delete cfg.model_choices[key];models=models.filter(function(x){return x.key!==key});renderModels();toast("已删除模型 "+key,"ok")}};tbody.appendChild(tr)})}
 function addModel(){var nk="NEW",i=1;while(cfg.model_choices[nk])nk="NEW"+(i++);cfg.model_choices[nk]={name:"",mmproj:""};models.push({key:nk,name:"",mmproj:"",name_exists:false,mmproj_exists:false});renderModels();toast("已添加空模型行，请填写后保存","warn")}
 function renderArgs(tid,obj){var tbody=document.getElementById(tid);tbody.innerHTML="";obj=obj||{};var keys=Object.keys(obj);if(!keys.length){tbody.innerHTML='<tr><td colspan="3" class="empty-state">暂无参数，点击上方添加</td></tr>';return}keys.forEach(function(k){var tr=document.createElement("tr");tr.innerHTML='<td><input type="text" value="'+escH(k)+'" data-field="key" style="font-weight:500;"></td><td><input type="text" value="'+escH(String(obj[k]!=null?obj[k]:""))+'" data-field="value"></td><td class="del-cell"><button class="del-btn" title="删除">\u2715</button></td>';tr.querySelector(".del-btn").onclick=function(){tr.remove()};tbody.appendChild(tr)})}
@@ -453,7 +455,7 @@ function addArg(tid){var tbody=document.getElementById(tid),empty=tbody.querySel
 function renderProofread(){var pr=cfg.proofread||{},grid=document.getElementById("proofreadGrid");grid.innerHTML="";[{k:"similarity_min",l:"相似度阈值",s:0.01},{k:"score_min",l:"最低评分",s:0.01},{k:"max_cand_cache",l:"候选缓存上限",s:100},{k:"max_replacement_combinations",l:"替换组合上限",s:1},{k:"auto_fix_score",l:"自动修正阈值",s:0.01}].forEach(function(f){var d=document.createElement("div");d.className="form-row";d.innerHTML='<span class="form-label">'+f.l+'</span><div class="form-ctrl"><input type="number" data-pr="'+f.k+'" value="'+(pr[f.k]!=null?pr[f.k]:"")+'" step="'+f.s+'"></div>';grid.appendChild(d)});document.getElementById("prEnableLlm").checked=!!pr.enable_llm;document.getElementById("prLegacyRules").checked=!!pr.enable_legacy_rules;document.getElementById("prLlmTimeout").value=pr.llm_timeout!=null?pr.llm_timeout:"";var sel=document.getElementById("prLlmModel");sel.innerHTML='<option value="">（自动使用当前模型）</option>';models.forEach(function(m){var o=document.createElement("option");o.value=m.key;o.textContent=m.key+" - "+m.name;sel.appendChild(o)});sel.value=pr.llm_model||""}
 function renderShortcuts(){renderArgs("shortcuts",cfg.shortcuts)}
 function renderRules(){var list=document.getElementById("rulesList"),rules=cfg.format_rules||[];if(!rules.length){list.innerHTML='<div class="empty-state">暂无格式规则</div>';return}list.innerHTML="";rules.forEach(function(r,idx){var card=document.createElement("div");card.className="rule-card";var ct="";if(r.conditions&&r.conditions.length){ct=r.conditions.map(function(c){var p=[];if(c.pattern)p.push(c.type==="regex"?"正则「"+c.pattern+"」":"包含「"+c.pattern+"」");else p.push("无条件");p.push("作用域: "+(c.scope==="page"?"当前页":c.scope==="paragraph"?"段落":"选中"));if(c.formats&&c.formats.length)p.push("\u2192 "+c.formats.join(", "));return p.join(" | ")}).join("；")}else if(r.condition){ct=r.condition.pattern?(r.condition.type||"contains")+"「"+r.condition.pattern+"」":"无条件"}var btn=document.createElement("button");btn.className="btn-small";btn.textContent="删除";btn.title="删除规则";btn.onclick=function(){if(confirm("确定删除此格式规则？")){cfg.format_rules.splice(idx,1);renderRules();toast("已删除格式规则","ok")}};card.innerHTML='<span class="rule-name">'+escH(r.name||"未命名")+'</span><span class="rule-cond">'+escH(ct||"无条件")+'</span>';card.appendChild(btn);list.appendChild(card)})}
-function collectConfig(){cfg.llama_server=document.getElementById("cfgLlamaServer").value.trim();cfg.models_dir=document.getElementById("cfgModelsDir").value.trim();cfg.browser=document.getElementById("cfgBrowser").value.trim();cfg.ocr_prompt=document.getElementById("cfgOcrPrompt").value;cfg.selected_model=document.getElementById("cfgSelectedModel").value;var er=document.querySelector('input[name="cfgEngine"]:checked');if(er)cfg.engine=er.value;var nm={};document.getElementById("modelTbody").querySelectorAll("tr").forEach(function(tr){var ins=tr.querySelectorAll("input");if(ins.length<2)return;var key=ins[0].value.trim();if(key){var m={name:ins[1].value.trim(),mmproj:ins.length>=3?ins[2].value.trim():""};var w=ins.length>=4?parseInt(ins[3].value,10):0;if(!isNaN(w)&&w>=1&&w<=64)m.workers=w;nm[key]=m}});cfg.model_choices=nm;cfg.llama_server_args=collectKVT("llamaArgs");cfg.vllm_server_args=collectKVT("vllmArgs");cfg.vllm_server=document.getElementById("cfgVllmServer").value.trim();var pr={};document.querySelectorAll("[data-pr]").forEach(function(el){var k=el.dataset.pr,v=el.value.trim();if(el.type==="number"&&v!=="")pr[k]=parseFloat(v);else pr[k]=v});pr.enable_llm=document.getElementById("prEnableLlm").checked;pr.enable_legacy_rules=document.getElementById("prLegacyRules").checked;var lm=document.getElementById("prLlmModel").value;if(lm)pr.llm_model=lm;var lt=document.getElementById("prLlmTimeout").value.trim();if(lt!=="")pr.llm_timeout=parseFloat(lt);cfg.proofread=pr;cfg.shortcuts=collectKVT("shortcuts")}
+function collectConfig(){cfg.llama_server=document.getElementById("cfgLlamaServer").value.trim();cfg.models_dir=document.getElementById("cfgModelsDir").value.trim();cfg.browser=document.getElementById("cfgBrowser").value.trim();cfg.gui_display=document.getElementById("cfgGuiDisplay").value;cfg.ocr_prompt=document.getElementById("cfgOcrPrompt").value;cfg.selected_model=document.getElementById("cfgSelectedModel").value;var er=document.querySelector('input[name="cfgEngine"]:checked');if(er)cfg.engine=er.value;var nm={};document.getElementById("modelTbody").querySelectorAll("tr").forEach(function(tr){var ins=tr.querySelectorAll("input");if(ins.length<2)return;var key=ins[0].value.trim();if(key){var m={name:ins[1].value.trim(),mmproj:ins.length>=3?ins[2].value.trim():""};var w=ins.length>=4?parseInt(ins[3].value,10):0;if(!isNaN(w)&&w>=1&&w<=64)m.workers=w;nm[key]=m}});cfg.model_choices=nm;cfg.llama_server_args=collectKVT("llamaArgs");cfg.vllm_server_args=collectKVT("vllmArgs");cfg.vllm_server=document.getElementById("cfgVllmServer").value.trim();var pr={};document.querySelectorAll("[data-pr]").forEach(function(el){var k=el.dataset.pr,v=el.value.trim();if(el.type==="number"&&v!=="")pr[k]=parseFloat(v);else pr[k]=v});pr.enable_llm=document.getElementById("prEnableLlm").checked;pr.enable_legacy_rules=document.getElementById("prLegacyRules").checked;var lm=document.getElementById("prLlmModel").value;if(lm)pr.llm_model=lm;var lt=document.getElementById("prLlmTimeout").value.trim();if(lt!=="")pr.llm_timeout=parseFloat(lt);cfg.proofread=pr;cfg.shortcuts=collectKVT("shortcuts")}
 function collectKVT(tid){var r={};document.getElementById(tid).querySelectorAll("tr").forEach(function(tr){var ins=tr.querySelectorAll("input");if(ins.length<2)return;var k=ins[0].value.trim(),v=ins[1].value;if(k)r[k]=v});return r}
 function collectExtraConfig(){
   try{
@@ -1147,6 +1149,26 @@ class _GuiHandler(BaseHTTPRequestHandler):
         if path == "/":
             self._send(200, _UI_HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
+        if path == "/tabhost":
+            # 标签页宿主页面：由 tabmanage 提供 HTML（含冻结 exe 兜底）
+            try:
+                import tabmanage  # noqa: PLC0415
+
+                html_bytes = tabmanage.tab_host_html()
+            except Exception:
+                html_bytes = b"<meta charset='utf-8'><body>\xe7\x95\x8c\xe9\x9d\xa2\xe5\x8a\xa0\xe8\xbd\xbd\xe5\xa4\xb1\xe8\xb4\xa5</body>"
+            self._send(200, html_bytes, "text/html; charset=utf-8")
+            return
+        if path == "/api/tabs":
+            # 标签栏数据：tabs 列表 + position
+            try:
+                import tabmanage  # noqa: PLC0415
+
+                payload = tabmanage.tabs_payload()
+            except Exception:
+                payload = {"ok": True, "tabs": [], "position": "top"}
+            self._send(200, self._json(payload))
+            return
         if path == "/api/config":
             self._api_config_get()
             return
@@ -1202,6 +1224,10 @@ class _GuiHandler(BaseHTTPRequestHandler):
                 if val is not None and not isinstance(val, str):
                     self._send(400, self._json({"ok": False, "error": f"{key} 必须是字符串"}))
                     return
+            gui_display = body.get("gui_display", cfg.get("gui_display", "pywebview"))
+            if gui_display not in ("pywebview", "browser"):
+                self._send(400, self._json({"ok": False, "error": "gui_display 仅支持 pywebview / browser"}))
+                return
             cfg.update(body)
             cfg = configmanage.validate_and_patch_config(cfg)
             with configmanage._CFG_LOCK:
@@ -1784,6 +1810,23 @@ class _GuiHandler(BaseHTTPRequestHandler):
         if body is _BAD_JSON:
             self._send(400, self._json({"ok": False, "error": "无效的 JSON"}))
             return
+        if path == "/api/tabs":
+            # 标签栏配置持久化：仅支持 position 字段
+            if not isinstance(body, dict):
+                self._send(400, self._json({"ok": False, "error": "请求体必须为 JSON 对象"}))
+                return
+            try:
+                import tabmanage  # noqa: PLC0415
+
+                ok, err = tabmanage.handle_tabs_post(body)
+            except Exception as e:
+                self._send(500, self._json({"ok": False, "error": str(e)}))
+                return
+            if not ok:
+                self._send(400, self._json({"ok": False, "error": err}))
+            else:
+                self._send(200, self._json({"ok": True}))
+            return
         if path == "/api/config":
             self._api_config_post(body)
             return
@@ -1828,18 +1871,155 @@ class _GuiHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 
+_GUI_WINDOW_TITLE = "ptoe 配置中心"
+
+
+def _open_display(url: str, title: str) -> tuple[str, object | None]:
+    """默认用 pywebview 内嵌窗口加载界面；config.json gui_display='browser' 时改用浏览器。
+
+    返回 (role, win) 元组：
+    - role: "browser" | "owner" | "guest"
+      * "browser": 浏览器模式或 pywebview 不可用，已回退 _open_browser，win 为 None
+      * "owner": 当前进程为标签页宿主（owner），win 为 pywebview Window 对象
+      * "guest": 当前进程作为 guest 加入已有合并窗口，不创建窗口，win 为 None
+    - win: pywebview Window 对象（仅 owner 时非 None），调用方需在 webview.start() 前注册
+      window.events.closed；browser/guest 模式为 None（调用方在主线程跑监视循环）。
+
+    pywebview 窗口默认最大化（config.json window_maximized=true，缺省）。
+    """
+    try:
+        from configmanage import get_config as _get_cfg
+
+        _mode = (_get_cfg(show_dialogs=False) or {}).get("gui_display", "pywebview")
+        _maximized = (_get_cfg(show_dialogs=False) or {}).get("window_maximized", True)
+        # 兼容字符串 "false"/"0"
+        if isinstance(_maximized, str):
+            _maximized = _maximized.lower() not in ("false", "0")
+        _maximized = bool(_maximized)
+    except Exception:  # noqa: BLE001
+        _mode = "pywebview"
+        _maximized = True
+    if _mode == "browser":
+        _open_browser(url)
+        return "browser", None
+    try:
+        import tabmanage  # noqa: PLC0415
+
+        _role = tabmanage.register_tab(title, url, base_url=url)
+    except Exception:  # noqa: BLE001  tabmanage 异常不阻塞，回退浏览器
+        _open_browser(url)
+        return "browser", None
+    if _role == "guest":
+        # guest 模式：不创建窗口，静默加入已有合并窗口
+        return "guest", None
+    try:
+        import webview as _webview  # noqa: PLC0415
+
+        _win = _webview.create_window(title, url + "/tabhost", maximized=_maximized)
+    except Exception:  # noqa: BLE001  pywebview 不可用/初始化失败 → 浏览器兜底
+        try:
+            import tabmanage as _tm  # noqa: PLC0415
+
+            _tm.reset_session()
+        except Exception:
+            pass
+        _open_browser(url)
+        return "browser", None
+    return "owner", _win
+
+
+def _open_browser(url: str) -> None:
+    """打开外部浏览器访问配置界面。
+
+    优先使用 config.json 的 browser 键指定的浏览器路径，否则用系统默认浏览器。
+    browser 模式（gui_display='browser'）或 pywebview 不可用/启动失败时使用。
+    """
+    try:
+        from configmanage import get_config as _get_cfg
+
+        _br_path = (_get_cfg(show_dialogs=False) or {}).get("browser", "")
+    except Exception:  # noqa: BLE001
+        _br_path = ""
+    try:
+        if _br_path:
+            subprocess.Popen([_br_path, url])
+        else:
+            webbrowser.open(url)
+    except Exception:  # noqa: BLE001  打不开浏览器不阻断服务
+        pass
+
+
+def _serve_loop(
+    state: dict,
+    idle_timeout: int,
+    *,
+    watch_gone: bool,
+    tab_key: str | None = None,
+    tab_base: str | None = None,
+) -> None:
+    """gui_serve 的监视主循环：逐轮处理文件对话框并监测界面关闭。
+
+    watch_gone=True 时按 _browser_gone 判定（浏览器标签页关闭/心跳失联），
+    pywebview 窗口模式传 False——窗口关闭走 window.events.closed 置 finished，
+    不再依赖心跳判定（避免窗口开着时心跳异常导致误关服务）。
+
+    tab_key/tab_base：guest 模式下传入（标签标题、可选的期望 owner 基址；
+    缺省 None 时以会话内 owner_base 为准），每 ~2s 探测一次
+    tabmanage.guest_session_ok()；若返回 False 则置 state["tab_lost"]=True 并 break，
+    由 gui_serve 外层负责接管重建窗口。
+    """
+    stale_since: float | None = None
+    _last_probe = 0.0
+    while not state["finished"].is_set():
+        time.sleep(0.5)
+        _drain_dialog_queue(state)
+        if watch_gone:
+            gone, stale_since = _browser_gone(
+                state, idle_timeout=idle_timeout, stale_since=stale_since
+            )
+            if gone:
+                state["finished"].set()
+                break
+        # guest 模式：定期探测会话是否仍有效（owner 存活且自身标签在列表中）
+        if tab_key is not None:
+            now = time.monotonic()
+            if now - _last_probe >= 2.0:
+                _last_probe = now
+                try:
+                    import tabmanage as _tm  # noqa: PLC0415
+
+                    if not _tm.guest_session_ok(tab_key, tab_base):
+                        state["tab_lost"] = True
+                        break
+                except Exception:
+                    # tabmanage 异常视为会话丢失，触发接管
+                    state["tab_lost"] = True
+                    break
+
+
 def gui_serve(
     host: str = "127.0.0.1",
     port: int = 0,
     open_browser: bool = True,
     idle_timeout: int = 120,
 ) -> None:
-    """启动 HTML 配置操作界面并阻塞，直到浏览器关闭（或 Ctrl+C）。
+    """启动 HTML 配置操作界面并阻塞，直到界面关闭（或 Ctrl+C）。
 
     - host/port：监听地址与端口（port=0 自动分配，实际端口见启动打印）；
-    - open_browser：True 时自动用默认浏览器打开界面；
+    - open_browser：True 时自动打开界面。默认以 pywebview 内置窗口显示；
+      config.json gui_display='browser' 时改用系统/自定义浏览器；
+      pywebview 启动失败亦自动回退浏览器。
     - idle_timeout：浏览器关闭（pagehide 信标）后等待的秒数，超过即自动退出；
       心跳（/api/ping）失联超过 idle_timeout*2 秒同样视为浏览器已关闭。
+      pywebview 窗口模式下不依赖心跳，窗口关闭即刻退出。
+
+    合并窗口模式（pywebview + 多进程）：
+    - 首个 pywebview 进程成为 owner，创建窗口加载 /tabhost，注册标签。
+    - 后续 pywebview 进程探测 owner 存活则作为 guest 加入（不建窗），
+      仅在主线程跑监视循环（_serve_loop），定期探测会话有效性。
+    - guest 探测到 owner 关闭/自身标签移除 → 自动清会话、重新注册成为 owner
+      并打开自己的标签窗口（_start_tabbed_window）。
+    - browser 模式与 --no-browser 行为完全不变（无合并、无标签）。
     """
     state: dict = {
         "finished": threading.Event(),
@@ -1891,43 +2071,66 @@ def gui_serve(
     serve_thread.start()
     url = f"http://{server.server_address[0]}:{server.server_address[1]}/"
     print(f"配置界面已启动: {url}（Ctrl+C 退出）")
+    _win = None
+    _role = None
     if open_browser:
-        try:
-            import webbrowser
+        _role, _win = _open_display(url, _GUI_WINDOW_TITLE)
+        if _role in ("owner", "guest"):
+            pass  # 合并窗口角色已由 tabmanage 决定（owner 建窗 / guest 静默加入）
+        if _win is not None:
+            _win.events.closed += lambda: state["finished"].set()
 
-            _br_path = ""
+    def _start_tabbed_window() -> None:
+        # 供 owner 首次进入与 guest 接管后复用：主线程 webview.start
+        nonlocal _win, _role
+        _role, _win = _open_display(url, _GUI_WINDOW_TITLE)
+        if _win is not None:
+            _win.events.closed += lambda: state["finished"].set()
             try:
-                import configmanage as _cfg_mod
-                _br_path = (_cfg_mod.get_config(show_dialogs=False) or {}).get("browser", "")
-            except Exception:
-                pass
-            if _br_path:
-                import subprocess as _br_subprocess
-                _br_subprocess.Popen([_br_path, url])
-            else:
-                webbrowser.open(url)
-        except Exception:  # noqa: BLE001  打不开浏览器不阻断服务
-            pass
+                import webview as _webview  # noqa: PLC0415
+                _webview.start(func=lambda: _serve_loop(state, idle_timeout, watch_gone=False))
+            except Exception:  # noqa: BLE001
+                print("pywebview 启动失败，改用浏览器打开界面")
+                _open_browser(url)
+                _serve_loop(state, idle_timeout, watch_gone=True)
+        else:
+            _serve_loop(state, idle_timeout, watch_gone=True)
+
     try:
-        # 浏览器关闭监测：页面每 30s 发心跳（/api/ping）；关闭标签页时发
-        # pagehide 信标（/api/bye）。信标确认关闭或心跳失联超过阈值后自动退出。
-        # 心跳失联需连续 _STALE_CONFIRM_SECONDS 确认，防休眠唤醒误判。
-        stale_since: float | None = None
-        while not state["finished"].is_set():
-            time.sleep(0.5)
-            # 文件选择对话框只能在主线程弹出（tkinter 线程安全），逐轮取走
-            # 队列里的请求弹框，阻塞直到用户选择/取消
-            _drain_dialog_queue(state)
-            gone, stale_since = _browser_gone(
-                state, idle_timeout=idle_timeout, stale_since=stale_since
-            )
-            if gone:
-                state["finished"].set()
-                break
+        if _win is not None:
+            # pywebview 模式（owner）：GUI 事件循环阻塞主线程；监视/对话框循环在
+            # webview.start(func=...) 的独立线程运行。窗口关闭 → events.closed
+            # 置 finished → func 循环退出 → start() 返回。
+            try:
+                import webview as _webview  # noqa: PLC0415
+                _webview.start(func=lambda: _serve_loop(
+                    state, idle_timeout, watch_gone=False
+                ))
+            except Exception:  # noqa: BLE001  pywebview 启动失败 → 浏览器兜底
+                print("pywebview 启动失败，改用浏览器打开界面")
+                _open_browser(url)
+                _serve_loop(state, idle_timeout, watch_gone=True)
+        elif _role == "guest":
+            # 加入已有合并窗口：不建窗，监视会话；宿主关闭/本标签移除 → 接管
+            _serve_loop(state, idle_timeout, watch_gone=False,
+                        tab_key=_GUI_WINDOW_TITLE, tab_base=None)
+            if state.get("tab_lost"):
+                import tabmanage as _tm  # noqa: PLC0415
+                _tm.reset_session()   # 清旧会话，重新注册即成为 owner
+                _start_tabbed_window()
+        else:
+            _serve_loop(state, idle_timeout, watch_gone=True)
     except KeyboardInterrupt:
         state["finished"].set()
         print("\n配置界面已退出")
     finally:
+        # 仅当我们是 owner 时才清会话；guest Ctrl+C 不应删除 owner 的会话
+        if _role == "owner":
+            try:
+                import tabmanage as _tm  # noqa: PLC0415
+                _tm.reset_session()
+            except Exception:
+                pass
         # Windows 下必须先 shutdown() 再 server_close()（顺序反了抛 WinError 10038）
         server.shutdown()
         server.server_close()

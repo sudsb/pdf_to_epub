@@ -83,6 +83,8 @@ let _loadDoneTimer = null;
 
 // 提示延迟（毫秒）：悬停超过该时间才显示提示文字；0 = 立即显示（localStorage 可配置）
 function tipDelay() { return loadInt('ptoe_tip_delay', 600); }
+// 纠错悬停弹出延迟（毫秒）：悬停校正文本超过该时间自动弹出采纳/忽略菜单；0 = 悬停即弹（设置-界面可调）
+function errHoverDelay() { return loadInt('ptoe_err_hover_delay', 1500); }
 // 提示文字：操作说明 + 对应快捷键（若有绑定）
 function tipTextFor(op) {
   const combo = bindings[op];
@@ -3383,6 +3385,10 @@ function _proofreadAutoDismiss(ed, i, skipRender) {
 function _flushPrPending() { for (const iStr in _prRenderPending) { if (!_prRenderPending[iStr]) continue; _prRenderPending[iStr] = false; const idx = Number(iStr); if (proofreadErrors[idx] && proofreadErrors[idx].length) renderProofread(idx); } }
 
 // 纠错确认悬浮窗（恒显示 errOk：有候选=采纳候选，无候选=删除 wrong）
+// 悬停状态（提前声明：hideErrPopup 会访问，避免 TDZ）
+let _errHoverKey = null;       // {i, k} 当前悬停的错误组
+let _errHoverTimer = null;     // 悬停计时
+let _errHoverLeaveTimer = null; // 离开热区后的宽限关闭计时
 function showErrPopup(rect) {
   const pop = document.getElementById('errPopup');
   pop.style.display = 'flex';
@@ -3397,6 +3403,12 @@ function showErrPopup(rect) {
 function hideErrPopup() {
   document.getElementById('errPopup').style.display = 'none';
   errKey = null;
+  // 悬停模式同步清空悬停态（采纳/忽略/滚动/点击外部等触发隐藏时一并清理）
+  clearTimeout(_errHoverTimer);
+  _errHoverTimer = null;
+  clearTimeout(_errHoverLeaveTimer);
+  _errHoverLeaveTimer = null;
+  _errHoverKey = null;
 }
 
 // ---------- 图片设置弹窗（点击编辑区内的图片弹出） ----------
@@ -3693,6 +3705,102 @@ document.addEventListener('click', function (e) {
   suppressPopupUntil = performance.now() + 250;
   showErrPopup(el.getBoundingClientRect());
 });
+// 悬停校正文本：停留超过设定时间自动弹出采纳/忽略悬浮窗（延时在设置-界面调整，0=悬停即弹）
+// （_errHoverKey/_errHoverTimer/_errHoverLeaveTimer 在 showErrPopup 上方声明）
+
+// 悬停热区：错误 span 与其相邻候选 span（同 data-err-i 视为一组）
+function _errHoverZoneEl(t) {
+  if (!t || !t.closest) return null;
+  const err = t.closest('.ptoe-err');
+  if (err) return err;
+  const fix = t.closest('.ptoe-fix');
+  if (fix && fix.dataset && fix.dataset.errI) return fix;
+  return null;
+}
+function _errHoverKeyOf(el) {
+  const row = el.closest('.page-row');
+  if (!row) return null;
+  const i = Number(row.dataset.i), k = Number(el.dataset.errI);
+  if (!isFinite(i) || !isFinite(k)) return null;
+  return { i: i, k: k };
+}
+// 取该组首个错误 span 作悬浮窗定位锚点
+function _errHoverAnchor(i, k) {
+  const row = [...host.children].find(r => Number(r.dataset.i) === i);
+  if (!row) return null;
+  const ed = row.querySelector('.editable');
+  return ed ? ed.querySelector('.ptoe-err[data-err-i="' + k + '"]') : null;
+}
+// 鼠标当前所在节点是否仍在同组热区或悬浮窗内
+function _errHoverStillInside(node) {
+  if (!node || !node.closest) return false;
+  if (node.closest('#errPopup')) return true;
+  if (!_errHoverKey) return false;
+  const zone = _errHoverZoneEl(node);
+  if (!zone) return false;
+  const kk = _errHoverKeyOf(zone);
+  return !!(kk && kk.i === _errHoverKey.i && kk.k === _errHoverKey.k);
+}
+function _errShowHoverPopup(i, k, anchor) {
+  suppressPopupUntil = performance.now() + 250;
+  errKey = { i: i, k: k };
+  showErrPopup(anchor.getBoundingClientRect());
+}
+document.addEventListener('mouseover', function (e) {
+  const zone = _errHoverZoneEl(e.target);
+  if (!zone) return;
+  const kk = _errHoverKeyOf(zone);
+  if (!kk) return;
+  const errors = proofreadErrors[kk.i];
+  if (!errors || !errors[kk.k] || errors[kk.k]._gone) return;
+  clearTimeout(_errHoverLeaveTimer);
+  // 同一组内移动（错误被拆成多段 span 时）→ 仅当悬停计时器仍悬挂时续期，不重启；
+  // 若计时器已被离开路径清除（鼠标先移出热区又移回），则重新计时
+  if (_errHoverTimer && _errHoverKey && _errHoverKey.i === kk.i && _errHoverKey.k === kk.k) return;
+  _errHoverKey = kk;
+  clearTimeout(_errHoverTimer);
+  const anchor = _errHoverAnchor(kk.i, kk.k);
+  if (!anchor || !anchor.isConnected) { _errHoverKey = null; return; }
+  const d = errHoverDelay();
+  if (d <= 0) { _errShowHoverPopup(kk.i, kk.k, anchor); return; }
+  _errHoverTimer = setTimeout(function () {
+    _errHoverTimer = null;
+    if (!_errHoverKey || _errHoverKey.i !== kk.i || _errHoverKey.k !== kk.k) return;
+    const a = _errHoverAnchor(kk.i, kk.k);
+    if (!a || !a.isConnected) { _errHoverKey = null; return; }
+    _errShowHoverPopup(kk.i, kk.k, a);
+  }, d);
+});
+document.addEventListener('mouseout', function (e) {
+  if (!_errHoverKey) return;
+  if (!_errHoverZoneEl(e.target)) return;
+  if (_errHoverStillInside(e.relatedTarget)) return;
+  clearTimeout(_errHoverTimer);
+  _errHoverTimer = null;
+  _errHoverLeaveTimer = setTimeout(function () {
+    _errHoverLeaveTimer = null;
+    hideErrPopup();
+    _errHoverKey = null;
+  }, 300);
+});
+// 悬浮窗自身：移入取消关闭计时；移出回同组热区则保持，否则宽限后关闭（仅悬停模式）
+(function () {
+  const pop = document.getElementById('errPopup');
+  pop.addEventListener('mouseenter', function () {
+    clearTimeout(_errHoverLeaveTimer);
+    clearTimeout(_errHoverTimer);
+  });
+  pop.addEventListener('mouseleave', function (e) {
+    if (!_errHoverKey) return;
+    if (_errHoverStillInside(e.relatedTarget)) return;
+    clearTimeout(_errHoverTimer);
+    _errHoverLeaveTimer = setTimeout(function () {
+      _errHoverLeaveTimer = null;
+      hideErrPopup();
+      _errHoverKey = null;
+    }, 300);
+  });
+})();
 // 采纳：有候选=替换为 candidates[0]；无候选（增字）=删除 wrong 文本（支持跨多文本节点）
 document.getElementById('errOk').addEventListener('click', function () {
   if (!errKey) { hideErrPopup(); return; }
@@ -4882,6 +4990,7 @@ function renderShortcutTable() {
 function openSettings() {
   renderShortcutTable();
   document.getElementById('tipDelayInput').value = tipDelay();
+  document.getElementById('errHoverDelayInput').value = errHoverDelay();
   loadFontSettings();
   document.getElementById('editorFontSizeInput').value = parseInt(document.documentElement.style.getPropertyValue('--editor-font-size') || '14', 10);
   document.getElementById('modalBg').style.display = 'flex';
@@ -5491,6 +5600,12 @@ document.getElementById('citationItalicEnabled').addEventListener('change', () =
 document.getElementById('editorFontSizeInput').addEventListener('change', (e) => {
   const v = parseInt(e.target.value, 10) || 14;
   applyFontSize(v);
+});
+// 纠错悬停弹出延迟设置（localStorage 持久化）
+document.getElementById('errHoverDelayInput').addEventListener('change', (e) => {
+  const v = parseInt(e.target.value, 10);
+  const d = isFinite(v) ? Math.max(0, Math.min(10000, v)) : 1500;
+  saveStr('ptoe_err_hover_delay', d);
 });
 // 暂存/保存/完成并转换/快捷键设置（2026-08-07 修复：四个绑定曾整块丢失 → 按钮点击无响应）
 document.getElementById('saveBtn').addEventListener('click', save);
