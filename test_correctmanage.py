@@ -32,6 +32,7 @@ from correctmanage import (
     _parse_llm_suggestions,
     _proofread_plain_text,
     _full_punct,
+    _ensure_marker_classes,
     diff_reocr_texts,
     _normalize_textcircled,
     _normalize_brackets,
@@ -195,6 +196,69 @@ class TestSanitize(unittest.TestCase):
         self.assertIn('style="text-align:center"', out4)
         self.assertIn('class="ptoe-note"', out4)
         self.assertIn('居中注释', out4)
+
+
+class TestEnsureMarkerClasses(unittest.TestCase):
+    """_ensure_marker_classes：serve 时只为「真正带 data-ptoe-marker 的标记 span」
+    补回 ptoe-marker 显示类。
+
+    2026-09-06 回归：旧实现 ``re.sub(r"<span(.*?)>", ...)`` 会给**所有** span
+    加 ptoe-marker 高亮类——注释里有段落标记时，注释内其他普通/格式 span 也被
+    渲染成黄色高亮（「整段注释高亮，只有标记该高亮」）。本组断言非标记 span
+    一律原样不动。
+    """
+
+    def test_marker_span_gets_class(self):
+        # 旧历史版本：仅有 data-ptoe-marker 无 class → 补 class
+        out = _ensure_marker_classes(
+            '<p class="ptoe-note">注释<span data-ptoe-marker="join">段</span>尾部</p>'
+        )
+        self.assertEqual(
+            out,
+            '<p class="ptoe-note">注释<span data-ptoe-marker="join" class="ptoe-marker">段</span>尾部</p>',
+        )
+
+    def test_marker_span_class_kept(self):
+        # 新存档已带 class → 原样不动（幂等）
+        html = '<p>正文<span data-ptoe-marker="full" class="ptoe-marker">全文</span></p>'
+        self.assertEqual(_ensure_marker_classes(html), html)
+
+    def test_non_marker_spans_untouched(self):
+        # 注释 + 段落标记场景：注释内普通文本/格式 span 不得被加高亮类
+        html = '<p class="ptoe-note">前<span style="text-align:center">ABC</span><span data-ptoe-marker="join">段</span>后</p>'
+        out = _ensure_marker_classes(html)
+        self.assertIn('<span style="text-align:center">ABC</span>', out)
+        self.assertNotIn('class="ptoe-marker"', '<span style="text-align:center">ABC</span>')
+        # 标记 span 仍正常补类
+        self.assertIn('<span data-ptoe-marker="join" class="ptoe-marker">段</span>', out)
+
+    def test_multi_marker_notes(self):
+        # 注释标记 + 段落标记并存：两者都补，其他 span 不动
+        html = (
+            '<p class="ptoe-note">'
+            '<span data-ptoe-marker="note">注</span>'
+            '正文<strong>加粗</strong>'
+            '<span data-ptoe-marker="join">段</span>'
+            '</p>'
+        )
+        out = _ensure_marker_classes(html)
+        self.assertIn('<span data-ptoe-marker="note" class="ptoe-marker">注</span>', out)
+        self.assertIn('<span data-ptoe-marker="join" class="ptoe-marker">段</span>', out)
+        self.assertIn('<strong>加粗</strong>', out)
+        # 除两个标记外，全串只应出现这 2 处 ptoe-marker class
+        self.assertEqual(out.count('class="ptoe-marker"'), 2)
+
+    def test_no_marker_attr_unchanged(self):
+        # 页面里根本没有 data-ptoe-marker → 原样返回（快捷路径）
+        html = '<p class="ptoe-note">仅注释<span class="x">普通</span></p>'
+        self.assertEqual(_ensure_marker_classes(html), html)
+
+    def test_marker_with_extra_attrs_class_merged(self):
+        # 标记 span 已有其他 class → 追加 ptoe-marker
+        out = _ensure_marker_classes('<p>a<span data-ptoe-marker="page" class="foo">页</span>b</p>')
+        self.assertEqual(
+            out, '<p>a<span data-ptoe-marker="page" class="foo ptoe-marker">页</span>b</p>'
+        )
 
 
 class TestCleanPageHtml(unittest.TestCase):
@@ -5545,6 +5609,253 @@ class TestShortcutsEndpoint(unittest.TestCase):
             self._stop(server)
 
 
+class TestUiSettingsEndpoint(unittest.TestCase):
+    """/api/ui_settings：矫正界面 UI 偏好服务端持久化（config.json 顶层 ui_settings）。
+
+    正确界面每次运行随机端口 → localStorage 按 origin 隔离每运行失效，
+    故持久化到 config.json（经 /api/ui_settings GET/POST 读写，与 shortcuts 同因）。
+    """
+
+    def _start(self):
+        import threading
+        from http.server import ThreadingHTTPServer
+
+        from correctmanage import _CorrectionHandler
+
+        state = {
+            "pages": {1: "<p>原文</p>"},
+            "finished": threading.Event(),
+            "preview_cache": {},
+            "pdf_path": None,
+            "img_dir": None,
+            "preview_dpi": 110,
+            "preview_quality": 82,
+            "last_heartbeat": 0.0,
+            "gone_at": None,
+            "idle_timeout": 600.0,
+            "auto_finished": False,
+        }
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _CorrectionHandler)
+        server.daemon_threads = True
+        server.state = state
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+    def _stop(self, server):
+        server.shutdown()
+        server.server_close()
+
+    def _patch_cfg(self, ui_settings=None):
+        import configmanage
+
+        cfg = {"model_choices": {}, "selected_model": None}
+        if ui_settings is not None:
+            cfg["ui_settings"] = ui_settings
+        orig = configmanage.get_config
+        configmanage.get_config = lambda *a, **k: cfg
+        self.addCleanup(lambda: setattr(configmanage, "get_config", orig))
+        return cfg
+
+    def _patch_setter(self):
+        import configmanage
+
+        calls = []
+        orig = configmanage.set_ui_settings
+        configmanage.set_ui_settings = lambda ui: calls.append(ui)
+        self.addCleanup(lambda: setattr(configmanage, "set_ui_settings", orig))
+        return calls
+
+    def test_get_returns_ui_settings(self):
+        import requests
+
+        self._patch_cfg({"tip_delay": 500, "err_hover_delay": 1000, "editor_font_size": 16, "img_mode": "full"})
+        server, base = self._start()
+        try:
+            res = requests.get(base + "/api/ui_settings").json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(
+                res["ui_settings"],
+                {"tip_delay": 500, "err_hover_delay": 1000, "editor_font_size": 16, "img_mode": "full"},
+            )
+        finally:
+            self._stop(server)
+
+    def test_get_missing_keys_returns_merged_defaults(self):
+        import requests
+
+        self._patch_cfg(None)  # 配置无 ui_settings 键
+        server, base = self._start()
+        try:
+            res = requests.get(base + "/api/ui_settings").json()
+            self.assertTrue(res["ok"])
+            # All four keys present with default values
+            self.assertEqual(
+                res["ui_settings"],
+                {"tip_delay": 600, "err_hover_delay": 1500, "editor_font_size": 14, "img_mode": ""},
+            )
+        finally:
+            self._stop(server)
+
+    def test_get_partial_stored_returns_merged(self):
+        import requests
+
+        self._patch_cfg({"tip_delay": 800})  # 只存了 tip_delay
+        server, base = self._start()
+        try:
+            res = requests.get(base + "/api/ui_settings").json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["ui_settings"]["tip_delay"], 800)
+            self.assertEqual(res["ui_settings"]["err_hover_delay"], 1500)
+            self.assertEqual(res["ui_settings"]["editor_font_size"], 14)
+            self.assertEqual(res["ui_settings"]["img_mode"], "")
+        finally:
+            self._stop(server)
+
+    def test_post_persists_via_set_ui_settings(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            payload = {"ui_settings": {"tip_delay": 700, "img_mode": "fit"}}
+            res = requests.post(
+                base + "/api/ui_settings", data=_json.dumps(payload)
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(calls, [{"tip_delay": 700, "img_mode": "fit"}])
+        finally:
+            self._stop(server)
+
+    def test_post_non_dict_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings", data=_json.dumps({"ui_settings": "nope"})
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("对象", res["error"])
+            self.assertEqual(calls, [], "非法载荷不应落盘")
+        finally:
+            self._stop(server)
+
+    def test_post_bad_tip_delay_type_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings", data=_json.dumps({"ui_settings": {"tip_delay": "abc"}})
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("数字", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+    def test_post_tip_delay_out_of_range_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings", data=_json.dumps({"ui_settings": {"tip_delay": 99999}})
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("范围", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+    def test_post_err_hover_delay_out_of_range_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings", data=_json.dumps({"ui_settings": {"err_hover_delay": 20000}})
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("范围", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+    def test_post_editor_font_size_out_of_range_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings", data=_json.dumps({"ui_settings": {"editor_font_size": 9}})
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("范围", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+    def test_post_bad_img_mode_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings", data=_json.dumps({"ui_settings": {"img_mode": "invalid"}})
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("取值无效", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+    def test_post_unknown_keys_ignored(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings", data=_json.dumps({"ui_settings": {"tip_delay": 900, "unknown_key": 123}})
+            ).json()
+            self.assertTrue(res["ok"])
+            # Only tip_delay should be in the call
+            self.assertEqual(calls, [{"tip_delay": 900}])
+        finally:
+            self._stop(server)
+
+
 class TestSetShortcutsConfig(unittest.TestCase):
     """configmanage.set_shortcuts：原子写 + 无变更不写盘。"""
 
@@ -5591,6 +5902,79 @@ class TestSetShortcutsConfig(unittest.TestCase):
         self.assertIn("citationItalicEnabled", self.cm.DEFAULT_CONFIG)
         patched = self.cm.validate_and_patch_config({"llama_server": "x", "models_dir": "y"})
         self.assertTrue(patched["citationItalicEnabled"])
+
+
+class TestSetUiSettingsConfig(unittest.TestCase):
+    """configmanage.set_ui_settings：原子写 + 无变更不写盘 + 清洗/钳制。"""
+
+    def setUp(self):
+        import configmanage
+
+        self.cm = configmanage
+        self.tmp = tempfile.mkdtemp(prefix="ptoe_cfg_")
+        self.path = str(Path(self.tmp) / "config.json")
+        self._orig_path = configmanage._CONFIG_PATH
+        configmanage._CONFIG_PATH = self.path
+        self.addCleanup(lambda: setattr(configmanage, "_CONFIG_PATH", self._orig_path))
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+
+    def test_writes_ui_settings(self):
+        import json as _json
+
+        self.cm.set_ui_settings({"tip_delay": 700, "img_mode": "fit"})
+        cfg = _json.loads(Path(self.path).read_text(encoding="utf-8"))
+        self.assertEqual(cfg["ui_settings"]["tip_delay"], 700)
+        self.assertEqual(cfg["ui_settings"]["img_mode"], "fit")
+        # Other keys get defaults
+        self.assertEqual(cfg["ui_settings"]["err_hover_delay"], 1500)
+        self.assertEqual(cfg["ui_settings"]["editor_font_size"], 14)
+
+    def test_no_write_when_unchanged(self):
+        import os as _os
+
+        self.cm.set_ui_settings({"tip_delay": 700})
+        mtime1 = _os.stat(self.path).st_mtime_ns
+        self.cm.set_ui_settings({"tip_delay": 700})  # 无变更 → 不写盘
+        self.assertEqual(_os.stat(self.path).st_mtime_ns, mtime1)
+
+    def test_clamp_tip_delay(self):
+        cfg = self.cm.set_ui_settings({"tip_delay": -100})
+        self.assertEqual(cfg["ui_settings"]["tip_delay"], 0)
+        cfg = self.cm.set_ui_settings({"tip_delay": 99999})
+        self.assertEqual(cfg["ui_settings"]["tip_delay"], 5000)
+
+    def test_clamp_err_hover_delay(self):
+        cfg = self.cm.set_ui_settings({"err_hover_delay": -5})
+        self.assertEqual(cfg["ui_settings"]["err_hover_delay"], 0)
+        cfg = self.cm.set_ui_settings({"err_hover_delay": 20000})
+        self.assertEqual(cfg["ui_settings"]["err_hover_delay"], 10000)
+
+    def test_clamp_editor_font_size(self):
+        cfg = self.cm.set_ui_settings({"editor_font_size": 5})
+        self.assertEqual(cfg["ui_settings"]["editor_font_size"], 10)
+        cfg = self.cm.set_ui_settings({"editor_font_size": 50})
+        self.assertEqual(cfg["ui_settings"]["editor_font_size"], 28)
+
+    def test_invalid_img_mode_falls_back(self):
+        cfg = self.cm.set_ui_settings({"img_mode": "invalid"})
+        self.assertEqual(cfg["ui_settings"]["img_mode"], "")
+
+    def test_valid_img_mode_accepted(self):
+        for m in ("", "full", "fit", "inline"):
+            cfg = self.cm.set_ui_settings({"img_mode": m})
+            self.assertEqual(cfg["ui_settings"]["img_mode"], m)
+
+    def test_non_dict_raises(self):
+        with self.assertRaises(ValueError):
+            self.cm.set_ui_settings("nope")
+
+    def test_default_config_seeds_ui_settings(self):
+        self.assertIn("ui_settings", self.cm.DEFAULT_CONFIG)
+        patched = self.cm.validate_and_patch_config({"llama_server": "x", "models_dir": "y"})
+        self.assertEqual(
+            patched["ui_settings"],
+            {"tip_delay": 600, "err_hover_delay": 1500, "editor_font_size": 14, "img_mode": ""},
+        )
 
 
 class TestConfigEndpoint(unittest.TestCase):

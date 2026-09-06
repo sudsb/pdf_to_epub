@@ -219,6 +219,15 @@ DEFAULT_CONFIG = {
     },
     # 引用字体是否默认斜体（2026-08）
     "citationItalicEnabled": True,
+    # 矫正界面 UI 偏好（2026-09）：提示/悬停延迟、编辑器字号、图片插入模式。
+    # correct_pages 每次运行随机端口 → localStorage 按 origin 隔离每次失效，
+    # 故持久化到 config.json（经 /api/ui_settings GET/POST 读写，与 shortcuts 同因）。
+    "ui_settings": {
+        "tip_delay": 600,
+        "err_hover_delay": 1500,
+        "editor_font_size": 14,
+        "img_mode": "",
+    },
     # 图片预处理（2026-08，OpenCV）：PDF 分割图片时启用，提高 OCR 识别率。
     # enabled 开关；gray 灰度 / denoise 中值去噪 / sharpen 锐化 / binarize 自适应二值化；
     # workers 0=自动按 CPU 核数（>0 时限制渲染进程数）。设置变更会使 .ptoe_split.json 缓存失效。
@@ -642,6 +651,66 @@ def set_shortcuts(shortcuts: dict) -> dict:
         except Exception as e:
             print(f"[config] Error updating shortcuts, fallback to default: {e}")
             cfg = DEFAULT_CONFIG.copy()
+            with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            return cfg
+
+
+def set_ui_settings(ui: dict) -> dict:
+    """设置矫正界面 UI 偏好（顶层键 ui_settings）并持久化。
+
+    与 set_shortcuts 同构：锁内读配置、校验/清洗、原子写回，返回新配置。
+    仅在确有变更时写盘。线程安全。
+    """
+    if not isinstance(ui, dict):
+        raise ValueError("ui_settings 必须是对象")
+    # 防御性清洗（HTTP 处理器已做严格 400 校验，此处兜底）
+    clean = {}
+    if "tip_delay" in ui:
+        try:
+            v = int(ui["tip_delay"])
+        except (TypeError, ValueError):
+            v = 600
+        clean["tip_delay"] = max(0, min(5000, v))
+    if "err_hover_delay" in ui:
+        try:
+            v = int(ui["err_hover_delay"])
+        except (TypeError, ValueError):
+            v = 1500
+        clean["err_hover_delay"] = max(0, min(10000, v))
+    if "editor_font_size" in ui:
+        try:
+            v = int(ui["editor_font_size"])
+        except (TypeError, ValueError):
+            v = 14
+        clean["editor_font_size"] = max(10, min(28, v))
+    if "img_mode" in ui:
+        v = str(ui["img_mode"])
+        clean["img_mode"] = v if v in ("", "full", "fit", "inline") else ""
+    with _CFG_LOCK:
+        try:
+            if os.path.exists(_CONFIG_PATH):
+                with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            else:
+                cfg = DEFAULT_CONFIG.copy()
+                # Deep-copy nested ui_settings to avoid mutating DEFAULT_CONFIG
+                if isinstance(cfg.get("ui_settings"), dict):
+                    cfg["ui_settings"] = dict(cfg["ui_settings"])
+            if not isinstance(cfg.get("ui_settings"), dict):
+                cfg["ui_settings"] = dict(DEFAULT_CONFIG.get("ui_settings", {}))
+            before = dict(cfg["ui_settings"])
+            cfg["ui_settings"].update(clean)
+            cfg = validate_and_patch_config(cfg)
+            if cfg["ui_settings"] != before:  # 无变更不写盘
+                _atomic_write_json(_CONFIG_PATH, cfg)
+            return cfg
+        except Exception as e:
+            print(f"[config] Error updating ui_settings, fallback to default: {e}")
+            cfg = DEFAULT_CONFIG.copy()
+            # Deep-copy nested ui_settings in fallback too
+            if isinstance(cfg.get("ui_settings"), dict):
+                cfg["ui_settings"] = dict(cfg["ui_settings"])
             with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
             return cfg

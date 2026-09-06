@@ -280,5 +280,11 @@
   "browser": "D:/min/min.exe",
   "gui_display": "pywebview",
   "tabs_position": "bottom",
-  "window_maximized": true
+  "window_maximized": true,
+  "ui_settings": {
+    "tip_delay": 600,
+    "err_hover_delay": 1500,
+    "editor_font_size": 14,
+    "img_mode": ""
+  }
 }

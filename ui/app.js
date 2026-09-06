@@ -90,9 +90,59 @@ let _loadHintTimer = null;
 let _loadDoneTimer = null;
 
 // 提示延迟（毫秒）：悬停超过该时间才显示提示文字；0 = 立即显示（localStorage 可配置）
-function tipDelay() { return loadInt('ptoe_tip_delay', 600); }
+function tipDelay() { return uiv('tip_delay', 600); }
 // 纠错悬停弹出延迟（毫秒）：悬停校正文本超过该时间自动弹出采纳/忽略菜单；0 = 悬停即弹（设置-界面可调）
-function errHoverDelay() { return loadInt('ptoe_err_hover_delay', 1500); }
+function errHoverDelay() { return uiv('err_hover_delay', 1500); }
+
+// 设置「界面」页偏好：服务端持久化到 config.json（/api/ui_settings）。
+// correct_pages 每运行随机端口 → localStorage 按 origin 隔离每次失效，
+// 故以内存 uiSettings 为准、服务端为准，localStorage 仅作加载前的同步兜底。
+const UI_SETTINGS_DEFAULTS = { tip_delay: 600, err_hover_delay: 1500, editor_font_size: 14, img_mode: '' };
+let uiSettings = null; // 服务端加载前为 null → 读 localStorage 兜底；加载后为完整对象
+function uiv(key, def) {
+  if (uiSettings && key in uiSettings && uiSettings[key] !== undefined && uiSettings[key] !== null) return uiSettings[key];
+  const lk = key === 'editor_font_size' ? 'ptoe_font_size' : 'ptoe_' + key;
+  return loadInt(lk, def);
+}
+async function loadUiSettingsFromServer() {
+  try {
+    const res = await fetchJSON('/api/ui_settings');
+    if (!res || !res.ok) return;
+    uiSettings = Object.assign({}, UI_SETTINGS_DEFAULTS, res.ui_settings || {});
+    saveUIMirror();
+    applyUiPrefs();
+    const bg = document.getElementById('modalBg');
+    if (bg && bg.style.display === 'flex') { // 设置弹窗开着时同步界面页输入框
+      document.getElementById('tipDelayInput').value = uiSettings.tip_delay;
+      document.getElementById('errHoverDelayInput').value = uiSettings.err_hover_delay;
+    }
+  } catch (e) { console.warn('loadUiSettingsFromServer failed: ' + e.message); }
+}
+function saveUIMirror() {
+  try {
+    localStorage.setItem('ptoe_tip_delay', String(uiSettings.tip_delay));
+    localStorage.setItem('ptoe_err_hover_delay', String(uiSettings.err_hover_delay));
+    localStorage.setItem('ptoe_font_size', String(uiSettings.editor_font_size));
+    localStorage.setItem('ptoe_img_mode', String(uiSettings.img_mode));
+  } catch (e) {}
+}
+function saveUiSettings() {
+  if (!uiSettings) return;
+  saveUIMirror();
+  fetch('/api/ui_settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ui_settings: uiSettings }),
+  }).catch(function () {});
+}
+function applyUiPrefs() {
+  const fs = (uiSettings && uiSettings.editor_font_size) || UI_SETTINGS_DEFAULTS.editor_font_size;
+  document.documentElement.style.setProperty('--editor-font-size', fs + 'px');
+  const s = document.getElementById('fontSizeSel');
+  if (s) s.value = fs;
+  const im = document.getElementById('imgModeSel');
+  if (im && uiSettings && uiSettings.img_mode) im.value = uiSettings.img_mode;
+}
 // 提示文字：操作说明 + 对应快捷键（若有绑定）
 function tipTextFor(op) {
   const combo = bindings[op];
@@ -2959,6 +3009,84 @@ function ctxMarkerInsert(type) {
   });
 }
 function ctxExportRun(fmt) { ctxRun(() => exportFile(fmt)); }
+// 右键菜单「复制/粘贴」二级菜单（2026-09）：
+// 格式复制 = execCommand('copy')（复制 HTML 格式到系统剪贴板）；
+// 纯文本复制 = navigator.clipboard.writeText（仅文字）；
+// 格式粘贴 = 读取剪贴板 HTML 后 insertHTML（无 HTML 则回退纯文本 insertText）；
+// 纯文本粘贴 = 读取剪贴板纯文本后 insertText。
+// paste 为异步操作（Clipboard API），不走 ctxRun（try/catch 仅捕获同步），
+// 改为 closeContextMenu 前预捕获目标页/行号/光标位置。
+function ctxCopyFormat() {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { showToast('请先选中要复制的文字', 'warn'); return; }
+  try {
+    if (!document.execCommand('copy')) throw new Error('copy failed');
+    showToast('已复制格式', 'ok');
+  } catch (e) { showToast('复制失败', 'fail'); }
+}
+function ctxCopyText() {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { showToast('请先选中要复制的文字', 'warn'); return; }
+  const text = sel.toString();
+  if (!text) { showToast('选区内容为空', 'warn'); return; }
+  navigator.clipboard.writeText(text).then(() => {
+    showToast('已复制纯文本', 'ok');
+  }).catch(() => { showToast('复制失败', 'fail'); });
+}
+// paste 辅助：定位光标到右键位置并插入内容
+function _ctxPastePosition(ed, range) {
+  if (!ed) return false;
+  ed.focus();
+  if (range && ed.contains(range.startContainer)) {
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+  return true;
+}
+function _ctxPasteHtml(html, ed, ri, range) {
+  if (!_ctxPastePosition(ed, range)) { showToast('请先点击某一页的文字', 'warn'); return; }
+  histRun('粘贴（格式）', [ri], () => {
+    withScrollStable(() => document.execCommand('insertHTML', false, html));
+    syncContent(ed);
+    markDirty(ri);
+    scheduleRemeasure(ri);
+  });
+}
+function _ctxPasteTextInsert(text, ed, ri, range) {
+  if (!_ctxPastePosition(ed, range)) { showToast('请先点击某一页的文字', 'warn'); return; }
+  histRun('粘贴（纯文本）', [ri], () => {
+    withScrollStable(() => document.execCommand('insertText', false, text));
+    syncContent(ed);
+    markDirty(ri);
+    scheduleRemeasure(ri);
+  });
+}
+async function ctxPasteFormat(ed, ri, range) {
+  if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
+  try {
+    const items = await navigator.clipboard.read();
+    for (const item of items) {
+      if (item.types.includes('text/html')) {
+        const blob = await item.getType('text/html');
+        const html = await blob.text();
+        if (html) { _ctxPasteHtml(html, ed, ri, range); showToast('已粘贴格式', 'ok'); return; }
+      }
+    }
+    // 无 HTML → 回退纯文本
+    const text = await navigator.clipboard.readText();
+    if (text) { _ctxPasteTextInsert(text, ed, ri, range); showToast('已粘贴纯文本', 'ok'); }
+    else showToast('剪贴板为空', 'warn');
+  } catch (e) { showToast('粘贴失败：无法读取剪贴板', 'fail'); }
+}
+async function ctxPasteText(ed, ri, range) {
+  if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
+  try {
+    const text = await navigator.clipboard.readText();
+    if (text) { _ctxPasteTextInsert(text, ed, ri, range); showToast('已粘贴纯文本', 'ok'); }
+    else showToast('剪贴板为空', 'warn');
+  } catch (e) { showToast('粘贴失败：无法读取剪贴板', 'fail'); }
+}
 // 右键菜单「添加规则」二级菜单：列出已保存格式规则，点击即应用到右键目标页。
 // 每次打开菜单时刷新（fetch /api/format_rules，fire-and-forget）；子菜单 hover
 // 才展开，异步填充通常已就绪。空列表显示「暂无规则」。
@@ -3024,10 +3152,30 @@ ctxMenu.addEventListener('click', (e) => {
     ctxRun(() => ctxApplyFormatRule(rule));
     return;
   }
-  // 二级菜单叶子项（插入标记 / 导出 子项）
+  // 二级菜单叶子项（复制/粘贴 / 插入标记 / 导出 子项）
   const subBtn = e.target.closest('.ctx-submenu .ctx-item');
   if (subBtn) {
     e.stopPropagation();
+    const cp = subBtn.dataset.ctxCopy;
+    if (cp) {
+      // 复制是同步/异步的剪贴板操作：不依赖右键目标页/光标，直接执行。
+      // 纯文本复制用 Clipboard API，格式复制用 execCommand('copy')（同步、无需焦点）。
+      if (cp === 'format') ctxCopyFormat();
+      else if (cp === 'text') ctxCopyText();
+      closeContextMenu();
+      return;
+    }
+    const ps = subBtn.dataset.ctxPaste;
+    if (ps) {
+      // 粘贴需要目标页/光标：先捕获右键目标（closeContextMenu 会清空 _ctxEditable/_ctxRange）。
+      const ed = _ctxEditable || currentEditable();
+      const ri = ed ? Number(ed.closest('.page-row').dataset.i) : -1;
+      const range = _ctxRange;
+      closeContextMenu();
+      if (ps === 'format') ctxPasteFormat(ed, ri, range);
+      else if (ps === 'text') ctxPasteText(ed, ri, range);
+      return;
+    }
     const mk = subBtn.dataset.ctxMarker;
     if (mk) { ctxMarkerInsert(mk); return; }
     const ex = subBtn.dataset.ctxExport;
@@ -4248,8 +4396,12 @@ document.addEventListener('keydown', function (e) {
 
 // 字号下拉：仅调整编辑区显示字号（CSS 变量 --editor-font-size；视图偏好，不写入保存内容）
 function applyFontSize(v) {
-  document.documentElement.style.setProperty('--editor-font-size', (v || 14) + 'px');
-  setStatus('编辑字号：' + (v || 14) + 'px');
+  const fv = v || 14;
+  document.documentElement.style.setProperty('--editor-font-size', fv + 'px');
+  setStatus('编辑字号：' + fv + 'px');
+  if (uiSettings) { uiSettings.editor_font_size = fv; saveUiSettings(); }
+  const s = document.getElementById('fontSizeSel');
+  if (s) s.value = fv;
 }
 
 // ---------- 格式规则（弹窗管理 + 条件列表/求值模式应用） ----------
@@ -5849,7 +6001,9 @@ document.getElementById('indClearBtn').addEventListener('click', () => applyInde
   document.getElementById(id).addEventListener('input', updateIndentPreview);
   document.getElementById(id).addEventListener('change', updateIndentPreview);
 });
-document.getElementById('imgModeSel').addEventListener('change', (e) => { saveStr('ptoe_img_mode', e.target.value); });
+document.getElementById('imgModeSel').addEventListener('change', (e) => {
+  if (uiSettings) { uiSettings.img_mode = e.target.value; saveUiSettings(); }
+});
 // 格式规则弹窗绑定
 document.getElementById('formatRulesBtn').addEventListener('click', openFormatRulesModal);
 document.getElementById('formatRulesCloseBtn').addEventListener('click', closeFormatRulesModal);
@@ -5884,6 +6038,35 @@ document.querySelectorAll('.settings-tab').forEach(btn => {
     document.getElementById('panel-' + tab).style.display = 'block';
   });
 });
+// 设置-快捷键：恢复默认
+document.getElementById('resetShortcutsBtn').addEventListener('click', () => {
+  bindings = Object.assign({}, DEFAULTS);
+  saveBindings();
+  renderShortcutTable();
+  showToast('快捷键已恢复默认设置', 'ok');
+});
+// 设置-字体：恢复默认（与 configmanage.DEFAULT_CONFIG fonts 一致）
+document.getElementById('resetFontsBtn').addEventListener('click', async () => {
+  document.getElementById('fontBody').value = 'serif';
+  document.getElementById('fontHeading').value = 'sans-serif';
+  document.getElementById('fontNote').value = 'serif';
+  document.getElementById('fontCitation').value = 'cursive';
+  document.getElementById('citationItalicEnabled').checked = true;
+  applyFontCSSVariables({ body: 'serif', heading: 'sans-serif', note: 'serif', citation: 'cursive' });
+  await saveFontSettings();
+  showToast('字体设置已恢复默认', 'ok');
+});
+// 设置-界面：恢复默认
+document.getElementById('resetUiSettingsBtn').addEventListener('click', () => {
+  uiSettings = Object.assign({}, UI_SETTINGS_DEFAULTS);
+  applyUiPrefs();
+  saveUiSettings();
+  document.getElementById('tipDelayInput').value = uiSettings.tip_delay;
+  document.getElementById('errHoverDelayInput').value = uiSettings.err_hover_delay;
+  document.getElementById('editorFontSizeInput').value = uiSettings.editor_font_size;
+  applyFontSize(uiSettings.editor_font_size);
+  showToast('界面设置已恢复默认', 'ok');
+});
 // 字体设置保存
 ['fontBody','fontHeading','fontNote','fontCitation'].forEach(id => {
   const el = document.getElementById(id);
@@ -5895,11 +6078,17 @@ document.getElementById('editorFontSizeInput').addEventListener('change', (e) =>
   const v = parseInt(e.target.value, 10) || 14;
   applyFontSize(v);
 });
-// 纠错悬停弹出延迟设置（localStorage 持久化）
+// 纠错悬停弹出延迟设置（服务端持久化 config.json ui_settings；随机端口下 localStorage 每次失效）
 document.getElementById('errHoverDelayInput').addEventListener('change', (e) => {
   const v = parseInt(e.target.value, 10);
   const d = isFinite(v) ? Math.max(0, Math.min(10000, v)) : 1500;
-  saveStr('ptoe_err_hover_delay', d);
+  if (uiSettings) { uiSettings.err_hover_delay = d; saveUiSettings(); }
+});
+// 提示延迟设置（持久化到服务端 config.json ui_settings；随机端口下 localStorage 每次失效）
+document.getElementById('tipDelayInput').addEventListener('change', (e) => {
+  const v = parseInt(e.target.value, 10);
+  const d = isFinite(v) ? Math.max(0, Math.min(5000, v)) : 600;
+  if (uiSettings) { uiSettings.tip_delay = d; saveUiSettings(); }
 });
 // 暂存/保存/完成并转换/快捷键设置（2026-08-07 修复：四个绑定曾整块丢失 → 按钮点击无响应）
 document.getElementById('saveBtn').addEventListener('click', save);
@@ -6054,6 +6243,7 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
   heights.length = pages.length; heights.fill(0);
   est = pages.length ? 420 : 420;
    loadBindingsFromServer();   // 服务端快捷键设置（异步覆盖，失败静默回退 localStorage/DEFAULTS）
+   loadUiSettingsFromServer(); // 服务端界面设置（异步覆盖，失败静默回退 localStorage/DEFAULTS）
   mdMode = loadBool('ptoe_md_mode');
   if (mdMode) {
     for (let i = 0; i < pages.length; i++) mdSourceMap.set(i, htmlToMd(pages[i].text));

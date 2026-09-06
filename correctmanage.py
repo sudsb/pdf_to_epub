@@ -1238,12 +1238,21 @@ def _ensure_marker_classes(html: str) -> str:
     `ptoe-marker`. When serving stored pages back to the browser we add the
     class back to any marker spans so they render highlighted without
     mutating the on-disk history payload.
+
+    2026-09-06 修复：只给「真正带 data-ptoe-marker 属性的标记 span」补 class，
+    绝不触碰其他普通/格式 span。此前用 ``re.sub(r"<span(.*?)>", ...)`` 匹配
+    全部 span，会把 ptoe-marker 高亮类错误地加到注释内/其他位置的普通 span 上，
+    「注释里有段落标记」时整段注释被渲染成高亮，只有标记该高亮。
     """
     if not html or "data-ptoe-marker" not in html:
         return html
 
     def _repl(m: re.Match) -> str:
         attrs = m.group(1) or ""
+        # 仅处理带 data-ptoe-marker 的标记 span；其余 span（普通文字、格式 span、
+        # 证明/纠错 span 等）一律原样返回，绝不加高亮类。
+        if not re.search(r"data-ptoe-marker\s*=", attrs):
+            return m.group(0)
         # find existing class attr
         cls_m = re.search(r'class="([^"]*)"', attrs)
         if cls_m:
@@ -5074,6 +5083,97 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 "application/json; charset=utf-8",
             )
 
+    def _ui_settings(self) -> None:
+        """矫正界面 UI 偏好：GET 读取 / POST 写入 config.json 顶层 ui_settings。
+
+        服务端持久化 —— correct_pages 每次运行随机端口，localStorage 按 origin
+        隔离会导致设置每运行失效（与 shortcuts / proofread_settings 同因）。
+        """
+        try:
+            from configmanage import get_config, set_ui_settings, DEFAULT_CONFIG
+
+            if self.command == "GET":
+                cfg = get_config(show_dialogs=False) or {}
+                stored = cfg.get("ui_settings")
+                if not isinstance(stored, dict):
+                    stored = {}
+                defaults = DEFAULT_CONFIG.get("ui_settings", {
+                    "tip_delay": 600,
+                    "err_hover_delay": 1500,
+                    "editor_font_size": 14,
+                    "img_mode": "",
+                })
+                merged = {
+                    "tip_delay": stored.get("tip_delay", defaults["tip_delay"]),
+                    "err_hover_delay": stored.get("err_hover_delay", defaults["err_hover_delay"]),
+                    "editor_font_size": stored.get("editor_font_size", defaults["editor_font_size"]),
+                    "img_mode": stored.get("img_mode", defaults["img_mode"]),
+                }
+                self._send(
+                    200,
+                    self._json({"ok": True, "ui_settings": merged}),
+                    "application/json; charset=utf-8",
+                )
+                return
+            # POST: {ui_settings: {...}}
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            body = json.loads(raw.decode("utf-8"))
+            ui = body.get("ui_settings")
+            if not isinstance(ui, dict):
+                self._send(
+                    400,
+                    self._json({"ok": False, "error": "ui_settings 必须是对象"}),
+                    "application/json; charset=utf-8",
+                )
+                return
+            # 逐键校验（非法 → 400，不落盘）
+            clean = {}
+            if "tip_delay" in ui:
+                try:
+                    v = int(ui["tip_delay"])
+                except (TypeError, ValueError):
+                    self._send(400, self._json({"ok": False, "error": "tip_delay 必须是数字"}), "application/json; charset=utf-8")
+                    return
+                if not (0 <= v <= 5000):
+                    self._send(400, self._json({"ok": False, "error": "tip_delay 超出范围（0-5000）"}), "application/json; charset=utf-8")
+                    return
+                clean["tip_delay"] = v
+            if "err_hover_delay" in ui:
+                try:
+                    v = int(ui["err_hover_delay"])
+                except (TypeError, ValueError):
+                    self._send(400, self._json({"ok": False, "error": "err_hover_delay 必须是数字"}), "application/json; charset=utf-8")
+                    return
+                if not (0 <= v <= 10000):
+                    self._send(400, self._json({"ok": False, "error": "err_hover_delay 超出范围（0-10000）"}), "application/json; charset=utf-8")
+                    return
+                clean["err_hover_delay"] = v
+            if "editor_font_size" in ui:
+                try:
+                    v = int(ui["editor_font_size"])
+                except (TypeError, ValueError):
+                    self._send(400, self._json({"ok": False, "error": "editor_font_size 必须是数字"}), "application/json; charset=utf-8")
+                    return
+                if not (10 <= v <= 28):
+                    self._send(400, self._json({"ok": False, "error": "editor_font_size 超出范围（10-28）"}), "application/json; charset=utf-8")
+                    return
+                clean["editor_font_size"] = v
+            if "img_mode" in ui:
+                v = str(ui["img_mode"])
+                if v not in ("", "full", "fit", "inline"):
+                    self._send(400, self._json({"ok": False, "error": "img_mode 取值无效"}), "application/json; charset=utf-8")
+                    return
+                clean["img_mode"] = v
+            set_ui_settings(clean)
+            self._send(200, self._json({"ok": True}), "application/json; charset=utf-8")
+        except Exception as e:  # noqa: BLE001
+            self._send(
+                500,
+                self._json({"ok": False, "error": str(e)}),
+                "application/json; charset=utf-8",
+            )
+
     def _config(self) -> None:
         """字体/界面配置：POST 写入 config.json fonts + citationItalicEnabled。
 
@@ -5306,6 +5406,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/shortcuts":
             self._shortcuts()
+            return
+        if path == "/api/ui_settings":
+            self._ui_settings()
             return
         if path == "/api/config":
             # 字体/界面配置：GET 读取 config.json fonts + citationItalicEnabled
@@ -5992,6 +6095,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/shortcuts":
             self._shortcuts()
+            return
+        if path == "/api/ui_settings":
+            self._ui_settings()
             return
         if path == "/api/config":
             self._config()
@@ -7585,6 +7691,19 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
 <div id="tip"></div>
 <!-- 右键上下文菜单（2026-08-08）：编辑区内右键弹出；重识别/插入标记/导出/Markdown 提示/保存/暂存 -->
 <div id="contextMenu" hidden>
+  <div class="ctx-item ctx-sub" data-ctx="copy">复制 <span class="ctx-arrow">▸</span>
+    <div class="ctx-submenu" id="ctxCopySub">
+      <button type="button" class="ctx-item" data-ctx-copy="format">格式复制</button>
+      <button type="button" class="ctx-item" data-ctx-copy="text">纯文本复制</button>
+    </div>
+  </div>
+  <div class="ctx-item ctx-sub" data-ctx="paste">粘贴 <span class="ctx-arrow">▸</span>
+    <div class="ctx-submenu" id="ctxPasteSub">
+      <button type="button" class="ctx-item" data-ctx-paste="format">格式粘贴</button>
+      <button type="button" class="ctx-item" data-ctx-paste="text">纯文本粘贴</button>
+    </div>
+  </div>
+  <div class="ctx-sep"></div>
   <button type="button" class="ctx-item" data-ctx="reocr">重识别</button>
   <button type="button" class="ctx-item" data-ctx="clear">清除</button>
   <div class="ctx-item ctx-sub" data-ctx="marker">插入标记 <span class="ctx-arrow">▸</span>
@@ -7713,6 +7832,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
     <div class="settings-panel" id="panel-shortcuts">
       <p style="font-size:12px;color:#5a6b7c;margin:8px 0;">每个操作绑定一个组合键；点击某行后按下新组合键完成绑定，Del/Backspace 清除，Esc 取消。绑定保存在本浏览器（localStorage）并同步到配置文件。</p>
       <table id="shortcutTable"></table>
+      <div style="margin-top:8px;"><button type="button" id="resetShortcutsBtn">恢复默认</button></div>
     </div>
     <div class="settings-panel" id="panel-fonts" style="display:none;">
       <p style="font-size:12px;color:#5a6b7c;margin:8px 0;">设置各类文本的字体族（CSS font-family），留空则使用浏览器默认。修改后实时生效，保存到配置文件。</p>
@@ -7732,6 +7852,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
           启用引用斜体（citation 格式自动应用 italic）
         </label>
       </div>
+      <div style="margin-top:12px;"><button type="button" id="resetFontsBtn">恢复默认</button></div>
     </div>
     <div class="settings-panel" id="panel-ui" style="display:none;">
       <h4 style="margin:8px 0 4px;">提示延迟</h4>
@@ -7743,6 +7864,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <h4 style="margin:16px 0 4px;">编辑器字号</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">调整编辑区显示字号（视图偏好，不写入保存内容）。</p>
       <label style="font-size:13px;">字号（px） <input type="number" id="editorFontSizeInput" min="10" max="28" step="1" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
+      <div style="margin-top:12px;"><button type="button" id="resetUiSettingsBtn">恢复默认</button></div>
     </div>
   </div>
   <button type="button" id="closeSettings" class="primary" style="margin-top:12px;">关闭</button>
