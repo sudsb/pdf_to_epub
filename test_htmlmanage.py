@@ -342,5 +342,42 @@ class TestHeadingCentering(unittest.TestCase):
         self.assertEqual(out.count('style="'), 1)
 
 
+class TestNewInlineFormatCSS(unittest.TestCase):
+    """新增 7 项行内格式 CSS 与渲染测试（2026-09）。"""
+
+    def test_css_contains_seven_new_rules(self):
+        """CSSManager.generate_stylesheet 包含全部 7 条 .ptoe-* 规则。"""
+        cssm = htmlmanage.CSSManager()
+        css = cssm.generate_stylesheet()
+        # 检查选择器存在
+        for selector in ('.ptoe-underline', '.ptoe-strike', '.ptoe-charbox', '.ptoe-shade', '.ptoe-highlight', '.ptoe-sup', '.ptoe-sub'):
+            self.assertIn(selector, css, f"Missing selector {selector}")
+        # 检查关键属性存在（CSS 输出含空格和分号，做宽松匹配）
+        self.assertIn('text-decoration: underline', css)
+        self.assertIn('text-decoration: line-through', css)
+        self.assertIn('border: 1px solid #333', css)
+        self.assertIn('padding: 0 .15em', css)
+        self.assertIn('border-radius: 2px', css)
+        self.assertIn('background: #eef1f4', css)
+        self.assertIn('background: #ffe45e', css)
+        self.assertIn('vertical-align: super', css)
+        self.assertIn('font-size: .7em', css)
+        self.assertIn('line-height: 1', css)
+        self.assertIn('vertical-align: sub', css)
+
+    def test_render_fragment_preserves_new_inline_spans(self):
+        """_render_fragment 保留段落内的新增行内 span（ptoe-highlight 等）不被剥离。"""
+        converter = htmlmanage.HTMLConverter(output_dir="/tmp")
+        # 含新增行内格式的段落
+        html = '<p>正文<span class="ptoe-highlight">突显文字</span>继续</p>'
+        out = converter._render_fragment(html)
+        self.assertIn('<span class="ptoe-highlight">突显文字</span>', out)
+        # 同时验证其他 6 种 class 也能通过
+        for cls in ("ptoe-underline", "ptoe-strike", "ptoe-charbox", "ptoe-shade", "ptoe-sup", "ptoe-sub"):
+            html2 = f'<p>正文<span class="{cls}">测试</span>继续</p>'
+            out2 = converter._render_fragment(html2)
+            self.assertIn(f'<span class="{cls}">测试</span>', out2)
+
+
 if __name__ == '__main__':
     unittest.main()

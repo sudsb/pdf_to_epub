@@ -50,6 +50,14 @@ VALID_FORMAT_OPS = {
     "first_indent",
     "hang_indent",
     "strip_ws",
+    # 2026-09 新增行内格式（7 项）
+    "underline",
+    "strike",
+    "charbox",
+    "shade",
+    "highlight",
+    "sup",
+    "sub",
 }
 
 # 空元素（void elements）——无闭合标签、无子节点
@@ -82,6 +90,8 @@ FORMAT_OP_GROUPS = {
     "merge": ["merge"],
     # 缩进模式互斥（2026-08-23）：顶格/缩进/首行缩进/悬挂缩进 同一规则链中先到先得
     "indent_mode": ["flush", "indent", "first_indent", "hang_indent"],
+    # 上标/下标互斥（2026-09）：同一文本不能同时是上标和下标
+    "sup_sub": ["sup", "sub"],
 }
 
 
@@ -352,14 +362,26 @@ class MiniDOMParser(HTMLParser):
                 self.stack.append(ElementNode(f"__skip_{tag}"))
                 return
 
-        # span 特殊处理：只保留 data-ptoe-marker 与 ptoe-marker class
+        # span 特殊处理：只保留 data-ptoe-marker 与允许的 class（ptoe-marker、ptoe-note、ptoe-citation、以及 7 个新行内格式 class）
         if tag == "span":
             new_attrs = {}
+            allowed_span_classes = {
+                "ptoe-marker",
+                "ptoe-note",
+                "ptoe-citation",
+                "ptoe-underline",
+                "ptoe-strike",
+                "ptoe-charbox",
+                "ptoe-shade",
+                "ptoe-highlight",
+                "ptoe-sup",
+                "ptoe-sub",
+            }
             for k, v in attr_dict.items():
                 if k == "data-ptoe-marker":
                     new_attrs[k] = v
                 elif k == "class" and isinstance(v, list):
-                    filtered = [c for c in v if c == "ptoe-marker"]
+                    filtered = [c for c in v if c in allowed_span_classes]
                     if filtered:
                         new_attrs[k] = filtered
             attr_dict = new_attrs
@@ -729,7 +751,7 @@ def _replace_node_in_parent(old_node: Node, new_nodes: list[Node]) -> None:
 
 def apply_inline_format(nodes_info: list[TextNodeInfo], start_off: int, end_off: int, op: str) -> bool:
     """
-    在指定偏移范围内应用行内格式（bold/italic/no_bold/remove/align）。
+    在指定偏移范围内应用行内格式（bold/italic/no_bold/remove/align/underline/strike/charbox/shade/highlight/sup/sub）。
     通过拆分/包裹文本节点实现。
     返回是否成功应用。
     """
@@ -752,12 +774,37 @@ def apply_inline_format(nodes_info: list[TextNodeInfo], start_off: int, end_off:
         # align_* 作为行内格式：用内联样式包裹，允许多个不同对齐在同一块内
         pos = op[6:]  # left/center/right
         return _wrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "span", {"style": f"text-align:{pos}"})
+    elif op == "underline":
+        # 下划线
+        return _wrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "span", {"class": "ptoe-underline"})
+    elif op == "strike":
+        # 删除线
+        return _wrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "span", {"class": "ptoe-strike"})
+    elif op == "charbox":
+        # 字符边框
+        return _wrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "span", {"class": "ptoe-charbox"})
+    elif op == "shade":
+        # 底纹
+        return _wrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "span", {"class": "ptoe-shade"})
+    elif op == "highlight":
+        # 突显
+        return _wrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "span", {"class": "ptoe-highlight"})
+    elif op == "sup":
+        # 上标：先移除可能存在的下标，再包裹上标（互斥）
+        _unwrap_inline_class(nodes_info, start_node, start_idx, end_node, end_idx, "ptoe-sub")
+        return _wrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "span", {"class": "ptoe-sup"})
+    elif op == "sub":
+        # 下标：先移除可能存在的上标，再包裹下标（互斥）
+        _unwrap_inline_class(nodes_info, start_node, start_idx, end_node, end_idx, "ptoe-sup")
+        return _wrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "span", {"class": "ptoe-sub"})
     elif op == "no_bold":
         return _unwrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "strong")
     elif op == "remove":
-        # 移除 strong/em，保留标记 span 与 img
+        # 移除 strong/em 以及所有新增行内格式 span，保留标记 span 与 img
         _unwrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "strong")
         _unwrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "em")
+        for cls in ("ptoe-note", "ptoe-citation", "ptoe-underline", "ptoe-strike", "ptoe-charbox", "ptoe-shade", "ptoe-highlight", "ptoe-sup", "ptoe-sub"):
+            _unwrap_inline_class(nodes_info, start_node, start_idx, end_node, end_idx, cls)
         return True
     return False
 
@@ -867,6 +914,38 @@ def _unwrap_inline(nodes_info: list[TextNodeInfo], start_node: TextNode, start_i
 
     for el in affected_elements:
         # 展平：将子节点移到父节点中
+        parent = el.parent
+        if not parent:
+            continue
+        try:
+            idx = parent.children.index(el)
+        except ValueError:
+            continue
+        parent.children[idx:idx+1] = el.children
+        for c in el.children:
+            c.parent = parent
+    return True
+
+
+def _unwrap_inline_class(nodes_info: list[TextNodeInfo], start_node: TextNode, start_idx: int, end_node: TextNode, end_idx: int, cls: str) -> bool:
+    """在范围内解包指定 class 的 <span>（移除标签保留内容）。用于清除行内格式。"""
+    affected_elements: list[ElementNode] = []
+
+    def collect_elements(node: Node):
+        if isinstance(node, ElementNode) and node.tag == "span":
+            classes = node.attrs.get("class", "").split()
+            if cls in classes:
+                affected_elements.append(node)
+        elif isinstance(node, ElementNode):
+            for child in node.children:
+                collect_elements(child)
+
+    root = start_node
+    while root.parent:
+        root = root.parent
+    collect_elements(root)
+
+    for el in affected_elements:
         parent = el.parent
         if not parent:
             continue
@@ -1184,9 +1263,10 @@ def apply_rules(
 # pattern/target/fmt_entry 视 note 为块级（改 span.ptoe-note 类），
 # match/group 视 note 为行内（_wrap_inline 包 span.ptoe-note））
 # align_* 已移至块级：text-align 对 inline span 无效，改用 ptoe-align-* 类
-_INLINE_LEAF_OPS = {"bold", "italic", "no_bold", "remove"}
+# 新增 7 项行内格式（2026-09）：underline/strike/charbox/shade/highlight/sup/sub
+_INLINE_LEAF_OPS = {"bold", "italic", "no_bold", "remove", "underline", "strike", "charbox", "shade", "highlight", "sup", "sub"}
 
-_INLINE_LEAF_OPS_M = {"bold", "italic", "no_bold", "remove", "note"}
+_INLINE_LEAF_OPS_M = {"bold", "italic", "no_bold", "remove", "note", "underline", "strike", "charbox", "shade", "highlight", "sup", "sub"}
 
 
 def _selection_bounds(
@@ -1466,7 +1546,8 @@ def _apply_pattern_conds(
         return
 
     # 行内格式（对齐已移至块级：ptoe-align-* 类，text-align 对 inline span 无效）
-    inline_ops = {"bold", "italic", "no_bold", "remove"}
+    # 新增 7 项行内格式（2026-09）：underline/strike/charbox/shade/highlight/sup/sub
+    inline_ops = {"bold", "italic", "no_bold", "remove", "underline", "strike", "charbox", "shade", "highlight", "sup", "sub"}
     inline_fmts = [op for op in fmts if op in inline_ops]
     block_fmts = [op for op in fmts if op not in inline_ops]
 

@@ -122,7 +122,17 @@ _ALIGN_CLASSES = {"ptoe-align-center", "ptoe-align-left", "ptoe-align-right"}
 # 行内对齐样式正则：style="text-align:left|center|right"（含空格容忍）
 _ALIGN_STYLE_RE = re.compile(r"text-align\s*:\s*(left|center|right)\s*(?:;|$)")
 # 行内格式类白名单：note/citation 等由规则引擎产生的行内 span 类
-_INLINE_FORMAT_CLASSES = {"ptoe-note", "ptoe-citation"}
+_INLINE_FORMAT_CLASSES = {
+    "ptoe-note",
+    "ptoe-citation",
+    "ptoe-underline",
+    "ptoe-strike",
+    "ptoe-charbox",
+    "ptoe-shade",
+    "ptoe-highlight",
+    "ptoe-sup",
+    "ptoe-sub",
+}
 
 _BLOCK_TAG_RE = re.compile(r"</?(p|h[1-6])([^>]*)>", flags=re.IGNORECASE)
 
@@ -4083,6 +4093,16 @@ def _html_to_export_blocks(html: str) -> list[tuple]:
 
 # 富文本块的行内标签集合（加粗/斜体/通用 span）
 _RICH_INLINE_TAGS = ("span", "strong", "b", "em", "i")
+# 新增 7 种行内格式类（2026-09）：下划线/删除线/字符边框/底纹/突显/上标/下标
+_RICH_INLINE_FORMAT_CLASSES = {
+    "ptoe-underline",
+    "ptoe-strike",
+    "ptoe-charbox",
+    "ptoe-shade",
+    "ptoe-highlight",
+    "ptoe-sup",
+    "ptoe-sub",
+}
 
 
 def _rich_parse_indent(attrs_d: dict[str, str]) -> dict[str, Any]:
@@ -4155,23 +4175,67 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             self.indent = _rich_parse_indent({})
             self.block_seen = False  # 是否已进入过块（孤立 img 不产生块）
             self.skip = 0  # >0 表示处于 script/style 等跳过区域
-            self.stack: list[tuple[str, bool]] = []  # (行内标签, 是否标记 span)
+            # 栈元素：(tag, is_marker, fmt_dict) — fmt_dict 记录该 span 携带的行内格式类
+            self.stack: list[tuple[str, bool, dict]] = []
 
-        def _flags(self) -> tuple[bool, bool]:
-            bold = any(t in ("strong", "b") for t, _ in self.stack)
-            italic = any(t in ("em", "i") for t, _ in self.stack)
-            return bold, italic
+        def _flags(self) -> dict:
+            """返回当前栈状态对应的行内格式标志字典。"""
+            bold = False
+            italic = False
+            underline = False
+            strike = False
+            charbox = False
+            shade = False
+            highlight = False
+            sup = False
+            sub = False
+            for _, is_marker, fmt in self.stack:
+                if is_marker:
+                    continue
+                if fmt.get("bold"):
+                    bold = True
+                if fmt.get("italic"):
+                    italic = True
+                if fmt.get("underline"):
+                    underline = True
+                if fmt.get("strike"):
+                    strike = True
+                if fmt.get("charbox"):
+                    charbox = True
+                if fmt.get("shade"):
+                    shade = True
+                if fmt.get("highlight"):
+                    highlight = True
+                if fmt.get("sup"):
+                    sup = True
+                if fmt.get("sub"):
+                    sub = True
+            return {
+                "bold": bold,
+                "italic": italic,
+                "underline": underline,
+                "strike": strike,
+                "charbox": charbox,
+                "shade": shade,
+                "highlight": highlight,
+                "sup": sup,
+                "sub": sub,
+            }
 
         def _push_text(self, txt: str) -> None:
             if not txt:
                 return
-            bold, italic = self._flags()
+            flags = self._flags()
             if self.runs:
                 last = self.runs[-1]
-                if last["bold"] == bold and last["italic"] == italic:
+                # 比较所有格式标志
+                if all(last.get(k) == flags[k] for k in flags):
                     last["text"] += txt
                     return
-            self.runs.append({"text": txt, "bold": bold, "italic": italic})
+            # 新 run：包含所有格式标志
+            run = {"text": txt}
+            run.update(flags)
+            self.runs.append(run)
 
         def _open_block(self, tag: str, attrs) -> None:
             self._flush()
@@ -4253,11 +4317,36 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                     self._emit_img(attrs)
                 return
             if tag in _RICH_INLINE_TAGS:
-                cls = (dict(attrs).get("class") or "").split()
+                attrs_d = dict(attrs)
+                cls = (attrs_d.get("class") or "").split()
                 if "ptoe-note" in cls:
                     self.note = True
-                self.stack.append((tag, "ptoe-marker" in cls))
-                if "ptoe-marker" not in cls:
+                is_marker = "ptoe-marker" in cls
+                # 解析 span 上的行内格式类
+                fmt = {}
+                if tag == "span" and not is_marker:
+                    for c in cls:
+                        if c == "ptoe-underline":
+                            fmt["underline"] = True
+                        elif c == "ptoe-strike":
+                            fmt["strike"] = True
+                        elif c == "ptoe-charbox":
+                            fmt["charbox"] = True
+                        elif c == "ptoe-shade":
+                            fmt["shade"] = True
+                        elif c == "ptoe-highlight":
+                            fmt["highlight"] = True
+                        elif c == "ptoe-sup":
+                            fmt["sup"] = True
+                        elif c == "ptoe-sub":
+                            fmt["sub"] = True
+                # strong/b/em/i 标签也记录格式
+                if tag in ("strong", "b"):
+                    fmt["bold"] = True
+                elif tag in ("em", "i"):
+                    fmt["italic"] = True
+                self.stack.append((tag, is_marker, fmt))
+                if not is_marker:
                     self.inner.append(self.get_starttag_text() or f"<{tag}>")
                 return
             # 其他标签（白名单外，罕见）：不进 runs，仅透传进 inner
@@ -4287,19 +4376,19 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                     if self.stack[idx][0] == tag:
                         seg = self.stack[idx:]
                         del self.stack[idx:]
-                        if not any(mk for _, mk in seg):
+                        if not any(mk for _, mk, _ in seg):
                             self.inner.append(f"</{tag}>")
                         break
 
         def handle_data(self, data) -> None:
             if self.skip:
                 return
-            if any(mk for _, mk in self.stack):
+            if any(mk for _, mk, _ in self.stack):
                 return  # 标记 span 内容整体剥除
             self._push_text(data)
             # inner 重转义（convert_charrefs 已解码实体；保持 HTML 形态供透传）
             self.inner.append(
-                str(data).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                str(data).replace("&", "&").replace("<", "<").replace(">", ">")
             )
 
     parser = _Parser()
@@ -4548,6 +4637,20 @@ def _build_docx(blocks: list[Any], path: str) -> None:
                 rpr += "<w:i/>"
             if note:
                 rpr += '<w:color w:val="808080"/>'
+            if r.get("underline"):
+                rpr += '<w:u w:val="single"/>'
+            if r.get("strike"):
+                rpr += "<w:strike/>"
+            if r.get("sup"):
+                rpr += '<w:vertAlign w:val="superscript"/>'
+            if r.get("sub"):
+                rpr += '<w:vertAlign w:val="subscript"/>'
+            if r.get("shade"):
+                rpr += '<w:shd w:val="clear" w:fill="EEF1F4"/>'
+            if r.get("highlight"):
+                rpr += '<w:shd w:val="clear" w:fill="FFE45E"/>'
+            if r.get("charbox"):
+                rpr += '<w:bdr w:val="single" w:sz="4" w:space="1" w:color="333333"/>'
             if sz:
                 rpr += f'<w:sz w:val="{sz}"/><w:szCs w:val="{sz}"/>'
             t = _docx_escape(r.get("text", "")).replace(
@@ -4597,6 +4700,14 @@ def _build_md(blocks: list[Any], path: str) -> None:
                 out.append(t)
         return "".join(out)
 
+    def _has_inline_formats(inner: str) -> bool:
+        """检查 inner HTML 是否包含新增的行内格式类。"""
+        for cls in ("ptoe-underline", "ptoe-strike", "ptoe-charbox",
+                      "ptoe-shade", "ptoe-highlight", "ptoe-sup", "ptoe-sub"):
+            if f'class="{cls}"' in inner or f"class='{cls}'" in inner:
+                return True
+        return False
+
     parts: list[str] = []
     for raw in blocks:
         b = _norm_export_block(raw)
@@ -4604,11 +4715,12 @@ def _build_md(blocks: list[Any], path: str) -> None:
             parts.append(f"![{b.get('alt') or ''}]({b.get('src') or ''})")
             continue
         attrs = b.get("attrs") or ""
-        if "class=" in attrs or "data-" in attrs:
-            # 带属性块：原样透传（与前端 htmlToMd 规则一致）
+        inner = b.get("inner") or ""
+        # 带属性块、或含新增行内格式类：原样透传（与前端 htmlToMd 规则一致）
+        if "class=" in attrs or "data-" in attrs or _has_inline_formats(inner):
             tag = b.get("tag") or b["kind"]
             parts.append(
-                f"<{tag}{(' ' + attrs) if attrs else ''}>{b.get('inner') or ''}</{tag}>"
+                f"<{tag}{(' ' + attrs) if attrs else ''}>{inner}</{tag}>"
             )
             continue
         kind = b["kind"]
@@ -7227,6 +7339,14 @@ body.paint-mode{cursor:copy;}
 /* 文字纠错：错误标注（删除线红色）+ 候选正确字（绿色）+ 确认悬浮窗 */
 .ptoe-err{text-decoration:line-through;color:#c00;background:#ffe0e0;padding:0 3px;border-radius:3px;cursor:pointer;}
 .ptoe-fix{color:#080;font-size:0.9em;}
+/* 7 new inline format classes (2026-09) */
+.ptoe-underline{text-decoration:underline;}
+.ptoe-strike{text-decoration:line-through;}
+.ptoe-charbox{border:1px solid #333;padding:0 .15em;border-radius:2px;}
+.ptoe-shade{background:#eef1f4;}
+.ptoe-highlight{background:#ffe45e;}
+.ptoe-sup{vertical-align:super;font-size:.7em;line-height:1;}
+.ptoe-sub{vertical-align:sub;font-size:.7em;line-height:1;}
 #errPopup{position:fixed;z-index:65;display:none;background:#fff;border:1px solid #ccc;border-radius:6px;padding:4px;box-shadow:0 2px 8px rgba(0,0,0,.2);gap:6px;}
 /* 图片设置弹窗：点击编辑区内的图片弹出，调整大小/位置/删除 */
 #imgPopup{position:fixed;z-index:65;display:none;flex-direction:column;gap:6px;padding:10px;background:#fff;border:1px solid #ccc;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.2);min-width:140px;}
@@ -7234,10 +7354,10 @@ body.paint-mode{cursor:copy;}
 .img-pop-btn:hover{background:#eef3fb;border-color:var(--accent);}
 #errOk{background:#2e8b57;color:#fff;border:none;border-radius:4px;padding:2px 10px;cursor:pointer;font-size:14px;}
 #errNo{background:#c0392b;color:#fff;border:none;border-radius:4px;padding:2px 10px;cursor:pointer;font-size:14px;}
-/* 文字纠错下拉菜单 */
-#proofreadMenu{position:fixed;z-index:70;background:#fff;border:1px solid #ddd;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.15);min-width:120px;padding:4px;display:none;}
-#proofreadMenu button{display:block;width:100%;text-align:left;padding:6px 10px;border:none;background:none;cursor:pointer;border-radius:4px;font-size:13px;}
-#proofreadMenu button:hover{background:#f0f0f0;}
+/* 文字纠错下拉菜单 / 文字包围 / 上标下标 */
+#proofreadMenu, #charWrapMenu, #supSubMenu{position:fixed;z-index:70;background:#fff;border:1px solid #ddd;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.15);min-width:120px;padding:4px;display:none;}
+#proofreadMenu button, #charWrapMenu button, #supSubMenu button{display:block;width:100%;text-align:left;padding:6px 10px;border:none;background:none;cursor:pointer;border-radius:4px;font-size:13px;}
+#proofreadMenu button:hover, #charWrapMenu button:hover, #supSubMenu button:hover{background:#f0f0f0;}
 /* 下拉指示符：小号低对比三角，提示「校」为下拉菜单；菜单展开时按钮高亮 */
 #proofreadBtn .ptoe-caret{font-size:9px;color:#8a97a6;margin-left:3px;vertical-align:1px;}
 #popup .sep{width:100%;height:0;border-top:1px solid var(--border);margin:2px 0;}
@@ -7390,6 +7510,9 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
     <button type="button" class="ic-btn" id="colorBtn" onmousedown="event.preventDefault()" title="文本颜色" aria-label="文本颜色">色</button>
     <button type="button" class="ic-btn" id="formatBrushBtn" onmousedown="event.preventDefault()" title="格式刷" aria-label="格式刷">刷</button>
     <button type="button" class="ic-btn" id="formatRulesBtn" onmousedown="event.preventDefault()" title="格式规则：对选中文字一键应用自定义规则（可多条叠加 / 条件分支；Ctrl+Shift+Q）" aria-label="格式规则">规</button>
+    <button type="button" class="ic-btn" id="charWrapBtn" onmousedown="event.preventDefault()" title="文字包围下拉菜单：下划线 / 删除线 / 字符边框 / 底纹" aria-label="文字包围">文 <span class="ptoe-caret">▾</span></button>
+    <button type="button" class="ic-btn" data-op="highlight" onmousedown="event.preventDefault()" title="突显文字：对选中文字设置背景色高亮" aria-label="突显文字">背</button>
+    <button type="button" class="ic-btn" id="supSubBtn" onmousedown="event.preventDefault()" title="上标下标下拉菜单：把选中文字设为上标或下标的小字符" aria-label="上标下标"><span class="ic-x">X</span> <span class="ptoe-caret">▾</span></button>
   </div>
 <div class="tb-group" role="group" aria-label="对齐">
      <button type="button" class="ic-btn" data-op="align_left" onmousedown="event.preventDefault()" title="居左" aria-label="居左">左</button>
@@ -7507,6 +7630,16 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
     </div>
     <small id="prLlmStatus" style="color:#666;display:block;margin-top:4px;"></small>
   </div>
+</div>
+<div id="charWrapMenu" class="tb-menu">
+  <button type="button" data-wrap="underline" role="menuitem">下划线</button>
+  <button type="button" data-wrap="strike" role="menuitem">删除线</button>
+  <button type="button" data-wrap="charbox" role="menuitem">字符边框</button>
+  <button type="button" data-wrap="shade" role="menuitem">底纹</button>
+</div>
+<div id="supSubMenu" class="tb-menu">
+  <button type="button" data-sup="sup" role="menuitem">上标</button>
+  <button type="button" data-sup="sub" role="menuitem">下标</button>
 </div>
 <div id="searchModalBg"><div class="modal search-modal">
   <div class="search-head"><h3>搜索 / 替换</h3><button type="button" id="searchCloseBtn" class="x-btn" title="关闭搜索" aria-label="关闭搜索">✕</button></div>

@@ -1141,5 +1141,154 @@ class TestApplyRules(unittest.TestCase):
             rulemanage._REGEX_CACHE.clear()
 
 
+class TestNewInlineFormats(unittest.TestCase):
+    """新增 7 项行内格式测试（2026-09）。"""
+
+    def test_parse_serialize_new_span_classes(self):
+        """解析/序列化往返保留新增 span class（underline/strike/charbox/shade/highlight/sup/sub）。"""
+        html = (
+            '<p>a<span class="ptoe-underline">b</span>c</p>'
+            '<p>a<span class="ptoe-strike">b</span>c</p>'
+            '<p>a<span class="ptoe-charbox">b</span>c</p>'
+            '<p>a<span class="ptoe-shade">b</span>c</p>'
+            '<p>a<span class="ptoe-highlight">b</span>c</p>'
+            '<p>a<span class="ptoe-sup">b</span>c</p>'
+            '<p>a<span class="ptoe-sub">b</span>c</p>'
+        )
+        root = parse_html(html)
+        out = serialize_html(root)
+        for cls in ("ptoe-underline", "ptoe-strike", "ptoe-charbox", "ptoe-shade", "ptoe-highlight", "ptoe-sup", "ptoe-sub"):
+            self.assertIn(f'class="{cls}"', out)
+
+    def test_apply_rules_underline_wraps_matched_range(self):
+        """apply_rules 含 underline op 时，匹配范围被 <span class="ptoe-underline"> 包裹。"""
+        html = "<p>测试下划线文本</p>"
+        rules = [{
+            "id": "r1",
+            "name": "Underline测试",
+            "mode": "first",
+            "conditions": [{
+                "type": "contains",
+                "pattern": "下划线",
+                "scope": "page",
+                "formats": ["underline"],
+            }],
+        }]
+        new_html, err = apply_rules(html, rules, all_rules=True)
+        self.assertIsNone(err)
+        self.assertIn('<span class="ptoe-underline">下划线</span>', new_html)
+
+    def test_sup_sub_mutual_exclusion_no_nesting(self):
+        """sup 后应用 sub（或反向）不产生嵌套 span，只保留最后应用的格式。"""
+        html = "<p>测试上下标</p>"
+        # 先应用 sup
+        rules1 = [{
+            "id": "r1",
+            "name": "Sup测试",
+            "mode": "first",
+            "conditions": [{
+                "type": "contains",
+                "pattern": "上下标",
+                "scope": "page",
+                "formats": ["sup"],
+            }],
+        }]
+        new_html, err = apply_rules(html, rules1, all_rules=True)
+        self.assertIsNone(err)
+        self.assertIn('<span class="ptoe-sup">上下标</span>', new_html)
+        self.assertNotIn('ptoe-sub', new_html)
+
+        # 再在同一范围应用 sub（模拟切换）
+        rules2 = [{
+            "id": "r2",
+            "name": "Sub测试",
+            "mode": "first",
+            "conditions": [{
+                "type": "contains",
+                "pattern": "上下标",
+                "scope": "page",
+                "formats": ["sub"],
+            }],
+        }]
+        new_html2, err2 = apply_rules(new_html, rules2, all_rules=True)
+        self.assertIsNone(err2)
+        # 应该只有 sub，没有嵌套
+        self.assertIn('<span class="ptoe-sub">上下标</span>', new_html2)
+        self.assertNotIn('ptoe-sup', new_html2)
+        # 确保没有 span 内嵌 span
+        self.assertEqual(new_html2.count('<span'), 1)
+
+    def test_remove_strips_new_inline_formats(self):
+        """remove op 移除 strong/em 以及所有新增行内格式 span，保留 marker span。"""
+        html = (
+            '<p><strong>粗</strong>'
+            '<span class="ptoe-underline">线</span>'
+            '<span class="ptoe-strike">删</span>'
+            '<span class="ptoe-charbox">框</span>'
+            '<span class="ptoe-shade">纹</span>'
+            '<span class="ptoe-highlight">亮</span>'
+            '<span class="ptoe-sup">上</span>'
+            '<span class="ptoe-sub">下</span>'
+            '<span class="ptoe-note">注</span>'
+            '<span class="ptoe-citation">引</span>'
+            '<span data-ptoe-marker="join" class="ptoe-marker">标记</span>'
+            '</p>'
+        )
+        rules = [{
+            "id": "r1",
+            "name": "Remove测试",
+            "mode": "first",
+            "conditions": [{
+                "type": "contains",
+                "pattern": "粗",
+                "scope": "page",
+                "formats": ["remove"],
+            }],
+        }]
+        new_html, err = apply_rules(html, rules, all_rules=True)
+        self.assertIsNone(err)
+        # strong/em 应被移除
+        self.assertNotIn("<strong>", new_html)
+        self.assertNotIn("<em>", new_html)
+        # 新增 7 项行内格式 span 应被移除（内容保留）
+        for cls in ("ptoe-underline", "ptoe-strike", "ptoe-charbox", "ptoe-shade", "ptoe-highlight", "ptoe-sup", "ptoe-sub"):
+            self.assertNotIn(f'class="{cls}"', new_html)
+        # ptoe-note 和 ptoe-citation 也应被移除
+        self.assertNotIn('class="ptoe-note"', new_html)
+        self.assertNotIn('class="ptoe-citation"', new_html)
+        # marker span 保留
+        self.assertIn('data-ptoe-marker="join"', new_html)
+        self.assertIn('class="ptoe-marker"', new_html)
+
+    def test_ops_conflict_sup_sub(self):
+        """ops_conflict('sup','sub') 为 True，ops_conflict('underline','bold') 为 False。"""
+        self.assertTrue(ops_conflict("sup", "sub"))
+        self.assertTrue(ops_conflict("sub", "sup"))
+        self.assertFalse(ops_conflict("underline", "bold"))
+        self.assertFalse(ops_conflict("strike", "italic"))
+        self.assertFalse(ops_conflict("charbox", "note"))
+        self.assertFalse(ops_conflict("shade", "citation"))
+        self.assertFalse(ops_conflict("highlight", "p"))
+
+    def test_rule_from_dict_drops_fake_op_keeps_underline(self):
+        """rule_from_dict 丢弃假 op 名（如 fake_op），保留 underline 等合法 op。"""
+        from rulemanage import rule_from_dict
+        rule_dict = {
+            "id": "r1",
+            "name": "测试",
+            "mode": "first",
+            "conditions": [{
+                "type": "contains",
+                "pattern": "测试",
+                "scope": "page",
+                "formats": ["underline", "fake_op", "bold"],
+            }],
+        }
+        rule = rule_from_dict(rule_dict)
+        self.assertIn("underline", rule.conditions[0].formats)
+        self.assertIn("bold", rule.conditions[0].formats)
+        self.assertNotIn("fake_op", rule.conditions[0].formats)
+
+
 if __name__ == "__main__":
     unittest.main()

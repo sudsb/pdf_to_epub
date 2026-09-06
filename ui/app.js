@@ -12,6 +12,9 @@ const OPS = [
   ['marker_full','全文标记'], ['marker_note','注释标记'], ['marker_join','段落标记'],
   ['marker_page','换页标记'],
   ['flush','顶格'], ['indent','缩进'],
+  // 新增内联格式（2026-09）
+  ['underline','下划线'], ['strike','删除线'], ['charbox','字符边框'],
+  ['shade','底纹'], ['highlight','突显'], ['sup','上标'], ['sub','下标'],
   // 工具操作（无需 currentEditable，直接调用）
   ['search','搜索'], ['clean','智能清理'], ['convert_t2s','繁→简'], ['convert_s2t','简→繁'],
   ['toggle_md','Markdown模式'], ['undo','撤销'], ['redo','重做'], ['history','历史记录'],
@@ -40,6 +43,9 @@ const OP_TIP = {
   marker_page:'换页标记（从此处之后的内容显示在新的一页）',
   proofread_accept: '采纳纠错（替换为候选字）', proofread_ignore: '忽略纠错（消除标注）',
   strip_ws: '去空（去除段落内全部空白，保留换行）',
+  // 新增内联格式提示
+  underline:'下划线', strike:'删除线', charbox:'字符边框',
+  shade:'底纹', highlight:'突显', sup:'上标', sub:'下标',
 };
 const DEFAULTS = {
   bold:'Ctrl+B', italic:'Ctrl+I', heading:'Ctrl+1', p:'Ctrl+0',
@@ -48,6 +54,8 @@ const DEFAULTS = {
    centerbold:'Alt+B', merge:'Alt+G', popup:'Alt+P',
   marker_full:'Ctrl+Shift+F', marker_note:'Ctrl+Shift+M', marker_join:'Ctrl+Shift+J',
   marker_page:'Ctrl+Shift+P',
+  // 新增内联格式默认快捷键（空 = 未绑定，用户可在设置中自行绑定，避免冲突浏览器键）
+  underline:'', strike:'', charbox:'', shade:'', highlight:'', sup:'', sub:'',
   // 工具操作默认快捷键
   search:'Ctrl+F', clean:'Ctrl+Shift+C', convert_t2s:'Ctrl+Shift+T', convert_s2t:'Ctrl+Shift+Y',
   toggle_md:'Ctrl+Shift+D', undo:'Ctrl+Z', redo:'Ctrl+Y', history:'Ctrl+H',
@@ -1253,6 +1261,148 @@ function toggleNote(ed) {
   });
 }
 
+// ---------- 新增内联格式工具（2026-09） ----------
+// 7 种内联 span 类：下划线、删除线、字符边框、底纹、突显、上标、下标
+const INLINE_CLASSES = ['ptoe-underline','ptoe-strike','ptoe-charbox','ptoe-shade','ptoe-highlight','ptoe-sup','ptoe-sub'];
+const INLINE_CLASS_LABEL = {
+  underline:'下划线', strike:'删除线', charbox:'字符边框',
+  shade:'底纹', highlight:'突显', sup:'上标', sub:'下标'
+};
+// 上/下标互斥：同一区域不能同时是上标和下标
+const INLINE_MUTEX = {
+  'ptoe-sup': ['ptoe-sup','ptoe-sub'],
+  'ptoe-sub': ['ptoe-sup','ptoe-sub']
+};
+
+// 解包与给定 range 相交的指定 class 的 span：把子节点移回父节点，保持顺序
+function unwrapSpans(block, cls, range) {
+  const spans = block.querySelectorAll('span.' + cls);
+  for (const span of spans) {
+    // 判断 span 是否与 range 相交
+    const spanRange = document.createRange();
+    spanRange.selectNodeContents(span);
+    if (range.compareBoundaryPoints(Range.START_TO_END, spanRange) >= 0 &&
+        range.compareBoundaryPoints(Range.END_TO_START, spanRange) <= 0) {
+      // 相交：解包（把子节点移到 span 父节点中，替换 span）
+      const frag = document.createDocumentFragment();
+      while (span.firstChild) frag.appendChild(span.firstChild);
+      span.parentNode.replaceChild(frag, span);
+    }
+  }
+}
+
+// 应用/切换内联 class（用于 toolbar/menu/brush/rules）
+// opts.toggle: true = 用户交互切换（已有则解包），false = 规则路径强制应用（无则包裹，有则保留）
+function applyInlineClass(ed, cls, opts) {
+  opts = opts || {};
+  const toggle = !!opts.toggle;
+  const row = ed.closest('.page-row');
+  const i = row ? Number(row.dataset.i) : -1;
+  const label = INLINE_CLASS_LABEL[cls.replace('ptoe-', '')] || cls;
+
+  histRun(label, [i], function () {
+    applyToSelectedBlocks(ed, function(block, range) {
+      // 互斥处理：上/下标不能共存
+      if (INLINE_MUTEX[cls]) {
+        for (const mCls of INLINE_MUTEX[cls]) {
+          unwrapSpans(block, mCls, range);
+        }
+      }
+
+      if (toggle) {
+        // 切换模式：若选区内已有该 class 的 span 相交 → 解包；否则包裹
+        const existing = block.querySelectorAll('span.' + cls);
+        let hasIntersect = false;
+        for (const span of existing) {
+          const spanRange = document.createRange();
+          spanRange.selectNodeContents(span);
+          if (range.compareBoundaryPoints(Range.START_TO_END, spanRange) >= 0 &&
+              range.compareBoundaryPoints(Range.END_TO_START, spanRange) <= 0) {
+            hasIntersect = true;
+            break;
+          }
+        }
+        if (hasIntersect) {
+          unwrapSpans(block, cls, range);
+        } else {
+          wrapRange(block, range, cls);
+        }
+      } else {
+        // 规则应用模式：仅在选区内无该 class 时包裹（不解包）
+        const existing = block.querySelectorAll('span.' + cls);
+        let hasIntersect = false;
+        for (const span of existing) {
+          const spanRange = document.createRange();
+          spanRange.selectNodeContents(span);
+          if (range.compareBoundaryPoints(Range.START_TO_END, spanRange) >= 0 &&
+              range.compareBoundaryPoints(Range.END_TO_START, spanRange) <= 0) {
+            hasIntersect = true;
+            break;
+          }
+        }
+        if (!hasIntersect) {
+          wrapRange(block, range, cls);
+        }
+      }
+    });
+    syncContent(ed);
+    if (row) { markDirty(i); scheduleRemeasure(i); }
+  });
+}
+
+// 把单个 block 的 range 包裹为 span.cls
+// 优先尝试整体包裹（extractContents + insertNode）；
+// 若 range 跨越嵌套元素/图片导致异常，回退到逐文本节点包裹
+function wrapRange(block, range, cls) {
+  try {
+    const clone = range.cloneRange();
+    const frag = clone.extractContents();
+    const span = document.createElement('span');
+    span.className = cls;
+    span.appendChild(frag);
+    clone.insertNode(span);
+    // 恢复/扩展选区覆盖新插入的 span
+    range.setStartBefore(span);
+    range.setEndAfter(span);
+    return;
+  } catch (e) {
+    // 回退：遍历 block 内与 range 相交的文本节点，逐个包裹
+    const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, {
+      acceptNode: function(node) {
+        if (node.parentElement && node.parentElement.closest('span.' + cls)) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    }, false);
+    const textNodes = [];
+    let node;
+    while ((node = walker.nextNode())) {
+      const nodeRange = document.createRange();
+      nodeRange.selectNodeContents(node);
+      if (range.compareBoundaryPoints(Range.START_TO_END, nodeRange) >= 0 &&
+          range.compareBoundaryPoints(Range.END_TO_START, nodeRange) <= 0) {
+        textNodes.push(node);
+      }
+    }
+    for (const tn of textNodes) {
+      if (!tn.textContent.trim() && !tn.textContent) continue; // 跳过空白文本节点（保留纯空白也可，视需求）
+      const tnRange = document.createRange();
+      tnRange.selectNodeContents(tn);
+      // 计算与原 range 的交集
+      const start = Math.max(0, range.startContainer === tn ? range.startOffset : 0);
+      const end = range.endContainer === tn ? range.endOffset : tn.textContent.length;
+      if (start >= end) continue;
+      const segRange = document.createRange();
+      segRange.setStart(tn, start);
+      segRange.setEnd(tn, end);
+      const segFrag = segRange.extractContents();
+      const s = document.createElement('span');
+      s.className = cls;
+      s.appendChild(segFrag);
+      segRange.insertNode(s);
+    }
+  }
+}
+
 function toggleCitation(ed) {
   // Toggle ptoe-citation on all blocks in selection (斜体 + 独立字体)
   const row = ed.closest('.page-row');
@@ -1309,8 +1459,33 @@ function applyFormatBrushToSelection(format) {
     if (format.bold) withScrollStable(() => document.execCommand('bold'));
     if (format.italic) withScrollStable(() => document.execCommand('italic'));
     if (format.color) withScrollStable(() => document.execCommand('foreColor', false, format.color));
+    // inline: 7 种新格式类（2026-09）
+    if (format.inlineClasses && format.inlineClasses.length) {
+      // 用 applyToSelectedBlocks 传入的块内 range（多块选区时全局 range 会误伤其他块）
+      const range = r || window.getSelection().getRangeAt(0);
+      for (const cls of INLINE_CLASSES) {
+        if (format.inlineClasses.includes(cls)) {
+          // 确保存在：若选区内无该 class 则包裹
+          const existing = block.querySelectorAll('span.' + cls);
+          let hasIntersect = false;
+          for (const span of existing) {
+            const spanRange = document.createRange();
+            spanRange.selectNodeContents(span);
+            if (range.compareBoundaryPoints(Range.START_TO_END, spanRange) >= 0 &&
+                range.compareBoundaryPoints(Range.END_TO_START, spanRange) <= 0) {
+              hasIntersect = true;
+              break;
+            }
+          }
+          if (!hasIntersect) wrapRange(block, range, cls);
+        } else {
+          // 移除：解包选区内相交的该 class span
+          unwrapSpans(block, cls, range);
+        }
+      }
+    }
     const row = ed.closest('.page-row'); if (row) { markDirty(Number(row.dataset.i)); scheduleRemeasure(Number(row.dataset.i)); }
-});
+  });
 }
 function applyIndentMode(ed, mode) {
     const row = ed.closest('.page-row');
@@ -1337,7 +1512,7 @@ function captureFormatFromSelection() {
   let node = range.commonAncestorContainer;
   if (node.nodeType === 3) node = node.parentElement;
   const block = (node && node.closest ? node.closest('p,div,h1,h2,h3,h4,h5,h6') : null) || ed;
-  const fmt = { blockClasses: [], bold: false, italic: false, color: null };
+  const fmt = { blockClasses: [], bold: false, italic: false, color: null, inlineClasses: [] };
   if (block && block.classList) {
     for (const c of ['ptoe-note','ptoe-align-left','ptoe-align-center','ptoe-align-right']) {
       if (block.classList.contains(c)) fmt.blockClasses.push(c);
@@ -1346,9 +1521,47 @@ function captureFormatFromSelection() {
   try { fmt.bold = document.queryCommandState('bold'); } catch (e) {}
   try { fmt.italic = document.queryCommandState('italic'); } catch (e) {}
   try { fmt.color = window.getComputedStyle(block).color; } catch (e) {}
+  // 捕获选区内的内联格式类（7 种新格式）
+  // 1) 遍历 range 内所有文本节点，收集其祖先 span 中的 INLINE_CLASSES
+  const walker = document.createTreeWalker(range.commonAncestorContainer, NodeFilter.SHOW_TEXT, {
+    acceptNode: function(n) {
+      const r = document.createRange();
+      r.selectNodeContents(n);
+      return (range.compareBoundaryPoints(Range.START_TO_END, r) >= 0 &&
+              range.compareBoundaryPoints(Range.END_TO_START, r) <= 0) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+    }
+  }, false);
+  const inlineSet = new Set();
+  let tn;
+  while ((tn = walker.nextNode())) {
+    const span = tn.parentElement && tn.parentElement.closest ? tn.parentElement.closest('span') : null;
+    if (span && span.classList) {
+      for (const cls of INLINE_CLASSES) {
+        if (span.classList.contains(cls)) inlineSet.add(cls);
+      }
+    }
+  }
+  // 2) 同时检查 range.cloneContents() 内完整包含的 span（防止跨块选区漏捕获）
+  try {
+    const frag = range.cloneContents();
+    const spans = frag.querySelectorAll('span');
+    for (const s of spans) {
+      if (s.classList) {
+        for (const cls of INLINE_CLASSES) {
+          if (s.classList.contains(cls)) inlineSet.add(cls);
+        }
+      }
+    }
+  } catch (e) {}
+  fmt.inlineClasses = Array.from(inlineSet);
   return fmt;
 }
 function applyOp(op) { const ed = currentEditable(); if (!ed) return;
+   // 新增内联格式（2026-09）：下划线、删除线、字符边框、底纹、突显、上标、下标
+   if (INLINE_CLASSES.includes('ptoe-' + op)) {
+     applyInlineClass(ed, 'ptoe-' + op, {toggle:true});
+     return;
+   }
    if (op.indexOf('marker_') === 0) { insertMarker(op); return; }
    if (op === 'note') { toggleNote(ed); return; }
    if (op === 'heading') { cycleHeading(ed); return; }
@@ -3504,6 +3717,32 @@ function toggleProofreadMenu() {
   else openProofreadMenu();
 }
 
+// ---------- 通用下拉菜单助手（用于 文/背/X 三个新菜单，2026-09） ----------
+function positionDropMenu(btnId, menuId) {
+  const btn = document.getElementById(btnId);
+  const menu = document.getElementById(menuId);
+  if (!btn || !menu) return;
+  const r = btn.getBoundingClientRect();
+  let left = r.left;
+  left = Math.max(8, Math.min(left, window.innerWidth - menu.offsetWidth - 8));
+  menu.style.left = left + 'px';
+  menu.style.top = (r.bottom + 2) + 'px';
+}
+function openDropMenu(btnId, menuId) {
+  positionDropMenu(btnId, menuId);
+  document.getElementById(menuId).style.display = 'block';
+  document.getElementById(btnId).classList.add('active');
+}
+function closeDropMenu(btnId, menuId) {
+  document.getElementById(menuId).style.display = 'none';
+  document.getElementById(btnId).classList.remove('active');
+}
+function toggleDropMenu(btnId, menuId) {
+  const menu = document.getElementById(menuId);
+  if (menu && menu.style.display === 'block') closeDropMenu(btnId, menuId);
+  else openDropMenu(btnId, menuId);
+}
+
 // 子项1 校正：对当前页执行纠错
 function proofreadCorrect() {
   closeProofreadMenu();
@@ -3888,6 +4127,17 @@ document.addEventListener('mousedown', function (e) {
   if (proofreadMenuOpen && !e.target.closest('#proofreadMenu') && !e.target.closest('#proofreadBtn')) {
     closeProofreadMenu();
   }
+  // 新增下拉菜单（2026-09）：charWrapMenu / supSubMenu
+  const cwMenu = document.getElementById('charWrapMenu');
+  const cwBtn = document.getElementById('charWrapBtn');
+  if (cwMenu && cwMenu.style.display === 'block' && !e.target.closest('#charWrapMenu') && !e.target.closest('#charWrapBtn')) {
+    closeDropMenu('charWrapBtn', 'charWrapMenu');
+  }
+  const ssMenu = document.getElementById('supSubMenu');
+  const ssBtn = document.getElementById('supSubBtn');
+  if (ssMenu && ssMenu.style.display === 'block' && !e.target.closest('#supSubMenu') && !e.target.closest('#supSubBtn')) {
+    closeDropMenu('supSubBtn', 'supSubMenu');
+  }
   // 点击图片弹窗外 → 关闭图片弹窗
   if (_imgKey && !e.target.closest('#imgPopup')) hideImgPopup();
 });
@@ -4010,6 +4260,9 @@ const FORMAT_RULE_OPTS = [
   ['p','正文'], ['merge','合并段落'], ['note','注释'], ['citation','引用'],
   ['flush','顶格'], ['indent','缩进'], ['first_indent','首行缩进'], ['hang_indent','悬挂缩进'],
   ['remove','清除格式'], ['strip_ws','去空'],
+  // 新增内联格式（2026-09）
+  ['underline','下划线'], ['strike','删除线'], ['charbox','字符边框'],
+  ['shade','底纹'], ['highlight','突显'], ['sup','上标'], ['sub','下标'],
 ];
 let formatRules = [];
 let formatRuleEditingId = null;
@@ -4024,6 +4277,8 @@ const FORMAT_OP_GROUPS = {
   merge: ['merge'],
   // 缩进模式互斥（2026-08-23）：顶格/缩进/首行缩进/悬挂缩进 同一块只能一个
   indent_mode: ['flush','indent','first_indent','hang_indent'],
+  // 上/下标互斥（2026-09）
+  sup_sub: ['sup','sub'],
 };
 function opGroup(op) {
   for (const g in FORMAT_OP_GROUPS) if (FORMAT_OP_GROUPS[g].includes(op)) return g;
@@ -4900,6 +5155,14 @@ function applySingleFormat(op, ed) {
     const tag = 'h' + op.slice(7);
     applyToSelectedBlocks(ed, function (block) { _convertBlockTag(block, tag); });
   }
+  // 新增内联格式（2026-09）：规则应用路径（toggle=false，强制应用不解包）
+  if (op === 'underline') { applyInlineClass(ed, 'ptoe-underline', {toggle:false}); return; }
+  if (op === 'strike') { applyInlineClass(ed, 'ptoe-strike', {toggle:false}); return; }
+  if (op === 'charbox') { applyInlineClass(ed, 'ptoe-charbox', {toggle:false}); return; }
+  if (op === 'shade') { applyInlineClass(ed, 'ptoe-shade', {toggle:false}); return; }
+  if (op === 'highlight') { applyInlineClass(ed, 'ptoe-highlight', {toggle:false}); return; }
+  if (op === 'sup') { applyInlineClass(ed, 'ptoe-sup', {toggle:false}); return; }
+  if (op === 'sub') { applyInlineClass(ed, 'ptoe-sub', {toggle:false}); return; }
   if (op === 'strip_ws') {
     const row = ed.closest('.page-row');
     const i = row ? Number(row.dataset.i) : -1;
@@ -5359,7 +5622,28 @@ document.addEventListener('keydown', (e) => {
         // start aggregated history entry
         _brushBefore = histBegin('格式刷', null);
         brushBtn.classList.add('active');
-        setStatus('已捕获格式（持续模式）。在目标文本上点击或选区后格式将被应用；再次点击 格式刷 可提交并结束。');
+        // 显示捕获到的格式列表（含新增内联格式）
+        const captured = [];
+        if (fmt.bold) captured.push('加粗');
+        if (fmt.italic) captured.push('斜体');
+        if (fmt.color) captured.push('颜色');
+        if (fmt.blockClasses && fmt.blockClasses.length) {
+          for (const c of fmt.blockClasses) {
+            if (c === 'ptoe-note') captured.push('注释');
+            else if (c === 'ptoe-align-left') captured.push('居左');
+            else if (c === 'ptoe-align-center') captured.push('居中');
+            else if (c === 'ptoe-align-right') captured.push('居右');
+          }
+        }
+        if (fmt.inlineClasses && fmt.inlineClasses.length) {
+          for (const cls of fmt.inlineClasses) {
+            const label = INLINE_CLASS_LABEL[cls.replace('ptoe-', '')] || cls;
+            captured.push(label);
+          }
+        }
+        const msg = captured.length ? '已捕获格式：' + captured.join('、') : '已捕获格式（无可见格式）';
+        setStatus(msg);
+        showToast(msg, 'ok');
       } else {
         // finish aggregated history entry and clear
         try { histEnd(_brushBefore, '格式刷'); } catch (err) { /* best-effort */ }
@@ -5538,17 +5822,27 @@ document.getElementById('replaceInput').addEventListener('keydown', (e) => { if 
 document.getElementById('searchPrevBtn').addEventListener('click', () => gotoMatch(-1));
 document.getElementById('searchNextBtn').addEventListener('click', () => gotoMatch(1));
 document.getElementById('searchCloseBtn').addEventListener('click', closeSearchModal);
-document.getElementById('searchModalBg').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeSearchModal(); });
+// 2026-09：遮罩点击关闭守卫。拖选弹窗内输入框文字时，若 mouseup 落在遮罩上
+// （弹窗卡片外），click 事件以 mousedown/mouseup 的公共祖先为 target，即遮罩本身
+// → 弹窗被误关（用户报告：搜索框内鼠标选词时搜索窗口随机消失）。修复=仅当
+// mousedown 也起于遮罩（真正的「点遮罩关闭」）时才响应点击关闭，拖选收尾不再误关。
+function _backdropClickClose(bgId, closeFn) {
+  const bg = document.getElementById(bgId);
+  let downOnBg = false;
+  bg.addEventListener('mousedown', function (e) { downOnBg = (e.target === bg); });
+  bg.addEventListener('click', function (e) { if (e.target === bg && downOnBg) closeFn(); });
+}
+_backdropClickClose('searchModalBg', closeSearchModal);
 document.getElementById('exportBtn').addEventListener('click', openExportModal);
 document.getElementById('exportTxtBtn').addEventListener('click', () => exportFile('txt'));
 document.getElementById('exportDocxBtn').addEventListener('click', () => exportFile('docx'));
 document.getElementById('exportMdBtn').addEventListener('click', () => exportFile('md'));
 document.getElementById('exportCloseBtn').addEventListener('click', closeExportModal);
-document.getElementById('exportModalBg').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeExportModal(); });
+_backdropClickClose('exportModalBg', closeExportModal);
 // 段落设置面板：打开/关闭/实时预览/确定/清除
 document.getElementById('indentDlgBtn').addEventListener('click', openIndentDialog);
 document.getElementById('indCloseBtn').addEventListener('click', closeIndentDialog);
-document.getElementById('indentModalBg').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeIndentDialog(); });
+_backdropClickClose('indentModalBg', closeIndentDialog);
 document.getElementById('indOkBtn').addEventListener('click', () => applyIndentSettings(false));
 document.getElementById('indClearBtn').addEventListener('click', () => applyIndentSettings(true));
 ['indLeft','indRight','indSpecial','indVal','indBefore','indAfter','indLh'].forEach(function(id) {
@@ -5559,18 +5853,18 @@ document.getElementById('imgModeSel').addEventListener('change', (e) => { saveSt
 // 格式规则弹窗绑定
 document.getElementById('formatRulesBtn').addEventListener('click', openFormatRulesModal);
 document.getElementById('formatRulesCloseBtn').addEventListener('click', closeFormatRulesModal);
-document.getElementById('formatRulesModalBg').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeFormatRulesModal(); });
+_backdropClickClose('formatRulesModalBg', closeFormatRulesModal);
 document.getElementById('formatRuleNewBtn').addEventListener('click', newFormatRule);
 document.getElementById('formatRulesApplyAllBtn').addEventListener('click', applyAllFormatRules);
 document.getElementById('frSaveBtn').addEventListener('click', saveFormatRule);
 document.getElementById('frCancelBtn').addEventListener('click', closeRuleModal);
 document.getElementById('frRuleCloseBtn').addEventListener('click', closeRuleModal);
-document.getElementById('frRuleModalBg').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeRuleModal(); });
+_backdropClickClose('frRuleModalBg', closeRuleModal);
 document.getElementById('frAddCondBtn').addEventListener('click', addCondition);
 document.getElementById('frFmtPopupCloseBtn').addEventListener('click', closeFmtPopup);
 document.getElementById('frFmtCancelBtn').addEventListener('click', closeFmtPopup);
 document.getElementById('frFmtOkBtn').addEventListener('click', confirmFmtPopup);
-document.getElementById('frFmtPopupBg').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeFmtPopup(); });
+_backdropClickClose('frFmtPopupBg', closeFmtPopup);
 // 格式规则快捷键 Ctrl+Shift+Q（独立注册，不依赖 bindings 体系）
 document.addEventListener('keydown', (e) => {
   if (e.ctrlKey && e.shiftKey && (e.key === 'Q' || e.key === 'q')) {
@@ -5579,7 +5873,7 @@ document.addEventListener('keydown', (e) => {
   }
 });
 document.getElementById('closeSettings').addEventListener('click', closeSettings);
-document.getElementById('modalBg').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeSettings(); });
+_backdropClickClose('modalBg', closeSettings);
 // 设置面板标签切换
 document.querySelectorAll('.settings-tab').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -5615,7 +5909,7 @@ document.getElementById('settingsBtn').addEventListener('click', openSettings);
 document.getElementById('mdToggleBtn').addEventListener('click', () => setMdMode(!mdMode));
 document.getElementById('helpBtn').addEventListener('click', openHelp);
 document.getElementById('closeHelp').addEventListener('click', () => { document.getElementById('helpModalBg').style.display = 'none'; });
-document.getElementById('helpModalBg').addEventListener('click', (e) => { if (e.target === e.currentTarget) document.getElementById('helpModalBg').style.display = 'none'; });
+_backdropClickClose('helpModalBg', function () { document.getElementById('helpModalBg').style.display = 'none'; });
 document.getElementById('fontSizeSel').addEventListener('change', (e) => applyFontSize(parseInt(e.target.value, 10) || 14));
 document.getElementById('jumpBtn').addEventListener('click', jumpToPage);
 document.getElementById('pageJump').addEventListener('keydown', (e) => { if (e.key === 'Enter') jumpToPage(); });
@@ -5629,6 +5923,40 @@ document.querySelectorAll('#toolbar button[data-op]').forEach((b) => {
   b.addEventListener('mouseleave', hideTip);
   b.addEventListener('click', () => { hideTip(); suppressPopupUntil = performance.now() + 250; applyOp(b.dataset.op); });
 });
+
+// 新增下拉菜单绑定（2026-09）：文/背/X 三个菜单 —— 空守卫，另一车道在 correctmanage.py 注入 DOM
+(function bindDropMenus() {
+  // 文字包围：charWrapBtn -> charWrapMenu（data-wrap: underline/strike/charbox/shade）
+  const cwBtn = document.getElementById('charWrapBtn');
+  const cwMenu = document.getElementById('charWrapMenu');
+  if (cwBtn && cwMenu) {
+    cwBtn.addEventListener('click', (e) => { e.preventDefault(); toggleDropMenu('charWrapBtn', 'charWrapMenu'); });
+    cwMenu.addEventListener('click', (e) => {
+      const item = e.target.closest('[data-wrap]');
+      if (!item) return;
+      closeDropMenu('charWrapBtn', 'charWrapMenu');
+      const ed = currentEditable();
+      if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
+      applyInlineClass(ed, 'ptoe-' + item.dataset.wrap, {toggle:true});
+    });
+  }
+  // 突显按钮：highlightBtn (data-op="highlight") 已由 toolbar 统一绑定走 applyOp，无需额外绑定
+  // 上标下标：supSubBtn -> supSubMenu（data-sup: sup/sub）
+  const ssBtn = document.getElementById('supSubBtn');
+  const ssMenu = document.getElementById('supSubMenu');
+  if (ssBtn && ssMenu) {
+    ssBtn.addEventListener('click', (e) => { e.preventDefault(); toggleDropMenu('supSubBtn', 'supSubMenu'); });
+    ssMenu.addEventListener('click', (e) => {
+      const item = e.target.closest('[data-sup]');
+      if (!item) return;
+      closeDropMenu('supSubBtn', 'supSubMenu');
+      const ed = currentEditable();
+      if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
+      applyInlineClass(ed, 'ptoe-' + item.dataset.sup, {toggle:true});
+    });
+  }
+  // 点击菜单外关闭：复用现有 mousedown 监听器（约 5976 行），在此追加两菜单
+})();
 // ---------- 滚动驱动虚拟列表 ----------
 // wheel/touchmove 置位「用户主动滚动」时间戳（供 withScrollStable 放弃还原）；
 // scroll 事件置位任意滚动时间戳并 rAF 节流驱动 updateViewport 挂载视口附近行。
@@ -5704,7 +6032,8 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
       const _modalIds = [
         'modalBg','searchModalBg','exportModalBg','indentModalBg','finishModalBg',
         'historyModalBg','helpModalBg','formatRulesModalBg','frRuleModalBg','frFmtPopupBg',
-        'imgPopup','errPopup','popup','proofreadMenu'
+        'imgPopup','errPopup','popup','proofreadMenu',
+        'charWrapMenu','supSubMenu'
       ];
       for (const id of _modalIds) {
         try {
@@ -5740,7 +6069,7 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
   // 防御性：确保没有 modal 遮罩在初始化时意外显示（会导致工具栏/按钮无法响应）
   // 注意：contextMenu 不在此列——它靠 hidden 属性 + CSS [hidden] 显隐，inline display:none
   // 会永久压过 #contextMenu{display:flex}，导致右键菜单永不显示（2026-08 修复）。
-  ['modalBg','searchModalBg','exportModalBg','indentModalBg','formatRulesModalBg','finishModalBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg','imgPopup','errPopup','popup','proofreadMenu'].forEach(function(id) {
+  ['modalBg','searchModalBg','exportModalBg','indentModalBg','formatRulesModalBg','finishModalBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg','imgPopup','errPopup','popup','proofreadMenu','charWrapMenu','supSubMenu'].forEach(function(id) {
     const el = document.getElementById(id);
     if (el) el.style.display = 'none';
   });

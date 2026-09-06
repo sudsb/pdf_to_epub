@@ -47,7 +47,7 @@
   - python check_js.py
   - python extract_js.py && node --check extracted_ui.js
 - Packaging (Windows):
-  - powershell -ExecutionPolicy Bypass -File .\pack.ps1  # builds onefile PyInstaller exe
+  - powershell -ExecutionPolicy Bypass -File .\0pack.ps1  # builds onedir PyInstaller package (dist\ptoe\)
 
 (Repository uses `uv run ...` wrappers in developer scripts; plain `python` commands work too.)
 
@@ -85,7 +85,7 @@
 ## Runtime / Tooling Preferences
 
 - Python >= 3.11 recommended.
-- Windows-first packaging via PyInstaller (pack.ps1). The released exe is single-file (onefile), no UPX.
+- Windows-first packaging via PyInstaller (0pack.ps1). The released form is a self-contained directory (dist\ptoe\), no UPX.
 - Node required only for static JS syntax checks (`node --check`).
 - Tests primarily use the stdlib `unittest`; `pytest` is required only for `test_config_llama.py`.
 - Avoid adding new heavy runtime dependencies; prefer optional imports guarded by try/except and conservative fallbacks.

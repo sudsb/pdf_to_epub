@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>使用手册 - PToEA</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial; padding: 24px; max-width: 980px; margin: auto; color: #24292e; background: #fff; }
+pre { background: #f6f8fa; padding: 12px; overflow: auto; }
+code { background: #f6f8fa; padding: 2px 4px; border-radius: 3px; }
+h1,h2,h3,h4,h5,h6 { color: #0366d6; }
+ul, ol { margin-left: 1.2em; }
+blockquote { color: #6a737d; padding-left: 12px; border-left: 4px solid #eee; }
+hr { border: none; border-top: 1px solid #e1e4e8; margin: 24px 0; }
+</style>
+
+</head>
+<body>
+<article>
+<h1>PToEA（ptoe）使用手册</h1>
+<p>版本说明：基于当前仓库代码自动生成。
+</p>
+<p>目录
+<ul>
+<li>概述</li>
+<li>功能亮点</li>
+<li>前置要求</li>
+<li>安装与依赖</li>
+<li>配置（config.json）详解</li>
+<li>快速开始（一次命令跑通）</li>
+<li>CLI 参考（常用命令与示例）</li>
+<li>矫正界面（GUI）与手动校对详解</li>
+<li>格式规则（Format Rules）说明与示例</li>
+<li>数据流与输出结构</li>
+<li>模型管理</li>
+<li>OCR 断点续传（Resume / Restart）</li>
+<li>打包为独立 exe（Windows）</li>
+<li>API / 程序化调用</li>
+<li>测试与验证</li>
+<li>常见问题与排查建议</li>
+<li>高级 / 开发者注意事项</li>
+</p>
+</ul>
+<hr/>
+<p>概述
+</p>
+<p>PToEA（仓库名 ptoe）是一个面向 Windows 的离线 PDF → OCR → EPUB 流水线工具：
+<ul>
+<li>将 PDF 拆成图片</li>
+<li>对图片进行 OCR（本地推理服务：llama.cpp 的 llama-server 或 vLLM-Omni）</li>
+<li>清理、结构化识别文本</li>
+<li>可选人工矫正（浏览器/pywebview 内嵌 UI）</li>
+<li>生成标准 EPUB3（OEBPS/Text/Images/nav.xhtml + mimetype FIRST）</li>
+</p>
+</ul>
+<p>主要源码文件（快速索引）：
+<ul>
+<li>mian.py — CLI 入口、流水线编排、菜单</li>
+<li>pdfmanage.py — PDF→图片拆分、ImageItem、ImageQueue</li>
+<li>llamamanage.py / vllmmanage.py — 推理引擎适配（runserver / stopserver / batch_infer / request）</li>
+<li>configmanage.py — config.json 读写（原子写 + 线程锁）</li>
+<li>stringmanage.py — 文本清理与结构化（标题检测、页码剥离、bbox 转换）</li>
+<li>correctmanage.py — 手动校对 UI 服务端及 apply_markers</li>
+<li>guimanage.py — 配置中心 / 前端服务</li>
+<li>htmlmanage.py / epubmanage.py — XHTML / EPUB 生成与打包</li>
+</p>
+</ul>
+<p>功能亮点
+<ul>
+<li>本地推理（支持 llama-server / vLLM-Omni；可临时使用本地 PaddleOCR 作为 OCR 引擎）</li>
+<li>可选人工校对界面：按页对照原图并可标注标题/粗体/斜体/注释/段落/全文分篇</li>
+<li>中途断点续传（.ocr_progress.json）与历史版本缓存（data/correction_history/）</li>
+<li>Windows 打包支持（PyInstaller onefile 可生成 dist/ptoe.exe）</li>
+<li>配置原子写入（tempfile + os.replace 与全局锁）避免损坏</li>
+</p>
+</ul>
+<p>前置要求
+<ul>
+<li>Windows（首选），Python ≥ 3.11</li>
+<li>uv（项目使用 uv 管理依赖 / 运行脚本；也可直接用 python）</li>
+<li>可选推理后端：</li>
+<li>llama.cpp + llama-server.exe（本项目默认/推荐，用于深度校对）</li>
+<li>vLLM-Omni（vllm serve，适合 GPU 环境）</li>
+<li>PaddleOCR（本地，仅作 OCR 阶段可用）</li>
+<li>Python 包（常用）：pymupdf（fitz）、requests、zhconv。项目采用懒加载（失败时会降级或抛清晰错误）。</li>
+</p>
+</ul>
+<p>安装与依赖
+</p>
+<p>在仓库根目录运行：
+</p>
+<p>powershell cd D:\code-project\python\PToEA uv sync
+</p>
+<p>说明：uv sync 会安装 pyproject.toml 中的依赖。若不使用 uv，可用 pip 在虚拟环境中安装：pymupdf, requests, zhconv 等。
+</p>
+<p>配置（config.json）详解
+</p>
+<p>配置文件位置：`./config.json`（项目工作目录下）。
+</p>
+<p>程序首次运行会自动创建并用 DEFAULT_CONFIG 回填缺失键；若 `llama_server` 或 `models_dir` 指向不存在路径，默认会弹出 tkinter 文件选择（可通过 headless 模式跳过）。
+</p>
+<p>关键配置（简要）：
+<ul>
+<li>llama_server: llama-server.exe 的路径（必填以便自动拉起服务）</li>
+<li>models_dir: 模型文件目录（含 .gguf / .mmproj）</li>
+<li>model_choices: 模型注册表，形如 {&quot;HY&quot;: {&quot;name&quot;:&quot;HunyuanOCR.BF16.gguf&quot;,&quot;mmproj&quot;:&quot;...&quot;,&quot;workers&quot;:2}, ...}</li>
+<li>selected_model: 默认选中的模型键</li>
+<li>engine: 推理引擎（&quot;llama&quot;（默认） | &quot;vllm&quot;）</li>
+<li>llama_server_args: 启动参数（host、port、temperature、parallel、max_tokens、ctx_size、flash_attn 等）</li>
+<li>vllm_server / vllm_server_args: vLLM-Omni 相关</li>
+<li>gui_display: &quot;pywebview&quot;（默认内嵌窗口）或 &quot;browser&quot;</li>
+<li>tabs_position: &quot;top&quot; / &quot;bottom&quot;（多标签窗口位置）</li>
+<li>window_maximized: pywebview 是否默认最大化（布尔）</li>
+<li>image_preprocess: OpenCV 预处理开关与选项（enabled, gray, denoise, sharpen, binarize, workers）</li>
+<li>format_rules: 矫正界面的格式规则（可在 GUI CRUD 或写入 config.json）</li>
+<li>shortcuts: 矫正界面快捷键映射（op -&gt; 键组合）</li>
+</p>
+</ul>
+<p>建议：首次配置请先确保 `llama_server` 与 `models_dir` 指向有效路径，避免启动时弹出文件对话框阻塞。
+</p>
+<p>通过命令行修改配置（不直接编辑 JSON）：
+</p>
+<p>powershell uv run python mian.py config set llama_server &quot;E:\xox\Tools\llama-c\llama-server.exe&quot; uv run python mian.py config set models_dir &quot;E:\model&quot; uv run python mian.py config set selected_model HY uv run python mian.py config set engine vllm
+</p>
+<p>若需在脚本中访问/修改：
+</p>
+<p>python from configmanage import get_config, set_ocr_prompt, set_llama_server_arg cfg = get_config(show_dialogs=False) set_ocr_prompt(&quot;自定义提示词&quot;) set_llama_server_arg(&quot;parallel&quot;, &quot;4&quot;)
+</p>
+<p>快速开始（一次命令跑通）
+</p>
+<p>powershell uv run python mian.py epub &quot;E:\Books\example.pdf&quot; --title &quot;Example Book&quot;
+</p>
+<p>例子输出（示例）： [1/4] Splitting PDF to images (dpi=200) ... [2/4] OCR via llama-server (model=&#x27;HY&#x27;, workers=auto) ... [3/4] Structuring text (12 page(s)) ... [4/4] Rendering XHTML and packing EPUB ... Done: D:\code-project\python\PToEA\data\Example Book\Example Book.epub
+</p>
+<p>CLI 参考（常用命令与示例）
+</p>
+<p>主命令：`mian.py`（可通过 `uv run python mian.py -h` 或打包后的 `ptoe.exe -h` 查看实时帮助）。
+</p>
+<p>核心子命令：
+<ul>
+<li>epub — 将 PDF 转为 EPUB（默认流程：split -&gt; OCR -&gt; structure -&gt; convert -&gt; pack）</li>   常用选项：   --dpi {0..4}（0=100,1=150,2=200,3=300,4=600; 默认 0）   --model MODEL（model_choices 中的键）   --engine {llama,vllm,paddle}   --workers WORKERS（OCR 并发线程，默认读取 model_choices.&lt;key&gt;.workers 或 3）   --timeout TIMEOUT（单次请求超时，秒，默认 600）   --thinking（启用思维链模式：不在提示词后追加“按原文原格式输出”）   --title / --author / --lang / --out-dir / --epub-path   --correct（开启矫正界面）   --correct-timeout（界面关闭后自动继续等待秒数）   --resume / --restart（断点续传或强制重识别）
+</p>
+</ul>
+<p>示例： uv run python mian.py epub &quot;E:\MYBooks\xxx.pdf&quot; --title &quot;书名&quot; --dpi 2 --workers 3
+</p>
+<ul>
+<li>resume — 继续上次中断的 OCR（只识别未完成页面或直接转换）</li>
+<li>correct — 直接打开手动矫正界面（不跑 OCR，页面优先加载本地历史缓存）</li>
+<li>model — 模型管理（list / show / set / add / remove）</li>
+<p>  示例：   uv run python mian.py model list   uv run python mian.py model add NEW --name model.gguf --mmproj mmproj.gguf [--force]
+<li>config — 快速设置配置项（仅支持 set 子命令及部份嵌套键）</li>   示例： uv run python mian.py config set llama_server &quot;...&quot;
+<li>gui — 启动配置中心（本地 HTTP + pywebview 或浏览器）</li>   uv run python mian.py gui [--host HOST] [--port PORT] [--no-browser] [--idle-timeout N]
+<li>stop — 停止推理服务（llama-server / vLLM）： uv run python mian.py stop [--engine llama|vllm]</li>
+</p>
+</ul>
+<p>打包 exe：双击 dist\ptoe.exe 将显示终端菜单（无参数 + 交互终端时），支持直接用 ptoe.exe epub &lt;pdf&gt; ... 等命令。
+</p>
+<p>矫正界面（GUI）与手动校对详解
+</p>
+<p>矫正界面为可选阶段（`--correct` 或 `mian.py correct`）：
+<ul>
+<li>左侧：页面预览图（点击切换原图/预览）</li>
+<li>右侧：可编辑的 OCR 文本（每行一个 div，按行/段落保留原结构）</li>
+<li>工具栏：格式（粗体/斜体/标题）、标记（全文分篇/段落合并/注释）、搜索/替换、校正（候选替换）、图片插入、导出 TXT/DOCX/EPUB</li>
+<li>虚拟列表：支持 1000+ 页（只渲染视口附近 DOM）</li>
+<li>撤回/前进：Ctrl+Z / Ctrl+Y，最多 10 步</li>
+<li>历史：data/correction_history/，每个 PDF 保留多版本，包含低分辨率预览图以支持跨机器共享</li>
+<li>自动继续：关闭界面后等待 `--correct-timeout` 秒自动继续后续流程（默认 600s）</li>
+</p>
+</ul>
+<p>功能亮点：批量应用格式规则、全文标记与段落重拼接、注释标记与段落对应、实时搜索/替换（支持正则）、导出含未保存修改的全部页。
+</p>
+<p>格式规则（Format Rules）说明与示例
+</p>
+<p>格式规则由若干规则项构成（可在 GUI CRUD 或通过 /api/format_rules 写入配置）：
+<ul>
+<li>规则对象：{id, name, mode(&quot;first&quot;|&quot;all&quot;), conditions: [...]}</li>
+<li>condition：{type: contains|prefix|suffix|regex, pattern, scope: selection|paragraph|page, formats: [ops]}</li>
+<li>支持 ops（示例）：bold, italic, h1..h6, align_left/center/right, note, remove, none</li>
+</p>
+</ul>
+<p>示例 1 — 注释段落识别： {   &quot;id&quot;: &quot;rule-anno-1&quot;,   &quot;name&quot;: &quot;注释段落识别&quot;,   &quot;mode&quot;: &quot;first&quot;,   &quot;conditions&quot;: [ {&quot;type&quot;:&quot;prefix&quot;,&quot;pattern&quot;:&quot;注：&quot;,&quot;scope&quot;:&quot;paragraph&quot;,&quot;formats&quot;:[&quot;note&quot;]} ] }
+</p>
+<p>示例 2 — 章节标题（正则）： {   &quot;id&quot;: &quot;rule-chap-head&quot;,   &quot;name&quot;: &quot;章节标题识别&quot;,   &quot;mode&quot;: &quot;first&quot;,   &quot;conditions&quot;: [ {&quot;type&quot;:&quot;regex&quot;,&quot;pattern&quot;:&quot;/^第\\d+章\\b/u&quot;,&quot;scope&quot;:&quot;paragraph&quot;,&quot;formats&quot;:[&quot;h1&quot;,&quot;align_center&quot;]} ] }
+</p>
+<p>示例 3 — 多条件组合（mode=all）： {   &quot;id&quot;: &quot;rule-toc-block&quot;,   &quot;name&quot;: &quot;目录条目美化&quot;,   &quot;mode&quot;: &quot;all&quot;,   &quot;conditions&quot;: [ {&quot;type&quot;:&quot;contains&quot;,&quot;pattern&quot;:&quot;目录&quot;,&quot;scope&quot;:&quot;paragraph&quot;,&quot;formats&quot;:[&quot;h3&quot;]}, {&quot;type&quot;:&quot;regex&quot;,&quot;pattern&quot;:&quot;/^[0-9]{1,2}\\s+.+/&quot;,&quot;scope&quot;:&quot;paragraph&quot;,&quot;formats&quot;:[&quot;align_left&quot;]} ] }
+</p>
+<p>数据流与输出结构
+</p>
+<p>主流水线： 1) pdfmanage.split_pdf_to_images(pdf, dpi, fmt) → data/&lt;pdf_stem&gt;/1.png, 2.png ... 2) llamamanage.batch_infer（或 vllmmanage / paddleocrmanage）→ per-page OCR 文本 3) stringmanage.clean_and_structure_text → structured pages（去除页码、bbox 转换、段落/标题初步识别） 4) correctmanage.correct_pages（可选）→ apply_markers 5) htmlmanage.HTMLConverter → OEBPS/Text/content_N.xhtml、Styles、Images 6) epubmanage.EPUBPacker → .epub（mimetype 首项，ZIP_STORED）
+</p>
+<p>输出目录示例： data/&lt;pdf_stem&gt;/ ├── 1.png, 2.png, ... ├── .ocr_progress.json ├── OEBPS/ │   ├── Text/content_1.xhtml │   ├── Styles/style.css │   ├── Images/ │   └── nav.xhtml ├── mimetype ├── META-INF/container.xml ├── content.opf └── &lt;title&gt;.epub
+</p>
+<p>模型管理
+</p>
+<p>模型注册表位于 config.json 的 `model_choices`：每个键对应对象 {name, mmproj, workers}：
+<ul>
+<li>name：gguf 文件名或相对路径（相对 models_dir）</li>
+<li>mmproj：多模态视觉投影文件（当模型支持 vision 时）</li>
+<li>workers：推荐并发数（batch_infer 未指定 --workers 时使用）</li>
+</p>
+</ul>
+<p>CLI 操作举例： uv run python mian.py model list uv run python mian.py model show uv run python mian.py model set HY uv run python mian.py model add NEW --name file.gguf --mmproj file.mmproj --force uv run python mian.py model remove OLD
+</p>
+<p>注意：configmanage.find_canonical_model_key(choices, key) 提供一致的大小写不敏感查找逻辑；若存在大小写冲突会被视为歧义并报错提示。
+</p>
+<p>OCR 断点续传（Resume / Restart）
+</p>
+<ul>
+<li>进度文件位置：data/&lt;pdf_stem&gt;/.ocr_progress.json（由 mian.py 的 _ocr_progress_path 确定）</li>
+<li>resume：继续识别未完成页面（默认询问），`--resume` / `--restart` 可跳过交互</li>
+<li>restart：忽略已有进度，从头识别全部页面（会覆盖进度）</li>
+</ul>
+<p>打包为独立 exe（Windows）
+</p>
+<p>仓库提供打包脚本（root）：0pack.ps1（历史名 pack.ps1）。
+</p>
+<p>powershell -ExecutionPolicy Bypass -File .\0pack.ps1
+</p>
+<p>要点：
+<ul>
+<li>使用 PyInstaller onefile + console（生成 dist\ptoe.exe）</li>
+<li>脚本通常会 --collect-all 对常用包（pymupdf、zhconv、pywebview 等）和 --add-data assets</li>
+<li>保证打包时将 dicts/、ui/、pyproject.toml 等必要数据文件加入</li>
+<li>建议使用 --noupx 以降低杀软误报</li>
+</p>
+</ul>
+<p>双击 exe 会显示终端菜单（交互模式），支持直接命令行用法：`ptoe.exe epub &lt;pdf&gt; ...`。
+</p>
+<p>API / 程序化调用
+</p>
+<p>仓库同时支持以库方式调用，示例：
+</p>
+<p>python from mian import pdf_to_epub res = pdf_to_epub(&quot;E:/MYBooks/xxx.pdf&quot;, dpi=100, model_key=&quot;HY&quot;, max_workers=3, title=&quot;书名&quot;) print(res[&quot;epub&quot;])  # EPUB 路径
+</p>
+<p>也可分步调用： from pdfmanage import split_pdf_to_images from llamamanage import batch_infer from stringmanage import clean_and_structure_text from htmlmanage import HTMLConverter
+</p>
+<h1>split -&gt; batch_infer -&gt; structure -&gt; convert -&gt; pack</h1>
+<p>测试与验证
+</p>
+<p>建议的快速 smoke tests（开发/修改后运行）：
+</p>
+<p>uv run python -m unittest test_pdfmanage test_mian test_correctmanage test_llamamanage test_stringmanage test_vllmmanage uv run python test_image_queue_request.py
+</p>
+<p>部分测试为 pytest 风格（如 test_config_llama.py），需要额外安装 pytest（uv add --dev pytest）。
+</p>
+<p>常见问题与排查建议
+</p>
+<ul>
+<li>启动卡住弹出文件对话框：说明 config.json 中 llama_server 或 models_dir 路径不存在。用 `mian.py config set` 指向有效路径，或在 headless 下运行 `get_config(show_dialogs=False)`。</li>
+<li>Read timed out / 单页超时：增加 --timeout，或降低 --workers / 降低 DPI 档位（dpi=2 较常用）。</li>
+<li>端口占用 / 无法启动模型：使用 `mian.py stop` 停止遗留服务，或直接 `python -c &quot;from llamamanage import stopserver; stopserver()&quot;`。</li>
+<li>打包后运行报找不到字典/数据文件：pack 脚本需把 dicts/、ui/ 等通过 --collect-all / --add-data 一并打包；本仓库 0pack.ps1 已包含常见收集操作。</li>
+<li>Frozen exe 丢失编码/缓冲的问题：mian.py 有对 stdout/stderr 非 tty 下强制 UTF-8+行缓冲的处理。</li>
+</ul>
+<p>高级 / 开发者注意事项
+</p>
+<ul>
+<li>线程与锁：configmanage 使用 module-level `_CFG_LOCK` 保护写操作；不要在持锁期间弹出 tkinter 对话框（实现上已把弹窗移出锁外）。</li>
+<li>原子写：使用 configmanage._atomic_write_json(path, obj)（临时文件 + os.replace）以避免写盘半截文件。</li>
+<li>推理后端：llamamanage 维护 module-global `_server_process` 与 `_SESSION`（requests.Session），保证连接复用；修改时注意不要破坏全局状态契约。</li>
+<li>EPUB 内部路径必须使用斜线 `/`（htmlmanage/epubmanage 假定这一约定）。</li>
+<li>嵌入的 UI 脚本（correctmanage.py 中的 _UI_HTML / 内联 script）非常长且敏感：任何修改后请抽出 js 并用 `node --check` 进行语法检查；仓库含检查脚本 `check_js.py` 与 `extract_js.py`。</li>
+</ul>
+<p>附录：快速命令速查
+</p>
+<ul>
+<li>依赖安装： uv sync</li>
+<li>生成 EPUB： uv run python mian.py epub &lt;pdf&gt; --title &quot;书名&quot;</li>
+<li>进入矫正： uv run python mian.py correct &lt;pdf&gt;</li>
+<li>继续上次： uv run python mian.py resume &lt;pdf&gt;</li>
+<li>启动 GUI： uv run python mian.py gui</li>
+<li>停止模型服务： uv run python mian.py stop</li>
+<li>打包 exe： powershell -ExecutionPolicy Bypass -File .\0pack.ps1</li>
+<li>单元测试（快速）： uv run python -m unittest test_pdfmanage test_stringmanage test_llamamanage</li>
+</ul>
+<hr/>
+<p>文件已写入：`使用手册.md`（仓库根目录）。
+</p>
+<p>说明：本手册以仓库代码为依据（mian.py、configmanage.py、pdfmanage.py、correctmanage.py、guimanage.py、README.md、USAGE.md 等），并保留示例与命令。若需要：
+<ul>
+<li>我可以把此手册转为 README.md 覆写现有 README，或生成 PDF/HTML 版本；</li>
+<li>或生成面向开发者的 `DEV_CHECKLIST.md`（打包/测试/部署步骤）和 `AGENTS.md`（已存在简短版），你选其中一项。</li>
+</p>
+</ul>
+</article>
+</body>
+</html>

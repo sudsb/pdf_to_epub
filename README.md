@@ -390,7 +390,7 @@ pywebview-window interface by default (config `gui_display=browser` switches to 
 powershell -ExecutionPolicy Bypass -File .\pack.ps1
 ```
 
-Produces `dist\ptoe.exe` (onefile + console). Double-click to enter terminal menu:
+Produces `dist\ptoe\ptoe.exe` (onedir + console). Double-click to enter terminal menu:
 
 ```
 1) PDF → EPUB 转换（OCR 全流程）

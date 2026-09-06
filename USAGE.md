@@ -402,15 +402,15 @@ result = pdf_to_epub("xxx.pdf", correct=True)
 
 ## 十一、打包为独立 exe 与终端菜单
 
-**`pack.ps1`**（项目根目录）用 PyInstaller 把 `mian.py` 打包成单个独立 exe（`dist\ptoe.exe`，onefile + console，无需 Python 环境）：
+**`0pack.ps1`**（项目根目录）用 PyInstaller 把 `mian.py` 打包成自包含目录（`dist\ptoe\`，onedir + console，无需 Python 环境）：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\pack.ps1
+powershell -ExecutionPolicy Bypass -File .\pack.ps1  # 或 0pack.ps1
 ```
 
 打包要点：
-- **onefile + console**：单文件、终端程序；`pyproject.toml` 一并打入，`--version` 显示正确版本号；`pymupdf`/`requests`/`zhconv`/`tkinter` 全部内置；`--noupx` 避免杀软误报。
-- **双击 `ptoe.exe` 启动终端菜单**（无参数 + 交互终端即进入）：
+- **onedir + console**：目录式分发（`dist\ptoe\ptoe.exe` + `_internal\` 依赖）；`pyproject.toml` 一并打入，`--version` 显示正确版本号；`pymupdf`/`requests`/`zhconv`/`tkinter` 全部内置；`--noupx` 避免杀软误报。**因采用 onedir，启动时不需解包到临时目录，首次启动无 onefile 式卡顿**。
+- **双击 `dist\ptoe\ptoe.exe` 启动终端菜单**（无参数 + 交互终端即进入）：
   ```
   1) PDF → EPUB 转换（OCR 全流程）   ← 交互式填写 PDF 路径/模型/DPI/并发/是否矫正
   2) 手动矫正（correct，不跑 OCR）

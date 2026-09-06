@@ -392,6 +392,34 @@ class CSSManager:
         .ptoe-citation {
           font-style: italic;
         }
+        /* 新增行内格式（2026-09）：下划线/删除线/字符边框/底纹/突显/上标/下标 */
+        .ptoe-underline {
+          text-decoration: underline;
+        }
+        .ptoe-strike {
+          text-decoration: line-through;
+        }
+        .ptoe-charbox {
+          border: 1px solid #333;
+          padding: 0 .15em;
+          border-radius: 2px;
+        }
+        .ptoe-shade {
+          background: #eef1f4;
+        }
+        .ptoe-highlight {
+          background: #ffe45e;
+        }
+        .ptoe-sup {
+          vertical-align: super;
+          font-size: .7em;
+          line-height: 1;
+        }
+        .ptoe-sub {
+          vertical-align: sub;
+          font-size: .7em;
+          line-height: 1;
+        }
         .ptoe-page-break {
           page-break-before: always;
           break-before: page;
