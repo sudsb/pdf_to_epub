@@ -97,6 +97,40 @@ DPI_LEVELS = {0: 100, 1: 150, 2: 200, 3: 300, 4: 600}
 _BAR_WIDTH = 24
 
 
+# 终端菜单横幅：字符画大字标题 + 双线边框，宽度 ≤ 78 列（含边框）
+# 内部宽度 76 列，版本号右对齐显示
+_MENU_BANNER = (
+    "╔═══════════════════════════════════════════════════════════════════════════╗\n"
+    "║ ██████ ██   ██ ██████  █████ ███   ██ ██████ ██   ██ ███████ ██████       ║\n"
+    "║ ██     ██   ██ ██      ██    ████  ██ ██   ██ ██   ██ ██      ██   ██      ║\n"
+    "║ █████  ██   ██ █████   █████ ██ ██ ██ ██████ ███████ █████   ██████       ║\n"
+    "║ ██     ██   ██ ██      ██    ██  ████ ██   ██ ██   ██ ██      ██   ██      ║\n"
+    "║ ██      █████  ██      █████ ██   ███ ██   ██ ██   ██ ███████ ██   ██      ║\n"
+    "║                                                                  {version:>6} ║\n"
+    "╚═══════════════════════════════════════════════════════════════════════════╝"
+)
+
+
+def _display_width(s: str) -> int:
+    """计算字符串在中文控制台的显示宽度：ASCII=1，CJK/全角/→=2。"""
+    width = 0
+    for ch in s:
+        o = ord(ch)
+        if o < 128:
+            width += 1
+        elif ch == "\u2192":  # → 右箭头，在 CJK 控制台按双宽处理
+            width += 2
+        elif 0x1100 <= o <= 0x115F or 0x2329 <= o <= 0x232A or \
+             0x2E80 <= o <= 0x303F or 0x3040 <= o <= 0xA4CF or \
+             0xAC00 <= o <= 0xD7A3 or 0xF900 <= o <= 0xFAFF or \
+             0xFE10 <= o <= 0xFE19 or 0xFE30 <= o <= 0xFE6F or \
+             0xFF00 <= o <= 0xFF60 or 0xFFE0 <= o <= 0xFFE6:
+            width += 2
+        else:
+            width += 1
+    return width
+
+
 def _read_meta() -> tuple[str, str]:
     """Return (name, version) from pyproject.toml or sensible defaults.
 
@@ -1156,54 +1190,99 @@ def _menu_model() -> None:
 
 def _run_menu(name: str, version: str) -> int:
     """无参数 + 交互终端时的终端菜单（打包 exe 双击启动即进入此界面）。"""
-    print(f"\n{name} {version} — PDF → OCR → EPUB 工具")
     from configmanage import get_config
 
+    # 打印大标题横幅（含版本号）
+    print()
+    print(_MENU_BANNER.format(version=version))
+
+    # 菜单项定义：(键, 显示文本)
+    _MENU_ITEMS = [
+        ("1", "PDF → EPUB 转换"),
+        ("2", "矫正界面"),
+        ("3", "配置信息"),
+        ("4", "模型管理"),
+        ("5", "中断重试"),
+        ("6", "帮助信息"),
+        ("7", "关闭引擎"),
+        ("8", "配置界面"),
+    ]
+
+    # 两列布局：左列 1-4，右列 5-8；第 0 项单独居中
+    # 计算左列最大显示宽度用于对齐
+    left_items = _MENU_ITEMS[:4]
+    right_items = _MENU_ITEMS[4:]
+
+    def _fmt_item(key: str, text: str) -> str:
+        return f"  {key}) {text}"
+
+    left_width = max(_display_width(_fmt_item(k, t)) for k, t in left_items)
+
     while True:
-        print("\n请选择操作：")
-        print("  1) PDF → EPUB 转换")
-        print("  2) 矫正界面")
-        print("  3) 配置信息")
-        print("  4) 模型管理")
-        print("  5) 中断重试 ")
-        print("  6) 帮助信息")
-        print("  7) 关闭引擎")
-        print("  8) 配置界面")
-        print("  0) 退出")
-        choice = _ask("请输入序号 [0-8]：")
-        if not choice:
-            # EOF（管道关闭/控制台关闭）或空输入：安全退出，避免死循环
+        print("请选择操作：")
+        # 打印两列
+        for (lk, lt), (rk, rt) in zip(left_items, right_items):
+            left_str = _fmt_item(lk, lt)
+            right_str = _fmt_item(rk, rt)
+            # 左列左对齐，按显示宽度补空格
+            pad = left_width - _display_width(left_str) + 4  # 列间距 4 空格
+            print(f"{left_str}{' ' * pad}{right_str}")
+        # 第 0 项单独居中打印
+        exit_str = _fmt_item("0", "退出")
+        exit_pad = (78 - _display_width(exit_str)) // 2
+        print(f"{' ' * exit_pad}{exit_str}")
+
+        # 使用原始 readline 区分 EOF（line==""）与空回车（line=="\n"）
+        try:
+            print("请输入序号 [0-8]：", end="", flush=True)
+            line = sys.stdin.readline()
+        except Exception:
+            line = ""
+
+        if line == "":
+            # EOF：管道关闭、控制台关闭、重定向无输入
             print("已退出。")
             break
+        choice = line.strip()
+        if choice == "":
+            # 用户直接按回车：重新显示菜单，不退出
+            continue
+
         if choice == "0":
             break
-        if choice == "1":
-            _menu_epub(get_config())
-        elif choice == "2":
-            _menu_correct()
-        elif choice == "3":
-            _menu_config()
-        elif choice == "4":
-            _menu_model()
-        elif choice == "5":
-            _menu_resume()
-        elif choice == "6":
-            print("  命令行用法（功能与菜单相同）：")
-            print(
-                "    mian.py epub <pdf> [--dpi 0-4] [--model KEY] [--workers N] [--thinking] [--correct] [--resume|--restart]"
-            )
-            print("    mian.py resume <pdf> [--restart]")
-            print("    mian.py correct [<pdf>]")
-            print("    mian.py config show|set <key> <value>")
-            print("    mian.py model list|show|set|add|remove")
-            print("    mian.py stop [--engine llama|vllm]")
-            print("  详见 USAGE.md 或 mian.py <子命令> --help")
-        elif choice == "7":
-            _menu_stop()
-        elif choice == "8":
-            _menu_gui()
-        else:
-            print("无效输入，请输入 0-8。")
+
+        try:
+            if choice == "1":
+                _menu_epub(get_config())
+            elif choice == "2":
+                _menu_correct()
+            elif choice == "3":
+                _menu_config()
+            elif choice == "4":
+                _menu_model()
+            elif choice == "5":
+                _menu_resume()
+            elif choice == "6":
+                print("  命令行用法（功能与菜单相同）：")
+                print(
+                    "    mian.py epub <pdf> [--dpi 0-4] [--model KEY] [--workers N] [--thinking] [--correct] [--resume|--restart]"
+                )
+                print("    mian.py resume <pdf> [--restart]")
+                print("    mian.py correct [<pdf>]")
+                print("    mian.py config show|set <key> <value>")
+                print("    mian.py model list|show|set|add|remove")
+                print("    mian.py stop [--engine llama|vllm]")
+                print("  详见 USAGE.md 或 mian.py <子命令> --help")
+            elif choice == "7":
+                _menu_stop()
+            elif choice == "8":
+                _menu_gui()
+            else:
+                print("无效输入，请输入 0-8。")
+        except Exception as e:
+            # 单个业务崩溃不杀菜单：打印错误后回到循环
+            print(f"错误：{e}")
+
     if getattr(sys, "frozen", False):
         # 打包后的 exe 双击启动：退出前暂停，避免控制台窗口一闪而过
         _pause()
