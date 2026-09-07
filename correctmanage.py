@@ -5745,6 +5745,78 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "application/json; charset=utf-8",
                 )
             return
+        if path == "/api/history/export/backup":
+            # 导出为备份文件：把选中的历史版本打包为 ZIP 并直接保存到
+            # data/data/ 目录（不走浏览器下载——pywebview WebView2 默认
+            # ALLOW_DOWNLOADS=False 会取消 blob 下载，导致导出静默失败）。
+            # 返回 {ok, path}，前端提示已保存位置。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b"{}"
+                body = json.loads(raw.decode("utf-8"))
+                ids = list(body.get("ids") or [])
+                if not ids:
+                    self._send(
+                        400,
+                        self._json({"ok": False, "error": "未选择要导出的历史版本"}),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+                import io
+                import time as _time
+                import zipfile
+
+                from pdfmanage import app_base_dir
+
+                buf = io.BytesIO()
+                count = 0
+                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for pid in ids:
+                        fp = _history_dir() / f"{pid}.json"
+                        if not fp.is_file():
+                            continue
+                        try:
+                            data = json.loads(fp.read_text(encoding="utf-8"))
+                            if not isinstance(data, dict):
+                                data = {"pages": {}}
+                            images = data.get("images") or _load_images_cache(
+                                _version_prefix(pid)
+                            )
+                            data["images"] = images or {}
+                            zf.writestr(
+                                f"{pid}.json",
+                                json.dumps(data, ensure_ascii=False, indent=2),
+                            )
+                            count += 1
+                        except Exception:  # noqa: BLE001
+                            continue
+                if count == 0:
+                    self._send(
+                        404,
+                        self._json({"ok": False, "error": "没有可导出的历史版本"}),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+                # 默认导出到程序 data/data/ 目录
+                data_dir = app_base_dir() / "data" / "data"
+                data_dir.mkdir(parents=True, exist_ok=True)
+                stamp = _time.strftime("%Y%m%d%H%M%S")
+                out_path = data_dir / f"ptoe_history_{stamp}.zip"
+                out_path.write_bytes(buf.getvalue())
+                self._send(
+                    200,
+                    self._json(
+                        {"ok": True, "path": str(out_path), "count": count}
+                    ),
+                    "application/json; charset=utf-8",
+                )
+            except Exception as e:  # noqa: BLE001
+                self._send(
+                    500,
+                    self._json({"ok": False, "error": str(e)}),
+                    "application/json; charset=utf-8",
+                )
+            return
         if path == "/api/history/import":
             # 把导出的历史版本 JSON 或 ZIP 导入本机（跨平台矫正活动）。
             # body 两种形态：

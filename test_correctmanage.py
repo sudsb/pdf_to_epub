@@ -7752,6 +7752,139 @@ class TestHistoryImportExport(unittest.TestCase):
             server.server_close()
             shutil.rmtree(hist_dir, ignore_errors=True)
 
+    def test_export_backup_saves_to_data_data(self):
+        """pywebview 环境历史导出：/api/history/export/backup 直接把 ZIP 写入
+        程序 data/data/ 目录（不走浏览器下载，WebView2 会取消 blob 下载），
+        返回 {ok, path, count} 供前端提示保存位置。"""
+        import io
+        import json as _json
+        import zipfile
+        import correctmanage as _cm
+        from http.server import ThreadingHTTPServer
+        from threading import Thread
+        import requests
+        from unittest import mock
+
+        hist_dir = Path(tempfile.mkdtemp(prefix="test_backup_hist_"))
+        _orig_dir = _cm._history_dir
+        _cm._history_dir = lambda: hist_dir
+        self.addCleanup(lambda: setattr(_cm, "_history_dir", _orig_dir))
+        base_dir = Path(tempfile.mkdtemp(prefix="test_backup_base_"))
+        prefix = "testprefix"
+        now = "20260101000000"
+        ids = []
+        for i in range(2):
+            stem = f"{prefix}_{now}_{i:04d}"
+            ids.append(stem)
+            payload = {
+                "pdf": "C:/books/test.pdf",
+                "name": f"test_{i}.pdf",
+                "pages": {"1": f"<p>Page {i}</p>"},
+                "proofread": {"errors": {}, "original": {}, "dismissed": {}},
+                "last_proofread_page": None,
+            }
+            (hist_dir / f"{stem}.json").write_text(
+                _json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        state = {
+            "pages": {},
+            "finished": __import__("threading").Event(),
+            "preview_cache": {},
+            "pdf_path": "C:/books/test.pdf",
+            "img_dir": None,
+            "preview_dpi": 110,
+            "preview_quality": 82,
+            "last_heartbeat": 0.0,
+            "gone_at": None,
+            "idle_timeout": 600.0,
+            "auto_finished": False,
+            "on_convert": None,
+            "convert_lock": __import__("threading").Lock(),
+            "history_prefix": prefix,
+            "history_lock": __import__("threading").Lock(),
+            "embedded_images": {},
+        }
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _cm._CorrectionHandler)
+        server.daemon_threads = True
+        server.state = state
+        Thread(target=server.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            with mock.patch("pdfmanage.app_base_dir", return_value=base_dir):
+                r = requests.post(
+                    base + "/api/history/export/backup",
+                    data=_json.dumps({"ids": ids}),
+                    headers={"Content-Type": "application/json"},
+                )
+            self.assertEqual(r.status_code, 200, r.text)
+            data = r.json()
+            self.assertTrue(data.get("ok"), data.get("error"))
+            self.assertEqual(data.get("count"), 2)
+            out_path = Path(data["path"])
+            # 必须落在程序 data/data/ 目录下且文件名符合时间戳规则
+            self.assertEqual(out_path.parent, base_dir / "data" / "data")
+            self.assertTrue(out_path.name.startswith("ptoe_history_"))
+            self.assertTrue(out_path.is_file())
+            with zipfile.ZipFile(out_path) as zf:
+                names = zf.namelist()
+                self.assertEqual(sorted(names), sorted(f"{i}.json" for i in ids))
+                for name in names:
+                    d = _json.loads(zf.read(name).decode("utf-8"))
+                    self.assertIn("pages", d)
+        finally:
+            server.shutdown()
+            server.server_close()
+            shutil.rmtree(hist_dir, ignore_errors=True)
+            shutil.rmtree(base_dir, ignore_errors=True)
+
+    def test_export_backup_empty_ids(self):
+        import json as _json
+        import correctmanage as _cm
+        from http.server import ThreadingHTTPServer
+        from threading import Thread
+        import requests
+
+        hist_dir = Path(tempfile.mkdtemp(prefix="test_backup_empty_"))
+        _orig_dir = _cm._history_dir
+        _cm._history_dir = lambda: hist_dir
+        self.addCleanup(lambda: setattr(_cm, "_history_dir", _orig_dir))
+        state = {
+            "pages": {},
+            "finished": __import__("threading").Event(),
+            "preview_cache": {},
+            "pdf_path": "C:/books/test.pdf",
+            "img_dir": None,
+            "preview_dpi": 110,
+            "preview_quality": 82,
+            "last_heartbeat": 0.0,
+            "gone_at": None,
+            "idle_timeout": 600.0,
+            "auto_finished": False,
+            "on_convert": None,
+            "convert_lock": __import__("threading").Lock(),
+            "history_prefix": "testprefix",
+            "history_lock": __import__("threading").Lock(),
+            "embedded_images": {},
+        }
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _cm._CorrectionHandler)
+        server.daemon_threads = True
+        server.state = state
+        Thread(target=server.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            r = requests.post(
+                base + "/api/history/export/backup",
+                data=_json.dumps({"ids": []}),
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(r.status_code, 400)
+            data = r.json()
+            self.assertIn("error", data)
+        finally:
+            server.shutdown()
+            server.server_close()
+            shutil.rmtree(hist_dir, ignore_errors=True)
+
 
 class TestPreviewCache(unittest.TestCase):
     """预览图磁盘缓存：路径规则、/preview 读缓存与回写、多进程预热 worker。"""

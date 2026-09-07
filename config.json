@@ -111,11 +111,18 @@
     "marker_note": "Ctrl+Shift+M",
     "marker_join": "Ctrl+Shift+J",
     "marker_page": "Ctrl+Shift+P",
+    "underline": "",
+    "strike": "",
+    "charbox": "",
+    "shade": "",
+    "highlight": "",
+    "sup": "",
+    "sub": "",
     "search": "Ctrl+F",
     "clean": "Ctrl+Shift+C",
     "convert_t2s": "Ctrl+Shift+T",
     "convert_s2t": "Ctrl+Shift+Y",
-    "toggle_md": "Ctrl+Shift+D",
+    "toggle_md": "",
     "undo": "Ctrl+Z",
     "redo": "Ctrl+Y",
     "history": "Ctrl+H",
@@ -283,7 +290,7 @@
   "window_maximized": true,
   "ui_settings": {
     "tip_delay": 600,
-    "err_hover_delay": 1500,
+    "err_hover_delay": 500,
     "editor_font_size": 14,
     "img_mode": ""
   }

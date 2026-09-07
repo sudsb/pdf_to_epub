@@ -2334,21 +2334,17 @@ document.getElementById('stayPageBtn').addEventListener('click', () => {
 // 导出：把选中版本打包为 ZIP（每版本一个自包含 JSON，含预览图），可拷贝到其它电脑；
 // 导入：读取导出的 JSON 或 ZIP 并落盘到本地历史缓存，供跨平台继续矫正。
 async function exportHistoryVersion(id) {
-  // 行内「导出」同样走 bulk ZIP 端点（单版本），保证导出格式统一为压缩包
+  // 行内「导出」同样走 backup 端点（单版本），保证导出格式统一为压缩包
   try {
-    const res = await fetch('/api/history/export/bulk', {
+    const res = await fetch('/api/history/export/backup', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids: [id] }),
     });
     if (!res.ok) { let err = '导出失败'; try { const j = await res.json(); if (j && j.error) err = j.error; } catch (_) {} throw new Error(err); }
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = id + '.zip';
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    showToast('已导出 ' + id + '.zip', 'ok');
+    const j = await res.json();
+    if (!j.ok) throw new Error(j.error || '导出失败');
+    showToast('已导出备份：' + (j.path || ''), 'ok');
   } catch (e) { showToast('导出失败：' + e, 'fail'); }
 }
 function _historyTimestamp() {
@@ -2361,19 +2357,15 @@ async function exportSelectedHistory() {
     const checks = document.querySelectorAll('.hist-check:checked');
     const ids = [...checks].map(c => c.dataset.id).filter(Boolean);
     if (!ids.length) { showToast('请先勾选要导出的历史记录', 'warn'); return; }
-    const res = await fetch('/api/history/export/bulk', {
+    const res = await fetch('/api/history/export/backup', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids }),
     });
     if (!res.ok) { let err = '导出失败'; try { const j = await res.json(); if (j && j.error) err = j.error; } catch (_) {} throw new Error(err); }
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = 'ptoe_history_' + _historyTimestamp() + '.zip';
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    showToast('已导出 ' + ids.length + ' 个版本（ZIP）', 'ok');
+    const j = await res.json();
+    if (!j.ok) throw new Error(j.error || '导出失败');
+    showToast('已导出 ' + ids.length + ' 个版本备份：' + (j.path || ''), 'ok');
   } catch (e) { showToast('导出失败：' + e, 'fail'); }
 }
 function importHistoryFile() { document.getElementById('historyImportFile').click(); }
