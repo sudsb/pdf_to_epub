@@ -454,8 +454,25 @@ function updateStatus() {
   }
   document.getElementById('status').textContent =
     '已编辑 ' + editedSet.size + '/' + pages.length + (dirty ? '（未保存）' : '') + extra;
+  updatePagePos();
 }
 function setStatus(s) { document.getElementById('status').textContent = s; }
+
+// 更新工具栏页码与最后校正页显示
+function updatePagePos() {
+  const posEl = document.getElementById('pagePos');
+  const lastEl = document.getElementById('prLastPage');
+  if (posEl) {
+    const idx = viewportPage();
+    const cur = (idx >= 0 && pages[idx]) ? pages[idx].page : NaN;
+    posEl.textContent = Number.isFinite(cur) ? ('第 ' + cur + ' / ' + pages.length + ' 页') : '';
+  }
+  if (lastEl) {
+    lastEl.textContent = (typeof lastProofreadPage === 'number' && lastProofreadPage >= 1) ? ('校正至第 ' + lastProofreadPage + ' 页') : '';
+  }
+  updateProgress();
+  updatePrBadge();
+}
 // ---------- 预览图加载提示（大跨度跳转白屏的可见反馈） ----------
 function _bumpImgPending(delta) {
   const before = _imgPending;
@@ -506,6 +523,43 @@ function updatePrCount() {
   let n = 0;
   for (const e of errors) { if (!e._gone) n++; }
   el.textContent = String(n);
+}
+function updateProgress() {
+  const bar = document.getElementById('progressBar');
+  const pct = document.getElementById('progressPct');
+  if (!bar || !pct) return;
+  const total = pages.length;
+  let ratio = 0;
+  if (total > 0 && typeof lastProofreadPage === 'number' && lastProofreadPage >= 1) {
+    let idx = -1;
+    for (let i = 0; i < pages.length; i++) { if (pages[i].page === lastProofreadPage) { idx = i; break; } }
+    if (idx >= 0) ratio = (idx + 1) / total;
+  }
+  bar.style.width = (ratio * 100) + '%';
+  pct.textContent = total > 0 ? (Math.round(ratio * 100) + '%') : '0%';
+}
+function updatePrBadge() {
+  const numEl = document.getElementById('errBadgeNum');
+  if (!numEl) return;
+  let total = 0;
+  for (let i = 0; i < pages.length; i++) {
+    const errs = proofreadErrors[i];
+    if (errs && errs.length) {
+      for (const e of errs) { if (!e._gone) total++; }
+    }
+  }
+  numEl.textContent = String(total);
+}
+function jumpToPageIndex(idx) {
+  if (idx < 0 || idx >= pages.length) return;
+  const hostTop = host.getBoundingClientRect().top + window.scrollY;
+  _progJumpTs = Date.now();
+  window.scrollTo({ top: Math.max(0, hostTop + prefixTop(idx) - 60), behavior: 'auto' });
+  updateViewport();
+  const row = host.querySelector('.page-row[data-i="' + idx + '"]');
+  if (row) { const ed = row.querySelector('.editable'); if (ed) ed.scrollTop = 0; }
+  hidePopup();
+  setStatus('已跳转到第 ' + pages[idx].page + ' 页');
 }
 function markDirty(i) {
   if (i >= 0 && !editedSet.has(i)) editedSet.add(i);
@@ -1193,6 +1247,7 @@ function updateViewport() {
       _viewportY = window.scrollY; // 校正后同步方向感知基准，避免下一帧误判方向
     }
   }
+  updatePagePos();
 }
 // ---------- 多行/多块选择辅助与格式应用 ----------
 function _blocksBetween(ed, startBlock, endBlock) {
@@ -2167,7 +2222,43 @@ async function stage() {
   }
   finally { btn.disabled = false; }
 }
-async function finish() {
+async function confirmFinish() {
+  let totalErrors = 0;
+  for (let i = 0; i < pages.length; i++) {
+    const errs = proofreadErrors[i];
+    if (errs && errs.length) totalErrors += errs.filter(e => !e._gone).length;
+  }
+  const title = document.getElementById('finishConfirmTitle');
+  const msg = document.getElementById('finishConfirmMsg');
+  const okBtn = document.getElementById('finishConfirmOk');
+  title.textContent = '确认转换';
+  if (totalErrors > 0) {
+    msg.textContent = '仍有 ' + totalErrors + ' 处待纠错，确定继续转换？';
+    okBtn.textContent = '继续转换';
+    okBtn.style.background = '#b8860b';
+    okBtn.style.borderColor = '#b8860b';
+  } else {
+    msg.textContent = '将保存并转换为 EPUB，确认继续？';
+    okBtn.textContent = '确认转换';
+    okBtn.style.background = '#1a7f37';
+    okBtn.style.borderColor = '#1a7f37';
+  }
+  document.getElementById('finishConfirmBg').style.display = 'flex';
+  return new Promise((resolve) => {
+    const done = () => {
+      document.getElementById('finishConfirmBg').style.display = 'none';
+      resolve(true);
+      _doFinish();
+    };
+    const cancel = () => {
+      document.getElementById('finishConfirmBg').style.display = 'none';
+      resolve(false);
+    };
+    document.getElementById('finishConfirmOk').addEventListener('click', done, { once: true });
+    document.getElementById('finishConfirmCancel').addEventListener('click', cancel, { once: true });
+  });
+}
+async function _doFinish() {
   const btn = document.getElementById('finishBtn');
   btn.disabled = true;
   btn.classList.add('loading');
@@ -2195,7 +2286,6 @@ async function finish() {
     showToast('转换完成', 'ok');
     showFinishModal('done');
   } else if (res && res.converted && res.converted.ok) {
-    // S4：历史缓存写入失败但转换成功 —— 提示警告，转换结果仍有效
     btn.disabled = false;
     setStatus('转换完成，但历史缓存写入失败（磁盘错误？）');
     showToast('转换完成，但历史缓存写入失败', 'warn');
@@ -2686,9 +2776,10 @@ async function loadHistoryVersion(id, name, ver) {
       }
     }
     dirty = true; updateStatus();
+    updatePagePos();
     closeHistory();
     loadedTitle = name.replace(/\.[^.\/\\]+$/, '');  // 去扩展名，无文件模式下作为 EPUB 标题
-    setStatus('已从历史版本载入 ' + loaded.length + ' 页，可继续矫正（保存/完成将生成新版本）');
+    setStatus('已载入历史版本 ' + loaded.length + ' 页');
   } catch (e) { showToast('加载历史版本失败：' + (e && e.message ? e.message : e), 'fail'); }
 }
 async function deleteHistory(ids, all) {
@@ -3451,6 +3542,7 @@ async function runProofread() {
     }
     proofreadErrors[i] = errors;
     lastProofreadPage = pages[i].page;
+    updatePagePos();
     if (errors.length) {
       renderProofread(i);
       scheduleRemeasure(i);
@@ -3922,6 +4014,7 @@ async function runReocr() {
     proofreadOriginal[i] = ed.innerHTML;
     proofreadErrors[i] = Array.isArray(res.diff) ? res.diff : [];
     lastProofreadPage = pages[i].page;
+    updatePagePos();
     if (proofreadErrors[i].length) {
       renderProofread(i);
       scheduleRemeasure(i);
@@ -5692,7 +5785,7 @@ const SHORTCUT_ACTIONS = {
   export: openExportModal,
   save: save,
   stage: stage,
-  finish: finish,
+  finish: confirmFinish,
   jump: jumpToPage,
   help: () => { document.getElementById('helpModalBg').style.display = 'flex'; },
   settings: openSettings,
@@ -5985,11 +6078,16 @@ function _backdropClickClose(bgId, closeFn) {
   bg.addEventListener('click', function (e) { if (e.target === bg && downOnBg) closeFn(); });
 }
 _backdropClickClose('searchModalBg', closeSearchModal);
-document.getElementById('exportBtn').addEventListener('click', openExportModal);
-document.getElementById('exportTxtBtn').addEventListener('click', () => exportFile('txt'));
-document.getElementById('exportDocxBtn').addEventListener('click', () => exportFile('docx'));
-document.getElementById('exportMdBtn').addEventListener('click', () => exportFile('md'));
-document.getElementById('exportCloseBtn').addEventListener('click', closeExportModal);
+const _exportBtn = document.getElementById('exportBtn');
+if (_exportBtn) _exportBtn.addEventListener('click', openExportModal);
+const _exportTxtBtn = document.getElementById('exportTxtBtn');
+if (_exportTxtBtn) _exportTxtBtn.addEventListener('click', () => exportFile('txt'));
+const _exportDocxBtn = document.getElementById('exportDocxBtn');
+if (_exportDocxBtn) _exportDocxBtn.addEventListener('click', () => exportFile('docx'));
+const _exportMdBtn = document.getElementById('exportMdBtn');
+if (_exportMdBtn) _exportMdBtn.addEventListener('click', () => exportFile('md'));
+const _exportCloseBtn = document.getElementById('exportCloseBtn');
+if (_exportCloseBtn) _exportCloseBtn.addEventListener('click', closeExportModal);
 _backdropClickClose('exportModalBg', closeExportModal);
 // 段落设置面板：打开/关闭/实时预览/确定/清除
 document.getElementById('indentDlgBtn').addEventListener('click', openIndentDialog);
@@ -6093,7 +6191,7 @@ document.getElementById('tipDelayInput').addEventListener('change', (e) => {
 // 暂存/保存/完成并转换/快捷键设置（2026-08-07 修复：四个绑定曾整块丢失 → 按钮点击无响应）
 document.getElementById('saveBtn').addEventListener('click', save);
 document.getElementById('stageBtn').addEventListener('click', stage);
-document.getElementById('finishBtn').addEventListener('click', finish);
+document.getElementById('finishBtn').addEventListener('click', confirmFinish);
 document.getElementById('settingsBtn').addEventListener('click', openSettings);
 document.getElementById('mdToggleBtn').addEventListener('click', () => setMdMode(!mdMode));
 document.getElementById('helpBtn').addEventListener('click', openHelp);
@@ -6111,6 +6209,67 @@ document.querySelectorAll('#toolbar button[data-op]').forEach((b) => {
   b.addEventListener('mouseenter', scheduleTip);
   b.addEventListener('mouseleave', hideTip);
   b.addEventListener('click', () => { hideTip(); suppressPopupUntil = performance.now() + 250; applyOp(b.dataset.op); });
+});
+
+// 进度条拖拽跳转 + 点击跳转
+(function bindProgressBar() {
+  const wrap = document.getElementById('progressWrap');
+  const bar = document.getElementById('progressBar');
+  if (!wrap || !bar) return;
+  let dragging = false;
+  function scrub(e) {
+    const rect = wrap.getBoundingClientRect();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    let x = clientX - rect.left;
+    let ratio = Math.max(0, Math.min(1, x / rect.width));
+    const idx = Math.min(pages.length - 1, Math.max(0, Math.round(ratio * (pages.length - 1))));
+    if (pages[idx]) jumpToPageIndex(idx);
+  }
+  wrap.addEventListener('mousedown', (e) => { dragging = true; scrub(e); });
+  window.addEventListener('mousemove', (e) => { if (dragging) scrub(e); });
+  window.addEventListener('mouseup', () => { dragging = false; });
+  wrap.addEventListener('touchstart', (e) => { dragging = true; scrub(e); }, { passive: true });
+  window.addEventListener('touchmove', (e) => { if (dragging) scrub(e.touches[0]); }, { passive: true });
+  window.addEventListener('touchend', () => { dragging = false; });
+})();
+
+// 上一页 / 下一页
+document.getElementById('prevPageBtn')?.addEventListener('click', () => {
+  const idx = viewportPage();
+  if (idx > 0) jumpToPageIndex(idx - 1);
+});
+document.getElementById('nextPageBtn')?.addEventListener('click', () => {
+  const idx = viewportPage();
+  if (idx < pages.length - 1) jumpToPageIndex(idx + 1);
+});
+
+// 待纠错徽标：点击跳转到第一个 pending error 页面并聚焦首处标注
+document.getElementById('errBadge')?.addEventListener('click', () => {
+  let firstIdx = -1;
+  for (let i = 0; i < pages.length; i++) {
+    const errs = proofreadErrors[i];
+    if (errs && errs.length && errs.some(e => !e._gone)) { firstIdx = i; break; }
+  }
+  if (firstIdx < 0) { showToast('当前没有待纠错', 'warn'); return; }
+  jumpToPageIndex(firstIdx);
+  setTimeout(() => {
+    const row = host.querySelector('.page-row[data-i="' + firstIdx + '"]');
+    if (row) {
+      const err = row.querySelector('.ptoe-err');
+      if (err) err.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }, 300);
+});
+
+// 导出 EPUB（dropdown 按钮）
+document.getElementById('exportEpubBtn')?.addEventListener('click', () => exportFile('epub'));
+
+// 完成确认弹窗：点击遮罩/取消/确认
+document.getElementById('finishConfirmCancel')?.addEventListener('click', () => {
+  document.getElementById('finishConfirmBg').style.display = 'none';
+});
+_backdropClickClose('finishConfirmBg', () => {
+  document.getElementById('finishConfirmBg').style.display = 'none';
 });
 
 // 新增下拉菜单绑定（2026-09）：文/背/X 三个菜单 —— 空守卫，另一车道在 correctmanage.py 注入 DOM
@@ -6145,6 +6304,41 @@ document.querySelectorAll('#toolbar button[data-op]').forEach((b) => {
     });
   }
   // 点击菜单外关闭：复用现有 mousedown 监听器（约 5976 行），在此追加两菜单
+})();
+
+// 更多下拉菜单切换（工具栏 .tb-more）
+(function bindMoreDropdowns() {
+  document.querySelectorAll('.tb-more').forEach(function (more) {
+    const btn = more.querySelector('.tb-more-btn');
+    const panel = more.querySelector('.tb-more-panel');
+    if (!btn || !panel) return;
+    btn.addEventListener('click', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      const isOpen = more.classList.toggle('open');
+      btn.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+    });
+  });
+  // 点击外部关闭所有 .tb-more
+  document.addEventListener('click', function (e) {
+    if (!e.target.closest('.tb-more')) {
+      document.querySelectorAll('.tb-more.open').forEach(function (more) {
+        more.classList.remove('open');
+        const btn = more.querySelector('.tb-more-btn');
+        if (btn) btn.setAttribute('aria-expanded', 'false');
+      });
+    }
+  });
+  // ESC 关闭
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') {
+      document.querySelectorAll('.tb-more.open').forEach(function (more) {
+        more.classList.remove('open');
+        const btn = more.querySelector('.tb-more-btn');
+        if (btn) btn.setAttribute('aria-expanded', 'false');
+      });
+    }
+  });
 })();
 // ---------- 滚动驱动虚拟列表 ----------
 // wheel/touchmove 置位「用户主动滚动」时间戳（供 withScrollStable 放弃还原）；
@@ -6219,7 +6413,7 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
     // Defensive: hide known modal/backdrop elements at startup to avoid accidental blocking overlays
     (function(){
       const _modalIds = [
-        'modalBg','searchModalBg','exportModalBg','indentModalBg','finishModalBg',
+        'modalBg','searchModalBg','exportModalBg','indentModalBg','finishModalBg','finishConfirmBg',
         'historyModalBg','helpModalBg','formatRulesModalBg','frRuleModalBg','frFmtPopupBg',
         'imgPopup','errPopup','popup','proofreadMenu',
         'charWrapMenu','supSubMenu'
@@ -6259,9 +6453,10 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
   // 防御性：确保没有 modal 遮罩在初始化时意外显示（会导致工具栏/按钮无法响应）
   // 注意：contextMenu 不在此列——它靠 hidden 属性 + CSS [hidden] 显隐，inline display:none
   // 会永久压过 #contextMenu{display:flex}，导致右键菜单永不显示（2026-08 修复）。
-  ['modalBg','searchModalBg','exportModalBg','indentModalBg','formatRulesModalBg','finishModalBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg','imgPopup','errPopup','popup','proofreadMenu','charWrapMenu','supSubMenu'].forEach(function(id) {
+  ['modalBg','searchModalBg','exportModalBg','indentModalBg','formatRulesModalBg','finishModalBg','finishConfirmBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg','imgPopup','errPopup','popup','proofreadMenu','charWrapMenu','supSubMenu'].forEach(function(id) {
     const el = document.getElementById(id);
     if (el) el.style.display = 'none';
   });
   setStatus('已加载 ' + pages.length + ' 页');
+  updatePagePos();
 })();

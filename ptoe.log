@@ -1124,3 +1124,75 @@ INFO|2026-09-06 15:30:33|render done: elapsed=0.0s
 INFO|2026-09-06 15:30:33|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_zn_2h5mp\out.epub, total_elapsed=0.0s
 INFO|2026-09-06 15:30:33|=== ptoe start: ['python.exe -m unittest', 'test_correctmanage', 'test_mian', 'test_stringmanage', 'test_pdfmanage', 'test_llamamanage'] ===
 INFO|2026-09-06 15:30:33|=== ptoe start: ['python.exe -m unittest', 'test_correctmanage', 'test_mian', 'test_stringmanage', 'test_pdfmanage', 'test_llamamanage'] ===
+INFO|2026-09-06 22:29:25|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-09-06 22:29:35|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', '--lang', 'zh-CN'] ===
+INFO|2026-09-07 08:44:32|=== ptoe start: ['python.exe -m unittest', 'test_mian', '-v'] ===
+INFO|2026-09-07 08:44:32|=== ptoe start: ['python.exe -m unittest', 'test_mian', '-v'] ===
+INFO|2026-09-07 08:44:32|=== ptoe start: ['python.exe -m unittest', 'test_mian', '-v'] ===
+INFO|2026-09-07 08:44:32|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_nhh47oj6\sample.pdf, dpi=100, model=HY, workers=None
+INFO|2026-09-07 08:44:32|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-09-07 08:44:32|starting server: model=HY, workers=4
+INFO|2026-09-07 08:44:32|server ready: model=HY, elapsed=0.0s
+INFO|2026-09-07 08:44:32|ocr done: total_pages=3, todo=3, excluded=0, errors=0, elapsed=0.0s
+INFO|2026-09-07 08:44:32|structure done: elapsed=0.0s
+INFO|2026-09-07 08:44:32|history done: elapsed=0.0s
+INFO|2026-09-07 08:44:32|render done: elapsed=0.0s
+INFO|2026-09-07 08:44:32|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_nhh47oj6\out.epub, total_elapsed=0.0s
+INFO|2026-09-07 08:44:32|=== ptoe start: ['python.exe -m unittest', 'test_mian', '-v'] ===
+INFO|2026-09-07 08:44:32|=== ptoe start: ['python.exe -m unittest', 'test_mian', '-v'] ===
+INFO|2026-09-07 09:15:26|=== ptoe start: ['python.EXE -m unittest', 'discover', '-v'] ===
+INFO|2026-09-07 09:15:26|=== ptoe start: ['python.EXE -m unittest', 'discover', '-v'] ===
+INFO|2026-09-07 09:15:39|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_hist_muy653e0\sample.pdf, dpi=100, model=HY, workers=None
+INFO|2026-09-07 09:15:39|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-09-07 09:15:39|starting server: model=HY, workers=4
+INFO|2026-09-07 09:15:39|server ready: model=HY, elapsed=0.0s
+INFO|2026-09-07 09:15:39|ocr done: total_pages=3, todo=3, excluded=0, errors=0, elapsed=0.0s
+INFO|2026-09-07 09:15:39|structure done: elapsed=0.0s
+INFO|2026-09-07 09:15:39|history done: elapsed=0.0s
+INFO|2026-09-07 09:15:39|render done: elapsed=0.0s
+INFO|2026-09-07 09:15:39|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_hist_muy653e0\out.epub, total_elapsed=0.0s
+INFO|2026-09-07 09:15:39|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_resume_orzdofpw\sample.pdf, dpi=100, model=HY, workers=None
+INFO|2026-09-07 09:15:39|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-09-07 09:15:39|starting server: model=HY, workers=4
+INFO|2026-09-07 09:15:39|server ready: model=HY, elapsed=0.0s
+INFO|2026-09-07 09:15:39|ocr done: total_pages=3, todo=3, excluded=0, errors=0, elapsed=0.0s
+INFO|2026-09-07 09:15:39|structure done: elapsed=0.0s
+INFO|2026-09-07 09:15:39|history done: elapsed=0.0s
+INFO|2026-09-07 09:15:39|render done: elapsed=0.0s
+INFO|2026-09-07 09:15:39|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_resume_orzdofpw\out.epub, total_elapsed=0.0s
+INFO|2026-09-07 09:15:39|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_resume_i0_oyrn4\sample.pdf, dpi=100, model=HY, workers=None
+INFO|2026-09-07 09:15:39|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-09-07 09:15:39|starting server: model=HY, workers=4
+INFO|2026-09-07 09:15:39|server ready: model=HY, elapsed=0.0s
+INFO|2026-09-07 09:15:39|ocr done: total_pages=3, todo=3, excluded=0, errors=0, elapsed=0.0s
+INFO|2026-09-07 09:15:39|structure done: elapsed=0.0s
+INFO|2026-09-07 09:15:39|history done: elapsed=0.0s
+INFO|2026-09-07 09:15:39|render done: elapsed=0.0s
+INFO|2026-09-07 09:15:39|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_resume_i0_oyrn4\out.epub, total_elapsed=0.0s
+INFO|2026-09-07 09:15:40|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_resume_3wo5pumq\sample.pdf, dpi=100, model=HY, workers=None
+INFO|2026-09-07 09:15:40|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-09-07 09:15:40|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_resume_zkg391y8\sample.pdf, dpi=100, model=HY, workers=None
+INFO|2026-09-07 09:15:40|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-09-07 09:15:40|starting server: model=HY, workers=4
+INFO|2026-09-07 09:15:40|server ready: model=HY, elapsed=0.0s
+INFO|2026-09-07 09:15:40|ocr done: total_pages=3, todo=1, excluded=0, errors=0, elapsed=0.0s
+INFO|2026-09-07 09:15:40|structure done: elapsed=0.0s
+INFO|2026-09-07 09:15:40|history done: elapsed=0.0s
+INFO|2026-09-07 09:15:40|render done: elapsed=0.0s
+INFO|2026-09-07 09:15:40|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_resume_zkg391y8\out.epub, total_elapsed=0.0s
+INFO|2026-09-07 09:15:40|=== ptoe start: ['python.EXE -m unittest', 'discover', '-v'] ===
+INFO|2026-09-07 09:15:40|=== ptoe start: ['python.EXE -m unittest', 'discover', '-v'] ===
+INFO|2026-09-07 09:15:40|=== ptoe start: ['python.EXE -m unittest', 'discover', '-v'] ===
+INFO|2026-09-07 09:15:40|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_l_0k_t14\sample.pdf, dpi=100, model=HY, workers=None
+INFO|2026-09-07 09:15:40|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.1s
+INFO|2026-09-07 09:15:40|starting server: model=HY, workers=4
+INFO|2026-09-07 09:15:40|server ready: model=HY, elapsed=0.0s
+INFO|2026-09-07 09:15:40|ocr done: total_pages=3, todo=3, excluded=0, errors=0, elapsed=0.0s
+INFO|2026-09-07 09:15:40|structure done: elapsed=0.0s
+INFO|2026-09-07 09:15:40|history done: elapsed=0.0s
+INFO|2026-09-07 09:15:40|render done: elapsed=0.0s
+INFO|2026-09-07 09:15:40|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_l_0k_t14\out.epub, total_elapsed=0.1s
+INFO|2026-09-07 09:15:40|=== ptoe start: ['python.EXE -m unittest', 'discover', '-v'] ===
+INFO|2026-09-07 09:15:40|=== ptoe start: ['python.EXE -m unittest', 'discover', '-v'] ===
+INFO|2026-09-07 09:18:02|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-09-07 09:18:14|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', '--lang', 'zh-CN'] ===

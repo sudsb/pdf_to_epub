@@ -41,6 +41,8 @@ from correctmanage import (
     _headings_to_body,
     _build_embedded_images,
     _prerender_embedded_images,
+    _html_to_rich_blocks,
+    _apply_join_marks,
 )
 
 
@@ -759,6 +761,57 @@ class TestApplyMarkers(unittest.TestCase):
         self.assertEqual(
             apply_markers(pages),
             [{"text": '<p>正文</p><p class="ptoe-note">注一</p><p>中间正文</p><p class="ptoe-note">注二</p>'}],
+        )
+
+    def test_note_no_marker_standalone_join_block_between_notes(self):
+        # 段落标记作为独立一段插在两个注释段落之间（2026-09-07 修复）：
+        # 纯标记块不打断注释合并链，前后两个注释仍合并为一个 <p>
+        pages = [
+            {"page": 1, "text": '<p>正文</p><p class="ptoe-note">注一前半</p>'},
+            {"page": 2, "text": '<p><span data-ptoe-marker="join">段落</span></p>'
+             '<p class="ptoe-note">注一后半</p>'},
+        ]
+        self.assertEqual(
+            apply_markers(pages),
+            [{"text": '<p>正文</p><p class="ptoe-note">注一前半注一后半</p>'}],
+        )
+
+    def test_note_no_marker_standalone_join_block_same_page(self):
+        # 同一页内独立 段落标记 <p> 夹在两个注释之间 → 合并
+        pages = [
+            {"page": 1, "text": '<p>正文</p><p class="ptoe-note">注一</p>'
+             '<p><span data-ptoe-marker="join">段落</span></p>'
+             '<p class="ptoe-note">注二</p>'}
+        ]
+        self.assertEqual(
+            apply_markers(pages),
+            [{"text": '<p>正文</p><p class="ptoe-note">注一注二</p>'}],
+        )
+
+    def test_note_no_marker_standalone_join_chain_three_notes(self):
+        # 两个独立 join 标记块串联三个注释段落 → 合并为一个
+        pages = [
+            {"page": 1, "text": '<p>正文</p><p class="ptoe-note">注一</p>'
+             '<p><span data-ptoe-marker="join">段落</span></p>'
+             '<p class="ptoe-note">注二</p>'
+             '<p><span data-ptoe-marker="join">段落</span></p>'
+             '<p class="ptoe-note">注三</p>'}
+        ]
+        self.assertEqual(
+            apply_markers(pages),
+            [{"text": '<p>正文</p><p class="ptoe-note">注一注二注三</p>'}],
+        )
+
+    def test_note_no_marker_standalone_join_after_trailing_join(self):
+        # 段尾 join 与独立 join 块叠加：同样合并为一个 <p>
+        pages = [
+            {"page": 1, "text": '<p>正文</p><p class="ptoe-note">注一<span data-ptoe-marker="join">段落</span></p>'},
+            {"page": 2, "text": '<p><span data-ptoe-marker="join">段落</span></p>'
+             '<p class="ptoe-note">注二</p>'},
+        ]
+        self.assertEqual(
+            apply_markers(pages),
+            [{"text": '<p>正文</p><p class="ptoe-note">注一注二</p>'}],
         )
 
     def test_note_cross_page_join_merge(self):
@@ -8259,6 +8312,150 @@ class TestHistoryRenameEndpoint(unittest.TestCase):
         latest = sorted(hist_dir.glob("manual_book_*.json"), key=lambda p: p.stat().st_mtime_ns)[-1]
         saved_data = _json.loads(latest.read_text(encoding="utf-8"))
         self.assertEqual(saved_data.get("display_name"), "新书名", "保存覆盖后应保留重命名名称")
+
+
+class TestExportJoinMerge(unittest.TestCase):
+    """段落标记 join 在 TXT/DOCX/MD 导出路径中的合并行为。"""
+
+    def test_rich_blocks_join_next(self):
+        blocks = _html_to_rich_blocks(
+            '<p>甲<span class="ptoe-marker" data-ptoe-marker="join">段落</span></p>'
+            '<p>乙</p>'
+        )
+        self.assertEqual(len(blocks), 2)
+        self.assertTrue(blocks[0].get("join_next"))
+        self.assertFalse(blocks[0].get("join_prev", False))
+        self.assertFalse(blocks[1].get("join_next", False))
+        self.assertFalse(blocks[1].get("join_prev", False))
+
+    def test_rich_blocks_join_prev(self):
+        blocks = _html_to_rich_blocks(
+            '<p>甲</p>'
+            '<p><span class="ptoe-marker" data-ptoe-marker="join">段落</span>乙</p>'
+        )
+        self.assertEqual(len(blocks), 2)
+        self.assertFalse(blocks[0].get("join_next", False))
+        self.assertFalse(blocks[0].get("join_prev", False))
+        self.assertTrue(blocks[1].get("join_prev"))
+        self.assertFalse(blocks[1].get("join_next", False))
+
+    def test_apply_join_merges_two_blocks(self):
+        html = (
+            '<p>甲</p>'
+            '<p><span class="ptoe-marker" data-ptoe-marker="join">段落</span>乙</p>'
+        )
+        blocks = _html_to_rich_blocks(html)
+        merged = _apply_join_marks(blocks)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["text"], "甲乙")
+        self.assertNotIn("join_prev", merged[0])
+        self.assertNotIn("join_next", merged[0])
+
+    def test_apply_join_merges_trailing_marker(self):
+        html = (
+            '<p>甲<span class="ptoe-marker" data-ptoe-marker="join">段落</span></p>'
+            '<p>乙</p>'
+        )
+        blocks = _html_to_rich_blocks(html)
+        merged = _apply_join_marks(blocks)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["text"], "甲乙")
+
+    def test_apply_join_chain_merge(self):
+        html = (
+            '<p>甲<span class="ptoe-marker" data-ptoe-marker="join">段落</span></p>'
+            '<p>乙<span class="ptoe-marker" data-ptoe-marker="join">段落</span></p>'
+            '<p>丙</p>'
+        )
+        blocks = _html_to_rich_blocks(html)
+        merged = _apply_join_marks(blocks)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["text"], "甲乙丙")
+
+    def test_apply_join_no_merge_heading(self):
+        html = (
+            '<p>甲<span class="ptoe-marker" data-ptoe-marker="join">段落</span></p>'
+            '<h1>乙</h1>'
+        )
+        blocks = _html_to_rich_blocks(html)
+        merged = _apply_join_marks(blocks)
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(merged[0]["text"], "甲")
+        self.assertEqual(merged[1]["text"], "乙")
+
+    def test_apply_join_no_merge_note_to_content(self):
+        html = (
+            '<p class="ptoe-note">注'
+            '<span class="ptoe-marker" data-ptoe-marker="join">段落</span></p>'
+            '<p>正文</p>'
+        )
+        blocks = _html_to_rich_blocks(html)
+        merged = _apply_join_marks(blocks)
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(merged[0]["text"], "注")
+        self.assertEqual(merged[1]["text"], "正文")
+
+    def test_apply_join_note_to_note_merges(self):
+        html = (
+            '<p class="ptoe-note">注'
+            '<span class="ptoe-marker" data-ptoe-marker="join">段落</span></p>'
+            '<p class="ptoe-note">注2</p>'
+        )
+        blocks = _html_to_rich_blocks(html)
+        merged = _apply_join_marks(blocks)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["text"], "注注2")
+        self.assertTrue(merged[0]["note"])
+
+    def test_txt_export_end_to_end_join(self):
+        import json as _json
+        import threading
+        from http.server import ThreadingHTTPServer
+        from correctmanage import _CorrectionHandler
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _CorrectionHandler)
+        server.daemon_threads = True
+        server.state = {
+            "pages": {1: "<p>（一）医疗队兼贸易<span class=\"ptoe-marker\" data-ptoe-marker=\"join\">段落</span></p><p>组认真研究了...</p>"},
+            "finished": threading.Event(),
+            "preview_cache": {},
+            "pdf_path": None,
+            "img_dir": None,
+            "preview_dpi": 110,
+            "preview_quality": 82,
+            "last_heartbeat": 0.0,
+            "gone_at": None,
+            "idle_timeout": 600.0,
+            "auto_finished": False,
+        }
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            out = Path(tempfile.mkdtemp(prefix="test_export_")) / "book.txt"
+            import requests
+
+            res = requests.post(
+                f"http://127.0.0.1:{server.server_address[1]}/api/export",
+                data=_json.dumps(
+                    {
+                        "format": "txt",
+                        "path": str(out),
+                        "pages": [
+                            {
+                                "page": 1,
+                                "html": "<p>（一）医疗队兼贸易<span class=\"ptoe-marker\" data-ptoe-marker=\"join\">段落</span></p><p>组认真研究了...</p>",
+                            }
+                        ],
+                    }
+                ),
+            ).json()
+            self.assertTrue(res["ok"], f"export failed: {res.get('error')}")
+            raw = out.read_bytes()
+            text = raw.decode("utf-8-sig").replace("\r\n", "\n")
+            # 段落标记应把两段合并为一段，中间无空行
+            self.assertEqual(text, "（一）医疗队兼贸易组认真研究了...\n")
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

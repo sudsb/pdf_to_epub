@@ -2787,9 +2787,13 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
                     t == "join" for _h, ms in item["segments"][:1] for t, _l in ms
                 )
                 if html:
-                    deferred_join = False  # 防止并入正文段落，保持原位
+                    # join 可来自：上一注释段段尾标记（note_join_prev）、本段首标记
+                    #（first_join）、或前一纯标记块的独立 join 标记（deferred_join）。
+                    # 取走后一律清空（防误并入前一正文段落，prev_note_joinable 兜底）
+                    join_pending = deferred_join or note_join_prev or first_join
+                    deferred_join = False
                     if (
-                        (note_join_prev or first_join)
+                        join_pending
                         and prev_note_joinable
                         and cur_article
                         and cur_article[-1].startswith("<p")
@@ -2803,9 +2807,12 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
                     prev_note_joinable = True
                 note_join_prev = any(t == "join" for t, _l in item["trailing"])
             continue
-        # 非注释块：重置注释段落合并状态（段落标记不跨非注释块生效）
-        prev_note_joinable = False
-        note_join_prev = False
+        # 非注释块：重置注释段落合并状态（段落标记不跨非注释块生效）；
+        # 纯标记块（无可视内容段，如单独一段 段落标记 <p><span join/>…）不打断
+        # 注释合并链——其 join 经 deferred_join 顺延到下一个注释段落
+        if any(seg_html for seg_html, _m in item["segments"]):
+            prev_note_joinable = False
+            note_join_prev = False
         for html, markers in item["segments"]:
             seg_notes: list[str] = []
             rest: list[tuple[str, str]] = []
@@ -4186,6 +4193,9 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             self.skip = 0  # >0 表示处于 script/style 等跳过区域
             # 栈元素：(tag, is_marker, fmt_dict) — fmt_dict 记录该 span 携带的行内格式类
             self.stack: list[tuple[str, bool, dict]] = []
+            self._join_at_start = False
+            self._join_last = False
+            self._has_non_ws_text = False
 
         def _flags(self) -> dict:
             """返回当前栈状态对应的行内格式标志字典。"""
@@ -4261,6 +4271,9 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             self.note = "ptoe-note" in (d.get("class") or "").split()
             self.indent = _rich_parse_indent(d)
             self.block_seen = True
+            self._join_at_start = False
+            self._join_last = False
+            self._has_non_ws_text = False
 
         def _flush(self) -> None:
             runs = self.runs
@@ -4277,19 +4290,21 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                 runs[-1]["text"] = runs[-1]["text"].rstrip()
             text = "".join(r["text"] for r in runs)
             if text:
-                self.blocks.append(
-                    {
-                        "kind": self.kind,
-                        "tag": self.tag,
-                        "text": text,
-                        "runs": runs,
-                        "align": _rich_align(self.attrs_str),
-                        "note": self.note,
-                        "attrs": self.attrs_str,
-                        "inner": inner,
-                        "indent": self.indent,
-                    }
-                )
+                block = {
+                    "kind": self.kind,
+                    "tag": self.tag,
+                    "text": text,
+                    "runs": runs,
+                    "align": _rich_align(self.attrs_str),
+                    "note": self.note,
+                    "attrs": self.attrs_str,
+                    "inner": inner,
+                    "indent": self.indent,
+                }
+                if self._join_at_start or self._join_last:
+                    block["join_prev"] = bool(self._join_at_start)
+                    block["join_next"] = bool(self._join_last)
+                self.blocks.append(block)
             self.kind, self.tag, self.attrs_str = "p", "p", ""
             self.note = False
             self.indent = _rich_parse_indent({})
@@ -4354,6 +4369,10 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                     fmt["bold"] = True
                 elif tag in ("em", "i"):
                     fmt["italic"] = True
+                if is_marker and attrs_d.get("data-ptoe-marker") == "join":
+                    if not self._has_non_ws_text:
+                        self._join_at_start = True
+                    self._join_last = True
                 self.stack.append((tag, is_marker, fmt))
                 if not is_marker:
                     self.inner.append(self.get_starttag_text() or f"<{tag}>")
@@ -4395,6 +4414,9 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             if any(mk for _, mk, _ in self.stack):
                 return  # 标记 span 内容整体剥除
             self._push_text(data)
+            if data.strip():
+                self._join_last = False
+                self._has_non_ws_text = True
             # inner 重转义（convert_charrefs 已解码实体；保持 HTML 形态供透传）
             self.inner.append(
                 str(data).replace("&", "&").replace("<", "<").replace(">", ">")
@@ -4405,6 +4427,67 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
     parser.close()
     parser._flush()
     return parser.blocks
+
+
+def _can_join_merge(a: dict, b: dict) -> bool:
+    return (
+        a.get("kind") == "p"
+        and b.get("kind") == "p"
+        and a.get("note") == b.get("note")
+    )
+
+
+def _apply_join_marks(blocks: list[dict]) -> list[dict]:
+    """对富文本块列表应用段落标记（join）合并规则。
+
+    - ``join_next``：当前块与下一块合并；
+    - ``join_prev``：当前块并入上一块。
+    仅当两块均为 ``<p>`` 且 ``note`` 标志一致时才合并（注释↔正文不混并）。
+    非 ``<p>`` 块（标题、图片等）打断合并链。
+    """
+    if not blocks:
+        return []
+
+    out: list[dict] = []
+    i = 0
+    while i < len(blocks):
+        cur = dict(blocks[i])
+        cur_join_next = cur.pop("join_next", False)
+        cur_join_prev = cur.pop("join_prev", False)
+
+        # 尝试与上一输出块合并：上一块带 join_next 或当前块带 join_prev
+        if out:
+            prev = out[-1]
+            prev_join_next = prev.pop("join_next", False)
+            if (prev_join_next or cur_join_prev) and _can_join_merge(prev, cur):
+                prev["text"] = (prev.get("text") or "") + (cur.get("text") or "")
+                prev["runs"] = (prev.get("runs") or []) + (cur.get("runs") or [])
+                prev["inner"] = (prev.get("inner") or "") + (cur.get("inner") or "")
+                prev["join_next"] = cur.pop("join_next", False)
+                i += 1
+                continue
+            prev["join_next"] = prev_join_next
+
+        # 不与前驱合并：检查是否可与后继合并
+        if cur_join_next and i + 1 < len(blocks):
+            nxt = dict(blocks[i + 1])
+            nxt_join_next = nxt.pop("join_next", False)
+            if _can_join_merge(cur, nxt):
+                cur["text"] = (cur.get("text") or "") + (nxt.get("text") or "")
+                cur["runs"] = (cur.get("runs") or []) + (nxt.get("runs") or [])
+                cur["inner"] = (cur.get("inner") or "") + (nxt.get("inner") or "")
+                cur["join_next"] = nxt_join_next
+                out.append(cur)
+                i += 2
+                continue
+
+        out.append(cur)
+        i += 1
+
+    for b in out:
+        b.pop("join_next", None)
+        b.pop("join_prev", None)
+    return out
 
 
 def _image_dims(data: bytes) -> tuple[int, int] | None:
@@ -6740,6 +6823,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     # 应用加粗注释标签转换（注　　释：）
                     html_text = transform_note_labels(str(item.get("html") or ""))
                     blocks.extend(_html_to_rich_blocks(html_text))
+                blocks = _apply_join_marks(blocks)
                 st = self.server.state
                 explicit = body.get("path")
                 used_dialog = False
@@ -7340,36 +7424,210 @@ _UI_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>矫正 - ptoe</title>
 <style>
-:root{--accent:#2f6fed;--border:#d8dee6;--bg:#f4f6f9;--editor-font-size:14px;}
+:root{
+  --accent:#3B6FFF;--accent-hover:#2D5AE0;--accent-soft:#E8EEFF;
+  --border:#D8DEE6;--border-strong:#C4CCD8;
+  --bg:#F4F6F9;--bg-elev:#FFFFFF;--bg-hover:#EEF2F7;--bg-active:#E1E8F0;
+  --text:#1C2733;--text-muted:#5A6B7C;--text-dim:#8A97A6;
+  --editor-font-size:14px;
+  --toolbar-h:40px;--btn-size:26px;--radius:6px;--radius-sm:4px;
+  --shadow-sm:0 1px 2px rgba(0,0,0,.06);--shadow-md:0 4px 12px rgba(0,0,0,.1);
+  --glass-bg:rgba(255,255,255,.75);--glass-border:rgba(216,222,230,.6);
+  --focus-ring:0 0 0 2px rgba(59,111,255,.35);
+  --transition:0.15s ease;
+}
+.dark{
+  --accent:#4D7FFF;--accent-hover:#6B94FF;--accent-soft:#1E2A4A;
+  --border:#3A4256;--border-strong:#4A546E;
+  --bg:#161B26;--bg-elev:#1E2535;--bg-hover:#262E42;--bg-active:#2E3852;
+  --text:#E4E8F0;--text-muted:#9AA4B8;--text-dim:#707A94;
+  --glass-bg:rgba(30,35,45,.75);--glass-border:rgba(58,66,86,.6);
+  --focus-ring:0 0 0 2px rgba(77,127,255,.4);
+  --shadow-sm:0 1px 2px rgba(0,0,0,.25);--shadow-md:0 4px 12px rgba(0,0,0,.35);
+}
 *{box-sizing:border-box}
-body{margin:0;font-family:"Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:#1c2733;}
-#toolbar{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:4px;padding:5px 8px;background:#fff;border-bottom:1px solid var(--border);flex-wrap:wrap;font-size:12px;}
-#toolbar .title{font-weight:700;margin-right:10px;}
+body{margin:0;font-family:"Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--text);}
+#toolbar{
+  position:sticky;top:0;z-index:20;
+  display:flex;align-items:center;gap:4px;
+  min-height:var(--toolbar-h);padding:0 10px;
+  background:var(--glass-bg);
+  backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+  border-bottom:1px solid var(--glass-border);
+  flex-wrap:wrap;font-size:12px;
+}
 #toolbar .spacer{flex:1;}
-#toolbar .sep{width:1px;height:22px;background:var(--border);margin:0 4px;}
-#toolbar label{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#5a6b7c;}
-#prCount{display:inline-flex;align-items:center;gap:2px;font-size:12px;color:#5a6b7c;white-space:nowrap;margin-left:4px;}
-#prCountNum{color:#e02020;font-weight:700;}
-#toolbar input[type=number]{width:64px;padding:3px 5px;border:1px solid var(--border);border-radius:4px;font:inherit;}
-/* U1：按功能分组的浅色区块，替代细分隔线；主操作组不折行、右端常驻 */
-#toolbar .tb-group{display:inline-flex;align-items:center;gap:3px;padding:2px 6px;background:#f4f6f9;border:1px solid #e4e9f0;border-radius:8px;white-space:nowrap;}
-#toolbar .tb-group .tb-label{font-size:11px;color:#8a97a6;margin-right:2px;user-select:none;}
-#toolbar .tb-main{flex-wrap:nowrap;background:transparent;border-color:transparent;margin-left:auto;}
-#toolbar .ic-btn{width:26px;height:26px;padding:0;display:inline-flex;align-items:center;justify-content:center;}
-/* 紧凑尺寸：工具栏内文字按钮/下拉/输入框缩小，配合 flex-wrap 保证最多两行 */
-#toolbar button{padding:3px 8px;font-size:12px;}
-#toolbar select{padding:3px 5px;font-size:12px;}
-#toolbar .ic-btn:disabled{opacity:.4;cursor:default;}
-button{font:inherit;padding:5px 11px;border:1px solid var(--border);border-radius:4px;background:#fff;cursor:pointer;}
+#toolbar label{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--text-muted);}
+#prCount{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text-muted);white-space:nowrap;}
+#prCountNum{
+  display:inline-flex;align-items:center;justify-content:center;
+  min-width:20px;height:18px;padding:0 6px;
+  background:rgba(224,32,32,.15);color:#E02020;
+  font-weight:700;font-size:11px;border-radius:999px;
+  border:1px solid rgba(224,32,32,.3);
+}
+.dark #prCountNum{background:rgba(224,32,32,.25);border-color:rgba(224,32,32,.4);}
+#toolbar input[type=number]{
+  width:64px;height:28px;padding:0 8px;
+  border:1px solid var(--border);border-radius:var(--radius-sm);
+  background:var(--bg-elev);color:var(--text);font:inherit;
+  transition:border-color var(--transition),box-shadow var(--transition);
+}
+#toolbar input[type=number]:focus{
+  outline:none;border-color:var(--accent);box-shadow:var(--focus-ring);
+}
+#toolbar select{
+  height:28px;padding:0 28px 0 8px;
+  border:1px solid var(--border);border-radius:var(--radius-sm);
+  background:var(--bg-elev) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%235A6B7C' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E") no-repeat right 8px center;
+  background-size:12px;color:var(--text);font:inherit;cursor:pointer;
+  appearance:none;-webkit-appearance:none;
+  transition:border-color var(--transition),box-shadow var(--transition);
+}
+#toolbar select:focus{outline:none;border-color:var(--accent);box-shadow:var(--focus-ring);}
+.dark #toolbar select{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239AA4B8' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");}
+
+/* 3-section layout */
+#toolbar .tb-section{display:flex;align-items:center;gap:3px;flex-wrap:wrap;}
+#toolbar .tb-left{flex:0 0 auto;min-width:0;}
+#toolbar .tb-center{flex:1 1 auto;min-width:0;justify-content:center;}
+#toolbar .tb-right{flex:0 0 auto;margin-left:auto;justify-content:flex-end;}
+/* Status bar: leftmost, single-line horizontal layout */
+#toolbar .tb-statusbar{display:flex;align-items:center;gap:8px;flex:0 0 auto;flex-wrap:nowrap;white-space:nowrap;}
+
+/* Groups as pills */
+#toolbar .tb-group{
+  display:inline-flex;align-items:center;gap:1px;
+  padding:0 3px;height:32px;
+  background:var(--bg-elev);border:1px solid var(--border);
+  border-radius:var(--radius);
+  white-space:nowrap;
+  transition:background var(--transition),border-color var(--transition),box-shadow var(--transition);
+}
+#toolbar .tb-group:hover{background:var(--bg-hover);border-color:var(--border-strong);}
+#toolbar .tb-group:focus-within{border-color:var(--accent);box-shadow:var(--focus-ring);}
+
+/* Icon buttons */
+#toolbar .ic-btn{
+  width:var(--btn-size);height:var(--btn-size);padding:0;
+  display:inline-flex;align-items:center;justify-content:center;
+  border:none;background:transparent;color:var(--text);
+  border-radius:var(--radius-sm);cursor:pointer;
+  transition:background var(--transition),color var(--transition),transform .05s ease;
+}
+#toolbar .ic-btn:hover{background:var(--bg-hover);color:var(--accent);}
+#toolbar .ic-btn:active{background:var(--bg-active);transform:scale(.96);}
+#toolbar .ic-btn:focus-visible{outline:none;box-shadow:var(--focus-ring);}
+#toolbar .ic-btn:disabled{opacity:.4;cursor:default;pointer-events:none;}
+#toolbar .ic-btn svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;}
+#toolbar .ic-btn.active{background:var(--accent-soft);color:var(--accent);}
+
+/* Text buttons */
+#toolbar .tb-btn{
+  height:26px;padding:0 7px;
+  border:1px solid var(--border);background:var(--bg-elev);color:var(--text);
+  border-radius:var(--radius-sm);font:inherit;font-size:12px;cursor:pointer;
+  transition:background var(--transition),border-color var(--transition),color var(--transition),transform .05s ease;
+}
+#toolbar .tb-btn:hover{background:var(--bg-hover);border-color:var(--border-strong);color:var(--accent);}
+#toolbar .tb-btn:active{background:var(--bg-active);transform:scale(.98);}
+#toolbar .tb-btn:focus-visible{outline:none;box-shadow:var(--focus-ring);}
+#toolbar .tb-btn:disabled{opacity:.5;cursor:not-allowed;}
+#toolbar .tb-btn.primary{
+  background:var(--accent);border-color:var(--accent);color:#fff;
+}
+#toolbar .tb-btn.primary:hover{background:var(--accent-hover);border-color:var(--accent-hover);}
+
+/* Prominent action buttons */
+#toolbar #stageBtn{background:transparent;border-color:var(--border);color:var(--text);}
+#toolbar #stageBtn:hover{background:var(--bg-hover);border-color:var(--accent);color:var(--accent);}
+#toolbar #saveBtn{
+  background:var(--accent-soft);border-color:var(--accent);color:var(--accent);
+  font-weight:600;padding:0 14px;
+}
+#toolbar #saveBtn:hover{background:var(--accent);border-color:var(--accent);color:#fff;}
+#toolbar #finishBtn{
+  background:var(--accent);border-color:var(--accent);color:#fff;
+  font-weight:600;padding:0 12px;box-shadow:var(--shadow-sm);
+}
+#toolbar #finishBtn:hover{background:var(--accent-hover);box-shadow:var(--shadow-md);transform:translateY(-1px);}
+#toolbar #finishBtn:active{transform:translateY(0);}
+
+/* Dropdown for "更多" */
+#toolbar .tb-more{position:relative;}
+#toolbar .tb-more-btn{
+  display:inline-flex;align-items:center;gap:4px;
+  height:28px;padding:0 10px;
+  border:1px solid var(--border);background:var(--bg-elev);color:var(--text);
+  border-radius:var(--radius-sm);font:inherit;font-size:12px;cursor:pointer;
+  transition:background var(--transition),border-color var(--transition);
+}
+#toolbar .tb-more-btn:hover{background:var(--bg-hover);border-color:var(--border-strong);}
+#toolbar .tb-more-btn:focus-visible{outline:none;box-shadow:var(--focus-ring);}
+#toolbar .tb-more-btn svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;}
+#toolbar .tb-more-panel{
+  position:absolute;top:calc(100% + 4px);right:0;z-index:30;
+  min-width:160px;padding:6px;
+  background:var(--bg-elev);border:1px solid var(--border);
+  border-radius:var(--radius);box-shadow:var(--shadow-md);
+  display:none;flex-direction:column;gap:2px;
+}
+#toolbar .tb-more.open .tb-more-panel{display:flex;}
+#toolbar .tb-more-panel .tb-btn{width:100%;text-align:left;justify-content:flex-start;}
+#toolbar .tb-more-panel .tb-btn:active{background:var(--bg-active);}
+
+/* Progress bar (center zone) */
+#progressWrap{flex-shrink:1;}
+#progressBar{transition:width 0.15s ease;}
+#progressPct{font-variant-numeric:tabular-nums;}
+#errBadge{transition:background var(--transition),border-color var(--transition),transform .05s ease;}
+#errBadge:hover{background:rgba(224,32,32,.18);border-color:rgba(224,32,32,.45);transform:scale(1.05);}
+#errBadge:active{transform:scale(0.97);}
+#errBadgeNum{font-variant-numeric:tabular-nums;}
+
+/* 保存 / 完成并转换 强视觉区分 */
+#toolbar #saveBtn{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600;padding:0 14px;}
+#toolbar #saveBtn:hover{background:var(--accent-hover);border-color:var(--accent-hover);color:#fff;}
+#toolbar #finishBtn{background:#1a7f37;border-color:#1a7f37;color:#fff;font-weight:600;padding:0 12px;box-shadow:var(--shadow-sm);}
+#toolbar #finishBtn:hover{background:#15692e;border-color:#15692e;box-shadow:var(--shadow-md);transform:translateY(-1px);}
+#toolbar #finishBtn:active{transform:translateY(0);}
+
+/* 完成确认弹窗 */
+#finishConfirmBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+#finishConfirmBg .modal{background:var(--bg-elev);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow-md);padding:16px;min-width:320px;max-width:90vw;}
+#finishConfirmTitle{margin:0 0 8px;font-size:15px;color:var(--text);}
+#finishConfirmMsg{margin:0 0 16px;font-size:13px;color:var(--text-muted);line-height:1.5;}
+#finishConfirmActions{display:flex;justify-content:flex-end;gap:8px;}
+#finishConfirmCancel{padding:6px 14px;font-size:13px;}
+#finishConfirmOk{padding:6px 14px;font-size:13px;background:#1a7f37;border-color:#1a7f37;color:#fff;font-weight:600;}
+#finishConfirmOk:hover{background:#15692e;border-color:#15692e;color:#fff;}
+
+/* 状态（紧凑） */
+#toolbar .tb-status{display:inline-flex;align-items:center;font-size:11px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:0 4px;}
+
+/* Status (truncate long text, never force toolbar reflow) */
+#status{font-size:12px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px;}
+#pos{font-size:12px;color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:80px;height:32px;flex-shrink:0;}
+#pagePos{font-size:12px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100px;height:32px;flex-shrink:0;}
+#prLastPage{font-size:12px;color:var(--accent);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100px;height:32px;flex-shrink:0;}
+/* Status spans as standalone flex items in .tb-right (wrap independently of action buttons) */
+#toolbar .tb-status{
+  display:inline-flex;align-items:center;
+  font-size:12px;color:var(--text-muted);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  padding:0 4px;
+}
+
+/* Global button styles (outside toolbar) */
+button{font:inherit;padding:5px 11px;border:1px solid var(--border);border-radius:4px;background:var(--bg-elev);color:var(--text);cursor:pointer;}
 button:hover{border-color:var(--accent);color:var(--accent);}
-button.active{border-color:var(--accent);background:#eef3fb;color:var(--accent);}
+button.active{border-color:var(--accent);background:var(--accent-soft);color:var(--accent);}
 button.primary{background:var(--accent);color:#fff;border-color:var(--accent);}
-button.primary:hover{background:#2256c2;color:#fff;}
+button.primary:hover{background:var(--accent-hover);color:#fff;}
 button:disabled{opacity:.5;cursor:not-allowed;}
-select{font:inherit;padding:5px 8px;border:1px solid var(--border);border-radius:4px;background:#fff;}
-#status{font-size:12px;color:#5a6b7c;}
-#pos{font-size:12px;color:#8a97a6;white-space:nowrap;}
-/* U2：三色 toast 提示（成功/失败/警告），顶部居中，3s 自动消失 */
+select{font:inherit;padding:5px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-elev);color:var(--text);}
+
+/* U2居中，3s 自动消失 */
 #toast{position:fixed;top:60px;left:50%;transform:translateX(-50%);z-index:90;display:flex;flex-direction:column;gap:6px;align-items:center;pointer-events:none;}
 .toast{background:#1c2733;color:#fff;font-size:13px;line-height:1.5;padding:8px 16px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.25);opacity:0;transform:translateY(-6px);transition:opacity .2s,transform .2s;max-width:70vw;}
 .toast.show{opacity:1;transform:translateY(0);}
@@ -7605,81 +7863,196 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
 </head>
 <body>
 <div id="toolbar">
-  <div class="tb-group" role="group" aria-label="格式">
-    <button type="button" class="ic-btn" data-op="bold" onmousedown="event.preventDefault()" title="粗体" aria-label="粗体"><span class="ic-b">B</span></button>
-    <button type="button" class="ic-btn" data-op="italic" onmousedown="event.preventDefault()" title="斜体" aria-label="斜体"><span class="ic-i">I</span></button>
-    <button type="button" class="ic-btn" data-op="heading" onmousedown="event.preventDefault()" title="标题：正文↔一级标题↔…↔六级标题循环" aria-label="标题"><span class="ic-h">标</span></button>
-    <button type="button" class="ic-btn" data-op="p" onmousedown="event.preventDefault()" title="正文：转为普通段落" aria-label="正文"><span class="ic-p">正</span></button>
-    <button type="button" class="ic-btn" data-op="remove" onmousedown="event.preventDefault()" title="清除格式" aria-label="清除格式"><span class="ic-t">清</span></button>
-    <button type="button" class="ic-btn" data-op="note" onmousedown="event.preventDefault()" title="注释：把当前块设为注释（小字灰色）" aria-label="注释">注</button>
-    <button type="button" class="ic-btn" data-op="strip_ws" onmousedown="event.preventDefault()" title="去空（去除段落内全部空白，保留换行）" aria-label="去空">去空</button>
-    <button type="button" class="ic-btn" id="colorBtn" onmousedown="event.preventDefault()" title="文本颜色" aria-label="文本颜色">色</button>
-    <button type="button" class="ic-btn" id="formatBrushBtn" onmousedown="event.preventDefault()" title="格式刷" aria-label="格式刷">刷</button>
-    <button type="button" class="ic-btn" id="formatRulesBtn" onmousedown="event.preventDefault()" title="格式规则：对选中文字一键应用自定义规则（可多条叠加 / 条件分支；Ctrl+Shift+Q）" aria-label="格式规则">规</button>
-    <button type="button" class="ic-btn" id="charWrapBtn" onmousedown="event.preventDefault()" title="文字包围下拉菜单：下划线 / 删除线 / 字符边框 / 底纹" aria-label="文字包围">文 <span class="ptoe-caret">▾</span></button>
-    <button type="button" class="ic-btn" data-op="highlight" onmousedown="event.preventDefault()" title="突显文字：对选中文字设置背景色高亮" aria-label="突显文字">背</button>
-    <button type="button" class="ic-btn" id="supSubBtn" onmousedown="event.preventDefault()" title="上标下标下拉菜单：把选中文字设为上标或下标的小字符" aria-label="上标下标"><span class="ic-x">X</span> <span class="ptoe-caret">▾</span></button>
+  <!-- LEFT: 导航与编辑区 -->
+  <div class="tb-section tb-left" role="region" aria-label="导航与编辑">
+    <!-- Zone 1: 导航 -->
+    <div class="tb-group" role="group" aria-label="导航">
+      <button type="button" class="ic-btn" id="searchOpenBtn" onmousedown="event.preventDefault()" title="搜索/替换全部页面 (Ctrl+F)" aria-label="搜索 (Ctrl+F)">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      </button>
+      <label style="display:inline-flex;align-items:center;gap:2px;">
+        <input type="number" id="pageJump" min="1" placeholder="页码" aria-label="跳转页码" title="跳转页码 (Ctrl+G)" style="width:64px;height:28px;padding:0 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text);font:inherit;">
+      </label>
+      <button type="button" class="tb-btn" id="jumpBtn" onmousedown="event.preventDefault()" title="跳转到指定页码 (Ctrl+G)">跳转</button>
+    </div>
+    <!-- Zone 1b: 编辑 -->
+    <div class="tb-group" role="group" aria-label="编辑">
+      <button type="button" class="ic-btn" id="undoBtn" onmousedown="event.preventDefault()" disabled title="撤回上一步 (Ctrl+Z)" aria-label="撤回 (Ctrl+Z)">
+        <svg viewBox="0 0 24 24"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg>
+      </button>
+      <button type="button" class="ic-btn" id="redoBtn" onmousedown="event.preventDefault()" disabled title="前进下一步 (Ctrl+Y / Ctrl+Shift+Z)" aria-label="前进 (Ctrl+Y)">
+        <svg viewBox="0 0 24 24"><path d="M21 7v6h-6"/><path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3L21 13"/></svg>
+      </button>
+      <label style="display:inline-flex;align-items:center;gap:2px;"><select id="fontSizeSel" aria-label="字号" title="字号" style="height:28px;padding:0 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text);font:inherit;">
+        <option value="12">12</option><option value="13">13</option><option value="14" selected>14</option>
+        <option value="15">15</option><option value="16">16</option><option value="17">17</option>
+        <option value="18">18</option><option value="20">20</option>
+      </select></label>
+    </div>
+    <!-- Zone 2: 格式/插入 -->
+    <div class="tb-group" role="group" aria-label="格式/插入">
+      <button type="button" class="ic-btn" data-op="bold" onmousedown="event.preventDefault()" title="粗体 (Ctrl+B)" aria-label="粗体 (Ctrl+B)">
+        <svg viewBox="0 0 24 24"><path d="M6 4h8a4 4 0 0 1 4 4v6a4 4 0 0 1-4 4H6z"/><path d="M6 12h9a4 4 0 0 0 0-8H6v16"/></svg>
+      </button>
+      <button type="button" class="ic-btn" data-op="italic" onmousedown="event.preventDefault()" title="斜体 (Ctrl+I)" aria-label="斜体 (Ctrl+I)">
+        <svg viewBox="0 0 24 24"><line x1="19" y1="4" x2="10" y2="4"/><line x1="14" y1="20" x2="5" y2="20"/><line x1="15" y1="4" x2="9" y2="20"/></svg>
+      </button>
+      <button type="button" class="ic-btn" data-op="heading" onmousedown="event.preventDefault()" title="标题：正文↔一级标题↔…↔六级标题循环 (Ctrl+1)" aria-label="标题 (Ctrl+1)">
+        <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16M8 6v12M16 6v12"/></svg>
+      </button>
+      <button type="button" class="ic-btn" data-op="p" onmousedown="event.preventDefault()" title="正文：转为普通段落 (Ctrl+0)" aria-label="正文 (Ctrl+0)">
+        <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+      </button>
+      <button type="button" class="ic-btn" data-op="remove" onmousedown="event.preventDefault()" title="清除格式" aria-label="清除格式">
+        <svg viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+      </button>
+      <button type="button" class="ic-btn" data-op="note" onmousedown="event.preventDefault()" title="注释：把当前块设为注释（小字灰色） (Ctrl+Shift+N)" aria-label="注释 (Ctrl+Shift+N)">
+        <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><line x1="10" y1="9" x2="8" y2="9"/></svg>
+      </button>
+      <button type="button" class="ic-btn" data-op="strip_ws" onmousedown="event.preventDefault()" title="去空（去除段落内全部空白，保留换行）" aria-label="去空">
+        <svg viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+      </button>
+      <button type="button" class="ic-btn" data-op="highlight" onmousedown="event.preventDefault()" title="突显文字：对选中文字设置背景色高亮" aria-label="突显文字">
+        <svg viewBox="0 0 24 24"><path d="M12 3v18M19 12H5"/></svg>
+      </button>
+      <!-- 更多 dropdown -->
+      <div class="tb-more">
+        <button type="button" class="tb-more-btn" aria-label="更多格式工具" aria-expanded="false" aria-controls="morePanelFormat">
+          更多 <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
+        <div class="tb-more-panel" id="morePanelFormat" role="menu">
+          <button type="button" class="tb-btn" id="charWrapBtn" role="menuitem" title="文字包围下拉菜单：下划线 / 删除线 / 字符边框 / 底纹" aria-label="文字包围">文字包围 <span class="ptoe-caret">▾</span></button>
+          <button type="button" class="tb-btn" id="supSubBtn" role="menuitem" title="上标下标下拉菜单：把选中文字设为上标或下标的小字符" aria-label="上标下标">上标/下标 <span class="ptoe-caret">▾</span></button>
+          <button type="button" class="tb-btn" id="formatBrushBtn" role="menuitem" title="格式刷" aria-label="格式刷">格式刷</button>
+          <button type="button" class="tb-btn" id="formatRulesBtn" role="menuitem" title="格式规则：对选中文字一键应用自定义规则（可多条叠加 / 条件分支；Ctrl+Shift+Q）" aria-label="格式规则">格式规则</button>
+          <button type="button" class="tb-btn" id="colorBtn" role="menuitem" title="文本颜色" aria-label="文本颜色">文本颜色</button>
+          <select id="imgModeSel" title="插入图片的显示模式：全画幅=占满文字宽度，局部=按原尺寸居中，行内=嵌在文字中间（50% 宽度）" style="width:100%;margin-bottom:4px;padding:4px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text);font:inherit;">
+            <option value="full">全画幅</option>
+            <option value="fit">局部</option>
+            <option value="inline">行内</option>
+          </select>
+          <button type="button" class="tb-btn" id="imgExternalBtn" role="menuitem" onmousedown="event.preventDefault()" title="从本地文件选择图片，插入到文字光标处" aria-label="插入外部图片">插入图片</button>
+          <input type="file" id="imgExternalInput" accept="image/*" style="display:none"/>
+          <button type="button" class="tb-btn" id="indentDlgBtn" role="menuitem" onmousedown="event.preventDefault()" title="段落设置：左/右缩进、首行/悬挂缩进、段前段后与行距（导出 EPUB 生效）" aria-label="段落设置">段落设置</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Zone 3: 文本工具 -->
+    <div class="tb-group" role="group" aria-label="文本工具">
+      <button type="button" class="tb-btn" id="toSimplifiedBtn" title="把全部页面文字转为简体（繁体→简体） (Ctrl+Shift+T)">繁→简</button>
+      <button type="button" class="tb-btn" id="toTraditionBtn" title="把全部页面文字转为繁体（简体→繁体） (Ctrl+Shift+Y)">简→繁</button>
+      <button type="button" class="tb-btn" id="mdToggleBtn" title="切换 Markdown 源码 / 富文本编辑模式（详见帮助） (Ctrl+Shift+D)">Markdown</button>
+      <button type="button" class="tb-btn" id="cleanBtn" title="智能清理：合并被 OCR 拆散的小段落、清除段首 #/* 等符号、归一化中英文标点、移除残留的 HTML 标签 (Ctrl+Shift+C)">清理</button>
+      <button type="button" class="tb-btn" id="proofreadBtn" title="文字纠错下拉菜单：校正当前页 / 应用全部候选 / 清除标注 / 回退原文 (Ctrl+K)" aria-label="文字纠错 (Ctrl+K)">校 <span class="ptoe-caret">▾</span></button>
+      <button type="button" class="ic-btn" data-op="align_left" onmousedown="event.preventDefault()" title="居左 (Ctrl+Shift+Left)" aria-label="居左 (Ctrl+Shift+Left)">
+        <svg viewBox="0 0 24 24"><line x1="3" y1="6" x2="15" y2="6"/><line x1="3" y1="12" x2="15" y2="12"/><line x1="3" y1="18" x2="15" y2="18"/></svg>
+      </button>
+      <button type="button" class="ic-btn" data-op="align_center" onmousedown="event.preventDefault()" title="居中 (Ctrl+Shift+Up)" aria-label="居中 (Ctrl+Shift+Up)">
+        <svg viewBox="0 0 24 24"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <button type="button" class="ic-btn" data-op="align_right" onmousedown="event.preventDefault()" title="居右 (Ctrl+Shift+Right)" aria-label="居右 (Ctrl+Shift+Right)">
+        <svg viewBox="0 0 24 24"><line x1="9" y1="6" x2="21" y2="6"/><line x1="9" y1="12" x2="21" y2="12"/><line x1="9" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <button type="button" class="ic-btn" data-op="flush" onmousedown="event.preventDefault()" title="顶格" aria-label="顶格">
+        <svg viewBox="0 0 24 24"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <button type="button" class="ic-btn" data-op="indent" onmousedown="event.preventDefault()" title="缩进" aria-label="缩进">
+        <svg viewBox="0 0 24 24"><line x1="3" y1="6" x2="21" y2="6"/><line x1="9" y1="12" x2="21" y2="12"/><line x1="9" y1="18" x2="21" y2="18"/></svg>
+      </button>
+    </div>
+
+    <!-- Zone 4: 标记 -->
+    <div class="tb-group" role="group" aria-label="标记">
+      <button type="button" class="ic-btn" data-op="marker_full" onmousedown="event.preventDefault()" title="全文标记：当前文章到此结束，后续内容属于新文章（开新页） (Ctrl+Shift+F)" aria-label="全文标记 (Ctrl+Shift+F)">
+        <svg viewBox="0 0 24 24"><path d="M4 4h16a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/><line x1="12" y1="8" x2="12" y2="16"/></svg>
+      </button>
+      <button type="button" class="ic-btn" data-op="marker_note" onmousedown="event.preventDefault()" title="注释标记：插入到光标处，由对应注释段落替换（数量需一一匹配） (Ctrl+Shift+M)" aria-label="注释标记 (Ctrl+Shift+M)">
+        <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><circle cx="12" cy="14" r="1"/></svg>
+      </button>
+      <button type="button" class="ic-btn" data-op="marker_join" onmousedown="event.preventDefault()" title="段落标记：插入到光标处；段首=与上一段合并，段尾=与下一段合并 (Ctrl+Shift+J)" aria-label="段落标记 (Ctrl+Shift+J)">
+        <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/><path d="M12 6v6M12 12v6" stroke-width="3"/></svg>
+      </button>
+      <button type="button" class="ic-btn" data-op="marker_page" onmousedown="event.preventDefault()" title="换页标记：从此处之后的内容显示在新的一页 (Ctrl+Shift+P)" aria-label="换页标记 (Ctrl+Shift+P)">
+        <svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><line x1="12" y1="10" x2="12" y2="14"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+      </button>
+    </div>
   </div>
-<div class="tb-group" role="group" aria-label="对齐">
-     <button type="button" class="ic-btn" data-op="align_left" onmousedown="event.preventDefault()" title="居左" aria-label="居左">左</button>
-     <button type="button" class="ic-btn" data-op="align_center" onmousedown="event.preventDefault()" title="居中" aria-label="居中">中</button>
-     <button type="button" class="ic-btn" data-op="align_right" onmousedown="event.preventDefault()" title="居右" aria-label="居右">右</button>
-     <button type="button" class="ic-btn" data-op="flush" onmousedown="event.preventDefault()" title="顶格" aria-label="顶格">顶格</button>
-     <button type="button" class="ic-btn" data-op="indent" onmousedown="event.preventDefault()" title="缩进" aria-label="缩进">缩进</button>
-     <button type="button" class="ic-btn" id="indentDlgBtn" onmousedown="event.preventDefault()" title="段落设置：左/右缩进、首行/悬挂缩进、段前段后与行距（导出 EPUB 生效）" aria-label="段落设置">¶</button>
-   </div>
-  <div class="tb-group" role="group" aria-label="标记">
-    <button type="button" class="ic-btn" data-op="marker_full" onmousedown="event.preventDefault()" title="全文标记：当前文章到此结束，后续内容属于新文章（开新页）" aria-label="全文标记">篇</button>
-    <button type="button" class="ic-btn" data-op="marker_note" onmousedown="event.preventDefault()" title="注释标记：插入到光标处，由对应注释段落替换（数量需一一匹配）" aria-label="注释标记">释</button>
-    <button type="button" class="ic-btn" data-op="marker_join" onmousedown="event.preventDefault()" title="段落标记：插入到光标处；段首=与上一段合并，段尾=与下一段合并" aria-label="段落标记">段</button>
-    <button type="button" class="ic-btn" data-op="marker_page" onmousedown="event.preventDefault()" title="换页标记：从此处之后的内容显示在新的一页" aria-label="换页标记">页</button>
+
+  <!-- CENTER: 进度/状态区 -->
+  <div class="tb-section tb-center" role="region" aria-label="进度">
+    <div class="tb-group" role="group" aria-label="进度" style="flex:1 1 auto; min-width:240px; justify-content:space-between; gap:6px; align-items:center;">
+      <button type="button" class="ic-btn" id="prevPageBtn" onmousedown="event.preventDefault()" title="上一页" aria-label="上一页">
+        <svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>
+      </button>
+      <span id="pagePos" aria-live="off" title="当前所在页码" style="font-size:12px;color:var(--text-muted);white-space:nowrap;">第 1 / 547 页</span>
+      <div id="progressWrap" style="flex:1;min-width:80px;height:6px;background:var(--border);border-radius:3px;cursor:pointer;position:relative;overflow:hidden;" title="点击或拖拽跳转到指定进度">
+        <div id="progressBar" style="width:0%;height:100%;background:var(--accent);border-radius:3px;transition:width 0.15s ease;"></div>
+      </div>
+      <span id="progressPct" style="font-size:11px;color:var(--text-muted);min-width:30px;text-align:right;">0%</span>
+      <span id="errBadge" title="点击跳转到第一个待纠错页面" style="display:inline-flex;align-items:center;gap:3px;font-size:11px;color:#E02020;cursor:pointer;white-space:nowrap;padding:2px 8px;border-radius:12px;background:rgba(224,32,32,.1);border:1px solid rgba(224,32,32,.25);font-weight:600;">
+        待纠错 <b id="errBadgeNum" style="min-width:14px;text-align:center;">0</b> 处
+      </span>
+      <button type="button" class="ic-btn" id="nextPageBtn" onmousedown="event.preventDefault()" title="下一页" aria-label="下一页">
+        <svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg>
+      </button>
+    </div>
+    <span id="prLastPage" class="tb-status" aria-live="off" title="最后一次校正/重识别的页码" style="font-size:11px;color:var(--accent);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:90px;"></span>
+    <span id="status" class="tb-status tb-status-main" style="font-size:11px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px;">加载中 ...</span>
+    <span id="prCount" title="当前页面存在的可纠错文字数量" style="font-size:11px;color:var(--text-muted);white-space:nowrap;">可纠错：<b id="prCountNum" style="color:#E02020;">0</b></span>
   </div>
-  <div class="tb-group" role="group" aria-label="转换">
-    <button type="button" id="toSimplifiedBtn" title="把全部页面文字转为简体（繁体→简体）">繁→简</button>
-    <button type="button" id="toTraditionBtn" title="把全部页面文字转为繁体（简体→繁体）">简→繁</button>
-    <button type="button" id="mdToggleBtn" title="切换 Markdown 源码 / 富文本编辑模式（详见帮助）">Markdown</button>
-  </div>
-  <div class="tb-group" role="group" aria-label="文本">
-    <button type="button" id="cleanBtn" title="智能清理：合并被 OCR 拆散的小段落、清除段首 #/* 等符号、归一化中英文标点、移除残留的 HTML 标签">清理</button>
-    <button type="button" id="proofreadBtn" title="文字纠错下拉菜单：校正当前页 / 应用全部候选 / 清除标注 / 回退原文" aria-label="文字纠错">校 <span class="ptoe-caret">▾</span></button>
-  </div>
-  <div class="tb-group" role="group" aria-label="撤销重做">
-    <button type="button" id="undoBtn" class="ic-btn" onmousedown="event.preventDefault()" disabled title="撤回上一步（Ctrl+Z）" aria-label="撤回（Ctrl+Z）">↶</button>
-    <button type="button" id="redoBtn" class="ic-btn" onmousedown="event.preventDefault()" disabled title="前进下一步（Ctrl+Y / Ctrl+Shift+Z）" aria-label="前进（Ctrl+Y）">↷</button>
-  </div>
-  <div class="tb-group" role="group" aria-label="图片">
-    <select id="imgModeSel" hidden title="插入图片的显示模式：全画幅=占满文字宽度，局部=按原尺寸居中，行内=嵌在文字中间（50% 宽度）">
-      <option value="full">全画幅</option>
-      <option value="fit">局部</option>
-      <option value="inline">行内</option>
-    </select>
-    <button type="button" id="imgExternalBtn" onmousedown="event.preventDefault()" title="从本地文件选择图片，插入到文字光标处">外部</button>
-    <input type="file" id="imgExternalInput" accept="image/*" style="display:none"/>
-  </div>
-  <div class="tb-group" role="group" aria-label="搜索替换">
-    <button type="button" id="searchOpenBtn" class="primary" title="搜索/替换全部页面：弹出窗口显示所有匹配结果，支持上一个/下一个跳转、替换当前与全部替换">搜</button>
-  </div>
-  <div class="tb-group" role="group" aria-label="字号与跳转">
-    <label>字号 <select id="fontSizeSel">
-      <option value="12">12</option><option value="13">13</option><option value="14" selected>14</option>
-      <option value="15">15</option><option value="16">16</option><option value="17">17</option>
-      <option value="18">18</option><option value="20">20</option>
-    </select></label>
-    <label>跳转 <input type="number" id="pageJump" min="1" placeholder="页码"></label>
-    <button type="button" id="jumpBtn" title="跳转到指定页码">跳转</button>
-  </div>
-  <span class="spacer"></span>
-  <span id="prCount" title="当前页面存在的可纠错文字数量（未采纳/未忽略的错误标注）">可纠错数：<b id="prCountNum">0</b></span>
-  <div class="tb-group tb-main" role="group" aria-label="工具与操作">
-    <button type="button" id="helpBtn" title="帮助：Markdown 格式、快捷键与标记说明">帮助</button>
-    <button type="button" id="historyBtn" title="历史记录：查看/管理本地矫正缓存（文件名与路径分列、多版本）">历史记录</button>
-    <button type="button" id="settingsBtn" title="设置">设置</button>
-    <button type="button" id="exportBtn" title="导出：把全部页面的文字（含未保存的修改）导出为 TXT / DOCX 文件，保存位置由弹窗选择">导出</button>
-    <span id="pos" aria-live="off"></span>
-    <span id="status">加载中 ...</span>
-    <button type="button" id="stageBtn" title="暂存：把当前修改暂时保存到本地历史缓存（不转换，可随时恢复）">暂存</button>
-    <button type="button" id="saveBtn">保存</button>
-    <button type="button" id="finishBtn" class="primary">完成并转换</button>
+
+  <!-- RIGHT: 操作区 -->
+  <div class="tb-section tb-right" role="region" aria-label="操作">
+    <div class="tb-group tb-main" role="group" aria-label="主要操作">
+      <button type="button" class="tb-btn" id="saveBtn" onmousedown="event.preventDefault()" title="保存 (Ctrl+S)" aria-label="保存 (Ctrl+S)" style="background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600;padding:0 14px;">
+        <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;fill:none;stroke-width:2;vertical-align:-2px;margin-right:4px;"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+        保存
+      </button>
+      <div style="position:relative;display:inline-flex;vertical-align:middle;">
+        <button type="button" class="tb-btn" id="finishBtn" onmousedown="event.preventDefault()" title="完成并转换 (Ctrl+Enter)" aria-label="完成并转换 (Ctrl+Enter)" style="background:#1a7f37;border-color:#1a7f37;color:#fff;font-weight:600;padding:0 12px;box-shadow:var(--shadow-sm);">
+          <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;fill:none;stroke-width:2;vertical-align:-2px;margin-right:4px;"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 3v18"/></svg>
+          完成并转换
+        </button>
+        <div class="tb-more" id="finishMore" style="position:absolute;top:100%;left:0;z-index:30;">
+          <button type="button" class="tb-more-btn" id="finishMoreBtn" aria-label="导出选项" aria-expanded="false" style="height:26px;padding:0 6px;border:1px solid var(--border);border-top:none;border-radius:0 0 var(--radius-sm) var(--radius-sm);background:var(--bg-elev);color:var(--text);">
+            <svg viewBox="0 0 24 24" width="12" height="12" style="stroke:currentColor;fill:none;stroke-width:2;"><polyline points="6 9 12 15 18 9"/></svg>
+          </button>
+          <div class="tb-more-panel" id="finishMorePanel" role="menu" style="left:0;right:auto;min-width:120px;">
+            <button type="button" class="tb-btn" id="exportTxtBtn" role="menuitem" title="导出为纯文本文件（.txt）">导出 TXT</button>
+            <button type="button" class="tb-btn" id="exportDocxBtn" role="menuitem" title="导出为 Word 文档（.docx）">导出 DOCX</button>
+            <button type="button" class="tb-btn" id="exportMdBtn" role="menuitem" title="导出为 Markdown 文件（.md）">导出 MD</button>
+            <button type="button" class="tb-btn" id="exportEpubBtn" role="menuitem" title="导出为 EPUB 电子书（.epub）">导出 EPUB</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="tb-group" role="group" aria-label="更多">
+      <div class="tb-more">
+        <button type="button" class="tb-more-btn" aria-label="更多" aria-expanded="false" aria-controls="morePanelRight" title="更多操作">
+          <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;fill:none;stroke-width:2;"><circle cx="12" cy="6" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="18" r="2"/></svg>
+          更多
+        </button>
+        <div class="tb-more-panel" id="morePanelRight" role="menu">
+          <button type="button" class="tb-btn" id="stageBtn" role="menuitem" title="暂存：把当前修改暂时保存到本地历史缓存（不转换，可随时恢复） (Ctrl+Shift+S)" aria-label="暂存 (Ctrl+Shift+S)" style="justify-content:flex-start;">
+            <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;fill:none;stroke-width:2;vertical-align:-2px;margin-right:4px;"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+            暂存
+          </button>
+          <button type="button" class="tb-btn" id="helpBtn" role="menuitem" title="帮助：Markdown 格式、快捷键与标记说明 (F1)" aria-label="帮助 (F1)" style="justify-content:flex-start;">
+            <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;fill:none;stroke-width:2;vertical-align:-2px;margin-right:4px;"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            帮助
+          </button>
+          <button type="button" class="tb-btn" id="historyBtn" role="menuitem" title="历史记录：查看/管理本地矫正缓存（文件名与路径分列、多版本） (Ctrl+H)" aria-label="历史记录 (Ctrl+H)" style="justify-content:flex-start;">
+            <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;fill:none;stroke-width:2;vertical-align:-2px;margin-right:4px;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            历史记录
+          </button>
+          <button type="button" class="tb-btn" id="settingsBtn" role="menuitem" title="设置 (Ctrl+Shift+O)" aria-label="设置 (Ctrl+Shift+O)" style="justify-content:flex-start;">
+            <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;fill:none;stroke-width:2;vertical-align:-2px;margin-right:4px;"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 15 19.4a1.65 1.65 0 0 0 1.82.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 15a1.65 1.65 0 0 0-1.51-1H21a2 2 0 0 1 2-2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            设置
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 <div id="hintbar">
@@ -7783,11 +8156,15 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
 </div></div>
 <div id="exportModalBg"><div class="modal search-modal">
   <div class="search-head"><h3>导出</h3><button type="button" id="exportCloseBtn" class="x-btn" title="关闭导出" aria-label="关闭导出">✕</button></div>
-  <p class="export-desc">把全部页面的文字（含未保存的修改）导出为文件；点击下方按钮后弹出窗口选择保存位置。DOCX 中标题自动加粗加大并居中，带章节大纲；对齐、缩进等段落格式同步导出；Markdown 与界面规则保持一致。</p>
-  <div class="export-actions">
-    <button type="button" id="exportDocxBtn" title="导出为 Word 文档（.docx）">导出为 DOCX</button>
-    <button type="button" id="exportMdBtn" title="导出为 Markdown 文件（.md）">导出为 MD</button>
-    <button type="button" id="exportTxtBtn" class="primary" title="导出为纯文本文件（.txt）">导出为 TXT</button>
+  <p class="export-desc">导出功能已移至工具栏「完成并转换」旁的下拉菜单，请直接在该菜单中选择导出格式。</p>
+  <div class="export-actions"></div>
+</div></div>
+<div id="finishConfirmBg"><div class="modal" style="min-width:320px;">
+  <h3 id="finishConfirmTitle">确认转换</h3>
+  <p id="finishConfirmMsg" style="font-size:13px;color:#33414f;margin:10px 0;">将保存并转换为 EPUB，确认继续？</p>
+  <div id="finishConfirmActions" style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px;">
+    <button type="button" id="finishConfirmCancel">取消</button>
+    <button type="button" id="finishConfirmOk" class="primary" style="background:#1a7f37;border-color:#1a7f37;color:#fff;">继续转换</button>
   </div>
 </div></div>
 <div id="indentModalBg"><div class="modal search-modal">
