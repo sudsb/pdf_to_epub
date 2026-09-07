@@ -36,6 +36,7 @@ from llamamanage import (
     _model_id_matches,
     _resolve_workers,
     _sniff_image_mime,
+    _truncation_warning,
     MAX_TOKENS,
     REQUEST_TIMEOUT,
 )
@@ -55,6 +56,16 @@ def _vll_args():
         cfg.get("models_dir") or "",
         cfg.get("model_choices") or {},
     )
+
+
+def _vllm_max_model_len():
+    """读取 vllm_server_args.max_model_len（服务端单次请求上下文上限）；
+    未设置/异常返回 None（vLLM 按模型原生 max_model_len）。"""
+    try:
+        v = get_config(show_dialogs=False).get("vllm_server_args", {}).get("max_model_len")
+        return int(v) if v not in (None, "") else None
+    except Exception:
+        return None
 
 
 def _base_url(sargs: dict) -> str:
@@ -411,7 +422,17 @@ def _request_image_new(
         if "choices" in result and result["choices"]:
             choice = result["choices"][0]
             if choice.get("finish_reason") == "length":
-                print(f"[request_image] WARNING: {img} hit max_tokens={MAX_TOKENS} (finish_reason=length) — 输出可能被截断，请检查该页内容")
+                # 与 llamamanage 同构：用 usage 区分触顶请求级 max_tokens 与
+                # vLLM 服务端 max_model_len 上下文占满（视觉图片 token 占大头）
+                print(
+                    _truncation_warning(
+                        img,
+                        result,
+                        max_tokens=MAX_TOKENS,
+                        ctx=_vllm_max_model_len(),
+                        ctx_hint="vllm_server_args.max_model_len",
+                    )
+                )
             return {"result": choice["message"]["content"], "error": None}
         return {"result": None, "error": f"No choices in response: {result}"}
     except Exception as e:

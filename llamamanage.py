@@ -71,6 +71,10 @@ REQUEST_TIMEOUT = 600
 # 默认 8192 更能容纳高 token 的页面与思考链场景；仍限制上界以防单页生成跑飞。
 # 可通过 config.json 的 llama_server_args.max_tokens 覆盖（见 USAGE.md）。
 MAX_TOKENS = 8192
+# 运行中服务端真实 n_ctx（经 /slots 探测，2026-09-07）。与配置 ctx_size 可能
+# 不一致：复用残留旧进程时（模型 id 相同但启动参数旧）实际上下文远小于配置，
+# 图片 token 占满后即截断。_truncation_ctx_size 优先用它，避免误判为请求级截断。
+_SERVER_CTX: int | None = None
 # runserver 等待模型加载完成的 health 轮询超时（秒）。大模型（含视觉投影器）
 # 从磁盘加载到显存可能远超 2 分钟，此期间 /health 一直返回 503；超时过短会
 # 误判启动失败（矫正界面表现为「服务未启动」，而进程其实仍在加载）。
@@ -447,6 +451,8 @@ def runserver(model_key: str = "HY", with_mmproj: bool = True, parallel: int | N
             cache 按槽位预分配浪费显存（溢出到 CPU 反而拖慢单页）。
     """
     global _server_process
+    global _SERVER_CTX
+    _SERVER_CTX = None  # 重置旧值；复用/启动成功后由 _record_server_ctx 重探
 
     if _active_engine() == "vllm":
         m = _vllm_module()
@@ -473,7 +479,35 @@ def runserver(model_key: str = "HY", with_mmproj: bool = True, parallel: int | N
     probe = _probe_server(model_name)
     if probe == "match":
         print(f"llama-server already running with model '{model_name}' — reusing")
-        return True
+        # 2026-09-07：复用的残留旧进程可能以旧参数启动，真实 n_ctx 远小于配置
+        # ctx_size，图片 token 易占满上下文触发截断（实测 usage 1785+263=2048 整，
+        # 即 n_ctx 被旧参数限制在 2048，OCR 每页输出仅剩一两百 token）。探测真实
+        # n_ctx：
+        #   - 低于配置 → 判定为残留进程，自动重启采用当前配置（不再静默降级）；
+        #   - /slots 探测失败 → 提示可能是旧服务，仍截断时建议停止重试。
+        _record_server_ctx()
+        try:
+            _sc = int(
+                (get_config(show_dialogs=False).get("llama_server_args") or {}).get("ctx_size") or 0
+            )
+        except Exception:
+            _sc = 0
+        if _SERVER_CTX and _sc and _SERVER_CTX < _sc:
+            print(
+                f"检测到复用服务 n_ctx={_SERVER_CTX} 低于配置 ctx_size={_sc}，"
+                f"判定为旧参数残留进程，自动重启以采用当前配置 ..."
+            )
+            if not _handle_stale_instance(model_name):
+                return False
+            # 端口已释放 → 继续下方新进程启动逻辑（不 return True）
+        else:
+            if _sc and _SERVER_CTX is None:
+                print(
+                    "提示：无法确认服务端真实 n_ctx（/slots 探测失败）。若该服务由"
+                    "旧版程序/旧参数启动，OCR 可能被小上下文截断——仍出现截断警告时"
+                    "请先停止 llama-server 再重新转换"
+                )
+            return True
     if probe == "mismatch":
         print(
             f"Port 8080 is occupied by a llama-server with a different model "
@@ -570,6 +604,20 @@ def runserver(model_key: str = "HY", with_mmproj: bool = True, parallel: int | N
     except Exception as e:
         print(f"Invalid llama_server_args.max_tokens: {e}")
 
+    # 生成余量提醒：视觉 OCR 每页图片会占数千 prompt token，实际生成预算 ≈
+    # n_ctx - 图片 token。ctx_size 与 max_tokens 相近时预算所剩无几，长页易被
+    # 上下文截断（finish_reason=length）——详见 _truncation_warning（2026-09-07）。
+    try:
+        _mt = int(sargs.get("max_tokens") or 0)
+        _cz = int(sargs.get("ctx_size") or 0)
+        if _cz and _mt and _cz < _mt + 1024:
+            print(
+                f"提示：ctx_size({_cz}) 与 max_tokens({_mt}) 相近，视觉模型图片 "
+                f"token 会进一步压缩生成空间，长页易输出截断，建议调大 ctx_size"
+            )
+    except (TypeError, ValueError):
+        pass
+
     for name, flag, minv, maxv in (
         ("ngram_size", "--ngram-size", 1, 1024),
         ("window_size", "--window-size", 1, 4096),
@@ -651,6 +699,7 @@ def runserver(model_key: str = "HY", with_mmproj: bool = True, parallel: int | N
             response = _SESSION.get("http://127.0.0.1:8080/health", timeout=5)
             if response.status_code == 200:
                 print("Server loaded successfully")
+                _record_server_ctx()  # 记录真实 n_ctx，供截断警告正确分流
                 return True
             # 503（Loading model）等非 200：服务未就绪，稍候重试。
             # 不 sleep 会忙轮询打满正在加载模型的进程，拖慢启动（2026-08-08）。
@@ -807,6 +856,8 @@ def stopserver():
     （2026-08-13：矫正界面「停止服务」与 CLI stop 命令都能关掉遗留实例）。
     """
     global _server_process
+    global _SERVER_CTX
+    _SERVER_CTX = None  # 服务停止后旧 n_ctx 探测值不再有效
 
     if _active_engine() == "vllm":
         m = _vllm_module()
@@ -1068,6 +1119,89 @@ def _sniff_image_mime(data: bytes) -> str:
     return "image/jpeg"
 
 
+def _record_server_ctx() -> int | None:
+    """Best-effort 记录运行中服务端的真实 n_ctx（/slots 首槽 n_ctx）。
+
+    复用的残留旧进程可能以旧参数启动（真实 n_ctx << 配置 ctx_size），
+    _truncation_warning 必须知道真实值才能正确分流（2026-09-07）。
+    任何失败（无服务/超时/解析错误/mock 干扰）都静默返回 None。
+    """
+    global _SERVER_CTX
+    try:
+        slots = _SESSION.get("http://127.0.0.1:8080/slots", timeout=3).json()
+        if isinstance(slots, list) and slots:
+            v = slots[0].get("n_ctx")
+            if isinstance(v, int) and v > 0:
+                _SERVER_CTX = v
+                return v
+    except Exception:
+        pass
+    return None
+
+
+def _truncation_ctx_size():
+    """截断判断用的上下文大小：优先运行中服务端真实 n_ctx（_SERVER_CTX，
+    由 runserver 复用/启动时经 _record_server_ctx 探测），回退配置 ctx_size。
+
+    2026-09-07 修复：此前只读配置 —— 复用旧残留进程（n_ctx 与配置不一致）
+    时 pt+ct < 配置 ctx，被误分流为「接近请求级上限」，掩盖真实根因。
+    """
+    if _SERVER_CTX is not None:
+        return _SERVER_CTX
+    try:
+        v = get_config(show_dialogs=False).get("llama_server_args", {}).get("ctx_size")
+        return int(v) if v not in (None, "") else None
+    except Exception:
+        return None
+
+
+def _truncation_warning(img, result, *, max_tokens=MAX_TOKENS, ctx=None, ctx_hint="ctx_size"):
+    """finish_reason=length 的根因诊断（2026-09-07）。
+
+    llama-server 在两种情况下都报 finish_reason=length，仅凭它无法区分：
+    ① 触顶请求级 max_tokens（本页输出确实极长）；
+    ② 服务端 n_ctx 被图片 prompt token 占满——视觉模型每页图片常占数千
+       token，实际生成预算 = n_ctx - prompt_tokens，远小于 max_tokens，
+       是长页截断最常见的原因。
+    用响应 usage 里的真实 token 数 + 服务端 n_ctx 判断属于哪种，给出可执行建议。
+    """
+    msg = (
+        f"[request_image] WARNING: {img} hit max_tokens={max_tokens} "
+        f"(finish_reason=length)"
+    )
+    usage = result.get("usage") if isinstance(result, dict) else None
+    pt = ct = None
+    if isinstance(usage, dict):
+        pt = usage.get("prompt_tokens")
+        ct = usage.get("completion_tokens")
+    if not (isinstance(pt, int) and isinstance(ct, int)):
+        return msg + " — 输出可能被截断，请检查该页内容"
+    msg += f" — 输出可能被截断: usage={{prompt:{pt}, completion:{ct}}}"
+    if ctx is not None and pt + ct >= ctx:
+        spare = max(ctx - pt, 0)
+        msg += (
+            f"，服务端上下文已满（{ctx_hint}={ctx}，该页图片+提示词占 {pt} "
+            f"token，生成可用空间仅约 {spare} token）"
+        )
+        msg += (
+            f"。建议：调大 {ctx_hint}（如 16384/32768），或降低图片分辨率/--dpi "
+            f"以减少图片 token"
+        )
+    elif ctx is None:
+        msg += "，无法确认服务端上下文大小（/slots 未返回 n_ctx）"
+        msg += (
+            "。若输出明显偏短，多为残留旧服务上下文偏小所致——建议先停止"
+            " llama-server 再重新转换；否则该页文字量确实极大时可调大 max_tokens"
+        )
+    else:
+        msg += f"，接近请求级上限 max_tokens={max_tokens}"
+        msg += (
+            "。建议：该页文字量确实极大时调大 max_tokens；"
+            "否则请检查该页内容是否有异常（如表格/图片被反复输出）"
+        )
+    return msg
+
+
 def _request_image_new(
     prompt: str,
     img,
@@ -1205,11 +1339,14 @@ def _request_image_new(
         if result.get("choices"):
             choice = result["choices"][0]
             # 提示词即使加了完整性要求，极长页面仍可能触顶 max_tokens 被截断
-            # （正常页 400-1000 tokens，绝不该到 4096）——打印警告便于发现内容丢失
+            # （正常页 400-1000 tokens，绝不该到 4096）。finish_reason=length
+            # 也可能是服务端 n_ctx 被图片 token 占满提前截断（视觉模型每页图片
+            # 常占数千 prompt token），_truncation_warning 用 usage 区分并给建议。
             if choice.get("finish_reason") == "length":
                 print(
-                    f"[request_image] WARNING: {img} hit max_tokens={MAX_TOKENS} "
-                    f"(finish_reason=length) — 输出可能被截断，请检查该页内容"
+                    _truncation_warning(
+                        img, result, max_tokens=MAX_TOKENS, ctx=_truncation_ctx_size()
+                    )
                 )
             return {"result": choice["message"]["content"], "error": None}
         return {"result": None, "error": f"No choices in response: {result}"}

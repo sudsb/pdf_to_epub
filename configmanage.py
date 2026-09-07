@@ -178,9 +178,12 @@ DEFAULT_CONFIG = {
         # ctx_size：显式限定服务端上下文 n_ctx（--ctx-size）。llama.cpp 缺省
         # "-c 0 = 从模型加载"，GLM-OCR 等视觉模型原生上下文可达数万 token，
         # KV cache 按原生上下文预分配会撑爆显存（实测同模型直接启动
-        # --ctx-size 8192 仅占 2G，PToEA 不传却占 6G）。单页 OCR/矫正用不到
-        # 超大上下文，默认 8192 即可（2026-09-01）。
-        "ctx_size": "8192",
+        # --ctx-size 8192 仅占 2G，PToEA 不传却占 6G）。注意视觉模型每页图片
+        # 会占数千 prompt token，生成预算 = n_ctx - 图片 token：ctx 必须明显
+        # 大于 max_tokens 才有完整输出空间，否则长页被上下文截断
+        # （finish_reason=length 误报为触顶 max_tokens）。默认 16384 兼顾
+        # 显存与生成余量（2026-09-01 引入，2026-09-07 由 8192 调大）。
+        "ctx_size": "16384",
     },
     # 推理引擎选择：'llama'（llama.cpp，默认）| 'vllm'（vLLM-Omni）
     "engine": "llama",

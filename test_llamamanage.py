@@ -649,5 +649,255 @@ class TestRunserverStaleInstance(unittest.TestCase):
             self.assertFalse(llm._handle_stale_instance("need.gguf"))
 
 
+class TestTruncationWarning(unittest.TestCase):
+    """_truncation_warning：finish_reason=length 的根因诊断（2026-09-07）。
+
+    llama-server 在「触顶请求级 max_tokens」与「服务端 n_ctx 被图片 token 占满」
+    两种情况下都报 finish_reason=length——视觉模型每页图片常占数千 prompt token，
+    实际生成预算 = n_ctx - prompt_tokens。本警告用 usage 区分并给出可执行建议。
+    """
+
+    def test_ctx_full_branch(self):
+        # 上下文被图片+生成占满：pt + ct >= n_ctx → 指向 ctx_size
+        w = llm._truncation_warning(
+            "<Item>", {"usage": {"prompt_tokens": 7700, "completion_tokens": 900}}, ctx=8192
+        )
+        self.assertIn("服务端上下文已满", w)
+        self.assertIn("ctx_size=8192", w)
+        self.assertIn("占 7700", w)
+        self.assertIn("生成可用空间仅约 492 token", w)  # 8192 - 7700
+        self.assertIn("调大 ctx_size", w)
+        self.assertNotIn("接近请求级上限", w)
+        self.assertNotIn("请检查该页内容", w)  # 有 usage 就不走兜底段
+
+    def test_ctx_full_custom_hint(self):
+        # vLLM 走 vllm_server_args.max_model_len 提示词（pt+ct>=ctx 才入此分支）
+        w = llm._truncation_warning(
+            "<Item>", {"usage": {"prompt_tokens": 31000, "completion_tokens": 2000}}, ctx=32768,
+            ctx_hint="vllm_server_args.max_model_len",
+        )
+        self.assertIn("vllm_server_args.max_model_len=32768", w)
+        self.assertIn("生成可用空间仅约 1768 token", w)
+
+    def test_request_cap_branch(self):
+        # 未触 n_ctx → 指向请求级 max_tokens
+        w = llm._truncation_warning(
+            "<Item>", {"usage": {"prompt_tokens": 5000, "completion_tokens": 1000}}, ctx=16384
+        )
+        self.assertIn("接近请求级上限 max_tokens=8192", w)
+        self.assertIn("调大 max_tokens", w)
+        self.assertIn("usage={prompt:5000, completion:1000}", w)
+        self.assertNotIn("服务端上下文已满", w)
+
+    def test_ctx_unknown_hints_stale_server(self):
+        # ctx=None（探测失败或未记录）→ 提示残留服务可能截断，不再误报请求级上限
+        # （2026-09-07：请求级上限只在该页输出真实触顶 max_tokens 时才提示）
+        w = llm._truncation_warning(
+            "<Item>", {"usage": {"prompt_tokens": 6000, "completion_tokens": 3000}}, ctx=None
+        )
+        self.assertIn("无法确认服务端上下文大小", w)
+        self.assertNotIn("接近请求级上限", w)
+
+    def test_no_usage_fallback(self):
+        # 响应无 usage 信息 → 保留原警告文本
+        w = llm._truncation_warning("<Item>", {}, ctx=8192)
+        self.assertIn("hit max_tokens=8192 (finish_reason=length)", w)
+        self.assertIn("输出可能被截断，请检查该页内容", w)
+
+    def test_usage_wrong_types_fallback(self):
+        # usage 键缺失/类型不对 → 兜底
+        w = llm._truncation_warning("<Item>", {"usage": {"prompt_tokens": "7700"}}, ctx=8192)
+        self.assertIn("请检查该页内容", w)
+        self.assertNotIn("服务端上下文已满", w)
+
+    def test_truncation_ctx_size_reads_config(self):
+        # _truncation_ctx_size：从 llama_server_args.ctx_size 取 int；缺失 → None
+        with mock.patch.object(
+            llm, "get_config",
+            return_value={"llama_server_args": {"ctx_size": "16384"}},
+        ):
+            self.assertEqual(llm._truncation_ctx_size(), 16384)
+        with mock.patch.object(llm, "get_config", return_value={"llama_server_args": {}}):
+            self.assertIsNone(llm._truncation_ctx_size())
+        with mock.patch.object(
+            llm, "get_config",
+            side_effect=RuntimeError("boom"),
+        ):
+            self.assertIsNone(llm._truncation_ctx_size())
+
+
+class TestServerCtxTracking(unittest.TestCase):
+    """_record_server_ctx / _truncation_ctx_size：真实服务端 n_ctx 优先（2026-09-07）。
+
+    复用的残留旧进程可能以旧参数启动（n_ctx 远小于配置 ctx_size），截断警告
+    必须知道真实 n_ctx 才能正确分流为「服务端上下文已满」而非误报请求级上限。
+    """
+
+    def setUp(self):
+        self._saved = llm._SERVER_CTX
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        llm._SERVER_CTX = self._saved
+
+    def test_record_server_ctx_parses_slots(self):
+        resp = mock.Mock()
+        resp.json.return_value = [{"n_ctx": 2048}]
+        with mock.patch.object(llm._SESSION, "get", return_value=resp) as g:
+            self.assertEqual(llm._record_server_ctx(), 2048)
+        g.assert_called_once()
+        self.assertEqual(llm._SERVER_CTX, 2048)
+
+    def test_record_server_ctx_empty_slots_keeps_old(self):
+        llm._SERVER_CTX = 777
+        resp = mock.Mock()
+        resp.json.return_value = []
+        with mock.patch.object(llm._SESSION, "get", return_value=resp):
+            self.assertIsNone(llm._record_server_ctx())
+        self.assertEqual(llm._SERVER_CTX, 777)  # 失败不改旧值
+
+    def test_record_server_ctx_exception_keeps_old(self):
+        llm._SERVER_CTX = 777
+        with mock.patch.object(
+            llm._SESSION, "get", side_effect=ConnectionError("refused")
+        ):
+            self.assertIsNone(llm._record_server_ctx())
+        self.assertEqual(llm._SERVER_CTX, 777)
+
+    def test_truncation_ctx_size_prefers_server_ctx(self):
+        # 运行中服务真实 n_ctx（残留旧进程）优先于配置
+        llm._SERVER_CTX = 2048
+        with mock.patch.object(
+            llm, "get_config",
+            return_value={"llama_server_args": {"ctx_size": "16384"}},
+        ):
+            self.assertEqual(llm._truncation_ctx_size(), 2048)
+
+    def test_truncation_ctx_size_falls_back_config(self):
+        llm._SERVER_CTX = None
+        with mock.patch.object(
+            llm, "get_config",
+            return_value={"llama_server_args": {"ctx_size": "16384"}},
+        ):
+            self.assertEqual(llm._truncation_ctx_size(), 16384)
+        with mock.patch.object(llm, "get_config", return_value={"llama_server_args": {}}):
+            self.assertIsNone(llm._truncation_ctx_size())
+
+    def test_truncation_ctx_size_config_raises(self):
+        llm._SERVER_CTX = None
+        with mock.patch.object(
+            llm, "get_config", side_effect=RuntimeError("boom")
+        ):
+            self.assertIsNone(llm._truncation_ctx_size())
+
+
+class TestServerReuseRestart(unittest.TestCase):
+    """runserver 复用分支：真实 n_ctx 低于配置 ctx_size 时自动重启残留进程
+    （2026-09-07）。
+
+    此前仅提示不处理——残留旧进程（未传 --ctx-size，n_ctx 落模型原生上下文，
+    如 2048）因模型名匹配被无限复用，OCR 每页被小上下文静默截断
+    （实测 usage 1785+263=2048 整，输出仅剩一两百 token）。现在探测到
+    n_ctx < 配置 ctx_size 即自动停旧进程并重启采用当前配置。
+    """
+
+    def setUp(self):
+        self._saved_ctx = llm._SERVER_CTX
+        self._saved_proc = llm._server_process
+
+        def _restore():
+            llm._SERVER_CTX = self._saved_ctx
+            llm._server_process = self._saved_proc
+
+        self.addCleanup(_restore)
+        llm._SERVER_CTX = None
+        llm._server_process = None
+
+    def _base_patches(self):
+        from contextlib import ExitStack
+
+        stack = ExitStack()
+        stack.enter_context(mock.patch.object(llm, "_active_engine", return_value="llama"))
+        stack.enter_context(
+            mock.patch.object(
+                llm,
+                "_reload_config",
+                return_value=(
+                    "E:/x/t/llama-server.exe",
+                    "E:/model",
+                    {"DOTS8": {"name": "dots.ocr.Q8_0.gguf", "mmproj": "dots_p.gguf"}},
+                    "DOTS8",
+                ),
+            )
+        )
+        stack.enter_context(mock.patch("os.path.exists", return_value=True))
+        stack.enter_context(mock.patch.object(llm, "_server_supports_arg", return_value=True))
+        stack.enter_context(mock.patch.object(llm, "_detect_gpu", return_value=(None, None)))
+        stack.enter_context(
+            mock.patch.object(
+                llm, "get_config", return_value={"llama_server_args": {"ctx_size": "16384"}}
+            )
+        )
+        return stack
+
+    def test_server_ctx_below_config_triggers_restart(self):
+        # 残留 2048 服务（模型名匹配被复用）→ 低于配置 16384 → 自动重启
+        with self._base_patches():
+            with mock.patch.object(llm, "_probe_server", return_value="match"):
+                with mock.patch.object(
+                    llm, "_record_server_ctx",
+                    side_effect=lambda: setattr(llm, "_SERVER_CTX", 2048),
+                ):
+                    with mock.patch.object(
+                        llm, "_handle_stale_instance", return_value=True
+                    ) as hsi:
+                        with mock.patch.object(
+                            llm, "subprocess", wraps=llm.subprocess
+                        ) as sp:
+                            sp.Popen = mock.Mock(return_value=mock.Mock(poll=lambda: None))
+                            health = mock.Mock(status_code=200)
+                            with mock.patch.object(llm._SESSION, "get", return_value=health):
+                                ok = llm.runserver("DOTS8")
+        self.assertTrue(ok)
+        hsi.assert_called_once()  # 残留进程被清理（关键断言）
+        sp.Popen.assert_called_once()  # 随后按当前配置重新启动
+
+    def test_server_ctx_matches_config_reuses_without_restart(self):
+        # 服务 n_ctx == 配置 → 普通复用，不清理不重启
+        with self._base_patches():
+            with mock.patch.object(llm, "_probe_server", return_value="match"):
+                with mock.patch.object(
+                    llm, "_record_server_ctx",
+                    side_effect=lambda: setattr(llm, "_SERVER_CTX", 16384),
+                ):
+                    with mock.patch.object(
+                        llm, "_handle_stale_instance", return_value=True
+                    ) as hsi:
+                        ok = llm.runserver("DOTS8")
+        self.assertTrue(ok)
+        hsi.assert_not_called()
+
+    def test_server_ctx_probe_failure_warns_and_reuses(self):
+        # /slots 探测失败（_SERVER_CTX 保持 None）→ 打提示但照常复用
+        with self._base_patches():
+            with mock.patch.object(llm, "_probe_server", return_value="match"):
+                with mock.patch.object(llm, "_record_server_ctx", return_value=None):
+                    with mock.patch.object(
+                        llm, "_handle_stale_instance", return_value=True
+                    ) as hsi:
+                        ok = llm.runserver("DOTS8")
+        self.assertTrue(ok)
+        hsi.assert_not_called()
+
+    def test_truncation_warning_ctx_none_hints_stale_server(self):
+        # ctx=None（无法确认服务端上下文）→ 提示残留服务可能截断，不再误报请求级上限
+        w = llm._truncation_warning(
+            "<Item>", {"usage": {"prompt_tokens": 1785, "completion_tokens": 263}}
+        )
+        self.assertIn("无法确认服务端上下文大小", w)
+        self.assertIn("残留旧服务上下文偏小", w)
+        self.assertNotIn("接近请求级上限", w)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1198,3 +1198,295 @@ INFO|2026-09-07 09:18:02|=== ptoe start: ['mian.py', 'gui'] ===
 INFO|2026-09-07 09:18:14|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', '--lang', 'zh-CN'] ===
 INFO|2026-09-07 10:02:18|=== ptoe start: ['mian.py', 'gui'] ===
 INFO|2026-09-07 10:02:24|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', '--lang', 'zh-CN'] ===
+INFO|2026-09-07 13:19:33|=== ptoe start: ['python.exe -m unittest', 'test_mian', 'test_stringmanage', 'test_pdfmanage'] ===
+INFO|2026-09-07 13:19:33|=== ptoe start: ['python.exe -m unittest', 'test_mian', 'test_stringmanage', 'test_pdfmanage'] ===
+INFO|2026-09-07 13:19:33|=== ptoe start: ['python.exe -m unittest', 'test_mian', 'test_stringmanage', 'test_pdfmanage'] ===
+INFO|2026-09-07 13:19:33|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_8926qo16\sample.pdf, dpi=100, model=HY, workers=None
+INFO|2026-09-07 13:19:34|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-09-07 13:19:34|starting server: model=HY, workers=4
+INFO|2026-09-07 13:19:34|server ready: model=HY, elapsed=0.0s
+INFO|2026-09-07 13:19:34|ocr done: total_pages=3, todo=3, excluded=0, errors=0, elapsed=0.0s
+INFO|2026-09-07 13:19:34|structure done: elapsed=0.0s
+INFO|2026-09-07 13:19:34|history done: elapsed=0.0s
+INFO|2026-09-07 13:19:34|render done: elapsed=0.0s
+INFO|2026-09-07 13:19:34|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_8926qo16\out.epub, total_elapsed=0.1s
+INFO|2026-09-07 13:19:34|=== ptoe start: ['python.exe -m unittest', 'test_mian', 'test_stringmanage', 'test_pdfmanage'] ===
+INFO|2026-09-07 13:19:34|=== ptoe start: ['python.exe -m unittest', 'test_mian', 'test_stringmanage', 'test_pdfmanage'] ===
+INFO|2026-09-07 14:31:50|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-09-07 14:33:03|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'epub', 'E:/MYBooks/books/毛泽东思想/《毛泽东思想万岁》武汉钢二司编 第一卷.pdf', '--dpi', '2', '--model', 'DOTS8', '--workers', '4', '--timeout', '600', '--lang', 'zh-CN'] ===
+INFO|2026-09-07 14:33:03|pdf_to_epub start: pdf=E:\MYBooks\books\毛泽东思想\《毛泽东思想万岁》武汉钢二司编 第一卷.pdf, dpi=200, model=DOTS8, workers=4
+INFO|2026-09-07 14:33:07|split done: pages=317, dir=D:\code-project\python\PToEA\data\《毛泽东思想万岁》武汉钢二司编 第一卷, elapsed=4.2s
+INFO|2026-09-07 14:33:08|starting server: model=DOTS8, workers=4
+INFO|2026-09-07 14:33:08|server ready: model=DOTS8, elapsed=0.0s
+ERROR|2026-09-07 14:33:08|page 2 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:08|page 4 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:08|page 3 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:08|page 1 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:08|page 5 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:08|page 8 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:08|page 7 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:08|page 6 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 9 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 10 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 11 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 12 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 14 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 13 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 15 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 16 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 17 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 18 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 19 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 20 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 21 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 22 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 23 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 24 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 25 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 26 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 28 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 27 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 29 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 30 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 31 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 32 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 33 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:09|page 34 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 35 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 36 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 37 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 38 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 39 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 40 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 41 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 42 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 44 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 43 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 45 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 46 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 47 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 48 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 49 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 50 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 51 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 53 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 52 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 54 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 55 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 56 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 57 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 58 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:10|page 59 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 61 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 60 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 62 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 63 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 64 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 65 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 66 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 67 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 68 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 69 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 70 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 71 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 72 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 73 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 74 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 75 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 76 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 77 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 78 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 79 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 80 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 81 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 82 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 83 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 84 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 85 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:11|page 86 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 87 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 88 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 89 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 90 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 91 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 92 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 94 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 93 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 95 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 96 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 97 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 98 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 99 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 100 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 101 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 102 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 103 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 104 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 105 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 106 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 107 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 108 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 109 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 110 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:12|page 111 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 113 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 112 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 114 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 115 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 116 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 117 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 118 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 119 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 121 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 120 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 122 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 123 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 125 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 124 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 126 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 127 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 128 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 129 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 130 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 131 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 132 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 133 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 134 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 135 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 136 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:13|page 137 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 138 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 139 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 140 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 141 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 142 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 143 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 144 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 145 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 146 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 147 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 148 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 149 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 151 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 150 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 152 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 153 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 155 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 154 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 156 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 157 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 158 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 159 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 160 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 161 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 163 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 162 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 164 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 166 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:14|page 165 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 167 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 168 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 169 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 170 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 171 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 172 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 173 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 175 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 174 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 176 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 177 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 178 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 179 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 180 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 182 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 181 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 183 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 184 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 186 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 185 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 187 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 188 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 191 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 190 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 189 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:33:15|page 192 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+INFO|2026-09-07 14:34:02|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-09-07 14:34:15|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'epub', 'E:/MYBooks/books/毛泽东思想/《毛泽东思想万岁》武汉钢二司编 第一卷.pdf', '--dpi', '2', '--model', 'DOTS8', '--workers', '4', '--timeout', '600', '--lang', 'zh-CN', '--exclude', '1-9'] ===
+INFO|2026-09-07 14:34:15|pdf_to_epub start: pdf=E:\MYBooks\books\毛泽东思想\《毛泽东思想万岁》武汉钢二司编 第一卷.pdf, dpi=200, model=DOTS8, workers=4
+INFO|2026-09-07 14:34:15|split done: pages=317, dir=D:\code-project\python\PToEA\data\《毛泽东思想万岁》武汉钢二司编 第一卷, elapsed=0.0s
+INFO|2026-09-07 14:34:15|exclude pages: [1, 2, 3, 4, 5, 6, 7, 8, 9] (count=9)
+INFO|2026-09-07 14:34:17|starting server: model=DOTS8, workers=4
+INFO|2026-09-07 14:34:17|server ready: model=DOTS8, elapsed=0.0s
+ERROR|2026-09-07 14:34:17|page 12 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:17|page 13 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:17|page 11 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:17|page 10 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 14 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 15 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 16 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 17 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 18 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 19 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 20 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 21 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 22 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 23 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 25 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 24 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 26 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 27 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 28 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 29 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 30 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 31 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 32 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 33 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 34 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 36 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 35 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 37 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 38 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 39 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 40 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 41 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:18|page 42 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:19|page 45 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:19|page 44 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:19|page 43 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+ERROR|2026-09-07 14:34:19|page 46 OCR failed: HTTP 400 Bad Request: request (3117 tokens) exceeds the available context size (2048 tokens), try increasing it
+INFO|2026-09-07 14:51:22|=== ptoe start: ['python.exe -m unittest', 'test_mian'] ===
+INFO|2026-09-07 14:51:22|=== ptoe start: ['python.exe -m unittest', 'test_mian'] ===
+INFO|2026-09-07 14:51:22|=== ptoe start: ['python.exe -m unittest', 'test_mian'] ===
+INFO|2026-09-07 14:51:22|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_kfo0ujyd\sample.pdf, dpi=100, model=HY, workers=None
+INFO|2026-09-07 14:51:22|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-09-07 14:51:22|starting server: model=HY, workers=4
+INFO|2026-09-07 14:51:22|server ready: model=HY, elapsed=0.0s
+INFO|2026-09-07 14:51:22|ocr done: total_pages=3, todo=3, excluded=0, errors=0, elapsed=0.0s
+INFO|2026-09-07 14:51:22|structure done: elapsed=0.0s
+INFO|2026-09-07 14:51:22|history done: elapsed=0.0s
+INFO|2026-09-07 14:51:22|render done: elapsed=0.0s
+INFO|2026-09-07 14:51:22|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_kfo0ujyd\out.epub, total_elapsed=0.0s
+INFO|2026-09-07 14:51:22|=== ptoe start: ['python.exe -m unittest', 'test_mian'] ===
+INFO|2026-09-07 14:51:22|=== ptoe start: ['python.exe -m unittest', 'test_mian'] ===
+INFO|2026-09-07 14:51:36|=== ptoe start: ['python.exe -m unittest', 'test_mian'] ===
+INFO|2026-09-07 14:51:36|=== ptoe start: ['python.exe -m unittest', 'test_mian'] ===
+INFO|2026-09-07 14:51:36|=== ptoe start: ['python.exe -m unittest', 'test_mian'] ===
+INFO|2026-09-07 14:51:36|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_6w8u8l3w\sample.pdf, dpi=100, model=HY, workers=None
+INFO|2026-09-07 14:51:36|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-09-07 14:51:36|starting server: model=HY, workers=4
+INFO|2026-09-07 14:51:36|server ready: model=HY, elapsed=0.0s
+INFO|2026-09-07 14:51:36|ocr done: total_pages=3, todo=3, excluded=0, errors=0, elapsed=0.0s
+INFO|2026-09-07 14:51:36|structure done: elapsed=0.0s
+INFO|2026-09-07 14:51:36|history done: elapsed=0.0s
+INFO|2026-09-07 14:51:36|render done: elapsed=0.0s
+INFO|2026-09-07 14:51:36|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_6w8u8l3w\out.epub, total_elapsed=0.0s
+INFO|2026-09-07 14:51:36|=== ptoe start: ['python.exe -m unittest', 'test_mian'] ===
+INFO|2026-09-07 14:51:36|=== ptoe start: ['python.exe -m unittest', 'test_mian'] ===
+INFO|2026-09-07 14:58:22|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-09-07 14:58:36|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'epub', 'E:/MYBooks/books/毛泽东思想/《毛泽东思想万岁》武汉钢二司编 第一卷.pdf', '--dpi', '2', '--model', 'DOTS8', '--workers', '4', '--timeout', '600', '--lang', 'zh-CN', '--exclude', '1-9'] ===
+INFO|2026-09-07 14:58:36|pdf_to_epub start: pdf=E:\MYBooks\books\毛泽东思想\《毛泽东思想万岁》武汉钢二司编 第一卷.pdf, dpi=200, model=DOTS8, workers=4
+INFO|2026-09-07 14:58:37|split done: pages=317, dir=D:\code-project\python\PToEA\data\《毛泽东思想万岁》武汉钢二司编 第一卷, elapsed=0.0s
+INFO|2026-09-07 14:58:37|exclude pages: [1, 2, 3, 4, 5, 6, 7, 8, 9] (count=9)
+INFO|2026-09-07 14:58:38|starting server: model=DOTS8, workers=4
+INFO|2026-09-07 14:58:58|server ready: model=DOTS8, elapsed=19.6s
+ERROR|2026-09-07 15:17:49|page 188 OCR failed: HTTP 500 Internal Server Error: The model produced output that does not match the expected peg-native format

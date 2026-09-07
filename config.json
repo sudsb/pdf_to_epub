@@ -65,7 +65,7 @@
     "cache_type_v": "q8_0",
     "log_verbosity": "0",
     "max_tokens": "8192",
-    "ctx_size": "8192"
+    "ctx_size": "16384"
   },
   "proofread": {
     "similarity_min": 0.67,
@@ -272,7 +272,7 @@
     "gray": true,
     "denoise": false,
     "sharpen": true,
-    "binarize": true,
+    "binarize": false,
     "workers": 8
   },
   "citationItalicEnabled": true,

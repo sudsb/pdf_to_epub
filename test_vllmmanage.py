@@ -298,5 +298,39 @@ class TestBatchPerf(_EngineResetMixin, unittest.TestCase):
         )
 
 
+class TestTruncationWire(_EngineResetMixin, unittest.TestCase):
+    """vLLM 侧截断警告：复用 llamamanage._truncation_warning + 服务端 max_model_len（2026-09-07）。"""
+
+    def test_finish_reason_length_prints_diagnostic(self):
+        resp = mock.Mock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {
+            "choices": [{"message": {"content": "半截文本"}, "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 31000, "completion_tokens": 2000},
+        }
+        printed = []
+        with mock.patch.object(vm, "_vll_args", return_value=FAKE_ARGS), \
+             mock.patch.object(vm, "_vllm_max_model_len", return_value=32768), \
+             mock.patch.object(vm._SESSION, "post", return_value=resp), \
+             mock.patch("builtins.print", side_effect=lambda *a: printed.append(" ".join(map(str, a)))):
+            res = vm._request_image_new("prompt", _FakeImg())
+        self.assertIsNone(res["error"])
+        self.assertEqual(res["result"], "半截文本")
+        self.assertEqual(len(printed), 1)
+        w = printed[0]
+        self.assertIn("vllm_server_args.max_model_len=32768", w)
+        self.assertIn("服务端上下文已满", w)
+        self.assertIn("生成可用空间仅约 1768 token", w)
+
+    def test_max_model_len_reads_config(self):
+        with mock.patch.object(vm, "get_config",
+                               return_value={"vllm_server_args": {"max_model_len": "32768"}}):
+            self.assertEqual(vm._vllm_max_model_len(), 32768)
+        with mock.patch.object(vm, "get_config", return_value={"vllm_server_args": {}}):
+            self.assertIsNone(vm._vllm_max_model_len())
+        with mock.patch.object(vm, "get_config", side_effect=RuntimeError("boom")):
+            self.assertIsNone(vm._vllm_max_model_len())
+
+
 if __name__ == "__main__":
     unittest.main()
