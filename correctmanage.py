@@ -2662,7 +2662,8 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
 
     # 注释段落（class="ptoe-note"）按文档顺序收集；段落标记（join）合并相邻注释
     annotations: list[str] = []
-    merge_next = False
+    merge_next = False  # 前一个 join 标记要求下一注释并入当前最后一条注释
+    prev_note = False   # 当前文档位置紧邻的前一个实质块是否为注释（供“段首 join”判断）
     for item in parsed:
         if item["note"]:
             text = "".join(h for h, _m in item["segments"]).strip()
@@ -2670,13 +2671,29 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
                 t == "join" for h, ms in item["segments"][:1] for t, _l in ms
             )
             if text:
-                if (merge_next or first_join) and annotations:
+                if (merge_next or (first_join and prev_note)) and annotations:
                     annotations[-1] += text
                 else:
                     annotations.append(text)
-            merge_next = any(t == "join" for t, _l in item["trailing"])
+                prev_note = True
+            merge_next = (
+                any(t == "join" for t, _l in item["trailing"])
+                if (text or prev_note)
+                else False
+            )
         else:
-            merge_next = False
+            has_content = bool(item["segments"])
+            if not has_content and prev_note and any(
+                t == "join" for t, _l in item["trailing"]
+            ):
+                # 独立段落标记块（例如跨页拆注释时单独放一个 join 标记）不打断
+                # 注释合并链；把它视作“要求下一注释并入上一条”。
+                merge_next = True
+            else:
+                # 正文/标题/图片等有内容块，或前面没有可合并注释时的纯标记块，
+                # 都会打断注释合并链（防止 join 跨正文误并入更早注释）。
+                prev_note = False
+                merge_next = False
 
     # 注释标记计数：正文中每个 note 标记对应一个注释段落，须一一匹配
     note_markers = sum(
@@ -2806,6 +2823,12 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
                         push_content(item["kind"], html, item.get("attrs", ""))
                     prev_note_joinable = True
                 note_join_prev = any(t == "join" for t, _l in item["trailing"])
+            else:
+                # 有正文注释标记时，注释段已被上方 annotations 收集并替换进正文，
+                # 不再参与正文排版。注释段附近/独立 join 块只用于注解合并，不能把
+                # join 顺延到正文流，否则会误合并注释段之后的正文段落。
+                deferred_join = False
+
             continue
         # 非注释块：重置注释段落合并状态（段落标记不跨非注释块生效）；
         # 纯标记块（无可视内容段，如单独一段 段落标记 <p><span join/>…）不打断

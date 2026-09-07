@@ -1196,3 +1196,5 @@ INFO|2026-09-07 09:15:40|=== ptoe start: ['python.EXE -m unittest', 'discover', 
 INFO|2026-09-07 09:15:40|=== ptoe start: ['python.EXE -m unittest', 'discover', '-v'] ===
 INFO|2026-09-07 09:18:02|=== ptoe start: ['mian.py', 'gui'] ===
 INFO|2026-09-07 09:18:14|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', '--lang', 'zh-CN'] ===
+INFO|2026-09-07 10:02:18|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-09-07 10:02:24|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', '--lang', 'zh-CN'] ===

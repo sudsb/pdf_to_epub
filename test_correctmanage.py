@@ -825,6 +825,49 @@ class TestApplyMarkers(unittest.TestCase):
             [{"text": '<p>甲<span class="ptoe-note">（注一前半注一后半）</span></p>'}],
         )
 
+    def test_note_marker_standalone_join_between_notes_merges(self):
+        # 注释标记路径下，独立段落标记块（纯 join 块）夹在两个注释之间也应合并
+        # 为一条注释后插入正文（与无注释标记路径的 2026-09-07 修复保持一致）。
+        pages = [
+            {"page": 1, "text": '<p>甲<span data-ptoe-marker="note">注释</span></p><p class="ptoe-note">注一前半</p>'},
+            {"page": 2, "text": '<p><span data-ptoe-marker="join">段落</span></p><p class="ptoe-note">注一后半</p>'},
+        ]
+        self.assertEqual(
+            apply_markers(pages),
+            [{"text": '<p>甲<span class="ptoe-note">（注一前半注一后半）</span></p>'}],
+        )
+
+    def test_note_marker_standalone_join_does_not_leak_into_following_body(self):
+        # 独立 join 块只应合并注释；注释被替换进正文后，该 join 不得残留并误合并
+        # 注释区之后的正文段落。
+        pages = [
+            {"page": 1, "text": '<p>甲<span data-ptoe-marker="note">注释</span></p>'
+             '<p class="ptoe-note">注一前半</p>'
+             '<p><span data-ptoe-marker="join">段落</span></p>'
+             '<p class="ptoe-note">注一后半</p>'
+             '<p>后续正文</p>'},
+        ]
+        self.assertEqual(
+            apply_markers(pages),
+            [{"text": '<p>甲<span class="ptoe-note">（注一前半注一后半）</span></p><p>后续正文</p>'}],
+        )
+
+
+    def test_note_first_join_after_body_does_not_merge_previous_annotation(self):
+        # 段首 join 只能合并紧邻的前一个注释；中间隔了正文时不得并入前面注释。
+        # 否则两条注释会被错误并成一条，注释标记数量校验/内容都会错位。
+        pages = [
+            {"page": 1, "text": '<p>甲<span data-ptoe-marker="note">注1</span></p><p class="ptoe-note">注一</p>'
+             '<p>正文</p><p>乙<span data-ptoe-marker="note">注2</span></p>'
+             '<p class="ptoe-note"><span data-ptoe-marker="join">段落</span>注二</p>'},
+        ]
+        self.assertEqual(
+            apply_markers(pages),
+            [{"text": '<p>甲<span class="ptoe-note">（注一）</span></p><p>正文</p>'
+             '<p>乙<span class="ptoe-note">（注二）</span></p>'}],
+        )
+
+
     def test_note_marker_at_trailing_position(self):
         # 段尾注释标记：注释追加到该段末尾
         pages = [
