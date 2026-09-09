@@ -71,6 +71,10 @@ REQUEST_TIMEOUT = 600
 # 默认 8192 更能容纳高 token 的页面与思考链场景；仍限制上界以防单页生成跑飞。
 # 可通过 config.json 的 llama_server_args.max_tokens 覆盖（见 USAGE.md）。
 MAX_TOKENS = 8192
+# 视觉 OCR 单页图片 + 提示词的保守 token 估算（实际 4600-8700，取低端）。
+# 启动时 ctx_size 余量低于此值 → 图片 token 会占满上下文、生成预算为零，
+# 与 _truncation_warning 的 pt+ct>=ctx 分支对应。
+_VISION_IMAGE_TOKEN_EST = 4096
 # 运行中服务端真实 n_ctx（经 /slots 探测，2026-09-07）。与配置 ctx_size 可能
 # 不一致：复用残留旧进程时（模型 id 相同但启动参数旧）实际上下文远小于配置，
 # 图片 token 占满后即截断。_truncation_ctx_size 优先用它，避免误判为请求级截断。
@@ -556,6 +560,25 @@ def runserver(model_key: str = "HY", with_mmproj: bool = True, parallel: int | N
         par = int(parallel)
     args += ["--parallel", str(par)]
 
+    # 视觉 OCR 每页图片会占数千 prompt token，而 --parallel 会把 ctx_size 平分给
+    # 每个槽位（每槽 n_ctx ≈ ctx_size // parallel），每槽生成预算 ≈ n_ctx - 图片
+    # token，预算过小则长页被上下文截断（finish_reason=length）。实测 16384//4=
+    # 4096 → 截断；16384//2=8192 → 完整；故取每槽 >= _VISION_IMAGE_TOKEN_EST*2
+    # （8192）为安全下限（2026-09-09）。
+    try:
+        _pp_ctx = int(sargs.get("ctx_size") or 0)
+        if par >= 1 and _pp_ctx >= 1:
+            per_slot = _pp_ctx // par
+            if per_slot < _VISION_IMAGE_TOKEN_EST * 2:
+                print(
+                    f"提示：--parallel {par} 会平分上下文，每槽仅约 {per_slot} token；"
+                    f"视觉 OCR 长页图片约占 ≈{_VISION_IMAGE_TOKEN_EST} token，生成预算紧张，"
+                    f"易被截断（finish_reason=length）。建议调低 parallel（如 1/2）"
+                    f"或调大 ctx_size（每槽 n_ctx ≈ ctx_size // parallel）"
+                )
+    except (TypeError, ValueError):
+        pass
+
     # --ctx-size：显式限定服务端上下文长度（n_ctx）。llama.cpp 不传时默认
     # "-c 0 = 从模型加载" —— 若模型原生上下文很大（GLM-OCR 等视觉模型可达数
     # 万 token），KV cache 会按原生上下文预分配，显存飙升（实测同模型直接启动
@@ -605,15 +628,17 @@ def runserver(model_key: str = "HY", with_mmproj: bool = True, parallel: int | N
         print(f"Invalid llama_server_args.max_tokens: {e}")
 
     # 生成余量提醒：视觉 OCR 每页图片会占数千 prompt token，实际生成预算 ≈
-    # n_ctx - 图片 token。ctx_size 与 max_tokens 相近时预算所剩无几，长页易被
-    # 上下文截断（finish_reason=length）——详见 _truncation_warning（2026-09-07）。
+    # n_ctx - 图片 token。ctx_size 不足以容纳图片 token + max_tokens 时，长页
+    # 易被上下文截断（finish_reason=length）——详见 _truncation_warning（2026-09-07）。
     try:
         _mt = int(sargs.get("max_tokens") or 0)
         _cz = int(sargs.get("ctx_size") or 0)
-        if _cz and _mt and _cz < _mt + 1024:
+        if _cz and _mt and _cz < _mt + _VISION_IMAGE_TOKEN_EST:
             print(
-                f"提示：ctx_size({_cz}) 与 max_tokens({_mt}) 相近，视觉模型图片 "
-                f"token 会进一步压缩生成空间，长页易输出截断，建议调大 ctx_size"
+                f"提示：ctx_size({_cz}) 在扣除图片 token（≈{_VISION_IMAGE_TOKEN_EST}）"
+                f"后，生成预算仅约 {max(_cz - _VISION_IMAGE_TOKEN_EST, 0)} token，"
+                f"长页易被上下文截断。建议调大 ctx_size（如 16384/32768），"
+                f"或降低 max_tokens/--dpi 以减少图片 token 占用"
             )
     except (TypeError, ValueError):
         pass
@@ -662,7 +687,10 @@ def runserver(model_key: str = "HY", with_mmproj: bool = True, parallel: int | N
             #   "0"/false/no/off → 禁用；
             #   "1"/true/yes/on  → 强制开启（按构建语法传值/传裸标志）；
             #   缺省             → 自动（新构建 auto / 老构建裸标志）。
-            fa = str(sargs.get("flash_attn") or "").strip().lower()
+            # 先归一为字符串再判空回退——整数 0 经 str() 得 "0" 才能命中禁用，
+            # 否则 `0 or ""` 会因 int 0 为假而回退到 ""（自动），破坏禁用契约。
+            fa_raw = sargs.get("flash_attn")
+            fa = ("" if fa_raw is None else str(fa_raw).strip().lower())
             if backend in ("CUDA", "Vulkan") and fa not in ("0", "false", "no", "off"):
                 style = _server_flash_attn_style(exe)
                 if fa in ("1", "true", "yes", "on") and style == "valued":
@@ -1178,14 +1206,14 @@ def _truncation_warning(img, result, *, max_tokens=MAX_TOKENS, ctx=None, ctx_hin
         return msg + " — 输出可能被截断，请检查该页内容"
     msg += f" — 输出可能被截断: usage={{prompt:{pt}, completion:{ct}}}"
     if ctx is not None and pt + ct >= ctx:
-        spare = max(ctx - pt, 0)
+        budget = max(ctx - pt, 0)
         msg += (
             f"，服务端上下文已满（{ctx_hint}={ctx}，该页图片+提示词占 {pt} "
-            f"token，生成可用空间仅约 {spare} token）"
+            f"token，生成预算 ≈ {budget} token）"
         )
         msg += (
-            f"。建议：调大 {ctx_hint}（如 16384/32768），或降低图片分辨率/--dpi "
-            f"以减少图片 token"
+            f"。此时调大 max_tokens 无效——需调大 {ctx_hint}（如 16384/32768）"
+            f"，或降低图片分辨率/--dpi 以减少图片 token 释放上下文空间"
         )
     elif ctx is None:
         msg += "，无法确认服务端上下文大小（/slots 未返回 n_ctx）"

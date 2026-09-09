@@ -1437,6 +1437,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "opencv-python" },
+    { name = "paddleocr" },
     { name = "pymupdf" },
     { name = "pywebview" },
     { name = "requests" },
@@ -1452,6 +1453,7 @@ paddle = [
 [package.metadata]
 requires-dist = [
     { name = "opencv-python", specifier = ">=4.8" },
+    { name = "paddleocr", specifier = ">=3.7.0" },
     { name = "paddleocr", marker = "extra == 'paddle'", specifier = ">=3.7" },
     { name = "paddlepaddle", marker = "extra == 'paddle'", specifier = ">=3.2" },
     { name = "pymupdf", specifier = ">=1.28.0" },

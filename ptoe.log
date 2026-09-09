@@ -1604,3 +1604,5 @@ INFO|2026-09-07 16:03:51|render done: elapsed=0.0s
 INFO|2026-09-07 16:03:51|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_n3z5m5xz\out.epub, total_elapsed=0.0s
 INFO|2026-09-07 16:03:51|=== ptoe start: ['python.exe -m unittest', 'discover'] ===
 INFO|2026-09-07 16:03:51|=== ptoe start: ['python.exe -m unittest', 'discover'] ===
+INFO|2026-09-07 16:22:18|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-09-07 16:22:30|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', '--lang', 'zh-CN'] ===

@@ -8,6 +8,7 @@ dependencies = [
     "zhconv>=1.4.3",
     "opencv-python>=4.8",
     "pywebview>=6.2.1,<7",
+    "paddleocr>=3.7.0",
 ]
 
 [project.optional-dependencies]
