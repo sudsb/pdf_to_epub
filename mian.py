@@ -463,11 +463,17 @@ def pdf_to_epub(
     print(f"      {len(img_paths)} page(s) -> {img_dir}")
     logger.info(f"split done: pages={len(img_paths)}, dir={img_dir}, elapsed={timings['split']:.1f}s")
 
-    print(
-        f"[2/4] OCR via llama-server (model='{model_key}', workers={max_workers if max_workers else 'auto'}) ...",
-        end="",
-        flush=True,
-    )
+    engine_label = _active_ocr_engine()
+    if engine_label == "paddle":
+        ocr_label = "PaddleOCR (本地推理)"
+        ocr_detail = f"workers={max_workers if max_workers else 'auto'}"
+    elif engine_label == "vllm":
+        ocr_label = "vLLM-Omni"
+        ocr_detail = f"model='{model_key}', workers={max_workers if max_workers else 'auto'}"
+    else:
+        ocr_label = "llama-server"
+        ocr_detail = f"model='{model_key}', workers={max_workers if max_workers else 'auto'}"
+    print(f"[2/4] OCR via {ocr_label} ({ocr_detail}) ...", end="", flush=True)
     t0 = time.perf_counter()
     total_pages = len(img_paths)
     t_ocr = time.perf_counter()
@@ -1967,6 +1973,9 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         if result.get("epub_error"):
             return 1
+        return 0
+    if args.version:
+        print(f"{name} {version}")
         return 0
     if args.echo is not None:
         print(args.echo)

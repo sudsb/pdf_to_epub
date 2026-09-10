@@ -21,9 +21,37 @@ from __future__ import annotations
 
 import os
 import threading
+from pathlib import Path
 from typing import Any, Callable
 
 __all__ = ["available", "detect_gpu", "get_predictor", "reset_predictor", "batch_infer"]
+
+
+def _setup_model_cache_dir() -> None:
+    """PaddlePaddle/PaddleX 模型默认下载位置 → 程序路径下（frozen 时为 exe 目录）。
+
+    paddlex 在 import 时读取 PADDLE_PDX_CACHE_HOME 决定 CACHE_DIR（模型落在
+    CACHE_DIR/official_models），因此必须在首次 import paddleocr/paddlex 之前
+    设置本环境变量（本模块顶层调用，天然早于任何惰性 paddleocr 导入）。
+    用户已显式设置该环境变量时尊重用户配置（即装即用）。
+    """
+    if os.environ.get("PADDLE_PDX_CACHE_HOME"):
+        return
+    try:
+        from pdfmanage import app_base_dir
+
+        base = app_base_dir()
+    except Exception:
+        base = Path(__file__).resolve().parent
+    cache = base / "models" / "paddlex"
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        cache = base
+    os.environ["PADDLE_PDX_CACHE_HOME"] = str(cache)
+
+
+_setup_model_cache_dir()
 
 _LOCK = threading.Lock()
 _PREDICTOR: Any = None
@@ -64,7 +92,7 @@ def _default_factory() -> Any:
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=False,
-        lang="zh",
+        lang="ch",  # PaddleOCR 3.x 简体中文代码为 "ch"（"zh" 不在模型名映射表 → No models available）
         device="gpu:0" if use_gpu else "cpu",
         cpu_threads=10,
         enable_mkldnn=True,
@@ -171,8 +199,12 @@ def batch_infer(
             outs = predictor.predict(path)
             texts: list[str] = []
             for res in outs or []:
-                res_data = getattr(res, "res", None) or {}
-                texts.extend(res_data.get("rec_texts") or [])
+                # PaddleOCR 3.x predict() 返回顶层 dict，rec_texts 直接是结果键；
+                # 兼容旧版/测试用的 .res 包装形状
+                res_data = getattr(res, "res", None)
+                if res_data is None and isinstance(res, dict):
+                    res_data = res
+                texts.extend((res_data or {}).get("rec_texts") or [])
             entry["result"] = "\n".join(texts)
         except Exception as exc:  # 逐页捕获：单页失败不中断整批
             entry["error"] = str(exc)

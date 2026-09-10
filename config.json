@@ -60,7 +60,7 @@
     "port": "8080",
     "temperature": "0",
     "repeat_penalty": "1.1",
-    "parallel": 2,
+    "parallel": "2",
     "cache_type_k": "q8_0",
     "cache_type_v": "q8_0",
     "log_verbosity": "0",

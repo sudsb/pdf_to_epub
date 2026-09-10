@@ -185,7 +185,7 @@ DEFAULT_CONFIG = {
         # 显存与生成余量（2026-09-01 引入，2026-09-07 由 8192 调大）。
         "ctx_size": "16384",
     },
-    # 推理引擎选择：'llama'（llama.cpp，默认）| 'vllm'（vLLM-Omni）
+    # 推理引擎选择：'llama'（llama.cpp，默认）| 'vllm'（vLLM-Omni）| 'paddle'（PaddleOCR 本地推理）
     "engine": "llama",
     # vLLM-Omni 可执行文件路径（如 "vllm" 或绝对路径）；空 = 仅连接模式
     # （vLLM-Omni 官方仅支持 Linux，Windows 用户可在 WSL2/远程手动启动后连接）

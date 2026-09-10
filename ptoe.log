@@ -1606,3 +1606,142 @@ INFO|2026-09-07 16:03:51|=== ptoe start: ['python.exe -m unittest', 'discover'] 
 INFO|2026-09-07 16:03:51|=== ptoe start: ['python.exe -m unittest', 'discover'] ===
 INFO|2026-09-07 16:22:18|=== ptoe start: ['mian.py', 'gui'] ===
 INFO|2026-09-07 16:22:30|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', '--lang', 'zh-CN'] ===
+INFO|2026-09-09 21:11:50|=== ptoe start: ['python.exe -m unittest', 'test_guimanage', '-v'] ===
+INFO|2026-09-09 21:11:50|=== ptoe start: ['python.exe -m unittest', 'test_guimanage', '-v'] ===
+INFO|2026-09-09 21:18:32|=== ptoe start: ['python.exe -m unittest', 'test_guimanage', '-v'] ===
+INFO|2026-09-09 21:18:32|=== ptoe start: ['python.exe -m unittest', 'test_guimanage', '-v'] ===
+INFO|2026-09-09 21:19:27|=== ptoe start: ['python.exe -m unittest', 'test_guimanage', '-v'] ===
+INFO|2026-09-09 21:19:27|=== ptoe start: ['python.exe -m unittest', 'test_guimanage', '-v'] ===
+INFO|2026-09-09 21:20:42|=== ptoe start: ['python.exe -m unittest', 'test_guimanage', 'test_config'] ===
+INFO|2026-09-09 21:20:42|=== ptoe start: ['python.exe -m unittest', 'test_guimanage', 'test_config'] ===
+INFO|2026-09-09 21:23:25|=== ptoe start: ['python.exe -m unittest', 'test_guimanage', '-v'] ===
+INFO|2026-09-09 21:23:25|=== ptoe start: ['python.exe -m unittest', 'test_guimanage', '-v'] ===
+INFO|2026-09-09 21:24:30|=== ptoe start: ['python.exe -m unittest', 'test_guimanage', 'test_config'] ===
+INFO|2026-09-09 21:24:30|=== ptoe start: ['python.exe -m unittest', 'test_guimanage', 'test_config'] ===
+INFO|2026-09-09 21:25:27|=== ptoe start: ['python.exe -m unittest', 'test_guimanage', 'test_paddleocrmanage', 'test_mian', 'test_llamamanage'] ===
+INFO|2026-09-09 21:25:27|=== ptoe start: ['python.exe -m unittest', 'test_guimanage', 'test_paddleocrmanage', 'test_mian', 'test_llamamanage'] ===
+INFO|2026-09-09 21:25:41|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_hist_s6304h05\sample.pdf, dpi=100, model=HY, workers=None
+INFO|2026-09-09 21:25:41|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-09-09 21:25:41|starting server: model=HY, workers=4
+INFO|2026-09-09 21:25:41|server ready: model=HY, elapsed=0.0s
+INFO|2026-09-09 21:25:41|ocr done: total_pages=3, todo=3, excluded=0, errors=0, elapsed=0.0s
+INFO|2026-09-09 21:25:41|structure done: elapsed=0.0s
+INFO|2026-09-09 21:25:41|history done: elapsed=0.0s
+INFO|2026-09-09 21:25:41|render done: elapsed=0.0s
+INFO|2026-09-09 21:25:41|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_hist_s6304h05\out.epub, total_elapsed=0.0s
+INFO|2026-09-09 21:25:41|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_resume_1rql2lf0\sample.pdf, dpi=100, model=HY, workers=None
+INFO|2026-09-09 21:25:41|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-09-09 21:25:41|starting server: model=HY, workers=4
+INFO|2026-09-09 21:25:41|server ready: model=HY, elapsed=0.0s
+INFO|2026-09-09 21:25:41|ocr done: total_pages=3, todo=3, excluded=0, errors=0, elapsed=0.0s
+INFO|2026-09-09 21:25:41|structure done: elapsed=0.0s
+INFO|2026-09-09 21:25:41|history done: elapsed=0.0s
+INFO|2026-09-09 21:25:41|render done: elapsed=0.0s
+INFO|2026-09-09 21:25:41|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_resume_1rql2lf0\out.epub, total_elapsed=0.0s
+INFO|2026-09-09 21:25:41|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_resume_00e7g_2l\sample.pdf, dpi=100, model=HY, workers=None
+INFO|2026-09-09 21:25:41|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-09-09 21:25:41|starting server: model=HY, workers=4
+INFO|2026-09-09 21:25:41|server ready: model=HY, elapsed=0.0s
+INFO|2026-09-09 21:25:41|ocr done: total_pages=3, todo=3, excluded=0, errors=0, elapsed=0.0s
+INFO|2026-09-09 21:25:41|structure done: elapsed=0.0s
+INFO|2026-09-09 21:25:41|history done: elapsed=0.0s
+INFO|2026-09-09 21:25:41|render done: elapsed=0.0s
+INFO|2026-09-09 21:25:41|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_resume_00e7g_2l\out.epub, total_elapsed=0.0s
+INFO|2026-09-09 21:25:41|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_resume_g_icqbo5\sample.pdf, dpi=100, model=HY, workers=None
+INFO|2026-09-09 21:25:41|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-09-09 21:25:41|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_resume_9xttlyli\sample.pdf, dpi=100, model=HY, workers=None
+INFO|2026-09-09 21:25:41|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-09-09 21:25:41|starting server: model=HY, workers=4
+INFO|2026-09-09 21:25:41|server ready: model=HY, elapsed=0.0s
+INFO|2026-09-09 21:25:41|ocr done: total_pages=3, todo=1, excluded=0, errors=0, elapsed=0.0s
+INFO|2026-09-09 21:25:41|structure done: elapsed=0.0s
+INFO|2026-09-09 21:25:41|history done: elapsed=0.0s
+INFO|2026-09-09 21:25:41|render done: elapsed=0.0s
+INFO|2026-09-09 21:25:41|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_resume_9xttlyli\out.epub, total_elapsed=0.0s
+INFO|2026-09-09 21:25:41|=== ptoe start: ['python.exe -m unittest', 'test_guimanage', 'test_paddleocrmanage', 'test_mian', 'test_llamamanage'] ===
+INFO|2026-09-09 21:25:41|=== ptoe start: ['python.exe -m unittest', 'test_guimanage', 'test_paddleocrmanage', 'test_mian', 'test_llamamanage'] ===
+INFO|2026-09-09 21:25:41|=== ptoe start: ['python.exe -m unittest', 'test_guimanage', 'test_paddleocrmanage', 'test_mian', 'test_llamamanage'] ===
+INFO|2026-09-09 21:25:41|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_fdely7fc\sample.pdf, dpi=100, model=HY, workers=None
+INFO|2026-09-09 21:25:41|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-09-09 21:25:41|starting server: model=HY, workers=4
+INFO|2026-09-09 21:25:41|server ready: model=HY, elapsed=0.0s
+INFO|2026-09-09 21:25:41|ocr done: total_pages=3, todo=3, excluded=0, errors=0, elapsed=0.0s
+INFO|2026-09-09 21:25:41|structure done: elapsed=0.0s
+INFO|2026-09-09 21:25:41|history done: elapsed=0.0s
+INFO|2026-09-09 21:25:41|render done: elapsed=0.0s
+INFO|2026-09-09 21:25:41|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_fdely7fc\out.epub, total_elapsed=0.0s
+INFO|2026-09-09 21:25:41|=== ptoe start: ['python.exe -m unittest', 'test_guimanage', 'test_paddleocrmanage', 'test_mian', 'test_llamamanage'] ===
+INFO|2026-09-09 21:25:41|=== ptoe start: ['python.exe -m unittest', 'test_guimanage', 'test_paddleocrmanage', 'test_mian', 'test_llamamanage'] ===
+INFO|2026-09-09 21:25:56|=== ptoe start: ['python.exe -m unittest', 'test_mian'] ===
+INFO|2026-09-09 21:25:56|=== ptoe start: ['python.exe -m unittest', 'test_mian'] ===
+INFO|2026-09-09 21:25:56|=== ptoe start: ['python.exe -m unittest', 'test_mian'] ===
+INFO|2026-09-09 21:25:56|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_sbio03cw\sample.pdf, dpi=100, model=HY, workers=None
+INFO|2026-09-09 21:25:56|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-09-09 21:25:56|starting server: model=HY, workers=4
+INFO|2026-09-09 21:25:56|server ready: model=HY, elapsed=0.0s
+INFO|2026-09-09 21:25:56|ocr done: total_pages=3, todo=3, excluded=0, errors=0, elapsed=0.0s
+INFO|2026-09-09 21:25:56|structure done: elapsed=0.0s
+INFO|2026-09-09 21:25:56|history done: elapsed=0.0s
+INFO|2026-09-09 21:25:56|render done: elapsed=0.0s
+INFO|2026-09-09 21:25:56|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_sbio03cw\out.epub, total_elapsed=0.1s
+INFO|2026-09-09 21:25:56|=== ptoe start: ['python.exe -m unittest', 'test_mian'] ===
+INFO|2026-09-09 21:25:56|=== ptoe start: ['python.exe -m unittest', 'test_mian'] ===
+INFO|2026-09-09 21:27:09|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-09-09 21:28:07|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'epub', 'E:/MYBooks/books/毛泽东思想/主席与毛远新同志谈话纪要.pdf', '--dpi', '2', '--model', 'DOTS8', '--engine', 'paddle', '--workers', '4', '--timeout', '600', '--lang', 'zh-CN'] ===
+INFO|2026-09-09 21:28:07|pdf_to_epub start: pdf=E:\MYBooks\books\毛泽东思想\主席与毛远新同志谈话纪要.pdf, dpi=200, model=DOTS8, workers=4
+INFO|2026-09-09 21:28:07|split done: pages=12, dir=D:\code-project\python\PToEA\data\主席与毛远新同志谈话纪要_1, elapsed=0.7s
+INFO|2026-09-09 21:36:19|=== ptoe start: ['python.exe -m unittest', 'test_paddleocrmanage', 'test_guimanage'] ===
+INFO|2026-09-09 21:36:19|=== ptoe start: ['python.exe -m unittest', 'test_paddleocrmanage', 'test_guimanage'] ===
+INFO|2026-09-09 21:44:00|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-09-09 21:44:27|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'epub', 'E:/MYBooks/books/毛泽东思想/主席与毛远新同志谈话纪要.pdf', '--dpi', '2', '--model', 'DOTS8', '--engine', 'paddle', '--workers', '4', '--timeout', '600', '--lang', 'zh-CN'] ===
+INFO|2026-09-09 21:44:27|pdf_to_epub start: pdf=E:\MYBooks\books\毛泽东思想\主席与毛远新同志谈话纪要.pdf, dpi=200, model=DOTS8, workers=4
+INFO|2026-09-09 21:44:27|split done: pages=12, dir=D:\code-project\python\PToEA\data\主席与毛远新同志谈话纪要_1, elapsed=0.0s
+INFO|2026-09-09 21:45:31|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'epub', 'E:/MYBooks/books/毛泽东思想/主席与毛远新同志谈话纪要.pdf', '--dpi', '2', '--model', 'DOTS8', '--engine', 'paddle', '--workers', '4', '--timeout', '600', '--lang', 'zh-CN'] ===
+INFO|2026-09-09 21:45:31|pdf_to_epub start: pdf=E:\MYBooks\books\毛泽东思想\主席与毛远新同志谈话纪要.pdf, dpi=200, model=DOTS8, workers=4
+INFO|2026-09-09 21:45:31|split done: pages=12, dir=D:\code-project\python\PToEA\data\主席与毛远新同志谈话纪要_1, elapsed=0.0s
+INFO|2026-09-09 22:20:22|=== ptoe start: ['mian.py', 'epub', 'C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\opencode\\paddle_smoke.pdf', '--engine', 'paddle', '--workers', '1', '--title', 'Paddle冒烟测试'] ===
+INFO|2026-09-09 22:20:23|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\opencode\paddle_smoke.pdf, dpi=100, model=DOTS8, workers=1
+INFO|2026-09-09 22:20:23|split done: pages=3, dir=D:\code-project\python\PToEA\data\paddle_smoke, elapsed=0.2s
+INFO|2026-09-09 22:21:26|ocr done: total_pages=3, todo=3, excluded=0, errors=0, elapsed=63.7s
+INFO|2026-09-09 22:21:26|structure done: elapsed=0.0s
+INFO|2026-09-09 22:21:26|history done: elapsed=0.0s
+INFO|2026-09-09 22:21:26|render done: elapsed=0.0s
+INFO|2026-09-09 22:21:26|pdf_to_epub success: epub=D:\code-project\python\PToEA\data\paddle_smoke\Paddle冒烟测试.epub, total_elapsed=64.0s
+INFO|2026-09-09 22:26:04|=== ptoe start: ['mian.py', 'epub', 'C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\opencode\\paddle_smoke.pdf', '--engine', 'paddle', '--workers', '1', '--title', 'Paddle冒烟测试'] ===
+INFO|2026-09-09 22:26:04|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\opencode\paddle_smoke.pdf, dpi=100, model=DOTS8, workers=1
+INFO|2026-09-09 22:26:04|split done: pages=3, dir=D:\code-project\python\PToEA\data\paddle_smoke, elapsed=0.0s
+INFO|2026-09-09 22:26:10|ocr done: total_pages=3, todo=3, excluded=0, errors=0, elapsed=6.4s
+INFO|2026-09-09 22:26:10|structure done: elapsed=0.0s
+INFO|2026-09-09 22:26:10|history done: elapsed=0.0s
+INFO|2026-09-09 22:26:11|render done: elapsed=0.0s
+INFO|2026-09-09 22:26:11|pdf_to_epub success: epub=D:\code-project\python\PToEA\data\paddle_smoke\Paddle冒烟测试.epub, total_elapsed=6.6s
+INFO|2026-09-09 22:28:41|=== ptoe start: ['python.exe -m unittest', 'test_guimanage'] ===
+INFO|2026-09-09 22:28:41|=== ptoe start: ['python.exe -m unittest', 'test_guimanage'] ===
+INFO|2026-09-10 06:51:30|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-09-10 06:51:57|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'epub', 'E:/MYBooks/books/毛泽东思想/主席与毛远新同志谈话纪要.pdf', '--dpi', '2', '--model', 'DOTS8', '--engine', 'paddle', '--workers', '4', '--timeout', '600', '--lang', 'zh-CN'] ===
+INFO|2026-09-10 06:51:57|pdf_to_epub start: pdf=E:\MYBooks\books\毛泽东思想\主席与毛远新同志谈话纪要.pdf, dpi=200, model=DOTS8, workers=4
+INFO|2026-09-10 06:51:57|split done: pages=12, dir=D:\code-project\python\PToEA\data\主席与毛远新同志谈话纪要_1, elapsed=0.0s
+INFO|2026-09-10 06:52:29|ocr done: total_pages=12, todo=12, excluded=0, errors=0, elapsed=29.8s
+INFO|2026-09-10 06:52:29|structure done: elapsed=0.0s
+INFO|2026-09-10 06:52:29|history done: elapsed=0.1s
+INFO|2026-09-10 06:52:29|render done: elapsed=0.1s
+INFO|2026-09-10 06:52:29|pdf_to_epub success: epub=D:\code-project\python\PToEA\data\主席与毛远新同志谈话纪要_1\主席与毛远新同志谈话纪要.epub, total_elapsed=32.0s
+INFO|2026-09-10 06:52:41|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', 'E:/MYBooks/books/毛泽东思想/主席与毛远新同志谈话纪要.pdf', '--engine', 'llama', '--lang', 'zh-CN'] ===
+INFO|2026-09-10 07:48:26|=== ptoe start: ['mian.py', '--version'] ===
+INFO|2026-09-10 07:49:32|=== ptoe start: ['mian.py', '--version'] ===
+INFO|2026-09-10 08:07:48|=== ptoe start: ['mian.py', 'epub', 'C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\opencode\\ptoe_paddle_smoke.pdf', '--engine', 'paddle', '--dpi', '2', '--workers', '1', '--model', 'DOTS8', '--out-dir', 'C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\opencode\\ptoe_dev_paddle_out', '--title', 'Smoke'] ===
+INFO|2026-09-10 08:07:48|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\opencode\ptoe_paddle_smoke.pdf, dpi=200, model=DOTS8, workers=1
+INFO|2026-09-10 08:07:48|split done: pages=2, dir=D:\code-project\python\PToEA\data\ptoe_paddle_smoke, elapsed=0.2s
+INFO|2026-09-10 08:07:55|ocr done: total_pages=2, todo=2, excluded=0, errors=0, elapsed=7.0s
+INFO|2026-09-10 08:07:55|structure done: elapsed=0.0s
+INFO|2026-09-10 08:07:55|history done: elapsed=0.0s
+INFO|2026-09-10 08:07:55|render done: elapsed=0.0s
+INFO|2026-09-10 08:07:55|pdf_to_epub success: epub=C:\Users\ADMINI~1\AppData\Local\Temp\opencode\ptoe_dev_paddle_out\Smoke.epub, total_elapsed=7.4s
+INFO|2026-09-10 08:09:40|=== ptoe start: ['mian.py', 'epub', 'C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\opencode\\ptoe_smoke_v3.pdf', '--engine', 'paddle', '--dpi', '2', '--workers', '1', '--model', 'DOTS8', '--out-dir', 'C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\opencode\\ptoe_dev_paddle_out3', '--title', 'Smoke'] ===
+INFO|2026-09-10 08:09:40|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\opencode\ptoe_smoke_v3.pdf, dpi=200, model=DOTS8, workers=1
+INFO|2026-09-10 08:09:40|split done: pages=2, dir=D:\code-project\python\PToEA\data\ptoe_smoke_v3, elapsed=0.2s
+INFO|2026-09-10 08:09:46|ocr done: total_pages=2, todo=2, excluded=0, errors=0, elapsed=6.3s
+INFO|2026-09-10 08:09:46|structure done: elapsed=0.0s
+INFO|2026-09-10 08:09:46|history done: elapsed=0.0s
+INFO|2026-09-10 08:09:46|render done: elapsed=0.0s
+INFO|2026-09-10 08:09:46|pdf_to_epub success: epub=C:\Users\ADMINI~1\AppData\Local\Temp\opencode\ptoe_dev_paddle_out3\Smoke.epub, total_elapsed=6.6s

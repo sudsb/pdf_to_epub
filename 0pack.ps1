@@ -19,8 +19,28 @@ Set-Location -LiteralPath $PSScriptRoot
 
 Write-Host "==> 构建 dist\ptoe\ptoe.exe（PyInstaller onedir / console）..." -ForegroundColor Cyan
 
+# 2026-09 防锁：运行中的 ptoe.exe（含 GUI/correction 实例）会占用自身镜像与
+# _internal\ 下 DLL → PyInstaller 清理旧 dist 目录时因句柄被占而失败
+# （WinError 32 "另一个程序正在使用此文件"）。构建前先结束残留实例。
+$ptoeProc = Get-Process -Name "ptoe" -ErrorAction SilentlyContinue
+if ($ptoeProc) {
+    Write-Host "==> 检测到 ptoe 进程仍在运行，先结束后再打包..." -ForegroundColor Yellow
+    $ptoeProc | Stop-Process -Force
+    Start-Sleep -Seconds 2
+}
+
 # 2026-08 词典数据（形近/同音/通用词表）随 --add-data "dicts;dicts" 打包
 # 2026-08 矫正界面脚本 ui/app.js 随 --add-data "ui;ui" 打包（缺失则矫正页 404）
+# 2026-09 PaddleOCR 引擎（--engine paddle）：
+#   - --collect-all paddlex：paddlex/configs/pipelines/OCR.yaml 等 350 个管道/模型
+#     配置文件缺失 → "The pipeline (OCR) does not exist!"（PyInstaller 默认只收 .py）
+#   - --collect-all paddle：libpaddle.pyd 运行时动态 LoadLibrary 的 libs/*.dll
+#     （phi.dll/mklml.dll 等）静态分析看不见，必须显式收集，否则 import paddle 失败
+#   - --collect-all paddleocr：当前无数据文件，保留以兼容未来版本
+#   - ocr-core 依赖（paddlex 的 deps.py 用 importlib.metadata 检查依赖是否安装，
+#     PyInstaller 默认不带 dist-info → 元数据缺失被误判为依赖不存在）：
+#     --copy-metadata 负责补元数据；--collect-all imagesize 补模块本体
+#     （pyclipper/pypdfium2/shapely/bidi 的模块已由 import 分析收进包，仅缺元数据）
 uv run --with pyinstaller pyinstaller --noconfirm --clean `
   --onedir --console `
   --noupx `
@@ -31,6 +51,16 @@ uv run --with pyinstaller pyinstaller --noconfirm --clean `
   --collect-all pymupdf `
   --collect-all cv2 `
   --collect-all zhconv `
+  --collect-all paddle `
+  --collect-all paddleocr `
+  --collect-all paddlex `
+  --collect-all nvidia `
+  --copy-metadata imagesize `
+  --copy-metadata pyclipper `
+  --copy-metadata pypdfium2 `
+  --copy-metadata python-bidi `
+  --copy-metadata shapely `
+  --collect-all imagesize `
   --collect-all webview `
   --collect-all pythonnet `
   --hidden-import webview.platforms.edgechromium `
