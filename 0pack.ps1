@@ -76,6 +76,57 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
+# ---------------------------------------------------------------
+# 2026-09-10 体积裁剪：移除推理用不到的冗余 CUDA 库与未用数据。
+#
+# 依据（均已实证）：
+#   - libpaddle.pyd 的 PE 导入链只依赖 cublas + cudnn（cublas64_12.dll、
+#     cudnn64_9.dll -> cudnn_adv/cnn/graph/ops），cufft/curand/cusolver/
+#     cusparse/nvjitlink 均不在导入链上，标准 CNN 推理（检测/识别）用不到；
+#   - paddle\__init__.py 的 Windows 分支用 os.path.exists 逐个检查
+#     _internal\nvidia\<pkg>\bin 是否存在，目录缺失时静默跳过、不报错；
+#   - 经裁剪后的 dist\ptoe\ptoe.exe 用 --engine paddle 实跑 3 页 OCR→EPUB
+#     全流程通过（GPU 正常初始化：device 0 / CC 8.6 / Runtime 12.6）。
+#   - cv2 的 opencv_videoio_ffmpeg*_64.dll 是视频 I/O 用（图像预处理用不到），
+#     data 下的 haarcascade/lbpcascade 是人脸检测级联（同样用不到）。
+# ---------------------------------------------------------------
+$internalDir = Join-Path $PSScriptRoot "dist\ptoe\_internal"
+$trimTargets = @(
+    @{ Path = "nvidia\cufft";     Desc = "CUFFT 快速傅里叶（推理不用）" },
+    @{ Path = "nvidia\curand";    Desc = "CURAND 随机数（训练用）" },
+    @{ Path = "nvidia\cusolver";  Desc = "CUSOLVER 线性求解（推理不用）" },
+    @{ Path = "nvidia\cusparse";  Desc = "CUSPARSE 稀疏矩阵（推理不用）" },
+    @{ Path = "nvidia\nvjitlink"; Desc = "NVJITLINK CUDA JIT（推理不用）" }
+)
+$trimMed = 0
+foreach ($t in $trimTargets) {
+    $full = Join-Path $internalDir $t.Path
+    if (Test-Path -LiteralPath $full) {
+        $sz = (Get-ChildItem -LiteralPath $full -Recurse -File | Measure-Object -Property Length -Sum).Sum
+        Remove-Item -LiteralPath $full -Recurse -Force
+        $trimMed += $sz
+        Write-Host ("  - 移除 {0}（{1:N1} MB，{2}）" -f $t.Path, ($sz/1MB), $t.Desc) -ForegroundColor DarkGray
+    }
+}
+foreach ($pkg in @('cufft','curand','cusolver','cusparse','nvjitlink')) {
+    Get-ChildItem -LiteralPath $internalDir -Directory -Filter "nvidia_${pkg}_*dist-info" -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force }
+}
+# cv2：视频 I/O 的 ffmpeg DLL 与人脸检测级联数据
+foreach ($f in @('opencv_videoio_ffmpeg4100_64.dll','opencv_videoio_ffmpeg500_64.dll')) {
+    $full = Join-Path $internalDir "cv2\$f"
+    if (Test-Path -LiteralPath $full) {
+        $trimMed += (Get-Item -LiteralPath $full).Length
+        Remove-Item -LiteralPath $full -Force
+    }
+}
+Get-ChildItem -LiteralPath (Join-Path $internalDir "cv2\data") -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like "haarcascade_*.xml" -or $_.Name -like "lbpcascade*" } |
+    ForEach-Object { $trimMed += $_.Length; Remove-Item -LiteralPath $_.FullName -Force }
+if ($trimMed -gt 0) {
+    Write-Host ("  == 体积裁剪完成：共释放 {0:N1} MB" -f ($trimMed/1MB)) -ForegroundColor Cyan
+}
+
 Write-Host ""
 Write-Host "完成：dist\ptoe\ptoe.exe（分发包为整个 dist\ptoe\ 目录）" -ForegroundColor Green
 Write-Host "  - 分发：把 dist\ptoe\ 整个目录（含 _internal\）复制/压缩给目标机器"
