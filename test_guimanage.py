@@ -179,6 +179,24 @@ class TestGuiEndpoints(GuiServerTestBase):
         self.assertEqual(data["port"], "8080")
         self.assertIn("busy", data)
 
+    def test_get_status_paddle_engine(self):
+        """GET /api/status engine=paddle → probe=local, port=--（mock _active_engine）。"""
+        import llamamanage
+
+        with mock.patch.object(
+            llamamanage, "_active_engine", return_value="paddle"
+        ), mock.patch.object(
+            llamamanage, "_probe_server"
+        ) as probe:
+            status, _, body = self._get("/api/status")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["engine"], "paddle")
+        self.assertEqual(data["probe"], "local")
+        self.assertEqual(data["port"], "--")
+        probe.assert_not_called()  # paddle 不走网络探测
+
     def test_post_config_invalid_engine_400(self):
         """POST /api/config 非法 engine → 400。"""
         status, body = self._post("/api/config", {"engine": "bad"})
@@ -186,6 +204,13 @@ class TestGuiEndpoints(GuiServerTestBase):
         data = json.loads(body)
         self.assertFalse(data["ok"])
         self.assertIn("engine", data["error"])
+
+    def test_post_config_paddle_engine_200(self):
+        """POST /api/config engine=paddle → 200 ok=True。"""
+        status, body = self._post("/api/config", {"engine": "paddle"})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
 
     def test_post_config_unknown_model_400(self):
         """POST /api/config selected_model 不在 model_choices → 400。"""
@@ -197,6 +222,16 @@ class TestGuiEndpoints(GuiServerTestBase):
         data = json.loads(body)
         self.assertFalse(data["ok"])
         self.assertIn("未知模型", data["error"])
+
+    def test_post_config_paddle_engine_persists(self):
+        """POST /api/config engine=paddle 写入后 GET /api/config 确认持久化。"""
+        status, body = self._post("/api/config", {"engine": "paddle"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        # GET 验证
+        _, _, body2 = self._get("/api/config")
+        data = json.loads(body2)
+        self.assertEqual(data["config"]["engine"], "paddle")
 
     def test_post_config_valid_write(self):
         """POST /api/config 合法写入 → 200 且临时文件内容变化（原子写）。"""
@@ -220,6 +255,30 @@ class TestGuiEndpoints(GuiServerTestBase):
         with open(self._cfg_path, 'r', encoding='utf-8') as f:
             on_disk = json.load(f)
         self.assertEqual(on_disk.get('selected_model'), 'ULQ4')
+
+    def test_start_correct_with_paddle_engine(self):
+        """POST /api/correct/start engine=paddle → 400（矫正不使用 PaddleOCR，仅 llama/vllm）。"""
+        # GuiServerTestBase setUp 不含 correct/convert 键，此处补全
+        self._state.setdefault("correct", {
+            "lock": threading.Lock(), "proc": None, "lines": [],
+            "running": False, "done": False, "success": False,
+            "exit_code": None, "error": None, "prompt": None,
+        })
+        self._state.setdefault("convert", {
+            "lock": threading.Lock(), "proc": None, "lines": [],
+            "running": False, "done": False, "success": False,
+            "exit_code": None, "error": None, "prompt": None,
+        })
+        fake = mock.Mock()
+        with mock.patch.object(guimanage.subprocess, "Popen", return_value=fake):
+            status, raw = self._post(
+                "/api/correct/start", {"engine": "paddle"}
+            )
+        self.assertEqual(status, 400)
+        data = json.loads(raw)
+        self.assertFalse(data["ok"])
+        self.assertIn("矫正仅支持 llama / vllm", data["error"])
+        fake.assert_not_called()
 
 
     def test_post_server_stop_ok(self):
@@ -979,6 +1038,20 @@ class TestGuiConvert(GuiServerTestBase):
                 self.assertFalse(data["ok"])
                 self.assertIn(expect, data["error"])
         popen.assert_not_called()
+
+    def test_start_convert_with_paddle_engine(self):
+        """POST /api/convert/start engine=paddle → 200（合法引擎，不被校验拒绝）。"""
+        fake = self._make_fake_proc(["Done: C:/tmp/out.epub"], rc=0)
+        with mock.patch.object(
+            guimanage.subprocess, "Popen", return_value=fake
+        ) as popen:
+            status, raw = self._post(
+                "/api/convert/start", self._start_body(engine="paddle")
+            )
+        self.assertEqual(status, 200)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"])
+        popen.assert_called_once()
 
     def test_start_success_flow(self):
         """合法启动 → 200；完成后 done/success/epub_path/lines 正确。"""

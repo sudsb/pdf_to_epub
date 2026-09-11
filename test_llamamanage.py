@@ -6,6 +6,7 @@
 - 单页失败不中断批次，结果按完成顺序返回。
 """
 
+import builtins
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -473,6 +474,16 @@ class TestPerfTuning(unittest.TestCase):
         args = self._run_server({"flash_attn": "0"}, detect_gpu=("CUDA", "NVIDIA"), flash_style="bare")
         self.assertNotIn("--flash-attn", args)
 
+    def test_runserver_flash_attn_disabled_by_int_zero(self):
+        # config flash_attn 为整数 0（configmanage.set_llama_server_arg 写入）→
+        # 也须禁用。旧代码 `str(sargs.get("flash_attn") or "")` 里 int 0 为假值
+        # → 回退 ""（auto）→ bare 构建误附加裸 --flash-attn，破坏禁用契约。
+        # 修复后先归一为字符串再判空，int 0 → "0" → 命中禁用语（2026-09-09）。
+        args = self._run_server(
+            {"flash_attn": 0}, detect_gpu=("CUDA", "NVIDIA"), flash_style="bare"
+        )
+        self.assertNotIn("--flash-attn", args)
+
     def test_runserver_flash_attn_forced_on_valued_build(self):
         # 值形式构建 + flash_attn=1 → 按正确语法强制传 --flash-attn on
         args = self._run_server({"flash_attn": "1"}, detect_gpu=("CUDA", "NVIDIA"), flash_style="valued")
@@ -482,6 +493,141 @@ class TestPerfTuning(unittest.TestCase):
         # 语法探测失败（未知构建）→ 保守不附加任何参数
         args = self._run_server({}, detect_gpu=("CUDA", "NVIDIA"), flash_style=None)
         self.assertNotIn("--flash-attn", args)
+
+
+class TestFlashAttnIntegerOff(unittest.TestCase):
+    """flash_attn 整数 0 必须禁用 Flash Attention（2026-09-09）。
+
+    configmanage.set_llama_server_arg('flash_attn', 0) 写入整数 0。
+    旧代码 `str(sargs.get("flash_attn") or "")`：int 0 为假值 → 回退 ""（auto），
+    禁用契约在 bare 构建上失效（误附加 --flash-attn）。修复后先归一为字符串。
+    """
+
+    def _run_capture(self, sargs):
+        """执行 runserver 并同时捕获 print 输出与启动 argv。"""
+        fake_proc = mock.Mock()
+        fake_proc.poll.return_value = None
+        fake_resp = mock.Mock(status_code=200)
+        cfg = {"llama_server_args": sargs}
+        orig_proc = llm._server_process
+        orig_max = llm.MAX_TOKENS
+        llm._server_process = None
+        printed = []
+        captured = {}
+        _orig_print = print
+
+        def _cap_print(*a, **kw):
+            printed.append(" ".join(str(x) for x in a))
+
+        try:
+            builtins.print = _cap_print
+            with mock.patch.object(llm, "_reload_config",
+                                   return_value=("exe", "mdir", {"HY": {"name": "HY.gguf"}}, "HY")), \
+                 mock.patch.object(llm, "get_config", return_value=cfg), \
+                 mock.patch.object(llm, "_probe_server", return_value="none"), \
+                 mock.patch.object(llm, "_detect_gpu", return_value=("CUDA", "NVIDIA")), \
+                 mock.patch.object(llm, "_server_flash_attn_style", return_value="bare"), \
+                 mock.patch.object(llm.os.path, "exists", return_value=True), \
+                 mock.patch.object(llm.subprocess, "Popen", return_value=fake_proc) as popen_mock, \
+                 mock.patch.object(llm._SESSION, "get", return_value=fake_resp):
+                llm.runserver("HY")
+            captured["args"] = popen_mock.call_args[0][0]
+        finally:
+            builtins.print = _orig_print
+            llm.MAX_TOKENS = orig_max
+            llm._server_process = orig_proc
+        captured["printed"] = printed
+        return captured
+
+    def test_int_zero_disables_flash_attn(self):
+        # 整数 0 → 修正后归一为 "0" → 禁用：不附加 --flash-attn
+        c = self._run_capture({"flash_attn": 0})
+        self.assertNotIn("--flash-attn", c["args"])
+        # 也不走 "enabled"/"auto" 打印路径（禁用时不打印 Flash Attention 消息）
+        self.assertFalse(
+            any("Flash Attention:" in p for p in c["printed"]),
+            "int 0 禁用后不应打印 Flash Attention enabled/auto 消息",
+        )
+
+    def test_string_zero_still_disables_flash_attn(self):
+        # 字符串 "0"（旧写法）行为不变：仍禁用
+        c = self._run_capture({"flash_attn": "0"})
+        self.assertNotIn("--flash-attn", c["args"])
+        self.assertFalse(
+            any("Flash Attention:" in p for p in c["printed"]),
+            "string '0' 禁用后不应打印 Flash Attention enabled/auto 消息",
+        )
+
+    def test_missing_flash_attn_uses_bare_auto(self):
+        # 缺省 → auto：bare 构建仍附加裸 --flash-attn（默认启用，行为不变）
+        c = self._run_capture({})
+        self.assertIn("--flash-attn", c["args"])
+        self.assertTrue(
+            any("Flash Attention: enabled" in p for p in c["printed"]),
+            "缺省时 bare 构建应打印 enabled",
+        )
+
+
+class TestParallelPerSlotWarning(unittest.TestCase):
+    """--parallel 平分 ctx_size → 每槽 n_ctx < 安全下限时输出警告（2026-09-09）。
+
+    实测 16384//4=4096 → 长页截断；16384//2=8192 → 完整。安全下限 =
+    _VISION_IMAGE_TOKEN_EST*2（8192）。仅警告，不修改配置。
+    """
+
+    def _run_capture(self, sargs, parallel=None):
+        """执行 runserver 并捕获 print 输出与启动 argv。"""
+        fake_proc = mock.Mock()
+        fake_proc.poll.return_value = None
+        fake_resp = mock.Mock(status_code=200)
+        cfg = {"llama_server_args": sargs}
+        orig_proc = llm._server_process
+        orig_max = llm.MAX_TOKENS
+        llm._server_process = None
+        printed = []
+        captured = {}
+        _orig_print = print
+
+        def _cap_print(*a, **kw):
+            printed.append(" ".join(str(x) for x in a))
+
+        try:
+            builtins.print = _cap_print
+            with mock.patch.object(llm, "_reload_config",
+                                   return_value=("exe", "mdir", {"HY": {"name": "HY.gguf"}}, "HY")), \
+                 mock.patch.object(llm, "get_config", return_value=cfg), \
+                 mock.patch.object(llm, "_probe_server", return_value="none"), \
+                 mock.patch.object(llm, "_detect_gpu", return_value=("", "")), \
+                 mock.patch.object(llm, "_server_supports_arg", return_value=True), \
+                 mock.patch.object(llm.os.path, "exists", return_value=True), \
+                 mock.patch.object(llm.subprocess, "Popen", return_value=fake_proc) as popen_mock, \
+                 mock.patch.object(llm._SESSION, "get", return_value=fake_resp):
+                llm.runserver("HY", parallel=parallel)
+            captured["args"] = popen_mock.call_args[0][0]
+        finally:
+            builtins.print = _orig_print
+            llm.MAX_TOKENS = orig_max
+            llm._server_process = orig_proc
+        captured["printed"] = printed
+        return captured
+
+    def test_parallel_4_ctx_16384_warns(self):
+        # 16384//4 = 4096 < 8192 → 每槽预算不足 → 警告
+        c = self._run_capture({"ctx_size": "16384", "parallel": "4"})
+        warns = [p for p in c["printed"] if "平分上下文" in p and "每槽仅约 4096" in p]
+        self.assertTrue(warns, "parallel=4 + ctx=16384 应输出每槽上下文警告")
+
+    def test_parallel_2_ctx_16384_no_warning(self):
+        # 16384//2 = 8192 >= 8192 → 每槽预算充足 → 不警告
+        c = self._run_capture({"ctx_size": "16384", "parallel": "2"})
+        warns = [p for p in c["printed"] if "平分上下文" in p]
+        self.assertFalse(warns, "parallel=2 + ctx=16384 不应警告")
+
+    def test_parallel_1_ctx_16384_no_warning(self):
+        # 16384//1 = 16384 >= 8192 → 不警告
+        c = self._run_capture({"ctx_size": "16384", "parallel": "1"})
+        warns = [p for p in c["printed"] if "平分上下文" in p]
+        self.assertFalse(warns, "parallel=1 + ctx=16384 不应警告")
 
 
 class TestFlashAttnStyle(unittest.TestCase):
@@ -665,8 +811,9 @@ class TestTruncationWarning(unittest.TestCase):
         self.assertIn("服务端上下文已满", w)
         self.assertIn("ctx_size=8192", w)
         self.assertIn("占 7700", w)
-        self.assertIn("生成可用空间仅约 492 token", w)  # 8192 - 7700
+        self.assertIn("生成预算 ≈ 492 token", w)  # 8192 - 7700
         self.assertIn("调大 ctx_size", w)
+        self.assertIn("调大 max_tokens 无效", w)
         self.assertNotIn("接近请求级上限", w)
         self.assertNotIn("请检查该页内容", w)  # 有 usage 就不走兜底段
 
@@ -677,7 +824,7 @@ class TestTruncationWarning(unittest.TestCase):
             ctx_hint="vllm_server_args.max_model_len",
         )
         self.assertIn("vllm_server_args.max_model_len=32768", w)
-        self.assertIn("生成可用空间仅约 1768 token", w)
+        self.assertIn("生成预算 ≈ 1768 token", w)
 
     def test_request_cap_branch(self):
         # 未触 n_ctx → 指向请求级 max_tokens
@@ -899,5 +1046,153 @@ class TestServerReuseRestart(unittest.TestCase):
         self.assertNotIn("接近请求级上限", w)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestStartupVisionBalanceWarning(unittest.TestCase):
+    """runserver 启动时视觉 OCR 生成余量提醒（2026-09-09）。
+
+    旧阈值 ctx_size < max_tokens + 1024 对视觉模型过窄（图片 token 实际 4600-8700），
+    改用 _VISION_IMAGE_TOKEN_EST=4096 估算后能正确触发警告。
+    """
+
+    def _runserver_with_sargs(self, sargs):
+        """mock runserver 返回捕获的 print 输出。"""
+        fake_proc = mock.Mock()
+        fake_proc.poll.return_value = None
+        fake_resp = mock.Mock(status_code=200)
+        cfg = {"llama_server_args": sargs}
+        orig_proc = llm._server_process
+        orig_max = llm.MAX_TOKENS
+        llm._server_process = None
+        printed = []
+        _orig_print = print
+        try:
+            # 劫持 print 以捕获警告
+            builtins.print = lambda *a, **kw: printed.append(" ".join(str(x) for x in a))
+            with mock.patch.object(llm, "_reload_config",
+                                   return_value=("exe", "mdir", {"HY": {"name": "HY.gguf"}}, "HY")), \
+                 mock.patch.object(llm, "get_config", return_value=cfg), \
+                 mock.patch.object(llm, "_probe_server", return_value="none"), \
+                 mock.patch.object(llm, "_detect_gpu", return_value=("", "")), \
+                 mock.patch.object(llm, "_server_supports_arg", return_value=True), \
+                 mock.patch.object(llm.os.path, "exists", return_value=True), \
+                 mock.patch.object(llm.subprocess, "Popen", return_value=fake_proc), \
+                 mock.patch.object(llm._SESSION, "get", return_value=fake_resp):
+                llm.runserver("HY")
+        finally:
+            builtins.print = _orig_print
+            llm.MAX_TOKENS = orig_max
+            llm._server_process = orig_proc
+        return printed
+
+    def test_warns_when_ctx_insufficient_for_image_tokens(self):
+        # ctx_size=12288, max_tokens=8192 → 旧阈值 8192+1024=9216 不触发（12288>9216）
+        # 新阈值 8192+4096=12288 → 12288<12288 不触发（边界）
+        # ctx_size=12287 → 新阈值触发（图片 token 会让生成预算不足）
+        printed = self._runserver_with_sargs({"max_tokens": "8192", "ctx_size": "12287"})
+        warns = [p for p in printed if "图片 token" in p]
+        self.assertTrue(warns, "ctx_size 不足时应输出图片 token 余量警告")
+
+    def test_no_warning_when_ctx_large_enough(self):
+        # ctx_size=16384, max_tokens=8192 → 16384 >= 8192+4096=12288 → 不警告
+        printed = self._runserver_with_sargs({"max_tokens": "8192", "ctx_size": "16384"})
+        warns = [p for p in printed if "图片 token" in p]
+        self.assertFalse(warns, "ctx_size 充足时不应输出图片 token 警告")
+
+    def test_old_threshold_would_miss_warning(self):
+        # ctx_size=9000, max_tokens=8192
+        # 旧阈值 8192+1024=9216 → 9000 < 9216 也会触发（恰好）
+        # 新阈值 8192+4096=12288 → 9000 < 12288 更宽触发
+        # 确认新阈值比旧阈值更宽：用旧阈值刚好不触发的值
+        # ctx_size=9217 > 9216（旧阈值不触发），但 9217 < 12288（新阈值触发）
+        printed = self._runserver_with_sargs({"max_tokens": "8192", "ctx_size": "9217"})
+        warns = [p for p in printed if "图片 token" in p]
+        self.assertTrue(warns, "新阈值应比旧阈值更宽地捕获图片 token 不足场景")
+
+
+class TestVisionImageTokenEst(unittest.TestCase):
+    """_VISION_IMAGE_TOKEN_EST 常量合理性（2026-09-09）。"""
+
+    def test_constant_value(self):
+        # 保守低端估算，实际视觉模型 4600-8700 token/页
+        self.assertGreaterEqual(llm._VISION_IMAGE_TOKEN_EST, 2048)
+        self.assertLessEqual(llm._VISION_IMAGE_TOKEN_EST, 16384)
+
+
+class TestStaleRestartBeforeInference(unittest.TestCase):
+    """Change D 验证：stale-server 重启在 runserver 内完成，在 batch_infer
+    发起页面请求之前（runserver 是 pipeline 的前置步骤）。
+
+    补充断言：重启后 _record_server_ctx 被再次调用以重新探测真实 n_ctx，
+    确保重启后的新进程上下文被正确记录。
+    """
+
+    def setUp(self):
+        self._saved_ctx = llm._SERVER_CTX
+        self._saved_proc = llm._server_process
+
+        def _restore():
+            llm._SERVER_CTX = self._saved_ctx
+            llm._server_process = self._saved_proc
+
+        self.addCleanup(_restore)
+        llm._SERVER_CTX = None
+        llm._server_process = None
+
+    def test_record_server_ctx_called_after_restart_for_reprobe(self):
+        """残留进程重启后，_record_server_ctx 应被再次调用以记录新进程的 n_ctx。"""
+        record_calls = []
+
+        def fake_record():
+            # 第一次调用（复用分支）：模拟残留 2048
+            if len(record_calls) == 0:
+                record_calls.append("first")
+                llm._SERVER_CTX = 2048
+                return 2048
+            # 第二次调用（新进程启动后）：模拟新进程 16384
+            record_calls.append("second")
+            llm._SERVER_CTX = 16384
+            return 16384
+
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(llm, "_active_engine", return_value="llama"))
+            stack.enter_context(mock.patch.object(
+                llm, "_reload_config",
+                return_value=("E:/x/t/llama-server.exe", "E:/model",
+                              {"M": {"name": "m.gguf", "mmproj": ""}}, "M")))
+            stack.enter_context(mock.patch("os.path.exists", return_value=True))
+            stack.enter_context(mock.patch.object(llm, "_server_supports_arg", return_value=True))
+            stack.enter_context(mock.patch.object(llm, "_detect_gpu", return_value=(None, None)))
+            stack.enter_context(mock.patch.object(
+                llm, "get_config", return_value={"llama_server_args": {"ctx_size": "16384"}}))
+            stack.enter_context(mock.patch.object(llm, "_probe_server", return_value="match"))
+            stack.enter_context(mock.patch.object(llm, "_record_server_ctx", side_effect=fake_record))
+            stack.enter_context(mock.patch.object(llm, "_handle_stale_instance", return_value=True))
+            fake_proc = mock.Mock()
+            fake_proc.poll.return_value = None
+            stack.enter_context(mock.patch.object(
+                llm, "subprocess", wraps=llm.subprocess))
+            llm.subprocess.Popen = mock.Mock(return_value=fake_proc)
+            health = mock.Mock(status_code=200)
+            stack.enter_context(mock.patch.object(llm._SESSION, "get", return_value=health))
+            ok = llm.runserver("M")
+
+        self.assertTrue(ok)
+        self.assertEqual(record_calls, ["first", "second"],
+                         "runserver 复用分支 + 新进程启动后各调一次 _record_server_ctx")
+
+
+class TestTruncationWarningBudgetMessage(unittest.TestCase):
+    """Change B 补充：context-bound 分支明确报告生成预算且提示 max_tokens 无效。"""
+
+    def test_budget_reported_in_message(self):
+        w = llm._truncation_warning(
+            "test", {"usage": {"prompt_tokens": 7500, "completion_tokens": 700}}, ctx=8192
+        )
+        self.assertIn("生成预算 ≈ 692 token", w)  # 8192 - 7500
+
+    def test_max_tokens_ineffective_stated(self):
+        w = llm._truncation_warning(
+            "test", {"usage": {"prompt_tokens": 7500, "completion_tokens": 800}}, ctx=8192
+        )
+        self.assertIn("调大 max_tokens 无效", w)
+        self.assertIn("调大 ctx_size", w)

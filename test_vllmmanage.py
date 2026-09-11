@@ -320,7 +320,7 @@ class TestTruncationWire(_EngineResetMixin, unittest.TestCase):
         w = printed[0]
         self.assertIn("vllm_server_args.max_model_len=32768", w)
         self.assertIn("服务端上下文已满", w)
-        self.assertIn("生成可用空间仅约 1768 token", w)
+        self.assertIn("生成预算 ≈ 1768 token", w)
 
     def test_max_model_len_reads_config(self):
         with mock.patch.object(vm, "get_config",

@@ -201,6 +201,7 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
         <div class="engine-switch" id="engineSwitch">
           <button class="active" data-eng="llama" onclick="setEngine('llama')">llama.cpp</button>
           <button data-eng="vllm" onclick="setEngine('vllm')">vLLM-Omni</button>
+          <button data-eng="paddle" onclick="setEngine('paddle')">PaddleOCR</button>
         </div>
         <div id="engineHint" style="font-size:12px;color:var(--text-dim);margin-bottom:10px;"></div>
       </div>
@@ -237,7 +238,7 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
       <div class="card">
         <div class="card-title"><span class="ct-icon">&#9733;</span> 模型与引擎</div>
         <div class="form-row"><span class="form-label">当前模型</span><div class="form-ctrl"><select id="cfgSelectedModel"></select></div></div>
-        <div class="form-row"><span class="form-label">推理引擎</span><div class="form-ctrl" style="display:flex;gap:16px;align-items:center;"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgEngine" value="llama" checked> llama.cpp</label><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgEngine" value="vllm"> vLLM-Omni</label></div></div>
+        <div class="form-row"><span class="form-label">推理引擎</span><div class="form-ctrl" style="display:flex;gap:16px;align-items:center;"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgEngine" value="llama" checked> llama.cpp</label><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgEngine" value="vllm"> vLLM-Omni</label><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgEngine" value="paddle"> PaddleOCR</label></div></div>
       </div>
       <div class="card">
         <div class="card-title"><span class="ct-icon">&#9998;</span> OCR 提示词</div>
@@ -356,7 +357,7 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
         <div class="convert-grid">
           <div class="form-row"><span class="form-label">DPI</span><div class="form-ctrl"><select id="cvtDpi"><option value="0" selected>0 = 100</option><option value="1">1 = 150</option><option value="2">2 = 200</option><option value="3">3 = 300</option><option value="4">4 = 600</option></select></div></div>
           <div class="form-row"><span class="form-label">模型</span><div class="form-ctrl"><select id="cvtModel" onchange="onCvtModelChange()"></select></div></div>
-          <div class="form-row"><span class="form-label">引擎</span><div class="form-ctrl"><select id="cvtEngine"><option value="">跟随配置</option><option value="llama">llama.cpp</option><option value="vllm">vLLM-Omni</option></select></div></div>
+          <div class="form-row"><span class="form-label">引擎</span><div class="form-ctrl"><select id="cvtEngine"><option value="">跟随配置</option><option value="llama">llama.cpp</option><option value="vllm">vLLM-Omni</option><option value="paddle">PaddleOCR</option></select></div></div>
           <div class="form-row"><span class="form-label">并发数</span><div class="form-ctrl"><input type="number" id="cvtWorkers" value="5" min="1" max="16"></div></div>
           <div class="form-row"><span class="form-label">超时（秒）</span><div class="form-ctrl"><input type="number" id="cvtTimeout" value="600" min="30" max="7200"></div></div>
           <div class="form-row"><span class="form-label">思考模式</span><div class="form-ctrl" style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="cvtThinking" style="width:16px;height:16px;accent-color:var(--accent)"><span class="form-hint" style="margin:0;">开启后显著变慢</span></div></div>
@@ -443,8 +444,8 @@ function escH(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/
 function switchPage(name){document.querySelectorAll(".nav-item").forEach(function(el){el.classList.toggle("active",el.dataset.page===name)});document.querySelectorAll(".page").forEach(function(el){el.classList.toggle("active",el.id==="page-"+name)});document.getElementById("sidebar").classList.remove("open")}
 function toggleSidebar(){document.getElementById("sidebar").classList.toggle("open")}
 function setEngine(eng){cfg.engine=eng;document.querySelectorAll(".engine-switch button").forEach(function(b){b.classList.toggle("active",b.dataset.eng===eng)});updateEngineHint()}
-function updateEngineHint(){var eng=cfg.engine||"llama",port=eng==="llama"?(cfg.llama_server_args||{}).port||"8080":(cfg.vllm_server_args||{}).port||"8000";document.getElementById("engineHint").textContent="当前引擎: "+eng+" | 默认端口: "+port}
-function renderStatus(s){var badgeEl=document.getElementById("stRunning"),navBadge=document.getElementById("navStatusBadge"),label,cls;if(s.probe==="match"){label="运行中";cls="badge-green";navBadge.textContent="运行中";navBadge.className="nav-badge running"}else if(s.probe==="mismatch"){label="模型不匹配";cls="badge-yellow";navBadge.textContent="异常";navBadge.className="nav-badge stopped"}else{label="未运行";cls=s.busy?"badge-yellow":"badge-gray";navBadge.textContent=s.busy?"启动中":"未运行";navBadge.className="nav-badge "+(s.busy?"running":"stopped")}badgeEl.innerHTML='<span class="badge '+cls+'">'+label+"</span>";if(s.busy&&s.probe==="none")badgeEl.innerHTML+=' <span style="font-size:11px;color:var(--yellow);margin-left:6px;">启动中...</span>';document.getElementById("stModel").textContent=s.model_name||s.model_key||"--";document.getElementById("stPort").textContent=s.port||"--";document.getElementById("stEngine").textContent=s.engine||cfg.engine||"llama";if(s.engine){document.querySelectorAll(".engine-switch button").forEach(function(b){b.classList.toggle("active",b.dataset.eng===s.engine)});cfg.engine=s.engine}updateEngineHint();document.getElementById("btnStart").disabled=s.probe==="match"||s.busy;document.getElementById("btnStop").disabled=s.probe==="none"&&!s.busy;if(s.last_error&&s.last_error!==_lastShownError){_lastShownError=s.last_error;addLog("服务错误: "+s.last_error,"log-err")}}
+function updateEngineHint(){var eng=cfg.engine||"llama",hint;if(eng==="paddle"){hint="当前引擎: paddle | 本地推理，无需启动服务"}else{var port=eng==="llama"?(cfg.llama_server_args||{}).port||"8080":(cfg.vllm_server_args||{}).port||"8000";hint="当前引擎: "+eng+" | 默认端口: "+port}document.getElementById("engineHint").textContent=hint}
+function renderStatus(s){var badgeEl=document.getElementById("stRunning"),navBadge=document.getElementById("navStatusBadge"),label,cls;if(s.probe==="match"){label="运行中";cls="badge-green";navBadge.textContent="运行中";navBadge.className="nav-badge running"}else if(s.probe==="mismatch"){label="模型不匹配";cls="badge-yellow";navBadge.textContent="异常";navBadge.className="nav-badge stopped"}else{label="未运行";cls=s.busy?"badge-yellow":"badge-gray";navBadge.textContent=s.busy?"启动中":"未运行";navBadge.className="nav-badge "+(s.busy?"running":"stopped")}badgeEl.innerHTML='<span class="badge '+cls+'">'+label+"</span>";if(s.busy&&s.probe==="none")badgeEl.innerHTML+=' <span style="font-size:11px;color:var(--yellow);margin-left:6px;">启动中...</span>';document.getElementById("stModel").textContent=s.model_name||s.model_key||"--";document.getElementById("stPort").textContent=s.port||"--";document.getElementById("stEngine").textContent=s.engine||cfg.engine||"llama";if(s.engine){document.querySelectorAll(".engine-switch button").forEach(function(b){b.classList.toggle("active",b.dataset.eng===s.engine)});cfg.engine=s.engine}updateEngineHint();document.getElementById("btnStart").disabled=s.probe==="match"||s.busy;document.getElementById("btnStop").disabled=s.probe==="none"&&!s.busy;if(s.engine==="paddle"){badgeEl.innerHTML='<span class="badge badge-green">本地推理</span>';document.getElementById("stPort").textContent="--";navBadge.textContent="本地推理";navBadge.className="nav-badge running";document.getElementById("btnStart").disabled=true;document.getElementById("btnStop").disabled=true}if(s.last_error&&s.last_error!==_lastShownError){_lastShownError=s.last_error;addLog("服务错误: "+s.last_error,"log-err")}}
 function renderAll(){renderBasic();renderModels();renderArgs("llamaArgs",cfg.llama_server_args);renderArgs("vllmArgs",cfg.vllm_server_args);renderProofread();renderShortcuts();renderRules();renderConvert();document.querySelectorAll(".engine-switch button").forEach(function(b){b.classList.toggle("active",b.dataset.eng===(cfg.engine||"llama"))});updateEngineHint()}
 function renderBasic(){document.getElementById("cfgLlamaServer").value=cfg.llama_server||"";document.getElementById("cfgModelsDir").value=cfg.models_dir||"";document.getElementById("cfgBrowser").value=cfg.browser||"";document.getElementById("cfgGuiDisplay").value=(cfg.gui_display||"pywebview");document.getElementById("cfgOcrPrompt").value=cfg.ocr_prompt||"";var sel=document.getElementById("cfgSelectedModel");sel.innerHTML="";models.forEach(function(m){var o=document.createElement("option");o.value=m.key;o.textContent=m.key+" - "+m.name;sel.appendChild(o)});sel.value=cfg.selected_model||"";document.querySelectorAll('input[name="cfgEngine"]').forEach(function(r){r.checked=r.value===(cfg.engine||"llama")});try{document.getElementById("cfgFontBody").value=(cfg.fonts&&cfg.fonts.body)||"";document.getElementById("cfgFontHeading").value=(cfg.fonts&&cfg.fonts.heading)||"";document.getElementById("cfgFontNote").value=(cfg.fonts&&cfg.fonts.note)||"";document.getElementById("cfgFontCitation").value=(cfg.fonts&&cfg.fonts.citation)||""}catch(e){}try{var ip=cfg.image_preprocess||{};document.getElementById("cfgImgPreEnabled").checked=!!ip.enabled;document.getElementById("cfgImgGray").checked=!!ip.gray;document.getElementById("cfgImgDenoise").checked=!!ip.denoise;document.getElementById("cfgImgSharpen").checked=!!ip.sharpen;document.getElementById("cfgImgBinarize").checked=!!ip.binarize;document.getElementById("cfgImgWorkers").value=(ip.workers!=null?ip.workers:"")}catch(e){}
 }
@@ -482,8 +483,8 @@ function collectExtraConfig(){
   }catch(e){/* element missing -> skip */}
 }
 function saveConfig(){collectConfig();collectExtraConfig();var btn=document.getElementById("saveBtn");btn.disabled=true;btn.classList.add("saving");addLog("保存配置中...","log-info");apiPost("/api/config",cfg).then(function(res){btn.disabled=false;btn.classList.remove("saving");if(res&&res.ok){var newModel=cfg.selected_model||"";toast("已切换模型："+newModel,"ok",5000);addLog("模型已切换: "+newModel,"log-ok");fetchStatus().then(function(s){if(s&&s.probe!=="none"){var hint="，当前服务仍在运行旧模型，重启后生效";toast("已切换模型："+newModel+hint,"ok",5500);addLog("服务仍运行旧模型，建议重启","log-warn")}else{toast("已切换模型："+newModel,"ok",5000);addLog("模型切换生效（无运行服务）","log-ok")}}).catch(function(){toast("已切换模型："+newModel,"ok",5000)})}else{var msg=res&&res.error?res.error:"未知错误";toast("保存失败: "+msg,"fail",5000);addLog("保存失败: "+msg,"log-err")}})}
-function serverStart(){var model=cfg.selected_model||"";document.getElementById("btnStart").disabled=true;document.getElementById("btnStart").textContent="启动中…";addLog("正在启动服务（模型: "+model+"）...","log-info");var startTime=Date.now();var pollInterval=setInterval(function(){apiGet("/api/status").then(function(res){if(!res||!res.ok)return;statusInfo=res;renderStatus(res);if(res.probe==="match"){clearInterval(pollInterval);var modelName=res.model_name||model;toast("模型已启动："+modelName,"ok",5000);addLog("服务已就绪: "+modelName,"log-ok");document.getElementById("btnStart").disabled=false;document.getElementById("btnStart").textContent="启动服务"}var now=Date.now();if(now-startTime>60000){clearInterval(pollInterval);toast("启动超时，请检查模型路径或端口配置","fail",5000);addLog("服务启动超时","log-err");document.getElementById("btnStart").disabled=false;document.getElementById("btnStart").textContent="启动服务"}},2000);setTimeout(function(){clearInterval(pollInterval);toast("启动超时，请检查模型路径或端口配置","fail",5000);addLog("服务启动超时","log-err");document.getElementById("btnStart").disabled=false;document.getElementById("btnStart").textContent="启动服务"},60000)});apiPost("/api/server/start",{model:model}).then(function(res){if(res&&res.ok){addLog("服务启动请求已发送","log-ok")}else{var msg=res&&res.error?res.error:"启动失败";toast(msg,"fail",5000);addLog("启动失败: "+msg,"log-err")}}).catch(function(e){toast("请求失败: "+e.message,"fail",5000);addLog("启动请求异常: "+e.message,"log-err");document.getElementById("btnStart").disabled=false;document.getElementById("btnStart").textContent="启动服务"})}
-function serverStop(){document.getElementById("btnStop").disabled=true;addLog("正在停止服务...","log-info");var stopStart=Date.now();apiPost("/api/server/stop").then(function(res){if(res&&res.ok){var pollStop=setInterval(function(){apiGet("/api/status").then(function(res){if(!res||!res.ok)return;statusInfo=res;renderStatus(res);if(res.probe==="none"||res.probe==="mismatch"){clearInterval(pollStop);toast("服务已停止","ok",5000);addLog("服务已停止","log-ok");document.getElementById("btnStop").disabled=false}else{if(Date.now()-stopStart>30000){clearInterval(pollStop);toast("停止超时，请重试","fail",5000);addLog("服务停止超时","log-err");document.getElementById("btnStop").disabled=false}}},2000);setTimeout(function(){clearInterval(pollStop);toast("停止超时，请重试","fail",5000);addLog("服务停止超时","log-err");document.getElementById("btnStop").disabled=false},30000)})}else{toast("停止失败","fail",5000);addLog("停止失败","log-err")}setTimeout(refreshStatus,1000)}).catch(function(e){toast("请求失败: "+e.message,"fail",5000);addLog("停止请求异常: "+e.message,"log-err");document.getElementById("btnStop").disabled=false})}
+function serverStart(){if(cfg.engine==="paddle"){toast("PaddleOCR 为本地推理引擎，无需启动服务","warn");return}var model=cfg.selected_model||"";document.getElementById("btnStart").disabled=true;document.getElementById("btnStart").textContent="启动中…";addLog("正在启动服务（模型: "+model+"）...","log-info");var startTime=Date.now();var pollInterval=setInterval(function(){apiGet("/api/status").then(function(res){if(!res||!res.ok)return;statusInfo=res;renderStatus(res);if(res.probe==="match"){clearInterval(pollInterval);var modelName=res.model_name||model;toast("模型已启动："+modelName,"ok",5000);addLog("服务已就绪: "+modelName,"log-ok");document.getElementById("btnStart").disabled=false;document.getElementById("btnStart").textContent="启动服务"}var now=Date.now();if(now-startTime>60000){clearInterval(pollInterval);toast("启动超时，请检查模型路径或端口配置","fail",5000);addLog("服务启动超时","log-err");document.getElementById("btnStart").disabled=false;document.getElementById("btnStart").textContent="启动服务"}},2000);setTimeout(function(){clearInterval(pollInterval);toast("启动超时，请检查模型路径或端口配置","fail",5000);addLog("服务启动超时","log-err");document.getElementById("btnStart").disabled=false;document.getElementById("btnStart").textContent="启动服务"},60000)});apiPost("/api/server/start",{model:model}).then(function(res){if(res&&res.ok){addLog("服务启动请求已发送","log-ok")}else{var msg=res&&res.error?res.error:"启动失败";toast(msg,"fail",5000);addLog("启动失败: "+msg,"log-err")}}).catch(function(e){toast("请求失败: "+e.message,"fail",5000);addLog("启动请求异常: "+e.message,"log-err");document.getElementById("btnStart").disabled=false;document.getElementById("btnStart").textContent="启动服务"})}
+function serverStop(){if(cfg.engine==="paddle"){toast("PaddleOCR 为本地推理引擎，无需停止服务","warn");return}document.getElementById("btnStop").disabled=true;addLog("正在停止服务...","log-info");var stopStart=Date.now();apiPost("/api/server/stop").then(function(res){if(res&&res.ok){var pollStop=setInterval(function(){apiGet("/api/status").then(function(res){if(!res||!res.ok)return;statusInfo=res;renderStatus(res);if(res.probe==="none"||res.probe==="mismatch"){clearInterval(pollStop);toast("服务已停止","ok",5000);addLog("服务已停止","log-ok");document.getElementById("btnStop").disabled=false}else{if(Date.now()-stopStart>30000){clearInterval(pollStop);toast("停止超时，请重试","fail",5000);addLog("服务停止超时","log-err");document.getElementById("btnStop").disabled=false}}},2000);setTimeout(function(){clearInterval(pollStop);toast("停止超时，请重试","fail",5000);addLog("服务停止超时","log-err");document.getElementById("btnStop").disabled=false},30000)})}else{toast("停止失败","fail",5000);addLog("停止失败","log-err")}setTimeout(refreshStatus,1000)}).catch(function(e){toast("请求失败: "+e.message,"fail",5000);addLog("停止请求异常: "+e.message,"log-err");document.getElementById("btnStop").disabled=false})}
 function refreshStatus(){addLog("刷新服务状态...","log-info");fetchStatus()}
 function pickFile(inputId){apiPost("/api/pick",{kind:"file",title:"选择文件"}).then(function(res){if(res&&res.ok&&!res.cancelled&&res.path){document.getElementById(inputId).value=res.path;toast("已选择文件","ok")}else if(res&&res.cancelled){toast("已取消选择","warn")}})}
 function pickDir(inputId){apiPost("/api/pick",{kind:"dir",title:"选择目录"}).then(function(res){if(res&&res.ok&&!res.cancelled&&res.path){document.getElementById(inputId).value=res.path;toast("已选择目录","ok")}else if(res&&res.cancelled){toast("已取消选择","warn")}})}
@@ -1105,18 +1106,22 @@ class _GuiHandler(BaseHTTPRequestHandler):
             model_key = cfg.get("selected_model") or ""
             info = (cfg.get("model_choices") or {}).get(model_key) or {}
             model_name = str(info.get("name") or model_key)
-            try:
-                probe = llamamanage._probe_server(model_name)
-            except Exception as e:  # noqa: BLE001  探测异常视为无服务
-                probe = "none"
-                if not self.server.state.get("last_error"):
-                    self.server.state["last_error"] = str(e)
-            if engine == "vllm":
-                args = cfg.get("vllm_server_args") or {}
-                port = str(args.get("port") or "8000")
+            if engine == "paddle":
+                probe = "local"
+                port = "--"
             else:
-                args = cfg.get("llama_server_args") or {}
-                port = str(args.get("port") or "8080")
+                try:
+                    probe = llamamanage._probe_server(model_name)
+                except Exception as e:  # noqa: BLE001  探测异常视为无服务
+                    probe = "none"
+                    if not self.server.state.get("last_error"):
+                        self.server.state["last_error"] = str(e)
+                if engine == "vllm":
+                    args = cfg.get("vllm_server_args") or {}
+                    port = str(args.get("port") or "8000")
+                else:
+                    args = cfg.get("llama_server_args") or {}
+                    port = str(args.get("port") or "8080")
             busy = self.server.state["serve_lock"].locked()
             self._send(
                 200,
@@ -1202,8 +1207,8 @@ class _GuiHandler(BaseHTTPRequestHandler):
             cfg = configmanage.get_config(show_dialogs=False)
             # 校验：engine / selected_model / llama_server / models_dir
             engine = body.get("engine", cfg.get("engine"))
-            if engine not in ("llama", "vllm"):
-                self._send(400, self._json({"ok": False, "error": "engine 仅支持 llama / vllm"}))
+            if engine not in ("llama", "vllm", "paddle"):
+                self._send(400, self._json({"ok": False, "error": "engine 仅支持 llama / vllm / paddle"}))
                 return
             choices = body.get("model_choices", cfg.get("model_choices") or {})
             sel = body.get("selected_model", cfg.get("selected_model"))
@@ -1367,8 +1372,8 @@ class _GuiHandler(BaseHTTPRequestHandler):
             self._send(400, self._json({"ok": False, "error": f"未知模型：{model}"}))
             return
         engine = body.get("engine") or ""
-        if engine not in ("", "llama", "vllm"):
-            self._send(400, self._json({"ok": False, "error": "engine 仅支持 llama / vllm"}))
+        if engine not in ("", "llama", "vllm", "paddle"):
+            self._send(400, self._json({"ok": False, "error": "engine 仅支持 llama / vllm / paddle"}))
             return
         workers = body.get("workers")
         if workers is not None and (type(workers) is not int or workers < 1):
@@ -1582,7 +1587,7 @@ class _GuiHandler(BaseHTTPRequestHandler):
             return
         engine = body.get("engine") or ""
         if engine not in ("", "llama", "vllm"):
-            self._send(400, self._json({"ok": False, "error": "engine 仅支持 llama / vllm"}))
+            self._send(400, self._json({"ok": False, "error": "矫正仅支持 llama / vllm（PaddleOCR 仅用于转换的图片识别阶段）"}))
             return
         for key in ("title", "author", "out_dir", "epub_path"):
             val = body.get(key)

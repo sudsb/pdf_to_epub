@@ -2980,6 +2980,7 @@ let _ctxEscCapture = null; // 菜单打开期间的临时 Esc 捕获监听（cap
 // 使 fn 同步段内可读右键目标，工具栏直调（不经 ctxRun）不受影响。
 let _ctxEditable = null; // 被右键的 .editable（右键目标页）
 let _ctxRange = null;    // 右键位置 caretRangeFromPoint 的 range（标记插入精确定位，jsdom 无则 null）
+let _ctxClipText = '';    // 右键打开时保存的选区文本（复制/粘贴 fallback）
 
 function closeContextMenu() {
   ctxMenuOpen = false;
@@ -2989,6 +2990,7 @@ function closeContextMenu() {
   if (_ctxEscCapture) { document.removeEventListener('keydown', _ctxEscCapture, true); _ctxEscCapture = null; }
   _ctxEditable = null; // 防陈旧右键目标泄漏到后续工具栏操作
   _ctxRange = null;
+  _ctxClipText = '';
 }
 
 function toggleCtxSub(parent) {
@@ -3029,6 +3031,12 @@ function openContextMenu(x, y) {
   closeProofreadMenu();
   refreshCtxRulesSub(); // 每次打开刷新「添加规则」二级菜单（异步填充规则名列表）
   suppressPopupUntil = performance.now() + 300; // 右键后的 mouseup 不弹选中菜单
+  // 保存选区文本：点击菜单项可能丢失选区，复制操作用此 fallback
+  _ctxClipText = '';
+  try {
+    const _sel = window.getSelection();
+    if (_sel && _sel.rangeCount > 0 && !_sel.isCollapsed) _ctxClipText = _sel.toString();
+  } catch (e) {}
   ctxMenu.hidden = false;
   // Ensure any inline display:none left from earlier defensive code is cleared so
   // offsetWidth/offsetHeight reflect real CSS. (Defensive: harmless if already blank.)
@@ -3101,17 +3109,25 @@ function ctxExportRun(fmt) { ctxRun(() => exportFile(fmt)); }
 // 改为 closeContextMenu 前预捕获目标页/行号/光标位置。
 function ctxCopyFormat() {
   const sel = window.getSelection();
-  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { showToast('请先选中要复制的文字', 'warn'); return; }
-  try {
-    if (!document.execCommand('copy')) throw new Error('copy failed');
-    showToast('已复制格式', 'ok');
-  } catch (e) { showToast('复制失败', 'fail'); }
+  const hasLiveSel = sel && sel.rangeCount > 0 && !sel.isCollapsed;
+  const clipText = (hasLiveSel ? sel.toString() : '') || _ctxClipText;
+  if (!clipText) { showToast('请先选中要复制的文字', 'warn'); return; }
+  // 尝试 execCommand 复制富文本格式
+  if (hasLiveSel) {
+    try {
+      if (document.execCommand('copy')) { showToast('已复制格式', 'ok'); return; }
+    } catch (e) {}
+  }
+  // fallback：写入纯文本（writeText 需用户激活 + 安全上下文，在 localhost 下可靠）
+  navigator.clipboard.writeText(clipText).then(() => {
+    showToast('已复制纯文本', 'ok');
+  }).catch(() => { showToast('复制失败', 'fail'); });
 }
 function ctxCopyText() {
   const sel = window.getSelection();
-  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { showToast('请先选中要复制的文字', 'warn'); return; }
-  const text = sel.toString();
-  if (!text) { showToast('选区内容为空', 'warn'); return; }
+  const hasLiveSel = sel && sel.rangeCount > 0 && !sel.isCollapsed;
+  const text = (hasLiveSel ? sel.toString() : '') || _ctxClipText;
+  if (!text) { showToast('请先选中要复制的文字', 'warn'); return; }
   navigator.clipboard.writeText(text).then(() => {
     showToast('已复制纯文本', 'ok');
   }).catch(() => { showToast('复制失败', 'fail'); });
@@ -3126,6 +3142,11 @@ function _ctxPastePosition(ed, range) {
     sel.addRange(range);
   }
   return true;
+}
+// 剪贴板读取 fallback：navigator.clipboard.readText() 需 clipboard-read 权限（浏览器不自动授予），
+// 隐藏 textarea + execCommand('paste') 在现代浏览器同样不可靠，兜底返回 null 让调用方提示 Ctrl+V。
+function _ctxReadClipboard() {
+  return navigator.clipboard.readText().catch(() => null);
 }
 function _ctxPasteHtml(html, ed, ri, range) {
   if (!_ctxPastePosition(ed, range)) { showToast('请先点击某一页的文字', 'warn'); return; }
@@ -3147,6 +3168,7 @@ function _ctxPasteTextInsert(text, ed, ri, range) {
 }
 async function ctxPasteFormat(ed, ri, range) {
   if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
+  // 优先用 read() 读 HTML（需 clipboard-read 权限）
   try {
     const items = await navigator.clipboard.read();
     for (const item of items) {
@@ -3156,19 +3178,17 @@ async function ctxPasteFormat(ed, ri, range) {
         if (html) { _ctxPasteHtml(html, ed, ri, range); showToast('已粘贴格式', 'ok'); return; }
       }
     }
-    // 无 HTML → 回退纯文本
-    const text = await navigator.clipboard.readText();
-    if (text) { _ctxPasteTextInsert(text, ed, ri, range); showToast('已粘贴纯文本', 'ok'); }
-    else showToast('剪贴板为空', 'warn');
-  } catch (e) { showToast('粘贴失败：无法读取剪贴板', 'fail'); }
+  } catch (e) {}
+  // read() 失败或无 HTML → 尝试 readText
+  const text = await _ctxReadClipboard();
+  if (text) { _ctxPasteTextInsert(text, ed, ri, range); showToast('已粘贴纯文本', 'ok'); }
+  else showToast('粘贴失败：请使用 Ctrl+V 粘贴', 'warn');
 }
 async function ctxPasteText(ed, ri, range) {
   if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
-  try {
-    const text = await navigator.clipboard.readText();
-    if (text) { _ctxPasteTextInsert(text, ed, ri, range); showToast('已粘贴纯文本', 'ok'); }
-    else showToast('剪贴板为空', 'warn');
-  } catch (e) { showToast('粘贴失败：无法读取剪贴板', 'fail'); }
+  const text = await _ctxReadClipboard();
+  if (text) { _ctxPasteTextInsert(text, ed, ri, range); showToast('已粘贴纯文本', 'ok'); }
+  else showToast('粘贴失败：请使用 Ctrl+V 粘贴', 'warn');
 }
 // 右键菜单「添加规则」二级菜单：列出已保存格式规则，点击即应用到右键目标页。
 // 每次打开菜单时刷新（fetch /api/format_rules，fire-and-forget）；子菜单 hover

@@ -26,6 +26,18 @@ class _FakeRes:
         self.res = {"rec_texts": texts}
 
 
+class _FakeDictPredictor:
+    """模拟真实 PaddleOCR 3.x：predict() 返回顶层 dict 列表（rec_texts 为顶层键）。"""
+
+    def __init__(self, texts=None):
+        self.calls = []
+        self.texts = texts or ["顶层甲", "顶层乙"]
+
+    def predict(self, path):
+        self.calls.append(path)
+        return [{"rec_texts": self.texts}]
+
+
 class _FakePredictor:
     """记录 predict 调用并返回固定文本。"""
 
@@ -95,6 +107,22 @@ class TestBatchInferContract(unittest.TestCase):
         # on_progress 逐页推进到 total
         self.assertEqual(progress, [(1, 2), (2, 2)])
         # 预测器按输入顺序被调用（顺序推理；结果才按页码排序）
+        self.assertEqual(pred.calls, self.imgs)
+
+    def test_top_level_dict_result_shape(self):
+        """PaddleOCR 3.x predict() 返回顶层 dict（rec_texts 为顶层键）。
+
+        2026-09 曾只兼容 .res 包装形状，导致真实引擎 result 恒空、
+        EPUB 无正文（旧测试用 _FakeRes 掩盖了该 bug）。
+        """
+        pred = _FakeDictPredictor()
+        paddleocrmanage.available = lambda: True
+        paddleocrmanage._predictor_factory = lambda: pred
+        res = paddleocrmanage.batch_infer(self.imgs)
+        self.assertEqual(len(res), 2)
+        for r in res:
+            self.assertIsNone(r["error"])
+            self.assertEqual(r["result"], "顶层甲\n顶层乙")
         self.assertEqual(pred.calls, self.imgs)
 
     def test_missing_file_error_entry(self):

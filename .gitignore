@@ -6,6 +6,8 @@ __pycache__/
 build/
 dist/
 *.spec
+# PaddlePaddle/PaddleX 模型缓存（程序路径下，首次运行自动生成）
+models/
 data/《毛泽东思想万岁》武汉钢二司编 第五卷/毛泽东思想万岁（1961—1968）.epub
 data/《毛泽东思想万岁》武汉钢二司编 第四卷/毛泽东思想万岁（1958—1960）.epub
 __pycache__/htmlmanage.cpython-311.pyc

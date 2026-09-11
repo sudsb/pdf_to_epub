@@ -70,7 +70,7 @@ hr { border: none; border-top: 1px solid #e1e4e8; margin: 24px 0; }
 <li>本地推理（支持 llama-server / vLLM-Omni；可临时使用本地 PaddleOCR 作为 OCR 引擎）</li>
 <li>可选人工校对界面：按页对照原图并可标注标题/粗体/斜体/注释/段落/全文分篇</li>
 <li>中途断点续传（.ocr_progress.json）与历史版本缓存（data/correction_history/）</li>
-<li>Windows 打包支持（PyInstaller onefile 可生成 dist/ptoe.exe）</li>
+<li>Windows 打包支持（PyInstaller onedir，默认生成 dist\ptoe\ 目录；可选 -OneFile 单文件）</li>
 <li>配置原子写入（tempfile + os.replace 与全局锁）避免损坏</li>
 </p>
 </ul>
@@ -213,16 +213,18 @@ hr { border: none; border-top: 1px solid #e1e4e8; margin: 24px 0; }
 </ul>
 <p>打包为独立 exe（Windows）
 </p>
-<p>仓库提供打包脚本（root）：0pack.ps1（历史名 pack.ps1）。
+<p>仓库提供打包脚本（root）：0pack.ps1。
 </p>
-<p>powershell -ExecutionPolicy Bypass -File .\0pack.ps1
+<p>powershell -ExecutionPolicy Bypass -File .\0pack.ps1 &nbsp;&nbsp;# 默认 onedir，约 2.5 GB（含 GPU PaddleOCR）<br>
+powershell -ExecutionPolicy Bypass -File .\0pack.ps1 -NoPaddle &nbsp;&nbsp;# 不打包 PaddleOCR 引擎，约 250 MB<br>
+powershell -ExecutionPolicy Bypass -File .\0pack.ps1 -OneFile &nbsp;&nbsp;# 单文件 exe（可选，默认不用）
 </p>
 <p>要点：
 <ul>
-<li>使用 PyInstaller onefile + console（生成 dist\ptoe.exe）</li>
-<li>脚本通常会 --collect-all 对常用包（pymupdf、zhconv、pywebview 等）和 --add-data assets</li>
-<li>保证打包时将 dicts/、ui/、pyproject.toml 等必要数据文件加入</li>
+<li>默认 PyInstaller onedir + console（生成 dist\ptoe\ptoe.exe 分发包，含 _internal\）；单文件需显式 -OneFile</li>
+<li>打包定义集中在 ptoe.spec（脚本只设置开关并调用它）：--collect-all 常用包（pymupdf、zhconv、pywebview 等）+ --add-data dicts/ui/pyproject.toml</li>
 <li>建议使用 --noupx 以降低杀软误报</li>
+<li>体积（2026-09 优化）：约 2.5 GB，比旧脚本产物（约 4.6 GB）小 45%；裁剪在复制前完成，逐项实测依据见 ptoe.spec 头部注释</li>
 </p>
 </ul>
 <p>双击 exe 会显示终端菜单（交互模式），支持直接命令行用法：`ptoe.exe epub &lt;pdf&gt; ...`。
