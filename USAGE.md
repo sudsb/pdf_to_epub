@@ -405,11 +405,16 @@ result = pdf_to_epub("xxx.pdf", correct=True)
 **`0pack.ps1`**（项目根目录）用 PyInstaller 把 `mian.py` 打包成自包含目录（`dist\ptoe\`，onedir + console，无需 Python 环境）：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\pack.ps1  # 或 0pack.ps1
+powershell -ExecutionPolicy Bypass -File .\0pack.ps1                  # 默认 onedir，约 2.5 GB（含 GPU PaddleOCR）
+powershell -ExecutionPolicy Bypass -File .\0pack.ps1 -NoPaddle        # 不打包 PaddleOCR 引擎，约 250 MB
+powershell -ExecutionPolicy Bypass -File .\0pack.ps1 -OneFile         # 单文件 exe（体积小、首启慢，默认不用）
+powershell -ExecutionPolicy Bypass -File .\0pack.ps1 -KeepCudnnAdv    # 保留 cudnn_adv64_9.dll（+233 MB）
 ```
 
 打包要点：
 - **onedir + console**：目录式分发（`dist\ptoe\ptoe.exe` + `_internal\` 依赖）；`pyproject.toml` 一并打入，`--version` 显示正确版本号；`pymupdf`/`requests`/`zhconv`/`tkinter` 全部内置；`--noupx` 避免杀软误报。**因采用 onedir，启动时不需解包到临时目录，首次启动无 onefile 式卡顿**。
+- **体积（2026-09 优化）**：`ptoe.spec` 现在是唯一的打包定义（脚本只负责设开关 + 调它），裁剪在 **Analysis 之后、复制之前** 完成，因此不再"先复制上千 MB 再删"。裸 collect-all 5.56 GB → 优化后约 2.52 GB（-55%）；相对旧脚本产物（约 4.6 GB，根目录残留孤儿 CUDA DLL）为 -45%。每一项裁剪/保留都有实测依据，见 `ptoe.spec` 头部注释（含"移除即失败"的必需清单：`cublasLt64_12.dll`、`cudnn_*_engines*`、`cudnn_ops/cnn/graph`、`mklml.dll`、`mkldnn.dll`、`phi.dll`）。
+- **-NoPaddle**：PaddleOCR 只是可选引擎（见 `pyproject.toml` 的 optional-dependencies），不打包它时 `--engine paddle` 不可用，其余功能（llama/vLLM OCR、手动矫正、配置界面、EPUB 打包）完全不受影响。
 - **双击 `dist\ptoe\ptoe.exe` 启动终端菜单**（无参数 + 交互终端即进入）：
   ```
   1) PDF → EPUB 转换（OCR 全流程）   ← 交互式填写 PDF 路径/模型/DPI/并发/是否矫正
