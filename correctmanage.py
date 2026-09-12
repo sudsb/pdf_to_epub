@@ -66,7 +66,7 @@ import time
 import webbrowser
 from collections import OrderedDict
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from difflib import SequenceMatcher
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -700,6 +700,24 @@ def _parse_llm_suggestions(raw: str, text: str, convert_t2s: bool = False):
         return [], f"模型响应解析失败：{_friendly_llm_error(str(e))}"
 
 
+@contextmanager
+def _proofread_engine_ctx():
+    """矫正/重识别操作期间把推理引擎钉扎为校正引擎（llamamanage._active_proofread_engine
+    ——config.json 顶层 proofread_engine 键，缺省 llama），退出后恢复按配置。
+
+    2026-08：矫正引擎与识别引擎分离——PDF 识别可能用 vllm/paddle，而矫正界面/深度
+    校对/重识别这类逐字大模型操作统一走校正引擎，避免矫正请求发到错误的引擎端口。
+    """
+    import llamamanage
+
+    pe = llamamanage._active_proofread_engine()
+    llamamanage.set_engine(pe)
+    try:
+        yield pe
+    finally:
+        llamamanage.set_engine(None)
+
+
 def _proofread_llm_enhance(text: str, errors: list, model_key: str = "qwen2b"):
     """Call llama-server via llamamanage.request to get additional sentence-level suggestions.
     Returns (suggestions, error_str|None): suggestions is a list of error dicts matching
@@ -718,9 +736,11 @@ def _proofread_llm_enhance(text: str, errors: list, model_key: str = "qwen2b"):
             " 仅在确定有改进价值时返回建议；不要返回空候选。\n文本:\n" + text
         )
         # append_ocr_instruction=False：不要追加"按原文原格式输出"（会与 JSON 指令冲突，2026-08-07 修复）
-        res = llamamanage.request(
-            prompt, model_key=model_key, thinking=False, append_ocr_instruction=False
-        )
+        # 矫正/深度校对用校正引擎（proofread_engine），与识别引擎分离（2026-08 修复）
+        with _proofread_engine_ctx():
+            res = llamamanage.request(
+                prompt, model_key=model_key, thinking=False, append_ocr_instruction=False
+            )
         if res.get("error"):
             return [], _friendly_llm_error(str(res.get("error")))
         return _parse_llm_suggestions(
@@ -3524,35 +3544,104 @@ def _server_info_path() -> Path:
     return app_base_dir() / "data" / "correct_server.json"
 
 
-def _write_server_info(port: int) -> None:
-    """原子写矫正服务信息 sidecar：{"port", "pid", "started"}。
+# 多实例 sidecar 互斥锁：correct_server.json 可能同时被多个矫正实例
+# （同一进程内双开、或与 GUI 配置中心）读写，_write/_clear 必须串行化，
+# 且删除条目只能针对本进程 pid+本实例端口，绝不误删其他实例的记录。
+_CORRECT_INFO_LOCK = threading.Lock()
+
+
+def _read_correct_server_info() -> list[dict]:
+    """读取矫正服务信息 sidecar，返回实例列表 list[dict]。
+
+    兼容两种历史形状：
+    - {"instances": [{port,pid,started,pdf,history_id}, ...]}（新，多实例列表）
+    - 旧单对象 {"port", "pid", "started"} → 包装为 [dict]
+    损坏/缺失 → []。
+    """
+    try:
+        p = _server_info_path()
+        if not p.exists():
+            return []
+        with open(p, "r", encoding="utf-8") as f:
+            info = json.load(f)
+        if isinstance(info, list):
+            return [x for x in info if isinstance(x, dict)]
+        if isinstance(info, dict):
+            inst = info.get("instances")
+            if isinstance(inst, list):
+                return [x for x in inst if isinstance(x, dict)]
+            # 旧单对象形状（多实例改造之前的写入格式）
+            if "port" in info or "pid" in info:
+                return [info]
+    except Exception:  # noqa: BLE001 — 损坏 sidecar 视为无记录
+        pass
+    return []
+
+
+def _write_server_info(port: int, *, pdf: str = "", history_id: str = "") -> None:
+    """原子写矫正服务信息 sidecar，追加/更新本实例（pid+port）条目。
+
+    列表结构 {"instances": [...]}——同一进程可同时运行多个矫正实例
+    （多开不同历史记录/PDF），互不覆盖；GUI 配置中心按列表发现全部实例。
 
     失败仅打印警告，不抛出——矫正流程不应因 sidecar 写入失败而中断。
     """
     try:
         from configmanage import _atomic_write_json
 
-        p = _server_info_path()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_json(str(p), {"port": int(port), "pid": os.getpid(), "started": time.time()})
+        entry = {
+            "port": int(port),
+            "pid": os.getpid(),
+            "started": time.time(),
+            "pdf": str(pdf or ""),
+            "history_id": str(history_id or ""),
+        }
+        with _CORRECT_INFO_LOCK:
+            p = _server_info_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            instances = _read_correct_server_info()
+            replaced = False
+            for it in instances:
+                if it.get("pid") == os.getpid() and it.get("port") == entry["port"]:
+                    it.update(entry)
+                    replaced = True
+                    break
+            if not replaced:
+                instances.append(entry)
+            _atomic_write_json(str(p), {"instances": instances})
     except Exception as e:  # noqa: BLE001
         print(f"[correctmanage] 写入矫正服务信息 sidecar 失败: {e}")
 
 
-def _clear_server_info() -> None:
-    """清除矫正服务信息 sidecar，仅当记录的 pid 匹配当前进程时删除。
+def _clear_server_info(port: int | None = None) -> None:
+    """清除矫正服务信息 sidecar 中本实例的条目，仅当记录的 pid 匹配当前进程时删除。
 
-    防止误删由更新实例写入的记录（竞态保护）。
+    port 给定时只删除「本 pid + 该端口」的条目（多实例并存时各清各的）；
+    port 为 None 时删除本进程全部条目（兼容旧语义）。空列表则删除文件。
     任何异常静默吞掉。
     """
     try:
-        p = _server_info_path()
-        if not p.exists():
-            return
-        with open(p, "r", encoding="utf-8") as f:
-            info = json.load(f)
-        if isinstance(info, dict) and info.get("pid") == os.getpid():
-            p.unlink()
+        with _CORRECT_INFO_LOCK:
+            p = _server_info_path()
+            if not p.exists():
+                return
+            instances = _read_correct_server_info()
+            if port is None:
+                kept = [it for it in instances if it.get("pid") != os.getpid()]
+            else:
+                kept = [
+                    it
+                    for it in instances
+                    if not (
+                        it.get("pid") == os.getpid() and it.get("port") == int(port)
+                    )
+                ]
+            if not kept:
+                p.unlink()
+            elif len(kept) != len(instances):
+                from configmanage import _atomic_write_json
+
+                _atomic_write_json(str(p), {"instances": kept})
     except Exception:  # noqa: BLE001
         pass
 
@@ -3770,12 +3859,18 @@ def _history_pages_for_init(
     *,
     history: bool,
     preload_history: bool,
+    history_id: str | None = None,
 ) -> dict[str, str]:
     """启动矫正界面时的初始文本来源。
 
     preload_history=True 时返回同一 PDF 最新历史版本（覆盖传入文本）；
     False 时返回空 dict（完全使用传入的 pages —— 重新识别后的新文本优先）。
+    history_id 给定时直接返回该指定版本的 pages（绕过"最新版本"逻辑，
+    由 correct_pages 在调用前负责校验版本存在并抛出 ValueError）。
     """
+    if history_id:
+        ver = _load_history_version(history_id)
+        return dict(ver["pages"]) if ver is not None else {}
     if history and preload_history:
         return _load_latest_history(pdf_path)
     return {}
@@ -3832,10 +3927,13 @@ def _write_history_version(state: dict[str, Any]) -> bool:
         return False
 
 
-def _overwrite_history(state: dict[str, Any]) -> bool:
-    """保存动作：不新建历史版本，直接覆盖当前（最新）历史版本文件。
+def _overwrite_history(state: dict[str, Any], *, history_id: str | None = None) -> bool:
+    """保存动作：不新建历史版本，直接覆盖历史版本文件。
 
-    同一份内容反复保存只更新同一个文件，多版本列表不会被保存刷屏；
+    history_id 给定时（打开指定历史版本矫正）直接覆盖该版本文件——
+    修改仍在原版本迭代，不产生新版本条目；
+    默认（无 history_id）覆盖当前（最新）历史版本文件——同一份内容反复保存
+    只更新同一个文件，多版本列表不会被保存刷屏；
     无历史文件时（首次保存）按 _write_history_version 的规则新建一个。
 
     返回是否写入成功（S4），失败时调用方须向用户报错。
@@ -3864,22 +3962,34 @@ def _overwrite_history(state: dict[str, Any]) -> bool:
             # _schedule_images_flush / _images_cache_path
         }
         with state["history_lock"]:
-            # S6：按 mtime 取最新版本覆盖（文件名时间戳同秒时不会覆盖错版本）
-            latest = None
-            for fp in d.glob(f"{prefix}_*.json"):
-                try:
-                    if (
-                        latest is None
-                        or fp.stat().st_mtime_ns > latest.stat().st_mtime_ns
-                    ):
-                        latest = fp
-                except OSError:
-                    continue
-            if latest is not None:
-                fp = latest
-            else:
-                stamp = time.strftime("%Y%m%d%H%M%S")
-                fp = d / f"{prefix}_{stamp}_{uuid4().hex[:4]}.json"
+            fp: Path | None = None
+            if history_id:
+                # 指定版本：直接覆盖该版本文件（id 即文件名 stem）；防路径穿越，
+                # 校验解析后仍在历史目录内（<prefix>.images.json 共享 sidecar 除外）。
+                cand = d / f"{history_id}.json"
+                if (
+                    cand.parent == d
+                    and cand.is_file()
+                    and not cand.name.endswith(".images.json")
+                ):
+                    fp = cand
+            if fp is None:
+                # S6：按 mtime 取最新版本覆盖（文件名时间戳同秒时不会覆盖错版本）
+                latest = None
+                for can in d.glob(f"{prefix}_*.json"):
+                    try:
+                        if (
+                            latest is None
+                            or can.stat().st_mtime_ns > latest.stat().st_mtime_ns
+                        ):
+                            latest = can
+                    except OSError:
+                        continue
+                if latest is not None:
+                    fp = latest
+                else:
+                    stamp = time.strftime("%Y%m%d%H%M%S")
+                    fp = d / f"{prefix}_{stamp}_{uuid4().hex[:4]}.json"
             fp.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
             )
@@ -6356,7 +6466,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 # 槽位取 1 即可——llama-server 的 KV cache ≈ n_ctx × parallel，默认
                 # 取 config 的 parallel(6)×max_tokens(8192) 会把 KV 预分配撑到数 GB，
                 # 显著超过直接启动（--parallel 1）的显存占用（2026-09-01 修复）。
-                running = bool(runserver(model_key, with_mmproj=has_mmproj, parallel=1))
+                # 矫正引擎与识别引擎分离：启动服务按校正引擎（proofread_engine）钉扎
+                with _proofread_engine_ctx():
+                    running = bool(runserver(model_key, with_mmproj=has_mmproj, parallel=1, ctx_size=8192))
                 if running:
                     # Issue 1 fix: persist model choice so it survives UI restart
                     try:
@@ -6652,125 +6764,128 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     return
                 content_type, img_bytes = img
                 ocr_prompt = cfg.get("ocr_prompt") or llamamanage.OCR_PROMPT
-                res = llamamanage._request_image_new(
-                    ocr_prompt,
-                    "",
-                    model_key=model_key,
-                    # 重识别为纯 OCR 任务：thinking=True 会触发 Qwen 隐藏思考链长生成，
-                    # KV 缓存暴涨占满显存且拖慢识别 ~7 倍（2026-08 修复）
-                    thinking=False,
-                    timeout=llamamanage.REQUEST_TIMEOUT,
-                    img_bytes=img_bytes,
-                    # 2026-08-31：把真实 MIME 传给 _request_image_new——页图为 PNG 时
-                    # 若数据 URI 错标 image/jpeg，llama-server 解图失败返回 500
-                    # （曾致「重识别失败:500 Server Error」）
-                    content_type=content_type,
-                )
-                # 2026-09-01：自动修复——若命中 peg-native format（多模态推理失败，常因
-                # 纯文本模式服务误收图），且所选模型配置了 mmproj，先探测服务端多模态能力，
-                # 仅当确认为纯文本模式（probe_mmproj=False）时才自动重启视觉服务并重试一次。
-                # 若探测为视觉模式或探测不明，则判定为单页图片异常（过大/损坏/MIME异常），
-                # 不重启服务，直接返回单页失败提示（含图片大小便于自查）。
-                err_str = str(res.get("error") or "")
-                auto_heal_attempted = False
-                if (
-                    res.get("error")
-                    and sel_has_mmproj
-                    and llamamanage._active_engine() == "llama"
-                    and any(k in err_str for k in _LLM_PEG_MARKERS)
-                ):
-                    # 先探测：当前服务是否真正加载了 mmproj（视觉投影）
-                    mmproj_probe = llamamanage._probe_mmproj()
-                    if mmproj_probe is False:
-                        # 确认为纯文本模式：执行自动重启并重试
-                        try:
-                            llamamanage.stopserver()
-                            time.sleep(0.5)
-                            ok = llamamanage.runserver(model_key, with_mmproj=True)
-                            if ok:
-                                auto_heal_attempted = True
-                                res = llamamanage._request_image_new(
+                with _proofread_engine_ctx():
+                    res = llamamanage._request_image_new(
+                        ocr_prompt,
+                        "",
+                        model_key=model_key,
+                        # 重识别为纯 OCR 任务：thinking=True 会触发 Qwen 隐藏思考链长生成，
+                        # KV 缓存暴涨占满显存且拖慢识别 ~7 倍（2026-08 修复）
+                        thinking=False,
+                        timeout=llamamanage.REQUEST_TIMEOUT,
+                        img_bytes=img_bytes,
+                        # 2026-08-31：把真实 MIME 传给 _request_image_new——页图为 PNG 时
+                        # 若数据 URI 错标 image/jpeg，llama-server 解图失败返回 500
+                        # （曾致「重识别失败:500 Server Error」）
+                        content_type=content_type,
+                    )
+                    # 2026-09-01：自动修复——若命中 peg-native format（多模态推理失败，常因
+                    # 纯文本模式服务误收图），且所选模型配置了 mmproj，先探测服务端多模态能力，
+                    # 仅当确认为纯文本模式（probe_mmproj=False）时才自动重启视觉服务并重试一次。
+                    # 若探测为视觉模式或探测不明，则判定为单页图片异常（过大/损坏/MIME异常），
+                    # 不重启服务，直接返回单页失败提示（含图片大小便于自查）。
+                    err_str = str(res.get("error") or "")
+                    auto_heal_attempted = False
+                    if (
+                        res.get("error")
+                        and sel_has_mmproj
+                        and llamamanage._active_engine() == "llama"
+                        and any(k in err_str for k in _LLM_PEG_MARKERS)
+                    ):
+                        # 先探测：当前服务是否真正加载了 mmproj（视觉投影）
+                        mmproj_probe = llamamanage._probe_mmproj()
+                        if mmproj_probe is False:
+                            # 确认为纯文本模式：执行自动重启并重试
+                            try:
+                                llamamanage.stopserver()
+                                time.sleep(0.5)
+                                # ctx_size=8192：矫正/重识别为单页请求，8192 足够，
+                                # 默认 16384 配置对纯文本/视觉单页无用且多占显存。
+                                ok = llamamanage.runserver(model_key, with_mmproj=True, ctx_size=8192)
+                                if ok:
+                                    auto_heal_attempted = True
+                                    res = llamamanage._request_image_new(
+                                        ocr_prompt,
+                                        "",
+                                        model_key=model_key,
+                                        thinking=False,
+                                        timeout=llamamanage.REQUEST_TIMEOUT,
+                                        img_bytes=img_bytes,
+                                        content_type=content_type,
+                                    )
+                                    err_str = str(res.get("error") or "")
+                            except Exception:
+                                # 自动修复过程出错：静默忽略，走统一错误处理
+                                pass
+                        else:
+                            # 探测为视觉模式 或 探测不明：判定为单页图片异常，不重启服务
+                            # 先尝试按页降分辨率重试一次，再决定是否返回错误
+                            img_size = len(img_bytes) if img_bytes else 0
+                            retry_bytes = None
+                            retry_ct = None
+                            try:
+                                # 以当前 _REOCR_MAX_SIDE 的一半为目标最大边，重新渲染更小的 JPEG
+                                # 复用 preview_doc 与锁，避免重开 PDF
+                                doc = _preview_doc(state)
+                                lock = state.get("preview_doc_lock")
+                                if (
+                                    doc is not None
+                                    and not getattr(doc, "is_closed", False)
+                                    and 1 <= page_no <= doc.page_count
+                                ):
+                                    import fitz
+                                    with lock if lock is not None else nullcontext():
+                                        r = doc[page_no - 1].rect
+                                    max_dim = max(r.width, r.height)
+                                    if max_dim > 0:
+                                        # 目标最大边 = _REOCR_MAX_SIDE // 2 (约 780px)，足够 OCR 且 token 大幅减少
+                                        target_side = _REOCR_MAX_SIDE // 2
+                                        dpi = (target_side * 72.0) / max_dim
+                                        quality = int(state.get("preview_quality", 70))
+                                        with lock if lock is not None else nullcontext():
+                                            pix = doc[page_no - 1].get_pixmap(
+                                                matrix=fitz.Matrix(dpi / 72.0, dpi / 72.0),
+                                                alpha=False,
+                                            )
+                                            retry_bytes = pix.tobytes("jpeg", jpg_quality=quality)
+                                            retry_ct = "image/jpeg"
+                            except Exception:
+                                # 任何渲染异常静默回退，走原错误分支
+                                retry_bytes = None
+                                retry_ct = None
+
+                            if retry_bytes and len(retry_bytes) < img_size:
+                                # 用降采样图再次请求
+                                res2 = llamamanage._request_image_new(
                                     ocr_prompt,
                                     "",
                                     model_key=model_key,
                                     thinking=False,
                                     timeout=llamamanage.REQUEST_TIMEOUT,
-                                    img_bytes=img_bytes,
-                                    content_type=content_type,
+                                    img_bytes=retry_bytes,
+                                    content_type=retry_ct,
                                 )
-                                err_str = str(res.get("error") or "")
-                        except Exception:
-                            # 自动修复过程出错：静默忽略，走统一错误处理
-                            pass
-                    else:
-                        # 探测为视觉模式 或 探测不明：判定为单页图片异常，不重启服务
-                        # 先尝试按页降分辨率重试一次，再决定是否返回错误
-                        img_size = len(img_bytes) if img_bytes else 0
-                        retry_bytes = None
-                        retry_ct = None
-                        try:
-                            # 以当前 _REOCR_MAX_SIDE 的一半为目标最大边，重新渲染更小的 JPEG
-                            # 复用 preview_doc 与锁，避免重开 PDF
-                            doc = _preview_doc(state)
-                            lock = state.get("preview_doc_lock")
-                            if (
-                                doc is not None
-                                and not getattr(doc, "is_closed", False)
-                                and 1 <= page_no <= doc.page_count
-                            ):
-                                import fitz
-                                with lock if lock is not None else nullcontext():
-                                    r = doc[page_no - 1].rect
-                                max_dim = max(r.width, r.height)
-                                if max_dim > 0:
-                                    # 目标最大边 = _REOCR_MAX_SIDE // 2 (约 780px)，足够 OCR 且 token 大幅减少
-                                    target_side = _REOCR_MAX_SIDE // 2
-                                    dpi = (target_side * 72.0) / max_dim
-                                    quality = int(state.get("preview_quality", 70))
-                                    with lock if lock is not None else nullcontext():
-                                        pix = doc[page_no - 1].get_pixmap(
-                                            matrix=fitz.Matrix(dpi / 72.0, dpi / 72.0),
-                                            alpha=False,
-                                        )
-                                        retry_bytes = pix.tobytes("jpeg", jpg_quality=quality)
-                                        retry_ct = "image/jpeg"
-                        except Exception:
-                            # 任何渲染异常静默回退，走原错误分支
-                            retry_bytes = None
-                            retry_ct = None
-
-                        if retry_bytes and len(retry_bytes) < img_size:
-                            # 用降采样图再次请求
-                            res2 = llamamanage._request_image_new(
-                                ocr_prompt,
-                                "",
-                                model_key=model_key,
-                                thinking=False,
-                                timeout=llamamanage.REQUEST_TIMEOUT,
-                                img_bytes=retry_bytes,
-                                content_type=retry_ct,
-                            )
-                            if not res2.get("error"):
-                                # 重试成功：用新结果继续走正常流程
-                                res = res2
-                                err_str = ""
-                            else:
-                                # 重试仍失败：更新错误信息并落入下方统一错误处理
-                                err_str = str(res2.get("error") or err_str)
-                        if res.get("error"):
-                            # 无重试或重试失败：构造友好提示并返回
-                            friendly = _friendly_llm_error(err_str)
-                            if retry_bytes:
-                                friendly += f"（该页图片可能过大/损坏/MIME异常，原始 {img_size} 字节→降采样 {len(retry_bytes)} 字节重试仍失败，已跳过自动重启；可尝试对该页单独降低分辨率或检查原图）"
-                            else:
-                                friendly += f"（该页图片可能过大/损坏/MIME异常，大小 {img_size} 字节，已跳过自动重启；可尝试对该页单独降低分辨率或检查原图）"
-                            self._send(
-                                200,
-                                self._json({"ok": False, "error": friendly}),
-                                "application/json; charset=utf-8",
-                            )
-                            return
-                        # 重试成功：已用降采样图取得结果，落入下方成功分支
+                                if not res2.get("error"):
+                                    # 重试成功：用新结果继续走正常流程
+                                    res = res2
+                                    err_str = ""
+                                else:
+                                    # 重试仍失败：更新错误信息并落入下方统一错误处理
+                                    err_str = str(res2.get("error") or err_str)
+                            if res.get("error"):
+                                # 无重试或重试失败：构造友好提示并返回
+                                friendly = _friendly_llm_error(err_str)
+                                if retry_bytes:
+                                    friendly += f"（该页图片可能过大/损坏/MIME异常，原始 {img_size} 字节→降采样 {len(retry_bytes)} 字节重试仍失败，已跳过自动重启；可尝试对该页单独降低分辨率或检查原图）"
+                                else:
+                                    friendly += f"（该页图片可能过大/损坏/MIME异常，大小 {img_size} 字节，已跳过自动重启；可尝试对该页单独降低分辨率或检查原图）"
+                                self._send(
+                                    200,
+                                    self._json({"ok": False, "error": friendly}),
+                                    "application/json; charset=utf-8",
+                                )
+                                return
+                            # 重试成功：已用降采样图取得结果，落入下方成功分支
                 if res.get("error"):
                     friendly = _friendly_llm_error(err_str)
                     # 若经历过自动修复尝试（上述分支已执行），在提示中追加说明
@@ -7100,7 +7215,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
             # 同一个文件）；暂存/完成并转换仍各生成一个新历史版本（可随时恢复）
             # S4：写入失败返回 False → 前端报错提示（不静默丢数据）
             if path == "/api/save":
-                ok = _overwrite_history(state)
+                # 打开指定历史版本时（state["history_id"]）定向覆盖该版本文件，
+                # 不在版本列表产生新条目；普通会话按 mtime 覆盖最新版本。
+                ok = _overwrite_history(state, history_id=state.get("history_id"))
             else:
                 ok = _write_history_version(state)
             payload = {"ok": ok, "saved": saved}
@@ -7284,6 +7401,7 @@ def correct_pages(
     on_convert: Callable[[list[dict[str, Any]]], dict[str, Any]] | None = None,
     history: bool = True,
     preload_history: bool = True,
+    history_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """启动手动矫正界面并阻塞，直到浏览器被关闭（或 Ctrl+C）。
 
@@ -7309,7 +7427,22 @@ def correct_pages(
     idle_timeout：浏览器（页面）被关闭后的等待秒数，超过即自动继续后续流程
     （保留最后一次保存/完成的内容）；默认 600 秒（10 分钟）。
     页面每 30s 发心跳，关闭标签页时发 pagehide 信标，据此监测。
+
+    history_id：指定打开的历史版本 id（版本文件名 stem，如 mian.py correct
+    --history-id）。给定后初始内容直接载入该版本（不走 _load_latest_history），
+    pdf_path 为空时用版本内记录的 pdf 兜底，保存（/api/save）定向覆盖该版本
+    文件而非"按 mtime 取最新"。
     """
+    # 指定历史版本优先：直接载入该版本内容，绕过"同一 PDF 最新版本"逻辑
+    history_id_meta: dict[str, Any] | None = None
+    if history_id:
+        history_id_meta = _load_history_version(history_id)
+        if history_id_meta is None:
+            raise ValueError(f"历史记录不存在或已损坏：{history_id}")
+        # 打开指定历史记录时强制启用历史缓存（否则保存无处可写）
+        history = True
+        if not pdf_path and history_id_meta.get("pdf"):
+            pdf_path = history_id_meta["pdf"]
     ordered = sorted(
         (
             {"page": int(p["page"]), "text": str(p.get("text") or "")}
@@ -7319,29 +7452,39 @@ def correct_pages(
         key=lambda x: x["page"],
     )
     # 历史缓存：同一 PDF 最新版本的矫正内容优先作为初始内容；
-    # preload_history=False 时（重新识别后）不加载历史，避免旧暂存覆盖新识别文本。
-    history_pages: dict[str, str] = _history_pages_for_init(
-        str(pdf_path), history=history, preload_history=preload_history
+    # preload_history=False 时（重新识别后）不加载历史，避免旧暂存覆盖新识别文本；
+    # history_id 给定时不走 _load_latest_history，直接用该版本内容。
+    history_pages: dict[str, str] = (
+        history_id_meta["pages"] if history_id_meta is not None else _history_pages_for_init(
+            str(pdf_path), history=history, preload_history=preload_history
+        )
     )
     if history_pages:
         loaded = sum(1 for p in ordered if str(p["page"]) in history_pages)
         if loaded:
             print(f"      已加载历史矫正记录（{loaded}/{len(ordered)} 页）")
+    # 初始内容：ordered 之外的页（如 pdf_path=None 打开历史版本）一并并入——
+    # 2026-08-15 说明：传入矫正界面的文本一律按正文展示——OCR 自动结构产生的
+    # <h1>-<h6> 标题归一为 <p>（标题由用户在界面手动标记），保证界面所见
+    # 与浏览器关闭后的返回结果一致；历史缓存内容按原样载入（normalize_headings=
+    # False，2026-08-15 修复）——其中可能含用户手动设置的标题，不能再归一为
+    # <p>（否则「保存后重开，已设置的标题格式丢失」）；OCR 自动标题的归一
+    # 只在写入历史时做一次（_save_ocr_history），此处仅对无历史的原始 OCR 文本兜底归一。
+    state_pages: dict[int, str] = {
+        int(p["page"]): _page_text(
+            str(history_pages.get(str(p["page"]), p["text"])),
+            normalize_headings=str(p["page"]) not in history_pages,
+        )
+        for p in ordered
+    }
+    for _pno, _html in history_pages.items():
+        try:
+            _n = int(_pno)
+        except (TypeError, ValueError):
+            continue
+        state_pages.setdefault(_n, _page_text(str(_html), normalize_headings=False))
     state: dict[str, Any] = {
-        "pages": {
-            # 2026-08-15：传入矫正界面的文本一律按正文展示——OCR 自动结构产生的
-            # <h1>-<h6> 标题归一为 <p>（标题由用户在界面手动标记），保证界面所见
-            # 与浏览器关闭后的返回结果一致。
-            # 2026-08-15 修复：历史缓存内容按原样载入（normalize_headings=False）——
-            # 其中可能含用户手动设置的标题，不能再归一为 <p>（否则「保存后重开，
-            # 已设置的标题格式丢失」）；OCR 自动标题的归一只在写入历史时做一次
-            # （_save_ocr_history），此处仅对无历史的原始 OCR 文本兜底归一。
-            p["page"]: _page_text(
-                str(history_pages.get(str(p["page"]), p["text"])),
-                normalize_headings=str(p["page"]) not in history_pages,
-            )
-            for p in ordered
-        },
+        "pages": state_pages,
         # S5：pages 读写共用锁（/api/pages、/api/history/load、保存/暂存/完成）
         "pages_lock": threading.Lock(),
         "finished": threading.Event(),
@@ -7381,7 +7524,30 @@ def correct_pages(
         # 预渲染页数上限：可经 config.json 顶层键 prerender_max_pages 覆盖
         "prerender_max_pages": _resolve_prerender_max(),
         "embedded_images": {},
+        "history_id": None,
     }
+    # 指定历史版本（history_id）：把该版本的纠错状态/预览图等元数据灌入 state，
+    # 保存（/api/save）时按 history_id 定向覆盖原文件而非"按 mtime 取最新"。
+    if history_id_meta is not None:
+        state["history_id"] = history_id
+        if history_id_meta.get("proofread"):
+            state["proofread"] = history_id_meta["proofread"]
+        if history_id_meta.get("last_proofread_page") is not None:
+            state["last_proofread_page"] = history_id_meta["last_proofread_page"]
+        if history_id_meta.get("embedded_images"):
+            state["embedded_images"] = history_id_meta["embedded_images"]
+        # 展示名：优先 display_name，其次 name（无文件会话/打开历史记录时用作书名）
+        _meta_entry = next(
+            (it for it in _history_entries() if it["id"] == history_id), None
+        )
+        _shown = (
+            str(_meta_entry.get("display_name") or _meta_entry.get("name") or "")
+            if _meta_entry
+            else ""
+        )
+        if _shown:
+            state["history_name"] = _shown
+            state["display_name"] = _shown
     server = ThreadingHTTPServer((host, port), _CorrectionHandler)
     server.daemon_threads = True
     server.state = state
@@ -7408,12 +7574,26 @@ def correct_pages(
             ).start()
     url = f"http://{server.server_address[0]}:{server.server_address[1]}/"
     print(f"      矫正界面已启动: {url}（对比原图与识别文字，完成后点「完成并转换」）")
-    # 记录服务信息 sidecar，供 GUI 配置中心发现并恢复已存活的矫正界面
-    _write_server_info(server.server_address[1])
+    # 合并窗口 tab 标题（2026-08）：同一 PDF 多开矫正时标题必须唯一——否则
+    # tabmanage._append_tab 按 title 去重会把两个矫正实例挤进同一个 tab。
+    # 带端口/历史版本名保证多实例互不冲突。
+    _pdf_name = str(Path(pdf_path).name) if pdf_path else ""
+    _win_title = (
+        f"矫正：{_pdf_name}（{server.server_address[1]}）"
+        if _pdf_name
+        else f"矫正：{state.get('history_name') or '手动录入'}（{server.server_address[1]}）"
+    )
+    # 记录服务信息 sidecar（列表结构，多实例互不覆盖；GUI 配置中心按 pid+port 区分），
+    # 供 GUI 配置中心发现并恢复已存活的矫正界面
+    _write_server_info(
+        server.server_address[1],
+        pdf=str(pdf_path) if pdf_path else "",
+        history_id=history_id or "",
+    )
     _win = None
     _role = None
     if open_browser:
-        _role, _win = _open_display(url, _CORRECT_WINDOW_TITLE)
+        _role, _win = _open_display(url, _win_title)
         if _role in ("owner", "guest"):
             pass  # 合并窗口角色已由 tabmanage 决定（owner 建窗 / guest 静默加入）
         if _win is not None:
@@ -7422,7 +7602,7 @@ def correct_pages(
     def _start_tabbed_window() -> None:
         # 供 owner 首次进入与 guest 接管后复用：主线程 webview.start
         nonlocal _win, _role
-        _role, _win = _open_display(url, _CORRECT_WINDOW_TITLE)
+        _role, _win = _open_display(url, _win_title)
         if _win is not None:
             _win.events.closed += lambda: state["finished"].set()
             try:
@@ -7450,7 +7630,7 @@ def correct_pages(
         elif _role == "guest":
             # 加入已有合并窗口：不建窗，监视会话；宿主关闭/本标签移除 → 接管
             _serve_loop(state, watch_gone=False,
-                        tab_key=_CORRECT_WINDOW_TITLE, tab_base=None)
+                        tab_key=_win_title, tab_base=None)
             if state.get("tab_lost"):
                 import tabmanage as _tm  # noqa: PLC0415
                 _tm.reset_session()   # 清旧会话，重新注册即成为 owner
@@ -7474,8 +7654,8 @@ def correct_pages(
                 _tm.reset_session()
             except Exception:
                 pass
-        # 清除服务信息 sidecar（仅当前进程 pid 匹配时删除）
-        _clear_server_info()
+        # 清除服务信息 sidecar 中本实例（本 pid + 端口）条目——多实例并存时各清各的
+        _clear_server_info(server.server_address[1])
         server.shutdown()
         server.server_close()
         serve_thread.join(timeout=5)

@@ -10,17 +10,59 @@ _browser_gone 判定，以及 mian.py 的 gui 子命令与终端菜单第 8 项�
 import json
 import os
 import queue
+import shutil
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from http.server import ThreadingHTTPServer
+from pathlib import Path as _Path
 from unittest import mock
 
 import configmanage
 import guimanage
 import mian
+
+
+class _BlockingIter:
+    """迭代永不结束：矫正子进程 stdout 保持打开（实例维持 running 状态）。"""
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        time.sleep(10)
+        return ""
+
+
+class _FakeCorrectProc:
+    """假的 subprocess.Popen：poll/wait/terminate/kill + stdout 迭代。
+
+    block=True 时 stdout 永不完结 → _correct_monitor 不会收尾，实例保持
+    running；否则给出若干行（含矫正界面地址 http://127.0.0.1:<port>/）。
+    """
+
+    def __init__(self, stdout_lines=None, block=False):
+        self.pid = 4242
+        self._terminated = False
+        if block:
+            self.stdout = _BlockingIter()
+        else:
+            self.stdout = list(stdout_lines or ["http://127.0.0.1:8123/\n"])
+
+    def poll(self):
+        return 0 if self._terminated else None
+
+    def wait(self, timeout=None):
+        return 0
+
+    def terminate(self):
+        self._terminated = True
+
+    def kill(self):
+        self._terminated = True
 
 
 def _minimal_config() -> dict:
@@ -77,6 +119,7 @@ class GuiServerTestBase(unittest.TestCase):
                 "error": None,
                 "prompt": None,
             },
+            "correct_instances": [],
         }
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), guimanage._GuiHandler)
         self._server.daemon_threads = True
@@ -279,6 +322,24 @@ class TestGuiEndpoints(GuiServerTestBase):
         self.assertFalse(data["ok"])
         self.assertIn("矫正仅支持 llama / vllm", data["error"])
         fake.assert_not_called()
+
+    def test_post_config_proofread_engine_invalid_400(self):
+        """POST /api/config proofread_engine='paddle' → 400（矫正仅 llama/vllm）。"""
+        status, raw = self._post("/api/config", {"proofread_engine": "paddle"})
+        self.assertEqual(status, 400)
+        data = json.loads(raw)
+        self.assertFalse(data["ok"])
+        self.assertIn("proofread_engine 仅支持 llama / vllm", data["error"])
+
+    def test_post_config_proofread_engine_vllm_persists(self):
+        """POST /api/config proofread_engine='vllm' → 200 且写盘。"""
+        status, raw = self._post("/api/config", {"proofread_engine": "vllm"})
+        self.assertEqual(status, 200)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"])
+        with open(self._cfg_path, "r", encoding="utf-8") as f:
+            on_disk = json.load(f)
+        self.assertEqual(on_disk["proofread_engine"], "vllm")
 
 
     def test_post_server_stop_ok(self):
@@ -596,7 +657,7 @@ class TestGuiConfigPost(unittest.TestCase):
             "beat_lock": threading.Lock(),
             "last_error": None,
             "convert": {"lock": threading.Lock(), "proc": None, "lines": [], "running": False, "done": False, "success": False, "exit_code": None, "epub_path": None, "error": None, "prompt": None},
-            "correct": {"lock": threading.Lock(), "proc": None, "lines": [], "running": False, "done": False, "success": False, "exit_code": None, "error": None, "prompt": None},
+            "correct_instances": [],
             "merge": {"lock": threading.Lock(), "lines": [], "running": False, "done": False, "success": False, "error": None, "out_path": None, "stop_event": threading.Event()},
         }
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), guimanage._GuiHandler)
@@ -1450,6 +1511,286 @@ class TestMianWiring(unittest.TestCase):
         gs.assert_called_once()
         self.assertIn("请选择操作", out)
         self.assertIn("配置界面", out)
+
+
+class TestCorrectMultiInstance(GuiServerTestBase):
+    """矫正界面多实例：/api/correct/start|status|stop（mock Popen，不真起进程）。"""
+
+    def _wait_until(self, cond, timeout=4.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if cond():
+                return True
+            time.sleep(0.05)
+        return cond()
+
+    def test_correct_start_ok_single_instance(self):
+        """POST /api/correct/start（无 pdf）+ 状态轮询 → 实例完成、地址已解析。"""
+        with mock.patch.object(
+            guimanage.subprocess, "Popen",
+            return_value=_FakeCorrectProc(["http://127.0.0.1:8123/\n", "启动完成\n"]),
+        ) as pop:
+            status, raw = self._post("/api/correct/start", {"pdf": None})
+        self.assertEqual(status, 200)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"])
+        self.assertIn("argv", data)
+        self.assertTrue(pop.called)
+
+        ok = self._wait_until(
+            lambda: len(guimanage._correct_instances(self._state)) == 1
+            and not guimanage._correct_instances(self._state)[0]["running"]
+            and guimanage._correct_instances(self._state)[0].get("url") is not None
+        )
+        self.assertTrue(ok, "矫正实例未进入完成态/未解析 URL")
+        inst = guimanage._correct_instances(self._state)[0]
+        self.assertEqual(inst["engine"], "llama")  # config 无 proofread_engine → 默认 llama
+        self.assertEqual(inst["port"], 8123)
+        self.assertEqual(inst["url"], "http://127.0.0.1:8123/")
+        self.assertGreaterEqual(len(inst["lines"]), 2)
+
+        # GET /api/correct/status 快照（含实例列表）
+        status2, _, raw2 = self._get("/api/correct/status")
+        self.assertEqual(status2, 200)
+        snap = json.loads(raw2)
+        self.assertTrue(snap["ok"])
+        self.assertEqual(snap["count"], 1)
+        self.assertEqual(snap["instances"][0]["url"], "http://127.0.0.1:8123/")
+
+    def test_correct_multi_instance_allowed(self):
+        """连续启动多个矫正实例 → 各自独立 id，全部可运行。"""
+        with mock.patch.object(
+            guimanage.subprocess, "Popen",
+            return_value=_FakeCorrectProc(block=True),
+        ):
+            s1, raw1 = self._post("/api/correct/start", {})
+            s2, raw2 = self._post("/api/correct/start", {})
+        self.assertEqual(s1, 200)
+        self.assertEqual(s2, 200)
+        insts = guimanage._correct_instances(self._state)
+        self.assertEqual(len(insts), 2)
+        self.assertNotEqual(insts[0]["id"], insts[1]["id"])
+        self.assertTrue(all(i["running"] for i in insts))
+
+    def test_correct_start_rejects_when_convert_running(self):
+        """转换运行中 → 409（转换与矫正互斥）。"""
+        self._state["convert"]["running"] = True
+        with mock.patch.object(guimanage.subprocess, "Popen") as pop:
+            status, raw = self._post("/api/correct/start", {})
+        self.assertEqual(status, 409)
+        data = json.loads(raw)
+        self.assertFalse(data["ok"])
+        self.assertIn("已有转换在运行", data["error"])
+        pop.assert_not_called()
+
+    def test_correct_engine_default_from_proofread_engine(self):
+        """config.proofread_engine=vllm 时启动缺省引擎为 vllm（argv 含 --engine vllm）。"""
+        with open(self._cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg["proofread_engine"] = "vllm"
+        with open(self._cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False)
+        with mock.patch.object(
+            guimanage.subprocess, "Popen",
+            return_value=_FakeCorrectProc(block=True),
+        ):
+            status, raw = self._post("/api/correct/start", {})
+        self.assertEqual(status, 200)
+        data = json.loads(raw)
+        self.assertIn("--engine", data["argv"])
+        self.assertIn("vllm", data["argv"])
+        self.assertEqual(guimanage._correct_instances(self._state)[0]["engine"], "vllm")
+
+    def test_correct_stop_with_id(self):
+        """body.id 指定实例 → 停止后实例 finalized 且不再 running。"""
+        with mock.patch.object(
+            guimanage.subprocess, "Popen",
+            return_value=_FakeCorrectProc(block=True),
+        ):
+            _, raw = self._post("/api/correct/start", {})
+        inst = guimanage._correct_instances(self._state)[0]
+        self.assertTrue(inst["running"])
+        status, resp = self._post("/api/correct/stop", {"id": inst["id"]})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(resp)["ok"])
+        self.assertFalse(inst["running"])
+        self.assertTrue(inst["finalized"])
+
+    def test_correct_stop_no_id_stops_latest(self):
+        """缺省 id → 停止最新实例，其余保持运行。"""
+        with mock.patch.object(
+            guimanage.subprocess, "Popen",
+            return_value=_FakeCorrectProc(block=True),
+        ):
+            self._post("/api/correct/start", {})
+            self._post("/api/correct/start", {})
+        insts = guimanage._correct_instances(self._state)
+        self.assertEqual(len(insts), 2)
+        status, resp = self._post("/api/correct/stop", {})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(resp)["ok"])
+        self.assertTrue(insts[0]["running"])
+        self.assertFalse(insts[1]["running"])
+        self.assertTrue(insts[1]["finalized"])
+
+    def test_correct_stop_unknown_id_400(self):
+        """未知 id → 400 中文错误。"""
+        status, raw = self._post("/api/correct/stop", {"id": "nope"})
+        self.assertEqual(status, 400)
+        data = json.loads(raw)
+        self.assertFalse(data["ok"])
+        self.assertIn("没有正在运行的矫正", data["error"])
+
+
+class TestCacheBackupHistory(GuiServerTestBase):
+    """缓存清理 / 数据备份 / 历史记录端点（注入临时 data_root，不碰真实 data/）。"""
+
+    def setUp(self):
+        super().setUp()
+        self._data_root = _Path(tempfile.mkdtemp(prefix="test_gui_data_"))
+        self._state["data_root"] = str(self._data_root)
+
+    def tearDown(self):
+        super().tearDown()
+        shutil.rmtree(self._data_root, ignore_errors=True)
+
+    def test_cache_clear_ok(self):
+        """清预览图/分割图/临时文件 → 200 ok，文件删除且 counts 正确。"""
+        preview = self._data_root / "preview_cache"
+        preview.mkdir(parents=True)
+        (preview / "a.jpg").write_bytes(b"x" * 10)
+        book = self._data_root / "book"
+        book.mkdir()
+        (book / ".ptoe_split.json").write_text("{}", encoding="utf-8")
+        (book / "1.png").write_bytes(b"y" * 20)
+        (book / "1.jpg").write_bytes(b"y" * 5)
+        tmp_marker = book / "1.tmp"          # 不在 preview_cache/correction_history 下，不应被清
+        tmp_marker.write_bytes(b"k")
+        hist = self._data_root / "correction_history"
+        hist.mkdir()
+        (hist / "t.tmp").write_bytes(b"t")
+
+        status, raw = self._post("/api/cache/clear", {"scopes": ["preview", "split", "tmp"]})
+        self.assertEqual(status, 200)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["counts"]["preview"], 1)
+        self.assertEqual(data["counts"]["split"], 3)  # 1.png + 1.jpg + .ptoe_split.json
+        self.assertEqual(data["counts"]["tmp"], 1)
+        self.assertGreater(data["freed"], 0)
+        self.assertFalse((preview / "a.jpg").exists())
+        self.assertFalse((book / "1.png").exists())
+        self.assertFalse((book / ".ptoe_split.json").exists())
+        self.assertFalse((hist / "t.tmp").exists())
+        self.assertTrue(tmp_marker.exists())  # 区域外不动
+
+    def test_cache_clear_bad_scopes_400(self):
+        """scopes 为空/非法 → 400。"""
+        for scopes in ([], ["other"], "preview", None):
+            status, raw = self._post("/api/cache/clear", {"scopes": scopes})
+            self.assertEqual(status, 400, scopes)
+            self.assertFalse(json.loads(raw)["ok"])
+
+    def test_cache_clear_blocked_when_convert_running(self):
+        """转换运行中 → 400。"""
+        self._state["convert"]["running"] = True
+        status, raw = self._post("/api/cache/clear", {"scopes": ["preview"]})
+        self.assertEqual(status, 400)
+        self.assertIn("请先停止正在运行的转换/矫正任务", json.loads(raw)["error"])
+
+    def test_cache_clear_blocked_when_correct_running(self):
+        """矫正实例运行中 → 400。"""
+        guimanage._correct_instances(self._state).append({"id": "x", "running": True})
+        status, raw = self._post("/api/cache/clear", {"scopes": ["preview"]})
+        self.assertEqual(status, 400)
+        self.assertIn("请先停止正在运行的转换/矫正任务", json.loads(raw)["error"])
+
+    def test_backup_create_default_excludes_images_and_epubs(self):
+        """默认备份：config + 词表 + 历史 json，不打包历史图片 / EPUB。"""
+        import correctmanage
+
+        hist = self._data_root / "correction_history"
+        hist.mkdir(parents=True)
+        (hist / "v1.json").write_text("{}", encoding="utf-8")
+        (hist / "v1.images.json").write_text("{}", encoding="utf-8")
+        (self._data_root / "proofread_dict.json").write_text("{}", encoding="utf-8")
+        (self._data_root / "book").mkdir()
+        (self._data_root / "book" / "out.epub").write_bytes(b"PK")
+
+        with mock.patch.object(correctmanage, "_history_dir", return_value=str(hist)):
+            status, raw = self._post("/api/backup/create", {})
+        self.assertEqual(status, 200)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"])
+        self.assertTrue(data["path"].endswith(".zip"))
+        with zipfile.ZipFile(data["path"]) as zf:
+            names = zf.namelist()
+        self.assertIn(os.path.basename(self._cfg_path), names)  # config.json 在根
+        self.assertIn("data/proofread_dict.json", names)
+        self.assertIn("data/correction_history/v1.json", names)
+        self.assertNotIn("data/correction_history/v1.images.json", names)
+        self.assertFalse(any(n.endswith(".epub") for n in names))
+
+    def test_backup_create_with_images_and_epubs(self):
+        """include_history_images + include_epubs → 历史图片与 EPUB 一并打包。"""
+        import correctmanage
+
+        hist = self._data_root / "correction_history"
+        hist.mkdir(parents=True)
+        (hist / "v1.json").write_text("{}", encoding="utf-8")
+        (hist / "v1.images.json").write_text("{}", encoding="utf-8")
+        (self._data_root / "book").mkdir()
+        (self._data_root / "book" / "out.epub").write_bytes(b"PK")
+        (self._data_root / "proofread_dict.json").write_text("{}", encoding="utf-8")
+
+        with mock.patch.object(correctmanage, "_history_dir", return_value=str(hist)):
+            status, raw = self._post(
+                "/api/backup/create",
+                {"include_history_images": True, "include_epubs": True},
+            )
+        self.assertEqual(status, 200)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"])
+        with zipfile.ZipFile(data["path"]) as zf:
+            names = zf.namelist()
+        self.assertIn("data/correction_history/v1.images.json", names)
+        self.assertIn("data/book/out.epub", names)
+
+    def test_backup_create_non_dict_400(self):
+        """body 非对象 → 400。"""
+        status, raw = self._post("/api/backup/create", ["x"])
+        self.assertEqual(status, 400)
+        data = json.loads(raw)
+        self.assertFalse(data["ok"])
+        self.assertIn("无效的 JSON", data["error"])
+
+    def test_history_get(self):
+        """GET /api/history 透传 correctmanage._history_entries。"""
+        import correctmanage
+
+        entries = [{"id": "abc", "name": "样例", "pages": 12}]
+        with mock.patch.object(correctmanage, "_history_entries", return_value=entries):
+            status, _, raw = self._get("/api/history")
+        self.assertEqual(status, 200)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["entries"], entries)
+
+    def test_history_delete_ok(self):
+        """POST /api/history/delete 透传 _delete_history([id], all_=False)。"""
+        import correctmanage
+
+        with mock.patch.object(correctmanage, "_delete_history") as dh:
+            status, raw = self._post("/api/history/delete", {"id": "abc"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(raw)["ok"])
+        dh.assert_called_once_with(["abc"], all_=False)
+
+    def test_history_delete_missing_id_400(self):
+        """缺 id → 400。"""
+        status, raw = self._post("/api/history/delete", {"id": ""})
+        self.assertEqual(status, 400)
+        self.assertIn("缺少 id", json.loads(raw)["error"])
 
 
 if __name__ == "__main__":

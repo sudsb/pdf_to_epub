@@ -79,7 +79,7 @@
     "llm_model": "HY",
     "llm_timeout": 3
   },
-  "engine": "llama",
+  "engine": "paddle",
   "vllm_server": "",
   "vllm_server_args": {
     "host": "127.0.0.1",
@@ -287,12 +287,13 @@
   "exclude_pages": [],
   "browser": "D:/min/min.exe",
   "gui_display": "pywebview",
-  "tabs_position": "bottom",
+  "tabs_position": "top",
   "window_maximized": true,
   "ui_settings": {
     "tip_delay": 600,
     "err_hover_delay": 500,
     "editor_font_size": 14,
     "img_mode": ""
-  }
+  },
+  "proofread_engine": "llama"
 }

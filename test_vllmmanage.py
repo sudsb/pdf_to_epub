@@ -136,6 +136,41 @@ class TestRunserver(_EngineResetMixin, unittest.TestCase):
         self.assertEqual(popen.call_count, 0, "连接模式不应启动本地进程")
 
 
+class TestRunserverCtxSize(_EngineResetMixin, unittest.TestCase):
+    """runserver ctx_size 覆盖 → vLLM 的 --max-model-len（矫正界面传 8192）。"""
+
+    def _launch(self, sargs, ctx_size=None):
+        args = ("C:/fake/vllm-server.exe", sargs,
+                "C:/models", {"HY": {"name": "HY", "mmproj": ""}})
+        proc = mock.Mock()
+        proc.poll.return_value = None  # 进程存活
+        ready = {"data": [{"id": "C:/models/HY"}]}
+        with mock.patch.object(vm, "_vll_args", return_value=args), \
+             mock.patch.object(vm, "_probe_server", return_value="none"), \
+             mock.patch.object(vm.subprocess, "Popen", return_value=proc) as popen, \
+             mock.patch.object(vm.time, "sleep"), \
+             mock.patch.object(vm._SESSION, "get",
+                               side_effect=[_resp(503), _resp(200, ready)]):
+            ok = vm.runserver("HY", ctx_size=ctx_size)
+        self.assertTrue(ok)
+        return popen.call_args[0][0]
+
+    def test_ctx_size_override_maps_to_max_model_len(self):
+        # ctx_size=8192 → argv 出现 --max-model-len 8192（配置无该键也生效）
+        cmd = self._launch({"host": "127.0.0.1"}, ctx_size=8192)
+        self.assertEqual(cmd[cmd.index("--max-model-len") + 1], "8192")
+
+    def test_ctx_size_override_beats_config(self):
+        # 配置 max_model_len=32768，显式覆盖 8192 → 以覆盖值为准
+        cmd = self._launch({"max_model_len": "32768"}, ctx_size=8192)
+        self.assertEqual(cmd[cmd.index("--max-model-len") + 1], "8192")
+
+    def test_ctx_size_none_keeps_config(self):
+        # 未传 ctx_size → 配置 max_model_len 原样透传
+        cmd = self._launch({"max_model_len": "32768"})
+        self.assertEqual(cmd[cmd.index("--max-model-len") + 1], "32768")
+
+
 class _FakeImg:
     """带 get_base64() 的假图片对象（鸭子类型，同 pdfmanage.ImageItem）。"""
 
@@ -191,7 +226,11 @@ class TestDispatch(_EngineResetMixin, unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual(m.call_count, 1)
-        self.assertEqual(m.call_args, mock.call("HY", with_mmproj=True, parallel=None))
+        self.assertEqual(
+            m.call_args,
+            mock.call("HY", with_mmproj=True, parallel=None, ctx_size=None),
+            "引擎分发应透传 ctx_size（默认 None）",
+        )
 
     def test_runserver_llama_engine_does_not_touch_vllm(self):
         llm.set_engine("llama")

@@ -12,8 +12,9 @@ _UI_HTML 占位符；本模块只负责后端端点与 CLI 接线，不自行编
   GET  /api/status      → 引擎 / 服务探测 / 端口 / 启动中状态
   GET  /api/ping        → 页面心跳（刷新 last_beat）
   GET  /api/convert/status → 转换进度快照（运行中/完成/日志/结果/待答弹窗询问）
-  GET  /api/correct/status → 矫正进度快照（运行中/完成/日志）
+  GET  /api/correct/status → 矫正实例列表快照（多实例，前端按选中实例回显日志）
   GET  /api/tools/merge/status → 合并进度快照（运行中/完成/日志/结果）
+  GET  /api/history      → 矫正历史条目列表（透传 correctmanage._history_entries）
   POST /api/config      → 校验并原子写配置
   POST /api/server/start→ 后台线程启动推理服务（llamamanage.runserver）
   POST /api/server/stop → 停止推理服务
@@ -22,8 +23,11 @@ _UI_HTML 占位符；本模块只负责后端端点与 CLI 接线，不自行编
   POST /api/convert/start → 子进程启动完整 PDF→EPUB 转换（流式日志）
   POST /api/convert/prompt → 回答子进程的弹窗询问（OCR 断点续传选择，写回 stdin）
   POST /api/convert/stop  → 停止正在运行的转换
-  POST /api/correct/start → 子进程启动矫正界面（流式日志）
-  POST /api/correct/stop  → 停止正在运行的矫正
+  POST /api/correct/start → 子进程启动矫正界面（多实例；pdf 可选；history_id 从历史打开）
+  POST /api/correct/stop  → 停止矫正实例（body.id 指定，缺省最新实例）
+  POST /api/cache/clear   → 清理预览图缓存 / 转换分割图片 / 临时文件（body.scopes）
+  POST /api/backup/create → 备份配置 / 矫正历史 / 用户词表为 zip（写入 data/backups/）
+  POST /api/history/delete→ 删除矫正历史条目（body.id）
   POST /api/tools/merge/start → 后台线程合并多 EPUB（epubmergemanage.merge_epubs）
   POST /api/tools/merge/stop  → 请求停止合并（当前章节完成后才会停止）
 
@@ -33,13 +37,17 @@ _UI_HTML 占位符；本模块只负责后端端点与 CLI 接线，不自行编
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
 import time
 import traceback
+import uuid
 import webbrowser
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 # 占位符：集成阶段由编排者替换成真实 UI 文件内容（不得删除该占位行）
 _UI_HTML = r"""
@@ -187,8 +195,9 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
     <div class="nav-item" data-page="vllm" onclick="switchPage('vllm')"><span class="nav-icon">▶</span> vLLM 参数</div>
     <div class="nav-item" data-page="proofread" onclick="switchPage('proofread')"><span class="nav-icon">✎</span> 校对参数</div>
     <div class="nav-item" data-page="shortcuts" onclick="switchPage('shortcuts')"><span class="nav-icon">⌨</span> 快捷键</div>
-    <div class="nav-item" data-page="rules" onclick="switchPage('rules')"><span class="nav-icon">&#9776;</span> 格式规则</div>
-    <div class="nav-item" data-page="tools" onclick="switchPage('tools')"><span class="nav-icon">&#9872;</span> 工具</div>
+    <div class="nav-item" data-page="rules" onclick="switchPage('rules')"><span class="nav-icon">☰</span> 格式规则</div>
+    <div class="nav-item" data-page="history" onclick="switchPage('history')"><span class="nav-icon">↺</span> 历史记录</div>
+    <div class="nav-item" data-page="tools" onclick="switchPage('tools')"><span class="nav-icon">✂</span> 工具</div>
   </nav>
   <div class="sidebar-overlay" onclick="toggleSidebar()"></div>
   <main class="content" id="contentArea">
@@ -197,7 +206,7 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
       <h2 class="page-title">服务状态</h2>
       <p class="page-desc">查看和控制 OCR 模型服务的运行状态。</p>
       <div class="card">
-        <div class="card-title"><span class="ct-icon">&#9673;</span> 当前引擎</div>
+        <div class="card-title"><span class="ct-icon">◎</span> 当前引擎</div>
         <div class="engine-switch" id="engineSwitch">
           <button class="active" data-eng="llama" onclick="setEngine('llama')">llama.cpp</button>
           <button data-eng="vllm" onclick="setEngine('vllm')">vLLM-Omni</button>
@@ -206,7 +215,7 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
         <div id="engineHint" style="font-size:12px;color:var(--text-dim);margin-bottom:10px;"></div>
       </div>
       <div class="card">
-        <div class="card-title"><span class="ct-icon">&#9673;</span> 服务信息</div>
+        <div class="card-title"><span class="ct-icon">◎</span> 服务信息</div>
         <div class="status-grid">
           <div class="status-item"><span class="si-label">运行状态</span><span class="si-value" id="stRunning"><span class="badge badge-gray">未知</span></span></div>
           <div class="status-item"><span class="si-label">当前模型</span><span class="si-value" id="stModel">--</span></div>
@@ -220,7 +229,7 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
         </div>
       </div>
       <div class="card">
-        <div class="card-title"><span class="ct-icon">&#9998;</span> 操作日志</div>
+        <div class="card-title"><span class="ct-icon">✒</span> 操作日志</div>
         <div class="log-box" id="logBox">等待操作...</div>
       </div>
     </div>
@@ -229,30 +238,31 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
       <h2 class="page-title">基础设置</h2>
       <p class="page-desc">配置核心路径、OCR 模型和引擎选项。</p>
       <div class="card">
-        <div class="card-title"><span class="ct-icon">&#9881;</span> 文件路径</div>
+        <div class="card-title"><span class="ct-icon">⚙</span> 文件路径</div>
         <div class="form-row"><span class="form-label">llama-server 路径</span><div class="form-ctrl"><div class="pick-row"><input type="text" id="cfgLlamaServer" placeholder="llama-server.exe 路径"><button class="btn-small" onclick="pickFile('cfgLlamaServer')">选择文件</button></div></div></div>
         <div class="form-row"><span class="form-label">模型目录</span><div class="form-ctrl"><div class="pick-row"><input type="text" id="cfgModelsDir" placeholder="模型文件所在目录"><button class="btn-small" onclick="pickDir('cfgModelsDir')">选择目录</button></div></div></div>
         <div class="form-row"><span class="form-label">自定义浏览器</span><div class="form-ctrl"><div class="pick-row"><input type="text" id="cfgBrowser" placeholder="留空使用系统默认浏览器"><button class="btn-small" onclick="pickFile('cfgBrowser')">选择文件</button></div><div class="form-hint">可执行文件路径，如 Chrome / Edge / Firefox。留空则使用系统默认浏览器。</div></div></div>
         <div class="form-row"><span class="form-label">界面加载方式</span><div class="form-ctrl"><select id="cfgGuiDisplay"><option value="pywebview">内置窗口（pywebview）</option><option value="browser">系统浏览器</option></select></div><div class="form-hint">默认以内置窗口显示配置界面；改为浏览器后下次启动在浏览器中打开。</div></div>
       </div>
       <div class="card">
-        <div class="card-title"><span class="ct-icon">&#9733;</span> 模型与引擎</div>
+        <div class="card-title"><span class="ct-icon">★</span> 模型与引擎</div>
         <div class="form-row"><span class="form-label">当前模型</span><div class="form-ctrl"><select id="cfgSelectedModel"></select></div></div>
         <div class="form-row"><span class="form-label">推理引擎</span><div class="form-ctrl" style="display:flex;gap:16px;align-items:center;"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgEngine" value="llama" checked> llama.cpp</label><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgEngine" value="vllm"> vLLM-Omni</label><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgEngine" value="paddle"> PaddleOCR</label></div></div>
+        <div class="form-row"><span class="form-label">校正引擎</span><div class="form-ctrl" style="display:flex;gap:16px;align-items:center;"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgProofreadEngine" value="llama" checked> llama.cpp</label><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgProofreadEngine" value="vllm"> vLLM-Omni</label></div><div class="form-hint">矫正界面使用的引擎（PaddleOCR 仅用于转换的图片识别阶段，不参与矫正/重识别）。</div></div>
       </div>
       <div class="card">
-        <div class="card-title"><span class="ct-icon">&#9998;</span> OCR 提示词</div>
+        <div class="card-title"><span class="ct-icon">✎</span> OCR 提示词</div>
         <div class="form-row" style="flex-direction:column;align-items:stretch;"><div class="form-ctrl"><textarea id="cfgOcrPrompt" rows="3" placeholder="输入 OCR 提示词..."></textarea></div><div class="form-hint">发送给模型的 OCR 指令。末尾会自动追加「按原文原格式输出」。</div></div>
       </div>
       <div class="card">
-        <div class="card-title"><span class="ct-icon">🖋</span> 字体设置</div>
+        <div class="card-title"><span class="ct-icon">✎</span> 字体设置</div>
         <div class="form-row"><span class="form-label">正文字体</span><div class="form-ctrl"><input type="text" id="cfgFontBody" placeholder="body font"></div></div>
         <div class="form-row"><span class="form-label">标题字体</span><div class="form-ctrl"><input type="text" id="cfgFontHeading" placeholder="heading font"></div></div>
         <div class="form-row"><span class="form-label">注释字体</span><div class="form-ctrl"><input type="text" id="cfgFontNote" placeholder="note font"></div></div>
         <div class="form-row"><span class="form-label">引用字体</span><div class="form-ctrl"><input type="text" id="cfgFontCitation" placeholder="citation font"></div></div>
       </div>
       <div class="card">
-        <div class="card-title"><span class="ct-icon">📷</span> 图片预处理</div>
+        <div class="card-title"><span class="ct-icon">▦</span> 图片预处理</div>
         <div class="form-row"><span class="form-label">启用预处理</span><div class="form-ctrl"><input type="checkbox" id="cfgImgPreEnabled"></div></div>
         <div class="form-row"><span class="form-label">灰度</span><div class="form-ctrl"><input type="checkbox" id="cfgImgGray"></div></div>
         <div class="form-row"><span class="form-label">去噪</span><div class="form-ctrl"><input type="checkbox" id="cfgImgDenoise"></div></div>
@@ -260,13 +270,27 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
         <div class="form-row"><span class="form-label">自适应二值化</span><div class="form-ctrl"><input type="checkbox" id="cfgImgBinarize"></div></div>
         <div class="form-row"><span class="form-label">预处理 workers</span><div class="form-ctrl"><input type="number" id="cfgImgWorkers" min="0" step="1"></div></div>
       </div>
+      <div class="card">
+        <div class="card-title"><span class="ct-icon">⌦</span> 缓存管理</div>
+        <p class="page-desc" style="margin:0 0 12px;">清理本地缓存文件释放磁盘空间。</p>
+        <div class="form-row"><span class="form-label">清除范围</span><div class="form-ctrl" style="display:flex;flex-wrap:wrap;gap:14px;align-items:center;"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="ccPreview" checked> 预览图缓存</label><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="ccSplit" checked> 转换分割图片</label><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="ccTmp"> 临时文件</label></div></div>
+        <div class="form-row"><span class="form-label">&nbsp;</span><div class="form-ctrl"><button class="btn-outline" id="ccClearBtn" onclick="clearCaches()">清除缓存</button><span class="form-hint" style="margin-left:10px;" id="ccResult"></span></div></div>
+        <div class="form-hint">清除范围须至少勾选一项；转换/矫正运行中不可清除。分割图片会被同 PDF 同参数复用，清除后下次转换需重新生成。</div>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="ct-icon">▣</span> 数据备份</div>
+        <p class="page-desc" style="margin:0 0 12px;">将配置、矫正历史与用户词表打包为 zip。</p>
+        <div class="form-row"><span class="form-label">包含内容</span><div class="form-ctrl" style="display:flex;flex-wrap:wrap;gap:14px;align-items:center;"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="bkImages"> 历史图片</label><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="bkEpubs"> EPUB 成品</label></div></div>
+        <div class="form-row"><span class="form-label">&nbsp;</span><div class="form-ctrl"><button class="btn-outline" id="bkBtn" onclick="createBackup()">立即备份</button><span class="form-hint" style="margin-left:10px;" id="bkResult"></span></div></div>
+        <div class="form-hint">始终包含 config.json、矫正历史（不含图片）、用户纠错词表；备份文件写入 data/backups/。</div>
+      </div>
     </div>
     <!-- 3. 模型管理 -->
     <div class="page" id="page-models">
       <h2 class="page-title">模型管理</h2>
       <p class="page-desc">管理已注册的 OCR 模型列表。每个模型需指定 GGUF 主文件和 mmproj 投影文件。</p>
       <div class="card">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;"><div class="card-title" style="margin-bottom:0;"><span class="ct-icon">&#9733;</span> 模型列表</div><button class="btn-add" onclick="addModel()">+ 添加模型</button></div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;"><div class="card-title" style="margin-bottom:0;"><span class="ct-icon">★</span> 模型列表</div><button class="btn-add" onclick="addModel()">+ 添加模型</button></div>
         <table class="dyn-table"><thead><tr><th style="width:80px;">键名</th><th>主模型文件 (name)</th><th>投影文件 (mmproj)</th><th style="width:64px;">并发</th><th style="width:50px;">主文件</th><th style="width:50px;">投影文件</th><th class="del-cell"></th></tr></thead><tbody id="modelTbody"></tbody></table>
         <div class="form-hint" style="margin-top:6px;">并发 = 该模型的推荐 OCR 并发数（不填则默认 3）。转换页与 CLI 未显式指定并发时按此值运行；显存充足可调大，大模型（如 BF16）建议 2-3 避免 KV 缓存溢出变慢。</div>
       </div>
@@ -276,7 +300,7 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
       <h2 class="page-title">llama 启动参数</h2>
       <p class="page-desc">llama-server 的启动参数键值对。键名对应命令行 --键名（自动转 kebab-case）。</p>
       <div class="card">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;"><div class="card-title" style="margin-bottom:0;"><span class="ct-icon">&#9654;</span> 参数列表</div><button class="btn-add" onclick="addArg('llamaArgs')">+ 添加参数</button></div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;"><div class="card-title" style="margin-bottom:0;"><span class="ct-icon">▶</span> 参数列表</div><button class="btn-add" onclick="addArg('llamaArgs')">+ 添加参数</button></div>
         <table class="dyn-table"><thead><tr><th style="width:200px;">参数名</th><th>值</th><th class="del-cell"></th></tr></thead><tbody id="llamaArgs"></tbody></table>
       </div>
     </div>
@@ -285,11 +309,11 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
       <h2 class="page-title">vLLM 启动参数</h2>
       <p class="page-desc">vLLM-Omni 服务的可执行文件路径和启动参数。</p>
       <div class="card">
-        <div class="card-title"><span class="ct-icon">&#9881;</span> vLLM 可执行文件</div>
+        <div class="card-title"><span class="ct-icon">⚙</span> vLLM 可执行文件</div>
         <div class="form-row"><span class="form-label">vllm_server 路径</span><div class="form-ctrl"><div class="pick-row"><input type="text" id="cfgVllmServer" placeholder="vllm 可执行文件路径（留空=仅连接模式）"><button class="btn-small" onclick="pickFile('cfgVllmServer')">选择文件</button></div><div class="form-hint">留空表示不启动本地进程，仅连接远程 vLLM 服务。</div></div></div>
       </div>
       <div class="card">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;"><div class="card-title" style="margin-bottom:0;"><span class="ct-icon">&#9654;</span> 参数列表</div><button class="btn-add" onclick="addArg('vllmArgs')">+ 添加参数</button></div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;"><div class="card-title" style="margin-bottom:0;"><span class="ct-icon">▶</span> 参数列表</div><button class="btn-add" onclick="addArg('vllmArgs')">+ 添加参数</button></div>
         <table class="dyn-table"><thead><tr><th style="width:220px;">参数名</th><th>值</th><th class="del-cell"></th></tr></thead><tbody id="vllmArgs"></tbody></table>
       </div>
     </div>
@@ -297,9 +321,9 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
     <div class="page" id="page-proofread">
       <h2 class="page-title">校对参数</h2>
       <p class="page-desc">文字校对引擎的参数配置，包括规则开关和 LLM 校对选项。</p>
-      <div class="card"><div class="card-title"><span class="ct-icon">&#9998;</span> 基本参数</div><div class="pr-grid" id="proofreadGrid"></div></div>
+      <div class="card"><div class="card-title"><span class="ct-icon">✎</span> 基本参数</div><div class="pr-grid" id="proofreadGrid"></div></div>
       <div class="card">
-        <div class="card-title"><span class="ct-icon">&#9998;</span> LLM 校对</div>
+        <div class="card-title"><span class="ct-icon">✎</span> LLM 校对</div>
         <div class="pr-grid">
           <div class="form-row"><span class="form-label">启用 LLM 校对</span><div class="form-ctrl"><input type="checkbox" id="prEnableLlm"></div></div>
           <div class="form-row"><span class="form-label">校对模型</span><div class="form-ctrl"><select id="prLlmModel"></select></div></div>
@@ -313,7 +337,7 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
       <h2 class="page-title">快捷键</h2>
       <p class="page-desc">矫正界面操作快捷键绑定。键值对格式：操作名 → 按键组合。</p>
       <div class="card">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;"><div class="card-title" style="margin-bottom:0;"><span class="ct-icon">&#8984;</span> 快捷键列表</div><button class="btn-add" onclick="addArg('shortcuts')">+ 添加快捷键</button></div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;"><div class="card-title" style="margin-bottom:0;"><span class="ct-icon">⌨</span> 快捷键列表</div><button class="btn-add" onclick="addArg('shortcuts')">+ 添加快捷键</button></div>
         <table class="dyn-table"><thead><tr><th style="width:220px;">操作名</th><th>按键组合</th><th class="del-cell"></th></tr></thead><tbody id="shortcuts"></tbody></table>
       </div>
     </div>
@@ -321,7 +345,7 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
     <div class="page" id="page-rules">
       <h2 class="page-title">格式规则</h2>
       <p class="page-desc">矫正界面的自动格式规则列表（仅展示，编辑请在矫正界面操作）。</p>
-      <div class="card"><div class="card-title"><span class="ct-icon">&#9776;</span> 已有规则</div><div id="rulesList"></div></div>
+      <div class="card"><div class="card-title"><span class="ct-icon">☰</span> 已有规则</div><div id="rulesList"></div></div>
     </div>
     <!-- 9. 转换 -->
     <div class="page" id="page-convert">
@@ -329,17 +353,18 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
       <p class="page-desc">选择 PDF 文件并设置参数，一键启动完整的转换流程。</p>
       <!-- 矫正界面 -->
       <div class="card">
-        <div class="card-title"><span class="ct-icon">&#9998;</span> 矫正界面</div>
-        <p class="page-desc" style="margin:0 0 12px;">启动矫正界面，在浏览器中手动校对 OCR 结果后生成 EPUB。</p>
+        <div class="card-title" style="display:flex;align-items:center;gap:8px;"><span class="ct-icon">✎</span> 矫正界面<span id="correctCount" style="margin-left:auto;font-size:12px;color:var(--text-dim);"></span></div>
+        <p class="page-desc" style="margin:0 0 12px;">在浏览器中手动校对 OCR 结果后生成 EPUB。可通过「历史记录」页多开矫正实例；启动后实例以 IP 地址+端口区分。</p>
         <div class="action-row">
           <button class="btn-start" id="crStartBtn" onclick="startCorrect()">启动矫正</button>
           <button class="btn-stop-convert" id="crStopBtn" onclick="stopCorrect()" style="display:none;">停止</button>
         </div>
+        <select id="correctSel" style="display:none;margin-top:10px;max-width:420px;" onchange="selectCorrect()"></select>
         <pre id="correctLog" style="margin-top:10px;">等待矫正任务...</pre>
       </div>
       <!-- 源文件 -->
       <div class="card">
-        <div class="card-title"><span class="ct-icon">&#128196;</span> 源文件</div>
+        <div class="card-title"><span class="ct-icon">☐</span> 源文件</div>
         <div class="form-row">
           <span class="form-label">PDF 路径</span>
           <div class="form-ctrl">
@@ -353,7 +378,7 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
       </div>
 <!-- 转换参数 -->
       <div class="card">
-        <div class="card-title"><span class="ct-icon">&#9881;</span> 转换参数</div>
+        <div class="card-title"><span class="ct-icon">⚙</span> 转换参数</div>
         <div class="convert-grid">
           <div class="form-row"><span class="form-label">DPI</span><div class="form-ctrl"><select id="cvtDpi"><option value="0" selected>0 = 100</option><option value="1">1 = 150</option><option value="2">2 = 200</option><option value="3">3 = 300</option><option value="4">4 = 600</option></select></div></div>
           <div class="form-row"><span class="form-label">模型</span><div class="form-ctrl"><select id="cvtModel" onchange="onCvtModelChange()"></select></div></div>
@@ -368,10 +393,9 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
           <div class="form-row"><span class="form-label">排除页</span><div class="form-ctrl"><input type="text" id="cvtExclude" placeholder="如 1-15,17,20（可选）"><div class="form-hint">跳过对指定序号图片的识别，多个用逗号分隔，支持区间。</div></div></div>
         </div>
       </div>
-      </div>
       <!-- 操作 -->
       <div class="card">
-        <div class="card-title"><span class="ct-icon">&#9654;</span> 操作</div>
+        <div class="card-title"><span class="ct-icon">▶</span> 操作</div>
         <div class="action-row">
           <button class="btn-start" id="cvtStartBtn" onclick="startConvert()">开始转换</button>
           <button class="btn-stop-convert" id="cvtStopBtn" onclick="stopConvert()" style="display:none;">停止</button>
@@ -379,16 +403,31 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
       </div>
       <!-- 运行日志 -->
       <div class="card">
-        <div class="card-title"><span class="ct-icon">&#9998;</span> 运行日志</div>
+        <div class="card-title"><span class="ct-icon">✒</span> 运行日志</div>
         <pre id="convertLog">等待转换任务...</pre>
       </div>
     </div>
-    <!-- 10. 工具 -->
+    <!-- 10. 历史记录 -->
+    <div class="page" id="page-history">
+      <h2 class="page-title">历史记录</h2>
+      <p class="page-desc">从矫正历史打开独立的矫正界面，可同时多开。删除条目不影响已生成的 EPUB。</p>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+        <div class="card-title" style="margin-bottom:0;"><span class="ct-icon">↺</span> 矫正历史</div>
+        <button class="btn-outline" id="historyRefreshBtn" onclick="renderHistory()">刷新</button>
+      </div>
+      <div class="card">
+        <table class="dyn-table" style="width:100%;">
+          <thead><tr><th>标题</th><th>PDF</th><th>更新时间</th><th style="width:52px;">页数</th><th style="width:80px;">最后校正页</th><th style="width:128px;">操作</th></tr></thead>
+          <tbody id="historyTbody"><tr><td colspan="6" class="empty-state">加载中...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <!-- 11. 工具 -->
     <div class="page" id="page-tools">
       <h2 class="page-title">工具</h2>
       <p class="page-desc">辅助工具。当前可用：多 EPUB 合并。</p>
       <div class="card">
-        <div class="card-title"><span class="ct-icon">&#128196;</span> 多 EPUB 合并</div>
+        <div class="card-title"><span class="ct-icon">⊕</span> 多 EPUB 合并</div>
         <p class="page-desc" style="margin:0 0 12px;">将多个 EPUB 按顺序合并为一个，合并顺序 = 列表顺序。</p>
         <div class="form-row">
           <span class="form-label">EPUB 文件</span>
@@ -407,14 +446,14 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
         <div class="form-hint">输出路径留空时，默认保存到第一个 EPUB 所在目录。</div>
       </div>
       <div class="card">
-        <div class="card-title"><span class="ct-icon">&#9654;</span> 操作</div>
+        <div class="card-title"><span class="ct-icon">▶</span> 操作</div>
         <div class="action-row">
           <button class="btn-start" id="mergeStartBtn" onclick="startMerge()">开始合并</button>
           <button class="btn-stop-convert" id="mergeStopBtn" onclick="stopMerge()" style="display:none;">停止</button>
         </div>
       </div>
       <div class="card">
-        <div class="card-title"><span class="ct-icon">&#9998;</span> 运行日志</div>
+        <div class="card-title"><span class="ct-icon">✒</span> 运行日志</div>
         <pre id="mergeLog" class="log-box">等待合并任务...</pre>
       </div>
     </div>
@@ -441,13 +480,13 @@ function addLog(text,cls){logLines.push({text:text,cls:cls||"log-info"});if(logL
 function renderLog(){var box=document.getElementById("logBox"),now=new Date(),ts=pad2(now.getHours())+":"+pad2(now.getMinutes())+":"+pad2(now.getSeconds());box.innerHTML=logLines.map(function(l){return '<span class="'+l.cls+'">['+ts+']</span> '+escH(l.text)}).join("\n");box.scrollTop=box.scrollHeight}
 function pad2(n){return n<10?"0"+n:""+n}
 function escH(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}
-function switchPage(name){document.querySelectorAll(".nav-item").forEach(function(el){el.classList.toggle("active",el.dataset.page===name)});document.querySelectorAll(".page").forEach(function(el){el.classList.toggle("active",el.id==="page-"+name)});document.getElementById("sidebar").classList.remove("open")}
+function switchPage(name){document.querySelectorAll(".nav-item").forEach(function(el){el.classList.toggle("active",el.dataset.page===name)});document.querySelectorAll(".page").forEach(function(el){el.classList.toggle("active",el.id==="page-"+name)});document.getElementById("sidebar").classList.remove("open");if(name==="history"&&!historyLoaded)renderHistory()}
 function toggleSidebar(){document.getElementById("sidebar").classList.toggle("open")}
 function setEngine(eng){cfg.engine=eng;document.querySelectorAll(".engine-switch button").forEach(function(b){b.classList.toggle("active",b.dataset.eng===eng)});updateEngineHint()}
 function updateEngineHint(){var eng=cfg.engine||"llama",hint;if(eng==="paddle"){hint="当前引擎: paddle | 本地推理，无需启动服务"}else{var port=eng==="llama"?(cfg.llama_server_args||{}).port||"8080":(cfg.vllm_server_args||{}).port||"8000";hint="当前引擎: "+eng+" | 默认端口: "+port}document.getElementById("engineHint").textContent=hint}
 function renderStatus(s){var badgeEl=document.getElementById("stRunning"),navBadge=document.getElementById("navStatusBadge"),label,cls;if(s.probe==="match"){label="运行中";cls="badge-green";navBadge.textContent="运行中";navBadge.className="nav-badge running"}else if(s.probe==="mismatch"){label="模型不匹配";cls="badge-yellow";navBadge.textContent="异常";navBadge.className="nav-badge stopped"}else{label="未运行";cls=s.busy?"badge-yellow":"badge-gray";navBadge.textContent=s.busy?"启动中":"未运行";navBadge.className="nav-badge "+(s.busy?"running":"stopped")}badgeEl.innerHTML='<span class="badge '+cls+'">'+label+"</span>";if(s.busy&&s.probe==="none")badgeEl.innerHTML+=' <span style="font-size:11px;color:var(--yellow);margin-left:6px;">启动中...</span>';document.getElementById("stModel").textContent=s.model_name||s.model_key||"--";document.getElementById("stPort").textContent=s.port||"--";document.getElementById("stEngine").textContent=s.engine||cfg.engine||"llama";if(s.engine){document.querySelectorAll(".engine-switch button").forEach(function(b){b.classList.toggle("active",b.dataset.eng===s.engine)});cfg.engine=s.engine}updateEngineHint();document.getElementById("btnStart").disabled=s.probe==="match"||s.busy;document.getElementById("btnStop").disabled=s.probe==="none"&&!s.busy;if(s.engine==="paddle"){badgeEl.innerHTML='<span class="badge badge-green">本地推理</span>';document.getElementById("stPort").textContent="--";navBadge.textContent="本地推理";navBadge.className="nav-badge running";document.getElementById("btnStart").disabled=true;document.getElementById("btnStop").disabled=true}if(s.last_error&&s.last_error!==_lastShownError){_lastShownError=s.last_error;addLog("服务错误: "+s.last_error,"log-err")}}
 function renderAll(){renderBasic();renderModels();renderArgs("llamaArgs",cfg.llama_server_args);renderArgs("vllmArgs",cfg.vllm_server_args);renderProofread();renderShortcuts();renderRules();renderConvert();document.querySelectorAll(".engine-switch button").forEach(function(b){b.classList.toggle("active",b.dataset.eng===(cfg.engine||"llama"))});updateEngineHint()}
-function renderBasic(){document.getElementById("cfgLlamaServer").value=cfg.llama_server||"";document.getElementById("cfgModelsDir").value=cfg.models_dir||"";document.getElementById("cfgBrowser").value=cfg.browser||"";document.getElementById("cfgGuiDisplay").value=(cfg.gui_display||"pywebview");document.getElementById("cfgOcrPrompt").value=cfg.ocr_prompt||"";var sel=document.getElementById("cfgSelectedModel");sel.innerHTML="";models.forEach(function(m){var o=document.createElement("option");o.value=m.key;o.textContent=m.key+" - "+m.name;sel.appendChild(o)});sel.value=cfg.selected_model||"";document.querySelectorAll('input[name="cfgEngine"]').forEach(function(r){r.checked=r.value===(cfg.engine||"llama")});try{document.getElementById("cfgFontBody").value=(cfg.fonts&&cfg.fonts.body)||"";document.getElementById("cfgFontHeading").value=(cfg.fonts&&cfg.fonts.heading)||"";document.getElementById("cfgFontNote").value=(cfg.fonts&&cfg.fonts.note)||"";document.getElementById("cfgFontCitation").value=(cfg.fonts&&cfg.fonts.citation)||""}catch(e){}try{var ip=cfg.image_preprocess||{};document.getElementById("cfgImgPreEnabled").checked=!!ip.enabled;document.getElementById("cfgImgGray").checked=!!ip.gray;document.getElementById("cfgImgDenoise").checked=!!ip.denoise;document.getElementById("cfgImgSharpen").checked=!!ip.sharpen;document.getElementById("cfgImgBinarize").checked=!!ip.binarize;document.getElementById("cfgImgWorkers").value=(ip.workers!=null?ip.workers:"")}catch(e){}
+function renderBasic(){document.getElementById("cfgLlamaServer").value=cfg.llama_server||"";document.getElementById("cfgModelsDir").value=cfg.models_dir||"";document.getElementById("cfgBrowser").value=cfg.browser||"";document.getElementById("cfgGuiDisplay").value=(cfg.gui_display||"pywebview");document.getElementById("cfgOcrPrompt").value=cfg.ocr_prompt||"";var sel=document.getElementById("cfgSelectedModel");sel.innerHTML="";models.forEach(function(m){var o=document.createElement("option");o.value=m.key;o.textContent=m.key+" - "+m.name;sel.appendChild(o)});sel.value=cfg.selected_model||"";document.querySelectorAll('input[name="cfgEngine"]').forEach(function(r){r.checked=r.value===(cfg.engine||"llama")});document.querySelectorAll('input[name="cfgProofreadEngine"]').forEach(function(r){r.checked=r.value===(cfg.proofread_engine||"llama")});try{document.getElementById("cfgFontBody").value=(cfg.fonts&&cfg.fonts.body)||"";document.getElementById("cfgFontHeading").value=(cfg.fonts&&cfg.fonts.heading)||"";document.getElementById("cfgFontNote").value=(cfg.fonts&&cfg.fonts.note)||"";document.getElementById("cfgFontCitation").value=(cfg.fonts&&cfg.fonts.citation)||""}catch(e){}try{var ip=cfg.image_preprocess||{};document.getElementById("cfgImgPreEnabled").checked=!!ip.enabled;document.getElementById("cfgImgGray").checked=!!ip.gray;document.getElementById("cfgImgDenoise").checked=!!ip.denoise;document.getElementById("cfgImgSharpen").checked=!!ip.sharpen;document.getElementById("cfgImgBinarize").checked=!!ip.binarize;document.getElementById("cfgImgWorkers").value=(ip.workers!=null?ip.workers:"")}catch(e){}
 }
 function renderModels(){var tbody=document.getElementById("modelTbody");tbody.innerHTML="";var keys=Object.keys(cfg.model_choices||{});if(!keys.length){tbody.innerHTML='<tr><td colspan="7" class="empty-state">暂无模型，点击上方「添加模型」</td></tr>';return}keys.forEach(function(key){var m=cfg.model_choices[key],info=models.find(function(x){return x.key===key}),nameOk=info?info.name_exists:false,mmOk=info?info.mmproj_exists:false,tr=document.createElement("tr");tr.innerHTML='<td><input type="text" value="'+escH(key)+'" data-field="key" style="font-weight:600;background:#f8f9fb;"></td><td><input type="text" value="'+escH(m.name||"")+'" data-field="name"></td><td><input type="text" value="'+escH(m.mmproj||"")+'" data-field="mmproj"></td><td><input type="number" min="1" max="64" value="'+(m.workers!=null?m.workers:"")+'" data-field="workers" style="width:52px;"></td><td class="'+(nameOk?"file-ok":"file-miss")+'">'+(nameOk?"\u2713":"\u2717")+'</td><td class="'+(mmOk?"file-ok":"file-miss")+'">'+(mmOk?"\u2713":"\u2717")+'</td><td class="del-cell"><button class="del-btn" title="删除模型">\u2715</button></td>';tr.querySelector(".del-btn").onclick=function(){if(confirm("确定删除模型「"+key+"」？")){delete cfg.model_choices[key];models=models.filter(function(x){return x.key!==key});renderModels();toast("已删除模型 "+key,"ok")}};tbody.appendChild(tr)})}
 function addModel(){var nk="NEW",i=1;while(cfg.model_choices[nk])nk="NEW"+(i++);cfg.model_choices[nk]={name:"",mmproj:""};models.push({key:nk,name:"",mmproj:"",name_exists:false,mmproj_exists:false});renderModels();toast("已添加空模型行，请填写后保存","warn")}
@@ -456,7 +495,7 @@ function addArg(tid){var tbody=document.getElementById(tid),empty=tbody.querySel
 function renderProofread(){var pr=cfg.proofread||{},grid=document.getElementById("proofreadGrid");grid.innerHTML="";[{k:"similarity_min",l:"相似度阈值",s:0.01},{k:"score_min",l:"最低评分",s:0.01},{k:"max_cand_cache",l:"候选缓存上限",s:100},{k:"max_replacement_combinations",l:"替换组合上限",s:1},{k:"auto_fix_score",l:"自动修正阈值",s:0.01}].forEach(function(f){var d=document.createElement("div");d.className="form-row";d.innerHTML='<span class="form-label">'+f.l+'</span><div class="form-ctrl"><input type="number" data-pr="'+f.k+'" value="'+(pr[f.k]!=null?pr[f.k]:"")+'" step="'+f.s+'"></div>';grid.appendChild(d)});document.getElementById("prEnableLlm").checked=!!pr.enable_llm;document.getElementById("prLegacyRules").checked=!!pr.enable_legacy_rules;document.getElementById("prLlmTimeout").value=pr.llm_timeout!=null?pr.llm_timeout:"";var sel=document.getElementById("prLlmModel");sel.innerHTML='<option value="">（自动使用当前模型）</option>';models.forEach(function(m){var o=document.createElement("option");o.value=m.key;o.textContent=m.key+" - "+m.name;sel.appendChild(o)});sel.value=pr.llm_model||""}
 function renderShortcuts(){renderArgs("shortcuts",cfg.shortcuts)}
 function renderRules(){var list=document.getElementById("rulesList"),rules=cfg.format_rules||[];if(!rules.length){list.innerHTML='<div class="empty-state">暂无格式规则</div>';return}list.innerHTML="";rules.forEach(function(r,idx){var card=document.createElement("div");card.className="rule-card";var ct="";if(r.conditions&&r.conditions.length){ct=r.conditions.map(function(c){var p=[];if(c.pattern)p.push(c.type==="regex"?"正则「"+c.pattern+"」":"包含「"+c.pattern+"」");else p.push("无条件");p.push("作用域: "+(c.scope==="page"?"当前页":c.scope==="paragraph"?"段落":"选中"));if(c.formats&&c.formats.length)p.push("\u2192 "+c.formats.join(", "));return p.join(" | ")}).join("；")}else if(r.condition){ct=r.condition.pattern?(r.condition.type||"contains")+"「"+r.condition.pattern+"」":"无条件"}var btn=document.createElement("button");btn.className="btn-small";btn.textContent="删除";btn.title="删除规则";btn.onclick=function(){if(confirm("确定删除此格式规则？")){cfg.format_rules.splice(idx,1);renderRules();toast("已删除格式规则","ok")}};card.innerHTML='<span class="rule-name">'+escH(r.name||"未命名")+'</span><span class="rule-cond">'+escH(ct||"无条件")+'</span>';card.appendChild(btn);list.appendChild(card)})}
-function collectConfig(){cfg.llama_server=document.getElementById("cfgLlamaServer").value.trim();cfg.models_dir=document.getElementById("cfgModelsDir").value.trim();cfg.browser=document.getElementById("cfgBrowser").value.trim();cfg.gui_display=document.getElementById("cfgGuiDisplay").value;cfg.ocr_prompt=document.getElementById("cfgOcrPrompt").value;cfg.selected_model=document.getElementById("cfgSelectedModel").value;var er=document.querySelector('input[name="cfgEngine"]:checked');if(er)cfg.engine=er.value;var nm={};document.getElementById("modelTbody").querySelectorAll("tr").forEach(function(tr){var ins=tr.querySelectorAll("input");if(ins.length<2)return;var key=ins[0].value.trim();if(key){var m={name:ins[1].value.trim(),mmproj:ins.length>=3?ins[2].value.trim():""};var w=ins.length>=4?parseInt(ins[3].value,10):0;if(!isNaN(w)&&w>=1&&w<=64)m.workers=w;nm[key]=m}});cfg.model_choices=nm;cfg.llama_server_args=collectKVT("llamaArgs");cfg.vllm_server_args=collectKVT("vllmArgs");cfg.vllm_server=document.getElementById("cfgVllmServer").value.trim();var pr={};document.querySelectorAll("[data-pr]").forEach(function(el){var k=el.dataset.pr,v=el.value.trim();if(el.type==="number"&&v!=="")pr[k]=parseFloat(v);else pr[k]=v});pr.enable_llm=document.getElementById("prEnableLlm").checked;pr.enable_legacy_rules=document.getElementById("prLegacyRules").checked;var lm=document.getElementById("prLlmModel").value;if(lm)pr.llm_model=lm;var lt=document.getElementById("prLlmTimeout").value.trim();if(lt!=="")pr.llm_timeout=parseFloat(lt);cfg.proofread=pr;cfg.shortcuts=collectKVT("shortcuts")}
+function collectConfig(){cfg.llama_server=document.getElementById("cfgLlamaServer").value.trim();cfg.models_dir=document.getElementById("cfgModelsDir").value.trim();cfg.browser=document.getElementById("cfgBrowser").value.trim();cfg.gui_display=document.getElementById("cfgGuiDisplay").value;cfg.ocr_prompt=document.getElementById("cfgOcrPrompt").value;cfg.selected_model=document.getElementById("cfgSelectedModel").value;var er=document.querySelector('input[name="cfgEngine"]:checked');if(er)cfg.engine=er.value;var per=document.querySelector('input[name="cfgProofreadEngine"]:checked');if(per)cfg.proofread_engine=per.value;var nm={};document.getElementById("modelTbody").querySelectorAll("tr").forEach(function(tr){var ins=tr.querySelectorAll("input");if(ins.length<2)return;var key=ins[0].value.trim();if(key){var m={name:ins[1].value.trim(),mmproj:ins.length>=3?ins[2].value.trim():""};var w=ins.length>=4?parseInt(ins[3].value,10):0;if(!isNaN(w)&&w>=1&&w<=64)m.workers=w;nm[key]=m}});cfg.model_choices=nm;cfg.llama_server_args=collectKVT("llamaArgs");cfg.vllm_server_args=collectKVT("vllmArgs");cfg.vllm_server=document.getElementById("cfgVllmServer").value.trim();var pr={};document.querySelectorAll("[data-pr]").forEach(function(el){var k=el.dataset.pr,v=el.value.trim();if(el.type==="number"&&v!=="")pr[k]=parseFloat(v);else pr[k]=v});pr.enable_llm=document.getElementById("prEnableLlm").checked;pr.enable_legacy_rules=document.getElementById("prLegacyRules").checked;var lm=document.getElementById("prLlmModel").value;if(lm)pr.llm_model=lm;var lt=document.getElementById("prLlmTimeout").value.trim();if(lt!=="")pr.llm_timeout=parseFloat(lt);cfg.proofread=pr;cfg.shortcuts=collectKVT("shortcuts")}
 function collectKVT(tid){var r={};document.getElementById(tid).querySelectorAll("tr").forEach(function(tr){var ins=tr.querySelectorAll("input");if(ins.length<2)return;var k=ins[0].value.trim(),v=ins[1].value;if(k)r[k]=v});return r}
 function collectExtraConfig(){
   try{
@@ -504,15 +543,19 @@ function pollConvertStatus(){apiGet("/api/convert/status").then(function(res){if
 function showConvertPrompt(p){var bg=document.getElementById("convertPromptBg");if(!bg)return;document.getElementById("convertPromptQuestion").textContent=p.question||"\u8bf7\u9009\u62e9\u64cd\u4f5c";var box=document.getElementById("convertPromptBtns");box.innerHTML="";(p.options||[]).forEach(function(o){var b=document.createElement("button");b.className=o.value===p.default?"btn-start":"btn-small";b.textContent=o.label||o.value;b.style.cssText="padding:10px 14px;font-size:13px;cursor:pointer;";b.onclick=function(){apiPost("/api/convert/prompt",{choice:o.value}).then(function(res){if(res&&res.ok){bg.style.display="none";addLog("\u5df2\u9009\u62e9: "+(o.label||o.value),"log-info");startPollConvert()}else{toast((res&&res.error)||"\u56de\u7b54\u5931\u8d25","fail");startPollConvert()}})};box.appendChild(b)});bg.style.display="flex"}
 function renderConvertLog(lines){var el=document.getElementById("convertLog");if(!lines.length)return;el.textContent=lines.join("\n");el.scrollTop=el.scrollHeight}
 function stopConvert(){apiPost("/api/convert/stop").then(function(res){if(res&&res.ok){toast("\u5df2\u8bf7\u6c42\u505c\u6b62","warn");addLog("\u5df2\u8bf7\u6c42\u505c\u6b62\u8f6c\u6362","log-warn");var bg=document.getElementById("convertPromptBg");if(bg)bg.style.display="none";setConvertBusy(false);stopPollConvert()}else{var msg=res&&res.error?res.error:"\u505c\u6b62\u5931\u8d25";toast(msg,"fail")}})}
-/* ===== 矫正界面 ===== */
+/* ===== 矫正界面（多实例） ===== */
 var correctPollTimer=null;
-function setCorrectBusy(busy){var start=document.getElementById("crStartBtn"),stop=document.getElementById("crStopBtn");if(busy){start.disabled=true;start.classList.add("running");start.textContent="\u77eb\u6b63\u4e2d\u2026";stop.style.display="";stop.disabled=false}else{start.disabled=false;start.classList.remove("running");start.textContent="\u542f\u52a8\u77eb\u6b63";stop.style.display="none";stop.disabled=true}}
-function startCorrect(){var pdf=document.getElementById("cvtPdf").value.trim();var engine=document.getElementById("cvtEngine").value;var params={pdf:pdf||null,engine:engine||null,title:document.getElementById("cvtTitle").value.trim(),author:document.getElementById("cvtAuthor").value.trim(),lang:document.getElementById("cvtLang").value.trim()||"zh-CN"};setCorrectBusy(true);var log=document.getElementById("correctLog");log.textContent="";addLog("\u542f\u52a8\u77eb\u6b63: "+(pdf||"\u65e0\u6587\u4ef6\u542f\u52a8"),"log-info");apiPost("/api/correct/start",params).then(function(res){if(res&&res.ok){toast("\u77eb\u6b63\u5df2\u542f\u52a8","ok");addLog("\u77eb\u6b63\u5df2\u542f\u52a8","log-ok");startPollCorrect()}else{var msg=res&&res.error?res.error:"\u542f\u52a8\u5931\u8d25";toast(msg,"fail");addLog("\u542f\u52a8\u5931\u8d25: "+msg,"log-err");setCorrectBusy(false)}})}
+var correctInstances=[];
+var selectedCorrectId=null;
+function setCorrectBusy(busy){var start=document.getElementById("crStartBtn"),stop=document.getElementById("crStopBtn");if(busy){start.disabled=true;start.classList.add("running");start.textContent="矫正中…";stop.style.display="";stop.disabled=false}else{start.disabled=false;start.classList.remove("running");start.textContent="启动矫正";stop.style.display="none";stop.disabled=true}}
+function startCorrect(){var pdf=document.getElementById("cvtPdf").value.trim();var engine=document.getElementById("cvtEngine").value;var params={pdf:pdf||null,engine:engine||null,title:document.getElementById("cvtTitle").value.trim(),author:document.getElementById("cvtAuthor").value.trim(),lang:document.getElementById("cvtLang").value.trim()||"zh-CN"};setCorrectBusy(true);var log=document.getElementById("correctLog");log.textContent="";addLog("启动矫正: "+(pdf||"无文件启动"),"log-info");apiPost("/api/correct/start",params).then(function(res){if(res&&res.ok){toast("矫正已启动","ok");addLog("矫正已启动","log-ok");startPollCorrect()}else{var msg=res&&res.error?res.error:"启动失败";toast(msg,"fail");addLog("启动失败: "+msg,"log-err");setCorrectBusy(false)}})}
 function startPollCorrect(){if(correctPollTimer)clearInterval(correctPollTimer);correctPollTimer=setInterval(pollCorrectStatus,500)}
 function stopPollCorrect(){if(correctPollTimer){clearInterval(correctPollTimer);correctPollTimer=null}}
-function pollCorrectStatus(){apiGet("/api/correct/status").then(function(res){if(!res||!res.ok)return;renderCorrectLog(res.lines||[]);if(res.running)return;stopPollCorrect();setCorrectBusy(false);if(res.done&&res.success===true){toast("\u77eb\u6b63\u5b8c\u6210","ok");addLog("\u77eb\u6b63\u5b8c\u6210","log-ok")}else if(res.done&&res.success===false){var errmsg=res.error||"\u77eb\u6b63\u5931\u8d25";toast(errmsg,"fail");addLog("\u77eb\u6b63\u5931\u8d25: "+errmsg,"log-err")}})}
+function renderCorrectSel(instances){var sel=document.getElementById("correctSel");if(!sel)return;var cnt=document.getElementById("correctCount");if(cnt)cnt.textContent="矫正实例："+instances.length;if(!instances.length){sel.style.display="none";selectedCorrectId=null;return}if(instances.length===1){sel.style.display="none";selectedCorrectId=instances[0].id;return}sel.style.display="";var prev=selectedCorrectId;sel.innerHTML="";instances.slice().reverse().forEach(function(inst){var o=document.createElement("option");o.value=inst.id;o.textContent=(inst.pdf?basename(inst.pdf):"无文件")+"（"+(inst.engine||"")+"："+(inst.port||"-")+"）"+(inst.running?"":"[已退出]");sel.appendChild(o)});if(prev){sel.value=prev}selectedCorrectId=sel.value}
+function selectCorrect(){var sel=document.getElementById("correctSel");if(!sel||!sel.value)return;selectedCorrectId=sel.value;for(var i=0;i<correctInstances.length;i++){if(correctInstances[i].id===selectedCorrectId){renderCorrectLog(correctInstances[i].lines||[]);break}}}
+function pollCorrectStatus(){apiGet("/api/correct/status").then(function(res){if(!res||!res.ok)return;correctInstances=res.instances||[];renderCorrectSel(correctInstances);var inst=null;for(var i=0;i<correctInstances.length;i++){if(correctInstances[i].id===selectedCorrectId){inst=correctInstances[i];break}}if(!inst&&correctInstances.length){inst=correctInstances[correctInstances.length-1];selectedCorrectId=inst.id;var selEl=document.getElementById("correctSel");if(selEl&&selEl.style.display!=="none")selEl.value=inst.id}if(inst){renderCorrectLog(inst.lines||[])}var running=false;for(var j=0;j<correctInstances.length;j++){if(correctInstances[j].running){running=true;break}}if(!running){stopPollCorrect();setCorrectBusy(false)}})}
 function renderCorrectLog(lines){var el=document.getElementById("correctLog");if(!lines.length)return;el.textContent=lines.join("\n");el.scrollTop=el.scrollHeight}
-function stopCorrect(){apiPost("/api/correct/stop").then(function(res){if(res&&res.ok){toast("\u5df2\u8bf7\u6c42\u505c\u6b62","warn");addLog("\u5df2\u8bf7\u6c42\u505c\u6b62\u77eb\u6b63","log-warn")}else{var msg=res&&res.error?res.error:"\u505c\u6b62\u5931\u8d25";toast(msg,"fail")}})}
+function stopCorrect(){apiPost("/api/correct/stop",{id:selectedCorrectId||undefined}).then(function(res){if(res&&res.ok){toast("已请求停止","warn");addLog("已请求停止矫正","log-warn")}else{var msg=res&&res.error?res.error:"停止失败";toast(msg,"fail")}})}
 /* ===== 工具页：多 EPUB 合并 ===== */
 var mergePollTimer=null;
 var mergeFiles=[];
@@ -529,6 +572,14 @@ function stopPollMerge(){if(mergePollTimer){clearInterval(mergePollTimer);mergeP
 function pollMergeStatus(){apiGet("/api/tools/merge/status").then(function(res){if(!res||!res.ok)return;renderMergeLog(res.lines||[]);if(res.running)return;stopPollMerge();setMergeBusy(false);if(res.done&&res.success===true){var out=res.out_path||"";var msg="\u5408\u5e76\u5b8c\u6210";if(out)msg+="\uff1a"+out;toast(msg,"ok");addLog(msg,"log-ok")}else if(res.done&&res.success===false){var errmsg=res.error||"\u5408\u5e76\u5931\u8d25";toast(errmsg,"fail");addLog("\u5408\u5e76\u5931\u8d25: "+errmsg,"log-err")}})}
 function renderMergeLog(lines){var el=document.getElementById("mergeLog");if(!lines.length)return;el.textContent=lines.join("\n");el.scrollTop=el.scrollHeight}
 function stopMerge(){apiPost("/api/tools/merge/stop").then(function(res){if(res&&res.ok){toast(res.message||"\u5df2\u8bf7\u6c42\u505c\u6b62","warn");addLog("\u5df2\u8bf7\u6c42\u505c\u6b62\u5408\u5e76","log-warn")}else{var msg=res&&res.error?res.error:"\u505c\u6b62\u5931\u8d25";toast(msg,"fail")}})}
+/* ===== 基础设置：缓存管理 / 数据备份 ===== */
+function clearCaches(){var scopes=[];if(document.getElementById("ccPreview").checked)scopes.push("preview");if(document.getElementById("ccSplit").checked)scopes.push("split");if(document.getElementById("ccTmp").checked)scopes.push("tmp");if(!scopes.length){toast("请至少选择一项清除范围","warn");return}var btn=document.getElementById("ccClearBtn"),out=document.getElementById("ccResult");btn.disabled=true;btn.textContent="清除中…";apiPost("/api/cache/clear",{scopes:scopes}).then(function(res){btn.disabled=false;btn.textContent="清除缓存";if(res&&res.ok){var mb=(res.freed/1048576).toFixed(1);out.textContent="已清除预览 "+res.counts.preview+" 项、分割图 "+res.counts.split+" 项、临时 "+res.counts.tmp+" 项，释放 "+mb+" MB";toast("缓存已清除","ok")}else{var msg=res&&res.error?res.error:"清除失败";out.textContent=msg;toast(msg,"fail")}})}
+function createBackup(){var params={include_history_images:document.getElementById("bkImages").checked,include_epubs:document.getElementById("bkEpubs").checked};var btn=document.getElementById("bkBtn"),out=document.getElementById("bkResult");btn.disabled=true;btn.textContent="备份中…";apiPost("/api/backup/create",params).then(function(res){btn.disabled=false;btn.textContent="立即备份";if(res&&res.ok){var mb=(res.size/1048576).toFixed(1);out.textContent="已备份 "+res.files+" 个文件："+res.path+"（"+mb+" MB）";toast("备份完成","ok")}else{var msg=res&&res.error?res.error:"备份失败";out.textContent=msg;toast(msg,"fail")}})}
+/* ===== 历史记录页 ===== */
+var historyLoaded=false;
+function renderHistory(){apiGet("/api/history").then(function(res){if(!res||!res.ok){toast("加载历史记录失败","fail");return}historyLoaded=true;var tbody=document.getElementById("historyTbody");var entries=res.entries||[];if(!entries.length){tbody.innerHTML='<tr><td colspan="6" class="empty-state">暂无历史记录</td></tr>';return}tbody.innerHTML="";entries.forEach(function(e){var tr=document.createElement("tr");var title=escH(e.display_name||e.name||(e.pdf?basename(e.pdf):"(未命名)"));var pdf=escH(e.pdf?basename(e.pdf):"");var upd=escH(e.updated||"");var pages=e.pages!=null?e.pages:"";var pr=e.last_proofread_page!=null?e.last_proofread_page:"";tr.innerHTML='<td>'+title+'</td><td style="font-size:12px;">'+pdf+'</td><td style="font-size:12px;">'+upd+'</td><td>'+pages+'</td><td>'+pr+'</td>';var ops=document.createElement("td");ops.style.cssText="white-space:nowrap;";var openBtn=document.createElement("button");openBtn.className="btn-small";openBtn.textContent="矫正";openBtn.onclick=function(){openHistoryCorrect(e)};var delBtn=document.createElement("button");delBtn.className="btn-small";delBtn.textContent="删除";delBtn.style.cssText="margin-left:6px;color:var(--red);border-color:var(--red);";delBtn.onclick=function(){deleteHistory(e)};ops.appendChild(openBtn);ops.appendChild(delBtn);tr.appendChild(ops);tbody.appendChild(tr)})})}
+function openHistoryCorrect(e){apiPost("/api/correct/start",{pdf:e.pdf||null,history_id:e.id}).then(function(res){if(res&&res.ok){toast("矫正已启动","ok")}else{var msg=res&&res.error?res.error:"启动失败";toast(msg,"fail")}})}
+function deleteHistory(e){if(!confirm("确定删除历史记录「"+(e.display_name||e.name||e.id)+"」？"))return;apiPost("/api/history/delete",{id:e.id}).then(function(res){if(res&&res.ok){toast("已删除","ok");renderHistory()}else{toast((res&&res.error)||"删除失败","fail")}})}
 setInterval(function(){fetch("/api/ping").catch(function(){})},30000);
 window.addEventListener("pagehide",function(){stopPollConvert();stopPollCorrect();stopPollMerge();navigator.sendBeacon("/api/bye")});
 window.addEventListener("pageshow",function(){fetch("/api/ping").catch(function(){})});
@@ -549,6 +600,12 @@ _CONVERT_MAX_LINES = 2000
 
 # 合并日志环形缓冲上限（行）：与转换同步
 _MERGE_MAX_LINES = 2000
+
+# 矫正日志环形缓冲上限（行）：每个矫正实例独立缓冲
+_CORRECT_MAX_LINES = 2000
+
+# 矫正子进程日志中矫正界面地址的正则（页面加载后打印 `http://127.0.0.1:端口/`）
+_CORRECT_URL_RE = re.compile(r"http://127\.0\.0\.1:(\d+)/")
 
 # 转换子进程的弹窗询问协议标记（与 mian.py _PROMPT_MARKER 同值）：子进程在
 # 需要用户决策（OCR 断点续传选择）时打印 `__PTOE_PROMPT__ <json>` 单行，
@@ -616,6 +673,7 @@ def _correct_argv(
     pdf: str | None = None,
     *,
     engine: str | None = None,
+    history_id: str | None = None,
     title: str | None = None,
     author: str | None = None,
     lang: str | None = None,
@@ -623,7 +681,11 @@ def _correct_argv(
     epub_path: str | None = None,
     correct_timeout: int | None = None,
 ) -> list[str]:
-    """组装「correct」子命令的 argv。pdf 可为 None（无文件启动）。"""
+    """组装「correct」子命令的 argv。pdf 可为 None（无文件启动）。
+
+    history_id 非 None 时追加 --history-id（矫正侧从历史恢复内容，键为
+    correctmanage 历史条目的 id 字段）。
+    """
     if getattr(sys, "frozen", False):
         argv = [sys.executable, "correct"]
     else:
@@ -632,6 +694,8 @@ def _correct_argv(
         argv.append(pdf)
     if engine:
         argv += ["--engine", engine]
+    if history_id:
+        argv += ["--history-id", history_id]
     if title:
         argv += ["--title", title]
     if author:
@@ -817,6 +881,82 @@ def _convert_monitor(st: dict, proc) -> None:
             if has_prompt:
                 st["prompt"] = None
             st["error"] = str(e)
+
+
+def _correct_instances(state: dict) -> list:
+    """取 state 的矫正实例列表（多实例）。
+
+    用 setdefault 防御：测试手工构造的 state 可能没有该键，gui_serve 的
+    正常 state 必然包含。
+    """
+    return state.setdefault("correct_instances", [])
+
+
+def _correct_monitor(inst: dict, proc) -> None:
+    """矫正子进程监控线程：流式收集 stdout，解析矫正界面地址，退出收尾。
+
+    inst 为 state["correct_instances"] 中的单实例 dict（字段写入均为简单
+    赋值，CPython GIL 下对状态读取的 handler 线程安全）；proc 为
+    subprocess.Popen 对象。矫正子进程会拉起 llama-server，后者继承 stdout
+    管道且常驻，因此与转换监控一致：stdout 由独立读线程搬进队列，主循环
+    以 proc.poll() 兜底收尾，绝不死等 EOF。日志中首个
+    `http://127.0.0.1:<port>/` 行记为实例界面地址。
+    """
+    lines_q = queue.Queue()
+
+    def _reader() -> None:
+        """后台读线程：逐行搬进队列；stdout EOF/异常时放 None 哨兵。"""
+        try:
+            for line in proc.stdout:
+                lines_q.put(line)
+        except Exception:  # noqa: BLE001  读取异常按 EOF 处理
+            pass
+        finally:
+            lines_q.put(None)
+
+    threading.Thread(target=_reader, daemon=True).start()
+
+    def _handle_line(text: str) -> None:
+        line = text.rstrip("\n")
+        if inst.get("port") is None:
+            m = _CORRECT_URL_RE.search(line)
+            if m:
+                port = int(m.group(1))
+                inst["port"] = port
+                inst["url"] = f"http://127.0.0.1:{port}/"
+        inst.setdefault("lines", []).append(line)
+        if len(inst["lines"]) > _CORRECT_MAX_LINES:
+            del inst["lines"][: len(inst["lines"]) - _CORRECT_MAX_LINES]
+
+    try:
+        while True:
+            try:
+                line = lines_q.get(timeout=0.5)
+            except queue.Empty:
+                # 主进程已退出：stdout 可能被子进程（llama-server）继承而永不
+                # EOF，给一点时间让读线程排空剩余缓冲
+                if proc.poll() is not None:
+                    drain_deadline = time.time() + 2.0
+                    while time.time() < drain_deadline:
+                        try:
+                            extra = lines_q.get(timeout=0.1)
+                        except queue.Empty:
+                            continue
+                        if extra is None:
+                            break
+                        _handle_line(extra)
+                    break
+                continue
+            if line is None:
+                break  # stdout 已 EOF（子进程未继承管道或已全部关闭）
+            _handle_line(line)
+        rc = proc.wait()
+        inst["running"] = False
+        inst["finalized"] = True
+        inst["exit_code"] = rc
+    except Exception:  # noqa: BLE001  监控线程异常不崩溃服务
+        inst["running"] = False
+        inst["finalized"] = True
 
 
 def _merge_worker(st: dict, paths, title, author, lang, out_path) -> None:
@@ -1192,6 +1332,9 @@ class _GuiHandler(BaseHTTPRequestHandler):
         if path == "/api/tools/merge/status":
             self._api_tools_merge_status()
             return
+        if path == "/api/history":
+            self._api_history_get()
+            return
         self._send(404, self._json({"ok": False, "error": "未找到"}))
 
     # -- POST --
@@ -1209,6 +1352,10 @@ class _GuiHandler(BaseHTTPRequestHandler):
             engine = body.get("engine", cfg.get("engine"))
             if engine not in ("llama", "vllm", "paddle"):
                 self._send(400, self._json({"ok": False, "error": "engine 仅支持 llama / vllm / paddle"}))
+                return
+            proofread_engine = body.get("proofread_engine", cfg.get("proofread_engine", "llama"))
+            if proofread_engine not in ("llama", "vllm"):
+                self._send(400, self._json({"ok": False, "error": "proofread_engine 仅支持 llama / vllm"}))
                 return
             choices = body.get("model_choices", cfg.get("model_choices") or {})
             sel = body.get("selected_model", cfg.get("selected_model"))
@@ -1568,7 +1715,14 @@ class _GuiHandler(BaseHTTPRequestHandler):
     # -- 矫正界面 --
 
     def _api_correct_start(self, body) -> None:
-        """POST /api/correct/start：子进程启动矫正界面。"""
+        """POST /api/correct/start：子进程启动矫正界面（多实例）。
+
+        不再做 sidecar 探测复用（原先的 path=state["correct"] 单实例标记已弃），
+        每次调用独立 Popen 一个 correct 子进程，实例追加进
+        state["correct_instances"]（支持从「历史记录」页多开）。引擎缺省取
+        config 的 proofread_engine，只允许 llama / vllm——PaddleOCR 仅用于
+        转换的图片识别阶段，不参与矫正/重识别。
+        """
         if not isinstance(body, dict):
             self._send(400, self._json({"ok": False, "error": "无效的 JSON"}))
             return
@@ -1585,8 +1739,8 @@ class _GuiHandler(BaseHTTPRequestHandler):
         if pdf and not os.path.isfile(pdf):
             self._send(400, self._json({"ok": False, "error": f"文件不存在：{pdf}"}))
             return
-        engine = body.get("engine") or ""
-        if engine not in ("", "llama", "vllm"):
+        engine = body.get("engine") or str(cfg.get("proofread_engine") or "llama")
+        if engine not in ("llama", "vllm"):
             self._send(400, self._json({"ok": False, "error": "矫正仅支持 llama / vllm（PaddleOCR 仅用于转换的图片识别阶段）"}))
             return
         for key in ("title", "author", "out_dir", "epub_path"):
@@ -1599,52 +1753,32 @@ class _GuiHandler(BaseHTTPRequestHandler):
         if correct_timeout is not None and (type(correct_timeout) is not int or correct_timeout < 1):
             self._send(400, self._json({"ok": False, "error": "correct_timeout 必须 >= 1"}))
             return
-        # 单飞：矫正或转换在运行则拒绝
-        # 已有存活的矫正界面（如浏览器被关闭但服务仍在等待）→ 返回地址供前端恢复
-        info = _read_correct_server_info()
-        if info is not None:
-            if _probe_correct_ui(info["port"]):
-                url = f"http://127.0.0.1:{info['port']}/"
-                self._send(
-                    200,
-                    self._json(
-                        {
-                            "ok": True,
-                            "already_running": True,
-                            "url": url,
-                            "message": "矫正已在运行，已重新打开界面",
-                        }
-                    ),
-                )
-                return
-            # 探测失败 = 记录已过期，清掉后照常启动
-            try:
-                p = _correct_server_info_path()
-                if p is not None and p.exists():
-                    p.unlink()
-            except Exception:  # noqa: BLE001
-                pass
+        history_id = body.get("history_id")
+        if history_id is not None and not isinstance(history_id, str):
+            self._send(400, self._json({"ok": False, "error": "history_id 必须是字符串"}))
+            return
         st = self.server.state
-        cr = st["correct"]
         cv = st["convert"]
-        with cr["lock"]:
-            if cr["running"]:
-                self._send(409, self._json({"ok": False, "error": "已有矫正在运行"}))
-                return
         with cv["lock"]:
             if cv["running"]:
                 self._send(409, self._json({"ok": False, "error": "已有转换在运行"}))
                 return
-        with cr["lock"]:
-            cr["lines"] = []
-            cr["done"] = False
-            cr["success"] = False
-            cr["exit_code"] = None
-            cr["error"] = None
-            cr["running"] = True
+        inst = {
+            "id": uuid.uuid4().hex[:12],
+            "pdf": pdf or None,
+            "history_id": history_id or None,
+            "engine": engine,
+            "proc": None,
+            "port": None,
+            "url": None,
+            "running": True,
+            "lines": [],
+            "finalized": False,
+        }
         argv = _correct_argv(
             pdf=pdf or None,
-            engine=engine or None,
+            engine=engine,
+            history_id=history_id or None,
             title=body.get("title"),
             author=body.get("author"),
             lang=lang,
@@ -1670,55 +1804,274 @@ class _GuiHandler(BaseHTTPRequestHandler):
                 kwargs["creationflags"] = flags
             proc = subprocess.Popen(argv, **kwargs)
         except Exception as e:
-            with cr["lock"]:
-                cr["running"] = False
-                cr["done"] = True
-                cr["success"] = False
-                cr["error"] = str(e)
+            inst["running"] = False
+            inst["finalized"] = True
+            inst["lines"].append(f"启动矫正失败：{e}")
             self._send(500, self._json({"ok": False, "error": f"启动矫正失败：{e}"}))
             return
-        with cr["lock"]:
-            cr["proc"] = proc
-        threading.Thread(
-            target=_convert_monitor, args=(cr, proc), daemon=True
-        ).start()
-        self._send(
-            200,
-            self._json({"ok": True, "message": "矫正已启动", "argv": argv}),
-        )
+        inst["proc"] = proc
+        _correct_instances(st).append(inst)
+        threading.Thread(target=_correct_monitor, args=(inst, proc), daemon=True).start()
+        self._send(200, self._json({"ok": True, "id": inst["id"], "message": "矫正已启动", "argv": argv}))
 
     def _api_correct_status(self) -> None:
-        """GET /api/correct/status：矫正进度快照。"""
-        cr = self.server.state["correct"]
-        with cr["lock"]:
-            self._send(
-                200,
-                self._json(
-                    {
-                        "ok": True,
-                        "running": cr["running"],
-                        "done": cr["done"],
-                        "success": cr["success"],
-                        "exit_code": cr["exit_code"],
-                        "lines": cr["lines"][-500:],
-                        "error": cr["error"],
-                    }
-                ),
+        """GET /api/correct/status：矫正实例列表快照（前端按 #correctSel 选择回显）。"""
+        instances = []
+        for inst in list(_correct_instances(self.server.state)):
+            proc = inst.get("proc")
+            if proc is not None and proc.poll() is not None and inst.get("running"):
+                inst["running"] = False
+                inst["finalized"] = True
+            instances.append(
+                {
+                    "id": inst.get("id"),
+                    "pdf": inst.get("pdf"),
+                    "history_id": inst.get("history_id"),
+                    "engine": inst.get("engine"),
+                    "running": bool(inst.get("running")),
+                    "port": inst.get("port"),
+                    "url": inst.get("url"),
+                    "lines": inst.get("lines", [])[-500:],
+                }
             )
+        self._send(200, self._json({"ok": True, "instances": instances, "count": len(instances)}))
 
-    def _api_correct_stop(self) -> None:
-        """POST /api/correct/stop：停止正在运行的矫正（kill 子进程）。"""
-        cr = self.server.state["correct"]
-        with cr["lock"]:
-            proc = cr.get("proc")
-            if not cr["running"] or proc is None:
-                self._send(400, self._json({"ok": False, "error": "没有正在运行的矫正"}))
-                return
+    def _api_correct_stop(self, body) -> None:
+        """POST /api/correct/stop：停止矫正实例（body.id 指定，缺省最新实例）。
+
+        先 terminate 优雅退出，最多等 5s 再 kill；Windows 下 terminate 只杀
+        顶层进程，矫正子进程拉起的 llama-server 由 taskkill /T 树杀兜底。
+        """
+        if body is not None and not isinstance(body, dict):
+            self._send(400, self._json({"ok": False, "error": "无效的 JSON"}))
+            return
+        body = body or {}
+        inst_id = body.get("id")
+        if inst_id is not None and not isinstance(inst_id, str):
+            self._send(400, self._json({"ok": False, "error": "id 必须是字符串"}))
+            return
+        insts = _correct_instances(self.server.state)
+        if inst_id is None:
+            inst = insts[-1] if insts else None
+        else:
+            inst = next((x for x in insts if x.get("id") == inst_id), None)
+        if inst is None:
+            self._send(400, self._json({"ok": False, "error": "没有正在运行的矫正"}))
+            return
+        proc = inst.get("proc")
+        if proc is None:
+            inst["running"] = False
+            inst["finalized"] = True
+            self._send(200, self._json({"ok": True, "message": "已请求停止"}))
+            return
         try:
-            proc.kill()
+            proc.terminate()
+        except Exception:  # noqa: BLE001  进程可能已退出，忽略
+            pass
+        deadline = time.time() + 5.0
+        while time.time() < deadline and proc.poll() is None:
+            time.sleep(0.05)
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            if proc.poll() is None and getattr(proc, "pid", None):
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True,
+                    timeout=8,
+                )
         except Exception:  # noqa: BLE001
             pass
+        inst["running"] = False
+        inst["finalized"] = True
         self._send(200, self._json({"ok": True, "message": "已请求停止"}))
+
+    # -- 缓存管理 / 数据备份 / 历史记录 --
+
+    def _api_cache_clear(self, body) -> None:
+        """POST /api/cache/clear：清理预览图缓存 / 转换分割图片 / 临时文件。
+
+        body.scopes ∈ {preview, split, tmp} 的非空子集。转换或任一矫正实例
+        运行中拒绝（分割图可能正被读取/复用）。data_root 缺省用
+        pdfmanage.app_base_dir()/data（测试可经 state 注入临时目录）。
+        """
+        if not isinstance(body, dict):
+            self._send(400, self._json({"ok": False, "error": "无效的 JSON"}))
+            return
+        st = self.server.state
+        cv = st["convert"]
+        with cv["lock"]:
+            if cv["running"]:
+                self._send(400, self._json({"ok": False, "error": "请先停止正在运行的转换/矫正任务"}))
+                return
+        for inst in _correct_instances(st):
+            if inst.get("running"):
+                self._send(400, self._json({"ok": False, "error": "请先停止正在运行的转换/矫正任务"}))
+                return
+        scopes = body.get("scopes")
+        valid = {"preview", "split", "tmp"}
+        if (
+            not isinstance(scopes, list)
+            or not scopes
+            or any(s not in valid for s in scopes)
+        ):
+            self._send(400, self._json({"ok": False, "error": "scopes 仅支持 preview / split / tmp 的非空子集"}))
+            return
+        try:
+            import pdfmanage
+            data_root = Path(st.get("data_root") or (pdfmanage.app_base_dir() / "data"))
+            freed = 0
+            counts = {"preview": 0, "split": 0, "tmp": 0}
+            preview_dir = data_root / "preview_cache"
+            if "preview" in scopes and preview_dir.is_dir():
+                for p in sorted(preview_dir.rglob("*"), key=lambda x: len(x.parts), reverse=True):
+                    try:
+                        if p.is_file():
+                            try:
+                                freed += p.stat().st_size
+                            except OSError:
+                                pass
+                            counts["preview"] += 1
+                            p.unlink(missing_ok=True)
+                        elif p.is_dir():
+                            try:
+                                p.rmdir()
+                            except OSError:
+                                pass
+                    except OSError:
+                        pass
+            if "split" in scopes and data_root.is_dir():
+                for sub in data_root.iterdir():
+                    if not sub.is_dir():
+                        continue
+                    if not (sub / ".ptoe_split.json").is_file():
+                        continue
+                    for ext in (".png", ".jpg", ".jpeg", ".webp"):
+                        for p in sub.glob("*" + ext):
+                            try:
+                                freed += p.stat().st_size
+                                counts["split"] += 1
+                                p.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                    for name in (".ptoe_split.json", ".ocr_progress.json"):
+                        p = sub / name
+                        if p.is_file():
+                            try:
+                                freed += p.stat().st_size
+                                counts["split"] += 1
+                                p.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+            if "tmp" in scopes and data_root.is_dir():
+                for d in (data_root / "preview_cache", data_root / "correction_history"):
+                    if d.is_dir():
+                        for p in d.glob("**/*.tmp"):
+                            try:
+                                freed += p.stat().st_size
+                                counts["tmp"] += 1
+                                p.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+            self._send(200, self._json({"ok": True, "freed": freed, "counts": counts}))
+        except Exception as e:
+            self._send(500, self._json({"ok": False, "error": str(e)}))
+
+    def _api_backup_create(self, body) -> None:
+        """POST /api/backup/create：备份配置 / 矫正历史 / 用户词表为 zip。
+
+        body.include_history_images / include_epubs 控制附加内容；备份写入
+        data/backups/ptoe_backup_<时间戳>.zip（文件名含秒，重名安全）。
+        """
+        if body is not None and not isinstance(body, dict):
+            self._send(400, self._json({"ok": False, "error": "无效的 JSON"}))
+            return
+        body = body or {}
+        include_images = bool(body.get("include_history_images"))
+        include_epubs = bool(body.get("include_epubs"))
+        try:
+            import configmanage
+            import pdfmanage
+            tmp_path = None
+            st = self.server.state
+            data_root = Path(st.get("data_root") or (pdfmanage.app_base_dir() / "data"))
+            backups_dir = data_root / "backups"
+            backups_dir.mkdir(parents=True, exist_ok=True)
+            ts = time.strftime("%Y%m%d%H%M%S")
+            fname = f"ptoe_backup_{ts}.zip"
+            tmp_path = backups_dir / (fname + ".tmp")
+            files = []  # (abs_path, arcname)
+            cfg_path = Path(configmanage._CONFIG_PATH)
+            if cfg_path.is_file():
+                files.append((cfg_path, cfg_path.name))
+            proof_dict = data_root / "proofread_dict.json"
+            if proof_dict.is_file():
+                files.append((proof_dict, "data/" + proof_dict.name))
+            hist_dir = None
+            try:
+                import correctmanage
+                hist_dir = correctmanage._history_dir()
+            except Exception:
+                hist_dir = data_root / "correction_history"
+            if hist_dir is not None and Path(hist_dir).is_dir():
+                for p in sorted(Path(hist_dir).glob("*.json")):
+                    if p.name.endswith(".images.json") and not include_images:
+                        continue
+                    files.append((p, "data/correction_history/" + p.name))
+            if include_epubs and data_root.is_dir():
+                for p in sorted(data_root.rglob("*.epub")):
+                    files.append((p, "data/" + p.relative_to(data_root).as_posix()))
+            seen = 0
+            with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                added = set()
+                for abs_p, arc in files:
+                    arc_key = str(arc)
+                    if arc_key in added:
+                        continue
+                    try:
+                        zf.write(str(abs_p), arcname=arc)
+                        added.add(arc_key)
+                        seen += 1
+                    except (OSError, zipfile.BadZipFile):
+                        continue
+            os.replace(tmp_path, backups_dir / fname)
+            size = os.path.getsize(backups_dir / fname)
+            self._send(200, self._json({"ok": True, "path": str(backups_dir / fname), "size": size, "files": seen}))
+        except Exception as e:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            self._send(500, self._json({"ok": False, "error": str(e)}))
+
+    def _api_history_get(self) -> None:
+        """GET /api/history：矫正历史条目（透传 correctmanage._history_entries）。"""
+        try:
+            import correctmanage
+            entries = correctmanage._history_entries()
+            self._send(200, self._json({"ok": True, "entries": entries}))
+        except Exception as e:
+            self._send(500, self._json({"ok": False, "error": str(e)}))
+
+    def _api_history_delete(self, body) -> None:
+        """POST /api/history/delete：删除矫正历史条目（透传 correctmanage._delete_history）。"""
+        if not isinstance(body, dict):
+            self._send(400, self._json({"ok": False, "error": "无效的 JSON"}))
+            return
+        hid = body.get("id")
+        if not isinstance(hid, str) or not hid:
+            self._send(400, self._json({"ok": False, "error": "缺少 id"}))
+            return
+        try:
+            import correctmanage
+            correctmanage._delete_history([hid], all_=False)
+            self._send(200, self._json({"ok": True}))
+        except Exception as e:
+            self._send(500, self._json({"ok": False, "error": str(e)}))
 
     # -- 工具：多 EPUB 合并 --
 
@@ -1860,7 +2213,16 @@ class _GuiHandler(BaseHTTPRequestHandler):
             self._api_correct_start(body)
             return
         if path == "/api/correct/stop":
-            self._api_correct_stop()
+            self._api_correct_stop(body)
+            return
+        if path == "/api/cache/clear":
+            self._api_cache_clear(body)
+            return
+        if path == "/api/backup/create":
+            self._api_backup_create(body)
+            return
+        if path == "/api/history/delete":
+            self._api_history_delete(body)
             return
         if path == "/api/tools/merge/start":
             self._api_tools_merge_start(body)
@@ -1910,7 +2272,7 @@ def _open_display(url: str, title: str) -> tuple[str, object | None]:
     try:
         import tabmanage  # noqa: PLC0415
 
-        _role = tabmanage.register_tab(title, url, base_url=url)
+        _role = tabmanage.register_tab(title, url, base_url=url, closeable=False)
     except Exception:  # noqa: BLE001  tabmanage 异常不阻塞，回退浏览器
         _open_browser(url)
         return "browser", None
@@ -2047,17 +2409,7 @@ def gui_serve(
             "error": None,
             "prompt": None,
         },
-        "correct": {
-            "lock": threading.Lock(),
-            "proc": None,
-            "lines": [],
-            "running": False,
-            "done": False,
-            "success": False,
-            "exit_code": None,
-            "error": None,
-            "prompt": None,
-        },
+        "correct_instances": [],
         "merge": {
             "lock": threading.Lock(),
             "lines": [],
@@ -2157,15 +2509,16 @@ def gui_serve(
             except Exception:  # noqa: BLE001  管道可能已关闭，忽略
                 pass
             cv["prompt"] = None
-        # 兜底：矫正子进程仍在运行时强制终止
-        cr = state["correct"]
-        with cr["lock"]:
-            proc = cr.get("proc")
-            if cr["running"] and proc is not None and proc.poll() is None:
+        # 兜底：矫正子进程仍在运行时强制终止（多实例全部遍历）
+        for _inst in _correct_instances(state):
+            proc = _inst.get("proc")
+            if _inst.get("running") and proc is not None and proc.poll() is None:
                 try:
                     proc.kill()
                 except Exception:  # noqa: BLE001
                     pass
+                _inst["running"] = False
+                _inst["finalized"] = True
         # 兜底：合并任务仍在运行时请求停止（引擎自行检查 stop_event）
         mg = state["merge"]
         with mg["lock"]:

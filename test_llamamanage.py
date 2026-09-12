@@ -414,7 +414,7 @@ class TestPerfTuning(unittest.TestCase):
         self.assertEqual(seen, ["llama", "llama"])
         self.assertIsNone(llm._BATCH_ENGINE, "批次结束应恢复钉扎值")
 
-    def _run_server(self, sargs, detect_gpu=("", ""), flash_style=None, parallel=None):
+    def _run_server(self, sargs, detect_gpu=("", ""), flash_style=None, parallel=None, ctx_size=None):
         """mock 掉子进程/探测后执行 runserver，返回启动 argv。"""
         fake_proc = mock.Mock()
         fake_proc.poll.return_value = None
@@ -432,7 +432,7 @@ class TestPerfTuning(unittest.TestCase):
                  mock.patch.object(llm.os.path, "exists", return_value=True), \
                  mock.patch.object(llm.subprocess, "Popen", return_value=fake_proc) as popen_mock, \
                  mock.patch.object(llm._SESSION, "get", return_value=fake_resp):
-                ok = llm.runserver("HY", parallel=parallel)
+                ok = llm.runserver("HY", parallel=parallel, ctx_size=ctx_size)
         finally:
             llm._server_process = orig_proc
         self.assertTrue(ok)
@@ -452,6 +452,16 @@ class TestPerfTuning(unittest.TestCase):
         # 配置缺失 → 默认 4（原默认 11 会让 KV cache 多占近 3 倍显存）
         args = self._run_server({})
         self.assertEqual(args[args.index("--parallel") + 1], "4")
+
+    def test_runserver_ctx_size_override(self):
+        # 矫正界面按需覆盖：配置 16384 → 显式传入 8192 时 --ctx-size 取 8192
+        args = self._run_server({"ctx_size": "16384"}, ctx_size=8192)
+        self.assertEqual(args[args.index("--ctx-size") + 1], "8192")
+
+    def test_runserver_ctx_size_none_keeps_config(self):
+        # 未传 ctx_size（OCR 流程/GUI 启动）→ 保持配置值 16384
+        args = self._run_server({"ctx_size": "16384"})
+        self.assertEqual(args[args.index("--ctx-size") + 1], "16384")
 
     def test_runserver_flash_attn_bare_flag_with_gpu(self):
         # 老构建（裸标志语法）+ CUDA → 附加裸 --flash-attn

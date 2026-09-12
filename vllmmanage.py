@@ -155,12 +155,19 @@ def check(llama, model_cfg, model_key: str = "HY") -> bool:
     return True
 
 
-def runserver(model_key: str = "HY", with_mmproj: bool = True, parallel: int | None = None):
+def runserver(
+    model_key: str = "HY",
+    with_mmproj: bool = True,
+    parallel: int | None = None,
+    ctx_size: int | None = None,
+):
     """启动 vLLM-Omni 服务并等待模型就绪（/v1/models 轮询）。
 
     with_mmproj 参数仅为与 llamamanage 签名一致而保留（vLLM 无 mmproj 概念，
     多模态能力由模型本身决定），调用方传什么都会被忽略。parallel 同理保留
     （vLLM 用连续批处理原生调度并发，无槽位/KV 切分概念）。
+    ctx_size: 覆盖 vllm_server_args.max_model_len 的服务端上下文长度——vLLM
+        对应标志为 --max-model-len（矫正界面按需传入 8192）。None 时保持配置值。
     """
     global _server_process
 
@@ -195,6 +202,11 @@ def runserver(model_key: str = "HY", with_mmproj: bool = True, parallel: int | N
         return False
 
     args = [vllm_server, "serve", model_arg]
+    # 矫正界面按需覆盖上下文长度（ctx_size → vLLM 的 --max-model-len）：
+    # dict 复制 + 键覆盖，下方循环自动发射 --max-model-len <val>。
+    if ctx_size is not None:
+        sargs = dict(sargs)
+        sargs["max_model_len"] = str(int(ctx_size))
     # vllm_server_args 键 → --kebab-case 标志；布尔值（1/true/yes）→ 裸标志；
     # extra_args 为原始字符串，shlex 切分后原样追加
     for key, val in sargs.items():

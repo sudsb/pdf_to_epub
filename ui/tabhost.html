@@ -49,6 +49,34 @@ html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family:
 .tab[data-active="false"] { background: #e5e7eb; color: #374151; }
 .tab[data-active="false"]:hover { background: #d1d5db; }
 
+/* 标签标题（保证省略号只作用于标题，关闭按钮常驻可见） */
+.tab-label {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* 标签关闭按钮 */
+.tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-left: 6px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  font-size: 14px;
+  line-height: 1;
+  color: inherit;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.tab-close:hover { background: rgba(0, 0, 0, 0.18); }
+.tab[data-active="true"] .tab-close:hover { background: rgba(255, 255, 255, 0.28); }
+
 /* 位置切换按钮 */
 #posToggle {
   margin-left: auto;
@@ -82,9 +110,12 @@ html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family:
   inset: 0;
   width: 100%;
   height: 100%;
-  display: none;
+  visibility: hidden;
 }
-.iframeWrap[data-active="true"] { display: block; }
+/* 用 visibility 而非 display:none 隐藏非激活标签：display:none 会把 iframe 内部
+   滚动位置清零（Chrome 实测 scrollY 归零且无法恢复），visibility 保留布局框与
+   视口尺寸，切回时滚动位置原样保留。不可见 iframe 不参与绘制也不接收事件。 */
+.iframeWrap[data-active="true"] { visibility: visible; }
 .iframeWrap iframe {
   width: 100%;
   height: 100%;
@@ -124,7 +155,7 @@ html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family:
 (() => {
   // ============ 状态 ============
   const state = {
-    tabs: [],           // [{title, url, iframe, tabEl, wrapEl}]
+    tabs: [],           // [{title, url, closeable, iframe, tabEl, wrapEl}]
     activeIndex: 0,     // 当前激活标签索引
     position: "top",    // "top" | "bottom"
     polling: true,
@@ -173,15 +204,34 @@ html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family:
     el.role = "tab";
     el.setAttribute("aria-selected", "false");
     el.setAttribute("data-active", "false");
-    el.textContent = tabData.title;
+    const label = document.createElement("span");
+    label.className = "tab-label";
+    label.textContent = tabData.title || "";
+    el.appendChild(label);
+    const close = document.createElement("span");
+    close.className = "tab-close";
+    close.title = "关闭标签页";
+    close.innerHTML = "&times;";
+    el.appendChild(close);
     el.dataset.index = index;
     return el;
   }
 
   function updateTabEl(el, tabData, isActive) {
-    el.textContent = tabData.title;
+    const label = el.querySelector(".tab-label");
+    if (label) label.textContent = (tabData && tabData.title) || "";
+    else el.textContent = (tabData && tabData.title) || "";
     el.dataset.active = isActive ? "true" : "false";
     el.setAttribute("aria-selected", isActive ? "true" : "false");
+  }
+
+  // 关闭按钮可见性：不可关闭或标签总数 ≤1 时隐藏
+  function updateCloseVisible(el, tabData, total) {
+    if (!el) return;
+    const close = el.querySelector(".tab-close");
+    if (!close) return;
+    const closable = !!(tabData && tabData.closeable !== false);
+    close.style.display = closable && total > 1 ? "" : "none";
   }
 
   function applyPosition(pos) {
@@ -191,6 +241,78 @@ html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family:
     posToggle.title = pos === "top"
       ? "当前为顶栏，点击切换到底栏（自动保存）"
       : "当前为底栏，点击切换到顶栏（自动保存）";
+  }
+
+  // 极简 toast（失败提示用；不依赖任何外部样式）
+  function showToast(msg) {
+    try {
+      let t = document.getElementById("ptoeTabToast");
+      if (!t) {
+        t = document.createElement("div");
+        t.id = "ptoeTabToast";
+        Object.assign(t.style, {
+          position: "fixed",
+          left: "50%",
+          bottom: "24px",
+          transform: "translateX(-50%)",
+          background: "rgba(17, 24, 39, 0.92)",
+          color: "#fff",
+          padding: "8px 16px",
+          borderRadius: "8px",
+          fontSize: "13px",
+          zIndex: 9999,
+          pointerEvents: "none",
+          opacity: "0",
+          transition: "opacity 200ms",
+          maxWidth: "80vw",
+        });
+        document.body.appendChild(t);
+      }
+      t.textContent = msg;
+      t.style.opacity = "1";
+      clearTimeout(t._timer);
+      t._timer = setTimeout(() => { t.style.opacity = "0"; }, 2600);
+    } catch (e) {
+      // toast 失败不影响功能
+    }
+  }
+
+  // 关闭指定标签页：通知服务端删除会话条目（best-effort 结束注册进程），成功后本地销毁
+  async function closeTab(tab, index) {
+    if (!tab || !tab.id) return;
+    // 以实际索引为准（同步/增删后闭包 index 会过期）：state.tabs 条目带 id，
+    // 用 id 反查而不是 indexOf —— 之前闭包持有的是服务端载荷对象，
+    // 与 state.tabs 里的包装对象身份不同，indexOf 永远找不到 → 关闭按钮失效。
+    const idx = state.tabs.findIndex(t => t && t.id === tab.id);
+    if (idx < 0) return;
+    try {
+      const res = await fetch("/api/tabs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "close", id: tab.id }),
+      });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "server not ok");
+
+      // 本地销毁
+      state.tabs.splice(idx, 1);
+      if (tab.tabEl) tab.tabEl.remove();
+      destroyIframe(tab.wrapEl);
+      // 重设激活索引：被删项之前的激活项左移，被删项自身保持在原位（指向相邻下一个）
+      if (idx < state.activeIndex) state.activeIndex -= 1;
+      if (state.activeIndex >= state.tabs.length) {
+        state.activeIndex = Math.max(0, state.tabs.length - 1);
+      }
+      setActive(state.activeIndex);
+      // 标签总数 ≤1 时隐藏最后一个标签的关闭按钮
+      if (state.tabs.length <= 1 && state.tabs[0] && state.tabs[0].tabEl) {
+        updateCloseVisible(state.tabs[0].tabEl, state.tabs[0], state.tabs.length);
+      }
+    } catch (e) {
+      console.warn("关闭标签页失败：", e);
+      showToast("关闭标签页失败：" + ((e && e.message) || e));
+    }
   }
 
   function setActive(index) {
@@ -203,16 +325,39 @@ html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family:
     state.activeIndex = index;
   }
 
+  // ============ 标签栏点击（事件委托：切换 / 关闭） ============
+  // 委托到 tabBar，点击时以 DOM 元素反查当前状态条目，避免闭包捕获过期
+  // index/id（此前新建标签的切换与关闭都闭包捕获创建时的索引/载荷对象，
+  // 增删后错位或身份不匹配导致失效）。
+  tabBar.addEventListener("click", (e) => {
+    const close = e.target.closest(".tab-close");
+    const tabEl = e.target.closest(".tab");
+    if (!tabEl) return; // posToggle 等非标签元素忽略
+    const idx = state.tabs.findIndex(t => t && t.tabEl === tabEl);
+    if (idx < 0) return;
+    if (close) {
+      closeTab(state.tabs[idx], idx);
+    } else {
+      setActive(idx);
+    }
+  });
+
   // ============ 标签栏同步（diff + 保留 iframe） ============
   function syncTabs(serverTabs) {
     const newSig = sigOfTabs(serverTabs);
     if (newSig === state.lastTabsSig && state.tabs.length === serverTabs.length) {
-      // 仅标题可能变化，逐个更新 label
+      // 仅标题可能变化，逐个更新 label（closeable 变化时同步关闭按钮可见性）
       serverTabs.forEach((st, i) => {
-        if (state.tabs[i] && state.tabs[i].title !== st.title) {
-          state.tabs[i].title = st.title;
-          if (state.tabs[i].tabEl) updateTabEl(state.tabs[i].tabEl, st, i === state.activeIndex);
+        const cur = state.tabs[i];
+        if (!cur) return;
+        if (cur.title !== st.title) {
+          cur.title = st.title;
+          if (cur.tabEl) updateTabEl(cur.tabEl, st, i === state.activeIndex);
         }
+        if (cur.closeable !== st.closeable) {
+          cur.closeable = st.closeable;
+        }
+        if (cur.tabEl) updateCloseVisible(cur.tabEl, cur, serverTabs.length);
       });
       return;
     }
@@ -236,14 +381,15 @@ html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family:
         usedOld[matchIdx] = true;
         const ot = oldTabs[matchIdx];
         ot.title = st.title; // 同步标题
+        ot.closeable = st.closeable; // 同步 closeable
+        ot.id = st.id; // id 以服务端会话为准（注册/重注册后可能变化）
         newTabs.push(ot);
       } else {
         // 新建
         const { wrap, iframe } = createIframe(st.url);
         const tabEl = createTabEl(st, newIdx);
-        tabEl.addEventListener("click", () => setActive(newIdx));
         tabBar.insertBefore(tabEl, posToggle);
-        newTabs.push({ title: st.title, url: st.url, iframe, wrapEl: wrap, tabEl });
+        newTabs.push({ title: st.title, url: st.url, id: st.id, closeable: st.closeable, iframe, wrapEl: wrap, tabEl });
       }
     });
 
@@ -258,7 +404,10 @@ html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family:
     // 3) 更新索引与激活态
     state.tabs = newTabs;
     newTabs.forEach((t, i) => {
-      if (t.tabEl) t.tabEl.dataset.index = i;
+      if (t.tabEl) {
+        t.tabEl.dataset.index = i;
+        updateCloseVisible(t.tabEl, t, newTabs.length);
+      }
     });
 
     // 处理激活索引：如果当前激活项被移除，回退到第一个

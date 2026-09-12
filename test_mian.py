@@ -44,6 +44,10 @@ class TestPdfToEpub(unittest.TestCase):
         self._tmp = Path(tempfile.mkdtemp(prefix="test_mian_"))
         self._pdf = self._tmp / "sample.pdf"
         _make_pdf(self._pdf, n=3)
+        # 钉住 llama 引擎：本类 mock 的是 llamamanage.batch_infer（HTTP 引擎路径）；
+        # 本机 config.json engine 若为 paddle，pdf_to_epub 会走本地 PaddleOCR 而绕过
+        # mock（真实推理耗时且正文不可预期）。tearDown 恢复原覆盖值。
+        self._orig_engine = llamamanage.set_engine("llama")
 
     def tearDown(self):
         # split_pdf_to_images writes to data/<pdf stem>/ next to pdfmanage.py
@@ -52,6 +56,7 @@ class TestPdfToEpub(unittest.TestCase):
         for d in data_dir.glob("sample*"):
             shutil.rmtree(d, ignore_errors=True)
         shutil.rmtree(self._tmp, ignore_errors=True)
+        llamamanage.set_engine(self._orig_engine)
 
     def test_pdf_to_epub_full_pipeline(self):
         def fake_batch_infer(images, prompts, model_key="HY", max_workers=3, thinking=False, timeout=600, on_progress=None, on_result=None):
@@ -216,12 +221,16 @@ class TestAutoHistory(unittest.TestCase):
 
         self._prefix = _history_prefix(str(self._pdf))
         self._hist_dir = self._data_dir / "correction_history"
+        # 钉住 llama 引擎：本测试 mock llamamanage.batch_infer，config engine=paddle
+        # 时会被真实 PaddleOCR 绕过（见 TestPdfToEpub.setUp 注释）。
+        self._orig_engine = llamamanage.set_engine("llama")
 
     def tearDown(self):
         _cleanup_histories(self._pdf)
         for d in self._data_dir.glob("sample*"):
             shutil.rmtree(d, ignore_errors=True)
         shutil.rmtree(self._tmp, ignore_errors=True)
+        llamamanage.set_engine(self._orig_engine)
 
     def test_pdf_to_epub_without_correct_saves_history(self):
         mian.split_pdf_to_images(self._pdf, dpi=100, fmt="png")
@@ -264,12 +273,16 @@ class TestOcrResume(unittest.TestCase):
         self._pdf = self._tmp / "sample.pdf"
         _make_pdf(self._pdf, n=3)
         self._data_dir = Path(pdfmanage.__file__).resolve().parent / "data"
+        # 钉住 llama 引擎：本类 mock llamamanage.batch_infer，config engine=paddle
+        # 时会被真实 PaddleOCR 绕过（见 TestPdfToEpub.setUp 注释）。
+        self._orig_engine = llamamanage.set_engine("llama")
 
     def tearDown(self):
         _cleanup_histories(self._pdf)
         for d in self._data_dir.glob("sample*"):
             shutil.rmtree(d, ignore_errors=True)
         shutil.rmtree(self._tmp, ignore_errors=True)
+        llamamanage.set_engine(self._orig_engine)
 
     def _split(self):
         return mian.split_pdf_to_images(self._pdf, dpi=100, fmt="png")
@@ -456,6 +469,86 @@ class TestStopCommand(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(seen, ["vllm"])
         self.assertIn("vLLM-Omni 已停止", buf.getvalue())
+
+
+class TestCorrectSubcommand(unittest.TestCase):
+    """mian.py correct 子命令（2026-09-12）：--history-id 传递 + 矫正引擎解析。
+
+    矫正引擎与 PDF OCR 引擎解耦：走 config.json 的 proofread_engine 键
+    （默认 llama），文本矫正入口不再受 --engine paddle 影响。
+    """
+
+    def tearDown(self):
+        # 清引擎覆盖（连同 _ENGINE_CACHE），避免污染后续测试
+        llamamanage.set_engine(None)
+
+    def _run_correct(self, argv, fake_result=None):
+        import contextlib
+        import io
+
+        calls: dict = {"pdf": None, "kw": {}}
+        orig = mian.correct_pdf
+
+        def _fake(pdf_path=None, *a, **kw):
+            calls["pdf"] = pdf_path
+            calls["kw"] = kw
+            return fake_result if fake_result is not None else {}
+
+        mian.correct_pdf = _fake
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                rc = mian.main(argv)
+        finally:
+            mian.correct_pdf = orig
+        return rc, calls, buf
+
+    def test_history_id_passed_to_correct_pdf(self):
+        rc, calls, _ = self._run_correct(["correct", "--history-id", "abc_123"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls["kw"].get("history_id"), "abc_123")
+
+    def test_history_id_none_when_omitted(self):
+        rc, calls, _ = self._run_correct(["correct"])
+        self.assertEqual(rc, 0)
+        self.assertIsNone(calls["kw"].get("history_id"))
+
+    def test_vllm_engine_applied_when_config_says_vllm(self):
+        import configmanage as _ccfg
+
+        orig_cfg = _ccfg.get_config
+        orig_set = llamamanage.set_engine
+        seen = []
+        _ccfg.get_config = lambda show_dialogs=False: {"proofread_engine": "vllm"}
+        llamamanage.set_engine = lambda e: seen.append(e) or orig_set(e)
+        try:
+            rc, _, _ = self._run_correct(["correct"])
+        finally:
+            _ccfg.get_config = orig_cfg
+            llamamanage.set_engine = orig_set
+        self.assertEqual(rc, 0)
+        self.assertIn("vllm", seen, "矫正引擎应取自 config.proofread_engine")
+
+    def test_cli_engine_overrides_config_for_correct(self):
+        import configmanage as _ccfg
+
+        orig_cfg = _ccfg.get_config
+        seen = []
+        _ccfg.get_config = lambda show_dialogs=False: {"proofread_engine": "vllm"}
+        orig_set = llamamanage.set_engine
+        llamamanage.set_engine = lambda e: seen.append(e) or orig_set(e)
+        try:
+            rc, _, _ = self._run_correct(["correct", "--engine", "llama"])
+        finally:
+            _ccfg.get_config = orig_cfg
+            llamamanage.set_engine = orig_set
+        self.assertEqual(rc, 0)
+        self.assertIn("llama", seen, "显式 --engine llama 应覆盖 config.vllm")
+
+    def test_paddle_engine_ignored_with_hint(self):
+        rc, calls, buf = self._run_correct(["correct", "--engine", "paddle"])
+        self.assertEqual(rc, 0)
+        self.assertIn("已忽略 --engine paddle", buf.getvalue())
+        self.assertIsNone(calls["kw"].get("history_id"))
 
 
 class TestGuiPrompt(unittest.TestCase):

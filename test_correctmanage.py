@@ -1172,9 +1172,17 @@ class TestPdfToEpubWithCorrection(unittest.TestCase):
     def test_correct_flag_wired_into_pipeline(self):
         def fake_batch_infer(images, prompts, model_key="HY", max_workers=3, thinking=False, timeout=600, on_progress=None, on_result=None):
             # 乱序返回，验证流水线按页码排序
+            # 注意：ImageItem 直接 str() 是 hex repr（无页码数字）→ _page_of 取不到页码；
+            # 用 .path（真实图片路径 data/<name>/N.png）才能正确回传页码
             out = []
             for i, p in reversed(list(enumerate(images, start=1))):
-                out.append({"img": str(p), "result": f"第{i}页内容", "error": None})
+                out.append(
+                    {
+                        "img": str(getattr(p, "path", p)),
+                        "result": f"第{i}页内容",
+                        "error": None,
+                    }
+                )
             return out
 
         calls = []
@@ -1617,6 +1625,200 @@ class TestHistoryPreloadFlag(unittest.TestCase):
         ):
             got = _history_pages_for_init("x.pdf", history=False, preload_history=True)
         self.assertEqual(got, {})
+
+    def test_history_id_passthrough_loads_version(self):
+        # history_id 给定时直接载入该版本 pages（不走"最新版本"逻辑）
+        from unittest import mock
+
+        with mock.patch(
+            "correctmanage._load_history_version",
+            return_value={"pages": {"3": "<p>指定版本</p>"}, "pdf": "z.pdf"},
+        ) as lv:
+            got = _history_pages_for_init(
+                None, history=False, preload_history=False, history_id="abc_1"
+            )
+        lv.assert_called_once_with("abc_1")
+        self.assertEqual(got, {"3": "<p>指定版本</p>"})
+
+    def test_history_id_bad_version_returns_empty(self):
+        from unittest import mock
+
+        with mock.patch("correctmanage._load_history_version", return_value=None):
+            got = _history_pages_for_init(
+                "x.pdf", history=True, preload_history=True, history_id="missing_1"
+            )
+        self.assertEqual(got, {})
+
+
+class TestSidecarMultiInstance(unittest.TestCase):
+    """矫正服务信息 sidecar（2026-09-12）：多实例并存互不覆盖，按 pid+port 清理。
+
+    回归：此前 sidecar 顶层是单个 dict {port,pid,started}，同一进程双开矫正时
+    后写覆盖前写 → GUI 配置中心只能发现最后一个实例；改为
+    {"instances": [...]} 列表并发写入/追加，清除只删除本 pid + 指定端口条目。
+    """
+
+    def setUp(self):
+        import correctmanage as _cm
+
+        self._cm = _cm
+        self._tmp = Path(tempfile.mkdtemp(prefix="test_sidecar_"))
+        orig = _cm._server_info_path
+        _cm._server_info_path = lambda: self._tmp / "correct_server.json"
+        self.addCleanup(lambda: setattr(_cm, "_server_info_path", orig))
+        self.addCleanup(lambda: shutil.rmtree(self._tmp, ignore_errors=True))
+
+    def test_empty_and_corrupt(self):
+        self.assertEqual(self._cm._read_correct_server_info(), [])
+        (self._tmp / "correct_server.json").write_text("not json{{", encoding="utf-8")
+        self.assertEqual(self._cm._read_correct_server_info(), [])
+
+    def test_legacy_single_object_shape(self):
+        import json as _json
+
+        (self._tmp / "correct_server.json").write_text(
+            _json.dumps({"port": 12345, "pid": 999, "started": 1.0}),
+            encoding="utf-8",
+        )
+        got = self._cm._read_correct_server_info()
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["port"], 12345)
+
+    def test_legacy_instances_list_shape(self):
+        import json as _json
+
+        (self._tmp / "correct_server.json").write_text(
+            _json.dumps({"instances": [{"port": 1, "pid": 2, "started": 1.0}]}),
+            encoding="utf-8",
+        )
+        got = self._cm._read_correct_server_info()
+        self.assertEqual([it["port"] for it in got], [1])
+
+    def test_write_append_and_clear_own_pid_port(self):
+        self._cm._write_server_info(11111, pdf="a.pdf", history_id="h1")
+        self._cm._write_server_info(22222, pdf="b.pdf")
+        got = self._cm._read_correct_server_info()
+        self.assertEqual(len(got), 2)
+        self.assertTrue(all(it["pid"] == os.getpid() for it in got))
+        self.assertEqual(got[0]["pdf"], "a.pdf")
+        self.assertEqual(got[0]["history_id"], "h1")
+        # 清一个端口：只剩另一个
+        self._cm._clear_server_info(11111)
+        got = self._cm._read_correct_server_info()
+        self.assertEqual([it["port"] for it in got], [22222])
+        # 全部清空（本 pid）→ 文件删除
+        self._cm._clear_server_info(None)
+        self.assertEqual(self._cm._read_correct_server_info(), [])
+        self.assertFalse((self._tmp / "correct_server.json").exists())
+
+    def test_clear_never_removes_foreign_pid(self):
+        import json as _json
+
+        (self._tmp / "correct_server.json").write_text(
+            _json.dumps(
+                {
+                    "instances": [
+                        {"port": 1, "pid": os.getpid(), "started": 1.0},
+                        {"port": 2, "pid": 424242, "started": 1.0},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._cm._clear_server_info(port=None)  # 语义：仅清本进程
+        got = self._cm._read_correct_server_info()
+        self.assertEqual(
+            [it["port"] for it in got], [2], "别的进程的实例不得被误删"
+        )
+
+    def test_write_update_replaces_same_pid_port(self):
+        self._cm._write_server_info(11111, pdf="a.pdf")
+        self._cm._write_server_info(11111, pdf="a2.pdf", history_id="h1")
+        got = self._cm._read_correct_server_info()
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["pdf"], "a2.pdf")
+        self.assertEqual(got[0]["history_id"], "h1")
+
+
+class TestOverwriteHistoryById(unittest.TestCase):
+    """_overwrite_history(state, history_id=...)（2026-09-12）：打开指定历史版本时
+    保存定向覆盖该版本文件，不产生新条目也不碰其他版本。
+    """
+
+    def _patch_history_dir(self, hist_dir):
+        import correctmanage as _cm
+
+        orig = _cm._history_dir
+        _cm._history_dir = lambda: hist_dir
+        self.addCleanup(lambda: setattr(_cm, "_history_dir", orig))
+        self.addCleanup(lambda: shutil.rmtree(hist_dir, ignore_errors=True))
+        return _cm
+
+    def _state(self, prefix="manual_x", pages=None):
+        return {
+            "history_prefix": prefix,
+            "history_name": "a.pdf",
+            "pages": pages if pages is not None else {1: "<p>c</p>"},
+            "proofread": {"errors": {}, "original": {}, "dismissed": {}},
+            "last_proofread_page": None,
+            "history_lock": __import__("threading").Lock(),
+        }
+
+    def test_overwrite_targets_exact_version(self):
+        import json as _json
+
+        hist_dir = Path(tempfile.mkdtemp(prefix="test_ovw_id_"))
+        cm = self._patch_history_dir(hist_dir)
+        v1 = "manual_x_20260101000000_0001"
+        v2 = "manual_x_20260102000000_0002"
+        for vid, txt in (
+            (v1, "<p>第一版</p>"),
+            (v2, "<p>第二版</p>"),
+        ):
+            (hist_dir / f"{vid}.json").write_text(
+                _json.dumps(
+                    {
+                        "pdf": "C:/a.pdf",
+                        "name": "a.pdf",
+                        "pages": {"1": txt},
+                        "updated": "2026-01-01 00:00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+        ok = cm._overwrite_history(
+            self._state(pages={1: "<p>改过的第一版</p>"}), history_id=v1
+        )
+        self.assertTrue(ok)
+        files = sorted(p.stem for p in hist_dir.glob("manual_x_*.json"))
+        self.assertEqual(files, [v1, v2], "不应新建版本文件")
+        data1 = _json.loads((hist_dir / f"{v1}.json").read_text(encoding="utf-8"))
+        self.assertEqual(data1["pages"], {"1": "<p>改过的第一版</p>"})
+        data2 = _json.loads((hist_dir / f"{v2}.json").read_text(encoding="utf-8"))
+        self.assertEqual(data2["pages"], {"1": "<p>第二版</p>"}, "其他版本不动")
+
+    def test_history_id_path_traversal_blocked(self):
+        import json as _json
+
+        hist_dir = Path(tempfile.mkdtemp(prefix="test_ovw_trav_"))
+        cm = self._patch_history_dir(hist_dir)
+        evil = Path(tempfile.mkdtemp(prefix="test_ovw_evil_")) / "x.json"
+        evil.write_text("INNOCENT", encoding="utf-8")
+        self.addCleanup(lambda: shutil.rmtree(evil.parent, ignore_errors=True))
+        (hist_dir / "manual_x_20260101000000_0001.json").write_text(
+            _json.dumps({"pdf": "", "pages": {"1": "<p>v</p>"}}), encoding="utf-8"
+        )
+        ok = cm._overwrite_history(self._state(), history_id="../evil/x")
+        self.assertTrue(ok)
+        self.assertEqual(
+            evil.read_text(encoding="utf-8"), "INNOCENT", "不得越界覆盖"
+        )
+        data = _json.loads(
+            (hist_dir / "manual_x_20260101000000_0001.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(data["pages"], {"1": "<p>c</p>"}, "回退覆盖本组最新版本")
 
 
 class TestConvertEndpoint(unittest.TestCase):
@@ -3386,7 +3588,7 @@ class TestLlmServerControl(unittest.TestCase):
         calls = []
         self._patch_llama_attr(
             "runserver",
-            lambda model_key, with_mmproj=True, parallel=1: calls.append((model_key, with_mmproj, parallel)) or True,
+            lambda model_key, with_mmproj=True, parallel=1, ctx_size=None: calls.append((model_key, with_mmproj, parallel)) or True,
         )
         server, base = self._start()
         try:
@@ -3407,7 +3609,7 @@ class TestLlmServerControl(unittest.TestCase):
         calls = []
         self._patch_llama_attr(
             "runserver",
-            lambda model_key, with_mmproj=True, parallel=1: calls.append((model_key, with_mmproj, parallel)) or True,
+            lambda model_key, with_mmproj=True, parallel=1, ctx_size=None: calls.append((model_key, with_mmproj, parallel)) or True,
         )
         server, base = self._start()
         try:
@@ -3426,7 +3628,7 @@ class TestLlmServerControl(unittest.TestCase):
         calls = []
         self._patch_llama_attr(
             "runserver",
-            lambda model_key, with_mmproj=True, parallel=1: calls.append((model_key, with_mmproj, parallel)) or True,
+            lambda model_key, with_mmproj=True, parallel=1, ctx_size=None: calls.append((model_key, with_mmproj, parallel)) or True,
         )
         server, base = self._start()
         try:
@@ -3468,7 +3670,7 @@ class TestLlmServerControl(unittest.TestCase):
         calls = []
         self._patch_llama_attr(
             "runserver",
-            lambda model_key, with_mmproj=True, parallel=1: calls.append((model_key, with_mmproj, parallel)) or True,
+            lambda model_key, with_mmproj=True, parallel=1, ctx_size=None: calls.append((model_key, with_mmproj, parallel)) or True,
         )
         server, base = self._start()
         try:
@@ -3495,7 +3697,7 @@ class TestLlmServerControl(unittest.TestCase):
         calls = []
         self._patch_llama_attr(
             "runserver",
-            lambda model_key, with_mmproj=True, parallel=1: calls.append((model_key, with_mmproj, parallel)) or True,
+            lambda model_key, with_mmproj=True, parallel=1, ctx_size=None: calls.append((model_key, with_mmproj, parallel)) or True,
         )
         server, base = self._start()
         try:
@@ -3503,6 +3705,27 @@ class TestLlmServerControl(unittest.TestCase):
             self.assertTrue(res["ok"])
             self.assertFalse(res["image_model"], "无 mmproj 的模型应标记 image_model=False")
             self.assertEqual(calls, [("HY", False, 1)], "无 mmproj 的模型应以纯文本模式启动")
+        finally:
+            self._stop(server)
+
+    def test_llm_start_runserver_ctx_size_8192(self):
+        """矫正界面启动服务 → runserver 必须传 ctx_size=8192（覆盖配置上下文）。"""
+        import json as _json
+
+        import requests
+
+        self._patch_cfg()
+        calls = []
+        self._patch_llama_attr(
+            "runserver",
+            lambda model_key, with_mmproj=True, parallel=1, ctx_size=None: calls.append((model_key, with_mmproj, parallel, ctx_size)) or True,
+        )
+        server, base = self._start()
+        try:
+            res = requests.post(base + "/api/llm_start", data=_json.dumps({"model": ""})).json()
+            self.assertTrue(res["ok"])
+            self.assertTrue(res["running"])
+            self.assertEqual(calls, [("HY", False, 1, 8192)], "矫正界面启动必须传 ctx_size=8192")
         finally:
             self._stop(server)
 

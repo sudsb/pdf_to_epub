@@ -187,6 +187,8 @@ DEFAULT_CONFIG = {
     },
     # 推理引擎选择：'llama'（llama.cpp，默认）| 'vllm'（vLLM-Omni）| 'paddle'（PaddleOCR 本地推理）
     "engine": "llama",
+    # 校正/重识别引擎：'llama'（默认）| 'vllm'。与识别引擎 engine 键独立，用于矫正界面的深度校对与重识别
+    "proofread_engine": "llama",
     # vLLM-Omni 可执行文件路径（如 "vllm" 或绝对路径）；空 = 仅连接模式
     # （vLLM-Omni 官方仅支持 Linux，Windows 用户可在 WSL2/远程手动启动后连接）
     "vllm_server": "",

@@ -2,12 +2,12 @@
 
 功能：
 - 维护会话文件：data/gui_tab_session.json（owner_pid、owner_base、tabs 列表、创建时间）。
-- register_tab(title, url, base_url)：首进程成为 owner 并建会话；后续进程探测 owner 存活则作为 guest 加入。
+- register_tab(title, url, base_url, *, closeable=True)：首进程成为 owner 并建会话；后续进程探测 owner 存活则作为 guest 加入。
 - _owner_alive(base_url)：GET {base_url}/tabhost，HTTP 200 视为存活。
 - guest_session_ok(title, owner_base)：检查会话是否有效且自身标签仍在。
 - reset_session()：owner 退出时清除会话，供 guest 接管重建。
 - tabs_payload()：返回 {ok, tabs[], position} 供前端渲染标签栏。
-- handle_tabs_post(body)：处理标签栏位置持久化（top/bottom）。
+- handle_tabs_post(body)：处理标签栏位置持久化（top/bottom）与关闭标签页（action="close" + id）。
 - tab_host_html()：读取 ui/tabhost.html（开发环境/冻结 exe 均支持），缺失时返回中文兜底页。
 
 所有函数均为防御式：不抛异常，静默回退，便于多进程并发安全。
@@ -15,9 +15,11 @@
 
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
+import uuid
 from typing import Any
 
 
@@ -94,8 +96,8 @@ def _owner_alive(base_url: str) -> bool:
         return False
 
 
-def _append_tab(session: dict, title: str, url: str) -> None:
-    """去重合并标签：同 title 保留最新 url，否则追加。就地修改 session。"""
+def _append_tab(session: dict, title: str, url: str, closeable: bool = True) -> None:
+    """去重合并标签：同 title 保留最新 url 并补齐 id/pid/closeable，否则追加。就地修改 session。"""
     tabs = session.get("tabs", [])
     if not isinstance(tabs, list):
         tabs = []
@@ -103,19 +105,32 @@ def _append_tab(session: dict, title: str, url: str) -> None:
     for t in tabs:
         if isinstance(t, dict) and t.get("title") == title:
             t["url"] = url
+            if not t.get("id"):
+                t["id"] = uuid.uuid4().hex
+            t["pid"] = os.getpid()
+            t["closeable"] = closeable
             found = True
             break
     if not found:
-        tabs.append({"title": title, "url": url})
+        tabs.append(
+            {
+                "title": title,
+                "url": url,
+                "id": uuid.uuid4().hex,
+                "pid": os.getpid(),
+                "closeable": closeable,
+            }
+        )
     session["tabs"] = tabs
 
 
-def register_tab(title: str, url: str, base_url: str) -> str:
+def register_tab(title: str, url: str, base_url: str, *, closeable: bool = True) -> str:
     """注册标签页，返回 "owner" 或 "guest"。
 
     - 读取会话；若存在且 owner 探测存活 → 去重/更新自身标签，写回，返回 "guest"。
     - 首次探测失败会短暂等待后重试一次（防启动竞态误判 owner 死亡误抢占），
       仍失败才新建会话（owner_pid=当前进程、owner_base=base_url、tabs=[{title,url}]），返回 "owner"。
+    - closeable：该标签页是否允许被关闭（主窗口等常驻标签传 False）。
     """
     with _TAB_LOCK:
         session = _read_session()
@@ -131,7 +146,7 @@ def register_tab(title: str, url: str, base_url: str) -> str:
                 alive = _owner_alive(owner_base)
             if alive:
                 # owner 存活：去重/更新自身标签
-                _append_tab(session, title, url)
+                _append_tab(session, title, url, closeable=closeable)
                 _write_session(session)
                 return "guest"
             # owner 确认已死：接管
@@ -141,7 +156,15 @@ def register_tab(title: str, url: str, base_url: str) -> str:
             "owner_pid": os.getpid(),
             "owner_base": base_url,
             "created": time.time(),
-            "tabs": [{"title": title, "url": url}],
+            "tabs": [
+                {
+                    "title": title,
+                    "url": url,
+                    "id": uuid.uuid4().hex,
+                    "pid": os.getpid(),
+                    "closeable": closeable,
+                }
+            ],
         }
         _write_session(new_session)
         return "owner"
@@ -202,18 +225,64 @@ def tabs_payload() -> dict:
     tabs = session.get("tabs", []) if session else []
     if not isinstance(tabs, list):
         tabs = []
-    # 仅保留合法条目
-    clean_tabs = [{"title": t.get("title", ""), "url": t.get("url", "")} for t in tabs if isinstance(t, dict)]
+    # 仅保留合法条目（tabs_payload 不暴露 pid，前端只需渲染与关闭所需字段）
+    clean_tabs = [
+        {
+            "title": t.get("title", ""),
+            "url": t.get("url", ""),
+            "id": t.get("id", ""),
+            "closeable": t.get("closeable", True),
+        }
+        for t in tabs
+        if isinstance(t, dict)
+    ]
     return {"ok": True, "tabs": clean_tabs, "position": position}
 
 
 def handle_tabs_post(body: dict) -> tuple[bool, str]:
-    """处理 /api/tabs POST：仅支持 position 字段（top/bottom）。
+    """处理 /api/tabs POST。
+
+    - position: top / bottom（标签栏位置持久化，既有逻辑）。
+    - action="close"（body 带 id）：从会话删除对应标签页，best-effort 结束其注册进程后写回。
 
     成功 → (True, "")；失败 → (False, 中文错误信息)。
     """
     if not isinstance(body, dict):
         return False, "请求体必须为 JSON 对象"
+    # 关闭指定标签页
+    if body.get("action") == "close":
+        tab_id = body.get("id")
+        if not isinstance(tab_id, str) or not tab_id:
+            return False, "缺少标签页 id"
+        with _TAB_LOCK:
+            session = _read_session()
+            if not session:
+                return False, "会话不存在"
+            tabs = session.get("tabs", [])
+            if not isinstance(tabs, list):
+                tabs = []
+            target = None
+            for t in tabs:
+                if isinstance(t, dict) and t.get("id") == tab_id:
+                    target = t
+                    break
+            if target is None:
+                return False, "标签页不存在"
+            tabs.remove(target)
+            session["tabs"] = tabs
+            # best-effort 结束注册该标签页的进程（自身进程不动）
+            pid = target.get("pid")
+            if isinstance(pid, int) and pid > 0 and pid != os.getpid():
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/PID", str(pid)],
+                        capture_output=True,
+                        timeout=10,
+                    )
+                except Exception:
+                    pass
+            _write_session(session)
+        return True, ""
     position = body.get("position")
     if position not in ("top", "bottom"):
         return False, "tabs_position 仅支持 top / bottom"

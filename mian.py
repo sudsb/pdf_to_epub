@@ -274,6 +274,7 @@ def correct_pdf(
     out_dir: str | Path | None = None,
     epub_path: str | Path | None = None,
     idle_timeout: int = 600,
+    history_id: str | None = None,
 ) -> dict:
     """直接启动手动矫正界面（不跑 OCR）。
 
@@ -283,10 +284,27 @@ def correct_pdf(
     无历史则为空白页；每次点「完成并转换」都会重新生成 EPUB（可留在页面继续
     修改后再次点击）。浏览器关闭超过 idle_timeout 秒后结束等待：已转换过用
     最近结果；否则有内容时补转一次，无内容则不转换。
+
+    history_id：打开指定历史版本矫正（如 mian.py correct --history-id <id>）。
+    指定后初始内容直接载入该版本；pdf_path 为空时优先从版本记录中的 pdf 字段
+    恢复预览图来源，取不到则进入无文件模式（仅历史文本，无 PDF 预览）。
     """
     # 惰性导入：correctmanage/htmlmanage 依赖（zhconv 等）仅在本命令用到时加载
     from correctmanage import correct_pages
     from htmlmanage import HTMLConverter
+
+    if pdf_path is None and history_id:
+        # 打开指定历史版本：优先从历史条目恢复 pdf（预览图来源跟随版本所属 PDF）
+        try:
+            from correctmanage import _history_entries
+
+            _hit = next(
+                (it for it in _history_entries() if it["id"] == history_id), None
+            )
+            if _hit and _hit.get("pdf"):
+                pdf_path = _hit["pdf"]
+        except Exception:  # noqa: BLE001 — 取不到 pdf 也能打开（仅文本无预览）
+            pass
 
     if pdf_path is not None:
         pdf = Path(pdf_path)
@@ -361,6 +379,7 @@ def correct_pdf(
         img_dir=None,
         idle_timeout=idle_timeout,
         on_convert=_convert_corrected,
+        history_id=history_id,
     )
     if last_convert.get("result") is not None:
         # 浏览器端已「完成并转换」过（可多次），直接用最近一次转换结果
@@ -868,8 +887,12 @@ def _save_ocr_history(pdf: Path, structured: dict) -> None:
             _write_history_version,
         )
 
+        # 以解析后的规范路径落盘（与 _history_prefix 内部 resolve() 一致）：
+        # Windows 8.3 短路径（如 %TEMP% 指向 ADMINI~1）经 Path.resolve() 还原为
+        # 长路径，保证历史记录中的 pdf 字段与用户手输路径可稳定比对/预览恢复。
+        pdf_resolved = str(Path(pdf).resolve())
         state = {
-            "pdf_path": str(pdf),
+            "pdf_path": pdf_resolved,
             "pages": {
                 # 与矫正界面 /api/pages 一致（2026-08-15）：所有传入矫正界面的文本
                 # 一律为正文——结构化产生的 <h1>-<h6> 标题经 _page_text 归一为 <p>
@@ -877,7 +900,7 @@ def _save_ocr_history(pdf: Path, structured: dict) -> None:
                 p["page"]: _page_text(p.get("text") or "")
                 for p in (structured.get("pages") or [])
             },
-            "history_prefix": _history_prefix(str(pdf)),
+            "history_prefix": _history_prefix(pdf_resolved),
             "history_lock": threading.Lock(),
             "history_name": pdf.name,
             "proofread": {"errors": {}, "original": {}, "dismissed": {}},
@@ -1465,6 +1488,12 @@ def main(argv: list[str] | None = None) -> int:
         default=600,
         help="浏览器被关闭后自动继续后续流程的等待秒数（默认 600=10 分钟）",
     )
+    correct_p.add_argument(
+        "--history-id",
+        default=None,
+        help="打开指定历史版本矫正（版本 id = data/correction_history/ 下文件名的 stem，"
+        "可用矫正界面的历史列表查看）；指定后初始内容直接载入该版本，保存定向覆盖原版本",
+    )
 
     resume_p = sub.add_parser(
         "resume",
@@ -1951,13 +1980,20 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
     if args.command == "correct":
+        # 矫正引擎解析（2026-09-12）：矫正（句子校正/深度校对/重识别）走
+        # config.json 的 proofread_engine 键（默认 llama），与 PDF OCR 引擎解耦；
+        # 显式 --engine llama/vllm 覆盖之；--engine paddle 仅用于 PDF 识别流程，
+        # 文本矫正仍使用大模型引擎 → 打印提示后回退 proofread_engine。
         if args.engine == "paddle":
-            # PaddleOCR 仅用于 PDF 识别流程；文本矫正仍使用大模型引擎
             print(
                 "PaddleOCR 仅用于 PDF 识别流程；文本矫正仍使用大模型引擎，已忽略 --engine paddle"
             )
-        else:
-            _apply_engine_arg(args.engine)
+        _cfg_pe = (
+            args.engine
+            if args.engine in ("llama", "vllm")
+            else (cfg or {}).get("proofread_engine") or "llama"
+        )
+        _apply_engine_arg(_cfg_pe)
         try:
             result = correct_pdf(
                 args.pdf,
@@ -1967,6 +2003,7 @@ def main(argv: list[str] | None = None) -> int:
                 out_dir=args.out_dir,
                 epub_path=args.epub_path,
                 idle_timeout=args.correct_timeout,
+                history_id=args.history_id,
             )
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)

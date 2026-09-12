@@ -113,11 +113,14 @@ _ENGINE_CACHE_TTL = 2.0  # 秒：批次内避免每页重复读 config.json
 _BATCH_ENGINE: str | None = None
 
 
-def set_engine(engine: str | None) -> None:
-    """CLI --engine 临时覆盖引擎选择（不写 config.json）。None 恢复按配置。"""
+def set_engine(engine: str | None) -> str | None:
+    """CLI --engine 临时覆盖引擎选择（不写 config.json）。None 恢复按配置。
+    返回之前的 _ENGINE_OVERRIDE 旧值，便于调用方恢复。"""
     global _ENGINE_OVERRIDE, _ENGINE_CACHE
+    old = _ENGINE_OVERRIDE
     _ENGINE_OVERRIDE = engine
     _ENGINE_CACHE = None
+    return old
 
 
 def _active_engine() -> str:
@@ -137,6 +140,15 @@ def _active_engine() -> str:
     _ENGINE_CACHE = eng
     _ENGINE_CACHE_TS = now
     return eng
+
+
+def _active_proofread_engine() -> str:
+    """矫正/重识别用引擎：优先 config.proofread_engine，缺省/非法回退 llama。仅 llama/vllm。"""
+    try:
+        eng = (get_config(show_dialogs=False).get("proofread_engine") or "llama").strip().lower()
+    except Exception:
+        return "llama"
+    return "llama" if eng not in ("llama", "vllm") else eng
 
 
 def _vllm_module():
@@ -442,7 +454,12 @@ def _handle_stale_instance(model_name: str) -> bool:
 #   {"error":{"message":"Loading model","type":"unavailable_error","code":503}}
 # 加载成功时
 #   {"status":"ok"}
-def runserver(model_key: str = "HY", with_mmproj: bool = True, parallel: int | None = None):
+def runserver(
+    model_key: str = "HY",
+    with_mmproj: bool = True,
+    parallel: int | None = None,
+    ctx_size: int | None = None,
+):
     """启动 llama-server 并等待模型加载完成。
 
     Args:
@@ -453,6 +470,8 @@ def runserver(model_key: str = "HY", with_mmproj: bool = True, parallel: int | N
         parallel: 调用方已知的实际并发数（如 pdf_to_epub 的 workers）。传入时
             --parallel 取 min(配置值, parallel)——槽位不多于实际并发，避免 KV
             cache 按槽位预分配浪费显存（溢出到 CPU 反而拖慢单页）。
+        ctx_size: 覆盖 llama_server_args.ctx_size 的服务端上下文大小（矫正界面
+            按需传入 8192）。None 时保持配置值。
     """
     global _server_process
     global _SERVER_CTX
@@ -460,7 +479,7 @@ def runserver(model_key: str = "HY", with_mmproj: bool = True, parallel: int | N
 
     if _active_engine() == "vllm":
         m = _vllm_module()
-        ok = m.runserver(model_key, with_mmproj=with_mmproj, parallel=parallel)
+        ok = m.runserver(model_key, with_mmproj=with_mmproj, parallel=parallel, ctx_size=ctx_size)
         _server_process = m._server_process
         return ok
 
@@ -491,9 +510,8 @@ def runserver(model_key: str = "HY", with_mmproj: bool = True, parallel: int | N
         #   - /slots 探测失败 → 提示可能是旧服务，仍截断时建议停止重试。
         _record_server_ctx()
         try:
-            _sc = int(
-                (get_config(show_dialogs=False).get("llama_server_args") or {}).get("ctx_size") or 0
-            )
+            _cfg_ctx = (get_config(show_dialogs=False).get("llama_server_args") or {}).get("ctx_size") or 0
+            _sc = int(ctx_size) if ctx_size is not None else int(_cfg_ctx)
         except Exception:
             _sc = 0
         if _SERVER_CTX and _sc and _SERVER_CTX < _sc:
@@ -533,6 +551,11 @@ def runserver(model_key: str = "HY", with_mmproj: bool = True, parallel: int | N
     # 服务器启动是一次性操作，此处多读一次 get_config() 无性能顾虑。
     cfg = get_config()
     sargs = cfg.get("llama_server_args", {}) or {}
+    # 矫正界面按需覆盖 ctx_size（如 8192）：dict 复制 + 键覆盖，驱动下方
+    # --ctx-size 构建、--parallel 平分槽位告警与生成预算告警统一使用生效值。
+    if ctx_size is not None:
+        sargs = dict(sargs)
+        sargs["ctx_size"] = str(int(ctx_size))
     for key, flag in (
         ("host", "--host"),
         ("port", "--port"),
