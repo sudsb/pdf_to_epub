@@ -293,7 +293,8 @@
     "tip_delay": 600,
     "err_hover_delay": 500,
     "editor_font_size": 14,
-    "img_mode": ""
+    "img_mode": "",
+    "rule_all_pages_confirm": true
   },
   "proofread_engine": "llama"
 }

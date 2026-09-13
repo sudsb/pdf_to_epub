@@ -350,16 +350,17 @@ class TestNewInlineFormatCSS(unittest.TestCase):
         cssm = htmlmanage.CSSManager()
         css = cssm.generate_stylesheet()
         # 检查选择器存在
-        for selector in ('.ptoe-underline', '.ptoe-strike', '.ptoe-charbox', '.ptoe-shade', '.ptoe-highlight', '.ptoe-sup', '.ptoe-sub'):
+        for selector in ('.ptoe-underline', '.ptoe-underdot', '.ptoe-strike', '.ptoe-charbox', '.ptoe-shade', '.ptoe-highlight', '.ptoe-sup', '.ptoe-sub'):
             self.assertIn(selector, css, f"Missing selector {selector}")
         # 检查关键属性存在（CSS 输出含空格和分号，做宽松匹配）
         self.assertIn('text-decoration: underline', css)
+        self.assertIn('text-decoration: underline dotted', css)
         self.assertIn('text-decoration: line-through', css)
         self.assertIn('border: 1px solid #333', css)
         self.assertIn('padding: 0 .15em', css)
         self.assertIn('border-radius: 2px', css)
         self.assertIn('background: #eef1f4', css)
-        self.assertIn('background: #ffe45e', css)
+        self.assertIn('background: #e0e0e0', css)
         self.assertIn('vertical-align: super', css)
         self.assertIn('font-size: .7em', css)
         self.assertIn('line-height: 1', css)

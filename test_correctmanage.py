@@ -9,6 +9,7 @@ Covers:
 """
 
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -498,6 +499,53 @@ class TestPagesEndpoint(unittest.TestCase):
             self._stop(server)
 
 
+_VOID_TAGS = {"br", "img", "hr", "meta", "link", "input"}
+_ARTICLE_BLOCK_TAGS = {"p", "div", "h1", "h2", "h3", "h4", "h5", "h6"}
+
+
+def _html_balance_problems(html: str) -> list[str]:
+    """结构合法性检查：标签闭合平衡 + <p> 内不得出现块级子元素。
+
+    用于把"标记/合并"产出的文章 HTML 卡在结构合法上——历史上出现过的
+    "注释 span 被段落标记切断漏 </span>""<div> 被包进 <p>"等问题都属于此类。
+    """
+    from html.parser import HTMLParser
+
+    problems: list[str] = []
+
+    class _Checker(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.stack: list[str] = []
+
+        def handle_starttag(self, tag, attrs):  # noqa: D102
+            if tag in _VOID_TAGS:
+                return
+            if tag in _ARTICLE_BLOCK_TAGS and "p" in self.stack:
+                problems.append(f"<p> 内出现块级子元素 <{tag}>")
+            self.stack.append(tag)
+
+        def handle_startendtag(self, tag, attrs):  # noqa: D102
+            return
+
+        def handle_endtag(self, tag):  # noqa: D102
+            if tag in _VOID_TAGS:
+                return
+            if tag not in self.stack:
+                problems.append(f"多余的结束标签 </{tag}>")
+                return
+            while self.stack and self.stack[-1] != tag:
+                problems.append(f"未闭合标签 <{self.stack[-1]}>")
+                self.stack.pop()
+            if self.stack:
+                self.stack.pop()
+
+    checker = _Checker()
+    checker.feed(html)
+    problems.extend(f"未闭合标签 <{t}>" for t in checker.stack)
+    return problems
+
+
 class TestApplyMarkers(unittest.TestCase):
     def test_join_merges_across_pages(self):
         pages = [
@@ -686,13 +734,15 @@ class TestApplyMarkers(unittest.TestCase):
         )
 
     def test_note_no_marker_join_stripped(self):
-        # 无注释标记时，注释块内的段落标记按切段语义消费（标记本身不残留）
+        # 无注释标记时，注释块内的段落标记按切段语义消费（标记本身不残留）；
+        # 跨「注释/正文」的段落标记照常合并（2026-09-13 统一语义），且合并后
+        # 段落保持正文、注释内容包成行内 span —— 两侧字号各自与界面一致
         pages = [
             {"page": 1, "text": '<p>正文</p><p class="ptoe-note"><span data-ptoe-marker="join">段落</span>注一</p>'}
         ]
         self.assertEqual(
             apply_markers(pages),
-            [{"text": '<p>正文</p><p class="ptoe-note">注一</p>'}],
+            [{"text": '<p>正文<span class="ptoe-note">注一</span></p>'}],
         )
 
     def test_note_no_marker_join_merges_adjacent_notes(self):
@@ -729,15 +779,17 @@ class TestApplyMarkers(unittest.TestCase):
             [{"text": '<p>正文</p><p class="ptoe-note">注一前半注一后半</p>'}],
         )
 
-    def test_note_no_marker_join_not_into_body(self):
-        # 正文段尾的段落标记不把注释并进正文：注释保持独立 <p>
+    def test_note_no_marker_join_into_body_merges(self):
+        # 正文段尾的段落标记与后续注释段合并（2026-09-13：段落标记合并标记前后
+        # 两段文本）。合并后段落仍是正文（标记前的正文不会跟着变成小字灰字），
+        # 注释段的内容包成行内 <span class="ptoe-note"> 保留小字灰字样式。
         pages = [
             {"page": 1, "text": '<p>正文前半<span data-ptoe-marker="join">段落</span></p>'
              '<p class="ptoe-note">注一</p>'}
         ]
         self.assertEqual(
             apply_markers(pages),
-            [{"text": '<p>正文前半</p><p class="ptoe-note">注一</p>'}],
+            [{"text": '<p>正文前半<span class="ptoe-note">注一</span></p>'}],
         )
 
     def test_note_no_marker_join_chain_three_notes(self):
@@ -753,14 +805,17 @@ class TestApplyMarkers(unittest.TestCase):
         )
 
     def test_note_no_marker_join_broken_by_body(self):
-        # 中间隔了正文块：段落标记不跨非注释块生效
+        # 段落标记只合并"相邻"两段：没有标记的位置不合并（注一 与 中间正文 之间
+        # 无标记 → 各自独立）；注二的段首标记只并入紧邻的上一段（中间正文），
+        # 合并后仍为正文段，注二内容为行内注释 span
         pages = [
             {"page": 1, "text": '<p>正文</p><p class="ptoe-note">注一</p><p>中间正文</p>'
              '<p class="ptoe-note"><span data-ptoe-marker="join">段落</span>注二</p>'}
         ]
         self.assertEqual(
             apply_markers(pages),
-            [{"text": '<p>正文</p><p class="ptoe-note">注一</p><p>中间正文</p><p class="ptoe-note">注二</p>'}],
+            [{"text": '<p>正文</p><p class="ptoe-note">注一</p>'
+                      '<p>中间正文<span class="ptoe-note">注二</span></p>'}],
         )
 
     def test_note_no_marker_standalone_join_block_between_notes(self):
@@ -813,6 +868,117 @@ class TestApplyMarkers(unittest.TestCase):
             apply_markers(pages),
             [{"text": '<p>正文</p><p class="ptoe-note">注一注二</p>'}],
         )
+
+    def test_join_merges_across_note_and_body_both_directions(self):
+        # 用户报告的场景：注释文本 + 段落标记，导出后必须合并，且合并后**两侧字号
+        # 各自与矫正界面一致**——混入正文段时合并结果不是注释段，注释内容改用
+        # 行内 <span class="ptoe-note"> 保留小字灰字（否则标记前的正文也会缩小）。
+        pages = [
+            {"page": 1, "text": '<p class="ptoe-note">注一前半<span data-ptoe-marker="join">段落</span></p>'
+             '<p>注一后半</p>'},
+            {"page": 2, "text": '<p>注二前半<span data-ptoe-marker="join">段落</span></p>'
+             '<p class="ptoe-note">注二后半</p>'},
+        ]
+        self.assertEqual(
+            apply_markers(pages),
+            [{"text": '<p><span class="ptoe-note">注一前半</span>注一后半</p>'
+                      '<p>注二前半<span class="ptoe-note">注二后半</span></p>'}],
+        )
+
+    def test_join_across_note_and_body_by_start_marker(self):
+        # 段首标记在注释段上：与上一正文段合并；合并段为正文，注释内容为行内 span
+        pages = [
+            {"page": 1, "text": '<p>正文前半</p><p class="ptoe-note">'
+                                '<span data-ptoe-marker="join">段落</span>正文后半</p>'}
+        ]
+        self.assertEqual(
+            apply_markers(pages),
+            [{"text": '<p>正文前半<span class="ptoe-note">正文后半</span></p>'}],
+        )
+
+    def test_join_note_chain_then_body_keeps_body_font(self):
+        # 注释+注释 合并成注释段后，再并入正文段 → 整段降级为正文段，
+        # 已并入的注释内容整体包成行内注释（标记两侧字号互不污染）
+        pages = [
+            {"page": 1, "text": '<p class="ptoe-note">注一<span data-ptoe-marker="join">段落</span></p>'
+             '<p class="ptoe-note">注二<span data-ptoe-marker="join">段落</span></p>'
+             '<p>正文</p>'}
+        ]
+        self.assertEqual(
+            apply_markers(pages),
+            [{"text": '<p><span class="ptoe-note">注一注二</span>正文</p>'}],
+        )
+
+    def test_join_note_and_body_never_shrinks_before_marker(self):
+        # 用户报告的问题回归：正文段（标记前）+ 注释段（标记后）合并后，
+        # 段落本身不得带 ptoe-note（否则标记前的正文整段变成小字灰字）
+        pages = [
+            {"page": 1, "text": '<p>前一段正文<span data-ptoe-marker="join">段落</span></p>'
+             '<p class="ptoe-note">（注）注释文字</p>'}
+        ]
+        out = apply_markers(pages)[0]["text"]
+        self.assertEqual(
+            out, '<p>前一段正文<span class="ptoe-note">（注）注释文字</span></p>'
+        )
+        self.assertFalse(out.startswith('<p class="ptoe-note"'), out)
+        self.assertEqual(_html_balance_problems(out), [])
+
+    def test_join_div_blocks_normalized_to_p(self):
+        # 未经过 sanitize 的 <div> 形态（历史版本/外部直接调用）：按 <p> 处理，
+        # 既不产出 <p><div>…</div></p> 非法嵌套，注释段落也能被正确识别与合并
+        pages = [
+            {"page": 1, "text": '<div class="ptoe-note">注一<span data-ptoe-marker="join">段落</span></div>'
+             '<div class="ptoe-note">注二</div>'}
+        ]
+        self.assertEqual(
+            apply_markers(pages),
+            [{"text": '<p class="ptoe-note">注一注二</p>'}],
+        )
+
+    def test_div_note_with_note_marker_not_counted_as_mismatch(self):
+        # div 注释段 + 正文注释标记：注释段识别不能失败（否则误报"数量不匹配"）
+        pages = [
+            {"page": 1, "text": '<p>甲<span data-ptoe-marker="note">注释</span></p>'
+             '<div class="ptoe-note">注一</div>'}
+        ]
+        self.assertEqual(
+            apply_markers(pages),
+            [{"text": '<p>甲<span class="ptoe-note">（注一）</span></p>'}],
+        )
+
+    def test_join_inside_inline_note_span_stays_balanced(self):
+        # 行内注释 span 被段落标记切断：前段补闭合、后段重开，输出结构合法
+        pages = [
+            {"page": 1, "text": '<p>甲<span class="ptoe-note">乙'
+                                '<span data-ptoe-marker="join">段落</span>丙</span></p>'}
+        ]
+        out = apply_markers(pages)[0]["text"]
+        self.assertEqual(
+            out,
+            '<p>甲<span class="ptoe-note">乙</span><span class="ptoe-note">丙</span></p>',
+        )
+        self.assertEqual(_html_balance_problems(out), [])
+
+    def test_article_html_wellformed_invariant(self):
+        # 回归护栏：各种标记/注释组合产出的文章 HTML 必须结构合法
+        # （标签闭合平衡、<p> 内无块级子元素）。把这类"看起来只是样式微调
+        # 却弄坏结构"的改动统一卡住，避免同类问题反复出现。
+        cases = [
+            '<p class="ptoe-note">注一<span data-ptoe-marker="join">段落</span></p><p>正文</p>',
+            '<p>正文</p><p class="ptoe-note"><span data-ptoe-marker="join">段落</span>注一</p>',
+            '<p class="ptoe-note">注一</p><p><span data-ptoe-marker="join">段落</span></p>'
+            '<p class="ptoe-note">注二</p>',
+            '<div class="ptoe-note">注一<span data-ptoe-marker="join">段落</span></div><div>正文</div>',
+            '<p>甲<span class="ptoe-note">乙<span data-ptoe-marker="join">段落</span>丙</span></p>',
+            '<h1>标题</h1><p>正文<span data-ptoe-marker="page">换页</span>续</p>',
+            '<p>甲<span data-ptoe-marker="note">注释</span></p><p class="ptoe-note">注一</p>',
+            '<p>甲<span data-ptoe-marker="full">全文</span></p><p>后篇</p>',
+            '<p class="ptoe-align-center">甲<span data-ptoe-marker="join">段落</span></p>'
+            '<p class="ptoe-note">乙<span data-ptoe-marker="join">段落</span></p><p>丙</p>',
+        ]
+        for text in cases:
+            out = apply_markers([{"page": 1, "text": text}])[0]["text"]
+            self.assertEqual(_html_balance_problems(out), [], f"输入: {text!r} 输出: {out!r}")
 
     def test_note_cross_page_join_merge(self):
         # 因分页被折断的注释：后半段带段落标记 → 与前半段合并为一条后插入正文
@@ -1908,6 +2074,116 @@ class TestCleanEndpoint(unittest.TestCase):
             self.assertEqual(res["pages"], [{"page": 1, "html": "<p>第一段</p>\n<p>续文</p>"}])
             # 无状态：服务端内容不变
             self.assertEqual(state["pages"][1], "<p>原文</p>")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestClipboardHelpers(unittest.TestCase):
+    """系统剪贴板通路（右键菜单复制/粘贴的兜底实现）：CF_HTML 编解码 + 端点接线。
+
+    CF_HTML 头部偏移必须是"UTF-8 字节偏移"，写错会导致其它程序粘贴出乱码或空内容，
+    因此这里对偏移逐项断言。
+    """
+
+    def test_cf_html_roundtrip(self):
+        from correctmanage import _cf_html_bytes, _cf_html_fragment
+
+        frag = '<p>甲<b>乙</b></p><p class="ptoe-note">注一（含中文）</p>'
+        raw = _cf_html_bytes(frag)
+        self.assertEqual(_cf_html_fragment(raw), frag)
+
+    def test_cf_html_offsets_are_byte_accurate(self):
+        from correctmanage import _cf_html_bytes
+
+        frag = "<p>中文 abc</p>"
+        raw = _cf_html_bytes(frag)
+        header = raw[: raw.index(b"<html")]
+        start = int(re.search(rb"StartFragment:(\d+)", header).group(1))
+        end = int(re.search(rb"EndFragment:(\d+)", header).group(1))
+        self.assertEqual(raw[start:end].decode("utf-8"), frag)
+        # 头部偏移都是 10 位定宽数字（按 CF_HTML 规范）
+        self.assertEqual(re.search(rb"StartHTML:(\d+)", header).group(1), b"0000000105")
+
+    def test_cf_html_fragment_fallback(self):
+        from correctmanage import _cf_html_fragment
+
+        # 无偏移头（有些程序只放裸 HTML）：整体返回；两样都没有 → 空串
+        self.assertEqual(_cf_html_fragment("<p>裸 HTML</p>".encode("utf-8")), "<p>裸 HTML</p>")
+        self.assertEqual(_cf_html_fragment(b"plain text"), "")
+        self.assertEqual(_cf_html_fragment(b""), "")
+
+
+class TestClipboardEndpoint(unittest.TestCase):
+    """/api/clipboard：POST 写、GET 读（右键菜单复制/粘贴的可靠通路）。
+
+    用 mock 替换真正的系统剪贴板调用——测试不应改写用户的剪贴板。
+    """
+
+    def _start(self):
+        import threading
+        from http.server import ThreadingHTTPServer
+
+        from correctmanage import _CorrectionHandler
+
+        state = {
+            "pages": {},
+            "finished": threading.Event(),
+            "preview_cache": {},
+            "pdf_path": None,
+            "img_dir": None,
+            "preview_dpi": 110,
+            "preview_quality": 82,
+            "last_heartbeat": 0.0,
+            "gone_at": None,
+            "idle_timeout": 600.0,
+            "auto_finished": False,
+        }
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _CorrectionHandler)
+        server.daemon_threads = True
+        server.state = state
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+    def test_clipboard_endpoints_roundtrip(self):
+        import json as _json
+
+        import requests
+
+        server, base = self._start()
+        try:
+            with mock.patch("correctmanage.clipboard_write", return_value=True) as w:
+                res = requests.post(
+                    base + "/api/clipboard",
+                    data=_json.dumps({"text": "纯文本", "html": "<b>富文本</b>"}),
+                ).json()
+                self.assertTrue(res["ok"])
+                w.assert_called_once_with("纯文本", "<b>富文本</b>")
+            with mock.patch(
+                "correctmanage.clipboard_snapshot", return_value=("T", "<b>H</b>")
+            ) as s:
+                res = requests.get(base + "/api/clipboard?rich=1").json()
+                self.assertEqual(res, {"ok": True, "text": "T", "html": "<b>H</b>"})
+                s.assert_called_once_with(rich=True)
+                # 不带 rich 时只读纯文本（避免无谓的 HTML 解析）
+                requests.get(base + "/api/clipboard")
+                s.assert_called_with(rich=False)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_clipboard_get_reports_empty(self):
+        import requests
+
+        server, base = self._start()
+        try:
+            with mock.patch(
+                "correctmanage.clipboard_snapshot", return_value=("", "")
+            ):
+                self.assertEqual(
+                    requests.get(base + "/api/clipboard").json(),
+                    {"ok": False, "text": "", "html": ""},
+                )
         finally:
             server.shutdown()
             server.server_close()
@@ -5994,7 +6270,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
             self.assertTrue(res["ok"])
             self.assertEqual(
                 res["ui_settings"],
-                {"tip_delay": 500, "err_hover_delay": 1000, "editor_font_size": 16, "img_mode": "full"},
+                {"tip_delay": 500, "err_hover_delay": 1000, "editor_font_size": 16, "img_mode": "full", "rule_all_pages_confirm": True},
             )
         finally:
             self._stop(server)
@@ -6007,10 +6283,10 @@ class TestUiSettingsEndpoint(unittest.TestCase):
         try:
             res = requests.get(base + "/api/ui_settings").json()
             self.assertTrue(res["ok"])
-            # All four keys present with default values
+            # All five keys present with default values
             self.assertEqual(
                 res["ui_settings"],
-                {"tip_delay": 600, "err_hover_delay": 1500, "editor_font_size": 14, "img_mode": ""},
+                {"tip_delay": 600, "err_hover_delay": 1500, "editor_font_size": 14, "img_mode": "", "rule_all_pages_confirm": True},
             )
         finally:
             self._stop(server)
@@ -6027,6 +6303,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
             self.assertEqual(res["ui_settings"]["err_hover_delay"], 1500)
             self.assertEqual(res["ui_settings"]["editor_font_size"], 14)
             self.assertEqual(res["ui_settings"]["img_mode"], "")
+            self.assertEqual(res["ui_settings"]["rule_all_pages_confirm"], True)
         finally:
             self._stop(server)
 
@@ -6174,6 +6451,43 @@ class TestUiSettingsEndpoint(unittest.TestCase):
         finally:
             self._stop(server)
 
+    def test_post_bad_rule_all_pages_confirm_type_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"rule_all_pages_confirm": "yes"}}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("布尔", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+    def test_post_rule_all_pages_confirm_persists(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"rule_all_pages_confirm": False}}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(calls, [{"rule_all_pages_confirm": False}])
+        finally:
+            self._stop(server)
+
 
 class TestSetShortcutsConfig(unittest.TestCase):
     """configmanage.set_shortcuts：原子写 + 无变更不写盘。"""
@@ -6247,6 +6561,13 @@ class TestSetUiSettingsConfig(unittest.TestCase):
         # Other keys get defaults
         self.assertEqual(cfg["ui_settings"]["err_hover_delay"], 1500)
         self.assertEqual(cfg["ui_settings"]["editor_font_size"], 14)
+        self.assertEqual(cfg["ui_settings"]["rule_all_pages_confirm"], True)
+
+    def test_non_bool_rule_all_pages_confirm_falls_back(self):
+        cfg = self.cm.set_ui_settings({"rule_all_pages_confirm": "yes"})
+        self.assertEqual(cfg["ui_settings"]["rule_all_pages_confirm"], True)
+        cfg = self.cm.set_ui_settings({"rule_all_pages_confirm": False})
+        self.assertEqual(cfg["ui_settings"]["rule_all_pages_confirm"], False)
 
     def test_no_write_when_unchanged(self):
         import os as _os
@@ -6292,7 +6613,7 @@ class TestSetUiSettingsConfig(unittest.TestCase):
         patched = self.cm.validate_and_patch_config({"llama_server": "x", "models_dir": "y"})
         self.assertEqual(
             patched["ui_settings"],
-            {"tip_delay": 600, "err_hover_delay": 1500, "editor_font_size": 14, "img_mode": ""},
+            {"tip_delay": 600, "err_hover_delay": 1500, "editor_font_size": 14, "img_mode": "", "rule_all_pages_confirm": True},
         )
 
 
@@ -6580,6 +6901,42 @@ class TestFormatRules(unittest.TestCase):
         self.assertEqual(len(rules), 1)
         self.assertEqual(rules[0]["conditions"][0]["scope"], "page")
 
+    def test_validate_accepts_all_pages_scope(self):
+        from correctmanage import _validate_format_rules
+
+        rules = _validate_format_rules(
+            [
+                {
+                    "name": "全部页",
+                    "mode": "first",
+                    "conditions": [
+                        {
+                            "type": "contains", "pattern": "X", "scope": "all_pages",
+                            "formats": ["bold"],
+                        }
+                    ],
+                }
+            ]
+        )
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0]["conditions"][0]["scope"], "all_pages")
+
+    def test_validate_all_pages_scope_default_still_selection_for_old(self):
+        # 旧模型迁移：无 scope 的条件仍落 selection（全部页是显式新值，与 page 同规则）
+        from correctmanage import _validate_format_rules
+
+        rules = _validate_format_rules(
+            [
+                {
+                    "name": "旧规则",
+                    "formats": ["bold"],
+                    "condition": {"enabled": True, "type": "contains", "pattern": "X"},
+                    "else_formats": [],
+                }
+            ]
+        )
+        self.assertEqual(rules[0]["conditions"][0]["scope"], "selection")
+
     def test_validate_page_scope_default_still_selection_for_old(self):
         # 旧模型迁移：无 scope 的条件仍落 selection（页面级是显式新值）
         from correctmanage import _validate_format_rules
@@ -6650,6 +7007,51 @@ class TestFormatRules(unittest.TestCase):
         cond = rules[0]["conditions"][0]
         self.assertIn("match_formats", cond)
         self.assertEqual(cond["match_formats"], [["italic"], ["align_center", "bold"]])
+
+    def test_validate_accepts_inline_format_ops(self):
+        from correctmanage import _validate_format_rules
+
+        rules = _validate_format_rules(
+            [
+                {
+                    "name": "行内格式",
+                    "conditions": [
+                        {
+                            "type": "contains", "pattern": "注", "scope": "selection",
+                            "formats": ["underline", "highlight", "sup", "sub"],
+                        },
+                        {
+                            "type": "regex", "pattern": "\\d+", "scope": "selection",
+                            "formats": ["strike"],
+                            "group_formats": [["charbox", "shade"], ["bold"]],
+                        },
+                    ],
+                }
+            ]
+        )
+        self.assertEqual(len(rules), 1)
+        conds = rules[0]["conditions"]
+        self.assertEqual(conds[0]["formats"], ["underline", "highlight", "sup", "sub"])
+        self.assertEqual(conds[1]["group_formats"], [["charbox", "shade"], ["bold"]])
+
+    def test_validate_rejects_inline_bogus_ops(self):
+        from correctmanage import _validate_format_rules
+
+        rules = _validate_format_rules(
+            [
+                {
+                    "name": "带非法行内op",
+                    "conditions": [
+                        {
+                            "type": "contains", "pattern": "X", "scope": "selection",
+                            "formats": ["underline", "bogus_inline", "sub"],
+                        }
+                    ],
+                }
+            ]
+        )
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0]["conditions"][0]["formats"], ["underline", "sub"])
 
     def test_validate_accepts_target_before(self):
         from correctmanage import _validate_format_rules
@@ -7067,6 +7469,169 @@ class TestFormatRules(unittest.TestCase):
         self.assertEqual(r["conditions"][1]["formats"], ["italic"])
 
 
+class TestFormatRulesAllPagesApply(unittest.TestCase):
+    """/api/format_rules/apply（mode:'all_pages'）：跨页逐页应用 + scope 归一化（2026-09-13）。"""
+
+    def _start(self):
+        import threading
+        from http.server import ThreadingHTTPServer
+
+        from correctmanage import _CorrectionHandler
+
+        state = {
+            "pages": {1: "<p>第一章 序</p>", 2: "<p>第二章 序</p>", 3: "<p>后记</p>"},
+            "finished": threading.Event(),
+            "preview_cache": {},
+            "pdf_path": None,
+            "img_dir": None,
+            "preview_dpi": 110,
+            "preview_quality": 82,
+            "last_heartbeat": 0.0,
+            "gone_at": None,
+            "idle_timeout": 600.0,
+            "auto_finished": False,
+        }
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _CorrectionHandler)
+        server.daemon_threads = True
+        server.state = state
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+    def _stop(self, server):
+        server.shutdown()
+        server.server_close()
+
+    def _apply(self, base, pages_html, rule):
+        import json as _json
+
+        import requests
+
+        pages_in = {str(i + 1): html for i, html in enumerate(pages_html)}
+        payload = {
+            "mode": "all_pages",
+            "pages": pages_in,
+            "rule_id": rule.get("id", "r-test"),
+            "rules": [rule],
+        }
+        return requests.post(base + "/api/format_rules/apply", data=_json.dumps(payload)).json()
+
+    def test_apply_all_pages_returns_only_changed_pages(self):
+        rule = {
+            "id": "r-test", "name": "首章加粗", "mode": "first",
+            "conditions": [
+                {"type": "contains", "pattern": "第一章", "scope": "all_pages", "formats": ["bold"], "target": "match"}
+            ],
+        }
+        server, base = self._start()
+        try:
+            res = self._apply(base, ["<p>第一章 序</p>", "<p>第二章 序</p>", "<p>后记</p>"], rule)
+            self.assertTrue(res["ok"])
+            pages_changed = [r["page"] for r in res["results"]]
+            # 只有命中「第一章」的页变化并返回；未命中页不进 results
+            self.assertEqual(pages_changed, [1])
+            self.assertIn("<strong>", res["results"][0]["html"])
+        finally:
+            self._stop(server)
+
+    def test_all_pages_without_match_returns_empty_results(self):
+        rule = {
+            "id": "r-test", "name": "无命中", "mode": "first",
+            "conditions": [
+                {"type": "contains", "pattern": "不存在", "scope": "all_pages", "formats": ["bold"], "target": "match"}
+            ],
+        }
+        server, base = self._start()
+        try:
+            res = self._apply(base, ["<p>第一章 序</p>", "<p>第二章 序</p>"], rule)
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["results"], [])
+        finally:
+            self._stop(server)
+
+    def test_selection_scope_normalized_to_page_in_all_pages_mode(self):
+        # selection 空 pattern 无条件条件在全部页模式下归一为 page → 整页应用（而非无选区被跳过）
+        rule = {
+            "id": "r-test", "name": "整页加粗", "mode": "first",
+            "conditions": [
+                {"type": "contains", "pattern": "", "scope": "selection", "formats": ["bold"], "target": "match"}
+            ],
+        }
+        server, base = self._start()
+        try:
+            res = self._apply(base, ["<p>正文甲</p>", "<p>正文乙</p>"], rule)
+            self.assertTrue(res["ok"])
+            pages_changed = [r["page"] for r in res["results"]]
+            self.assertEqual(pages_changed, [1, 2])
+            for r in res["results"]:
+                self.assertIn("<strong>", r["html"])
+        finally:
+            self._stop(server)
+
+    def test_all_pages_scope_in_page_branch_also_applies(self):
+        # all_pages 与 page 在 eval 层共用一个整页语义；验证两种 scope 产出相同形状的结果
+        rule = {
+            "id": "r-sel", "name": "全部页条件", "mode": "first",
+            "conditions": [
+                {"type": "contains", "pattern": "标", "scope": "all_pages", "formats": ["bold"], "target": "match"}
+            ],
+        }
+        server, base = self._start()
+        try:
+            res = self._apply(base, ["<p>标题甲</p>", "<p>正文乙</p>"], rule)
+            self.assertTrue(res["ok"])
+            changed = {r["page"] for r in res["results"]}
+            self.assertEqual(changed, {1})
+            self.assertIn("<strong>", res["results"][0]["html"])
+        finally:
+            self._stop(server)
+
+    def test_invalid_payloads_400(self):
+        import json as _json
+
+        import requests
+
+        bad_rule = {
+            "id": "r-test", "name": "条件无效", "mode": "first",
+            "conditions": [
+                {"type": "regex", "pattern": "(unclosed", "scope": "all_pages", "formats": ["bold"]}
+            ],
+        }
+        good_rule = {
+            "id": "r-test", "name": "合法", "mode": "first",
+            "conditions": [
+                {"type": "contains", "pattern": "X", "scope": "all_pages", "formats": ["bold"]}
+            ],
+        }
+        server, base = self._start()
+        try:
+            # 空 rules
+            res = requests.post(base + "/api/format_rules/apply", data=_json.dumps(
+                {"mode": "all_pages", "pages": {"1": "<p>x</p>"}, "rule_id": "r1", "rules": []}
+            )).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("空或全部无效", res["error"])
+            # pages 非对象
+            res = requests.post(base + "/api/format_rules/apply", data=_json.dumps(
+                {"mode": "all_pages", "pages": [], "rule_id": "r1", "rules": [good_rule]}
+            )).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("pages", res["error"])
+            # rule_id 缺失（规则须合法，否则先被规则校验拦截）
+            res = requests.post(base + "/api/format_rules/apply", data=_json.dumps(
+                {"mode": "all_pages", "pages": {"1": "<p>x</p>"}, "rules": [good_rule]}
+            )).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("rule_id", res["error"])
+            # 规则全非法（坏正则被过滤 → rules 空）
+            res = requests.post(base + "/api/format_rules/apply", data=_json.dumps(
+                {"mode": "all_pages", "pages": {"1": "<p>x</p>"}, "rule_id": "r1", "rules": [bad_rule]}
+            )).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("空或全部无效", res["error"])
+        finally:
+            self._stop(server)
+
+
 class TestFormatRulesConfig(unittest.TestCase):
     """configmanage.set_format_rules：原子写。"""
 
@@ -7129,6 +7694,42 @@ class TestFormatRulesConfig(unittest.TestCase):
             {"llama_server": "x", "models_dir": "y"}
         )
         self.assertEqual(patched["format_rules"], [])
+
+    def test_persists_match_formats_and_group_formats(self):
+        # 回归：match_formats 曾因 set_format_rules 未序列化而丢失（保存后 reload 无格式）
+        import json as _json
+
+        rules = [
+            {
+                "id": "m1", "name": "多次匹配", "mode": "first",
+                "conditions": [
+                    {
+                        "type": "regex", "pattern": "\\d+", "scope": "selection",
+                        "formats": ["bold"],
+                        "target": "match",
+                        "group_formats": [["underline"], ["shade"]],
+                        "match_formats": [["italic"], ["align_center", "bold"]],
+                    },
+                    {
+                        "type": "regex", "pattern": "\\d+", "scope": "selection",
+                        "formats": ["strike"],
+                        "target": "between",
+                        "between_end_pattern": "\\n",
+                        "group_formats": [["highlight"]],
+                        "match_formats": [],
+                    },
+                ],
+            }
+        ]
+        self.cm.set_format_rules(rules)
+        cfg = _json.loads(Path(self.path).read_text(encoding="utf-8"))
+        conds = cfg["format_rules"][0]["conditions"]
+        self.assertEqual(conds[0]["group_formats"], [["underline"], ["shade"]])
+        self.assertEqual(conds[0]["match_formats"], [["italic"], ["align_center", "bold"]])
+        self.assertEqual(conds[0]["target"], "match")
+        # 空 match_formats 不写键、group_formats 仍保留
+        self.assertEqual(conds[1]["group_formats"], [["highlight"]])
+        self.assertNotIn("match_formats", conds[1])
 
 
 # ---------------------------------------------------------------------------

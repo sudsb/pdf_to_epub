@@ -126,6 +126,7 @@ _INLINE_FORMAT_CLASSES = {
     "ptoe-note",
     "ptoe-citation",
     "ptoe-underline",
+    "ptoe-underdot",
     "ptoe-strike",
     "ptoe-charbox",
     "ptoe-shade",
@@ -134,7 +135,10 @@ _INLINE_FORMAT_CLASSES = {
     "ptoe-sub",
 }
 
-_BLOCK_TAG_RE = re.compile(r"</?(p|h[1-6])([^>]*)>", flags=re.IGNORECASE)
+# 块级标签：p / h1-6 / div。div 与 sanitize_html 的处理保持一致（统一按 <p> 处理）：
+# 若把 <div> 当行内内容，未清洗数据（历史版本/外部直接调用 apply_markers）会被
+# 包成 <p><div …></div></p> 非法嵌套，并且注释段落识别失败 → 注释数量校验误报。
+_BLOCK_TAG_RE = re.compile(r"</?(p|div|h[1-6])([^>]*)>", flags=re.IGNORECASE)
 
 _PAGE_BREAK_CLASS = "ptoe-page-break"
 _IMG_CLASSES = {
@@ -229,6 +233,14 @@ _VALID_FORMAT_OPS = {
     "no_bold",      # 不加粗：移除加粗但保留其他格式
     "citation",     # 引用：斜体 + 独立字体设置
     "strip_ws",     # 去空：去除段落内全部空白字符（保留换行）
+    # 新增行内格式操作（2026-09）：与 ui/app.js FORMAT_RULE_OPTS 一一对应
+    "underline",    # 下划线
+    "strike",       # 删除线
+    "charbox",      # 字符边框
+    "shade",        # 底纹
+    "highlight",    # 突显
+    "sup",          # 上标
+    "sub",          # 下标
 }
 
 # 预览图磁盘缓存预热：模块级引用 ProcessPoolExecutor，便于测试 monkeypatch。
@@ -294,7 +306,7 @@ def _validate_format_rules(rules) -> list:
                     ctype = "contains"
                 pattern = str(cond_raw.get("pattern") or "")
                 scope = str(cond_raw.get("scope") or "selection")
-                if scope not in ("selection", "paragraph", "page"):
+                if scope not in ("selection", "paragraph", "page", "all_pages"):
                     scope = "selection"
                 if not pattern:
                     continue  # 启用了条件但没写内容：整条丢弃（与旧行为一致）
@@ -336,7 +348,7 @@ def _validate_format_rules(rules) -> list:
                     ctype = "contains"
                 pattern = str(c.get("pattern") or "")
                 scope = str(c.get("scope") or "selection")
-                if scope not in ("selection", "paragraph", "page"):
+                if scope not in ("selection", "paragraph", "page", "all_pages"):
                     scope = "selection"
                 if ctype == "regex" and pattern:
                     try:
@@ -1052,6 +1064,70 @@ _TOKEN_RE = re.compile(
     r'(<span\s+data-ptoe-marker="[^"]*"[^>]*>.*?</span>|<[^>]+>)',
     flags=re.IGNORECASE | re.DOTALL,
 )
+
+# 行内标签白名单（与 sanitize_html 放行集合一致）：标记切在行内标签内部时，
+# 前段补闭合、后段重新打开，保证每段都是合法片段。
+_INLINE_TAGS = frozenset({"strong", "em", "span"})
+
+# 已渲染块的结构化判定（取代脆弱的 `startswith("<p")` / `endswith("</p>")` 字符串比较，
+# 避免换标签/加属性后合并判断静默失效——这类"看起来只是样式微调却弄坏合并"的改动
+# 曾多次导致注释段落标记不生效）：
+#   1) _RENDERED_BLOCK_RE：可合并的段落块 = 单个 <p>/<div> 元素；
+#   2) _PAGE_BREAK_ATTR_RE：换页占位块不是段落，不能作为合并目标。
+_RENDERED_BLOCK_RE = re.compile(r"^(<(p|div)\b[^>]*>)(.*)(</\2>)$", re.DOTALL | re.IGNORECASE)
+_PAGE_BREAK_ATTR_RE = re.compile(r'class="[^"]*\bptoe-page-break\b', re.IGNORECASE)
+_NOTE_ATTR_RE = re.compile(r'class="[^"]*\bptoe-note\b', re.IGNORECASE)
+
+
+def _wrap_note_span(html: str) -> str:
+    """把内容包成行内注释 span（小字灰字，CSS 对 p.ptoe-note / span.ptoe-note 同款样式）。
+
+    用于"注释段落与正文段落被段落标记合并"：合并后的块只能是"整段注释"或
+    "整段正文"一种，另一侧的内容必须包成行内注释，才能各自保留它在矫正界面里
+    的字号（否则整段被染成小字灰字——标记前的正文也会跟着缩小）。
+    """
+    if not html or not html.strip():
+        return html
+    return f'<span class="{_NOTE_CLASS}">{html}</span>'
+
+
+def _strip_note_class(open_tag: str) -> str:
+    """去掉开标签 class 中的 ptoe-note（注释段被正文并入时降级为正文段）。"""
+    m = re.search(r'class="([^"]*)"', open_tag)
+    if not m:
+        return open_tag
+    keep = [c for c in m.group(1).split() if c != _NOTE_CLASS]
+    if keep:
+        return open_tag[: m.start(1)] + " ".join(keep) + open_tag[m.end(1):]
+    return re.sub(r"\s+>", ">", open_tag[: m.start()] + open_tag[m.end():])
+
+
+def _merge_paragraph(last_rendered: str, html: str, *, note: bool) -> str | None:
+    """把 html 并入上一个已渲染段落块并返回新块 HTML；不可合并时返回 None。
+
+    合并规则（2026-09 统一，替代此前"只允许注释↔注释"的特殊分支）：
+    - 段落标记（join）合并相邻的两个段落，与是否为注释段落无关；
+    - 前一块的对齐/缩进等属性保留（既有约定：合并保留首段属性）；
+    - **字号不受污染**：只有当参与合并的各段"都是注释"时合并结果才是注释段；
+      一旦有正文段参与（注释+正文混合），合并结果是正文段，其中的注释内容用
+      `<span class="ptoe-note">` 包起来——这样标记两侧各自的字号与矫正界面一致
+      （此前把 ptoe-note 直接并到段落上，会让标记前的正文一起变成小字灰字）。
+    """
+    m = _RENDERED_BLOCK_RE.match(last_rendered.strip())
+    if not m:
+        return None
+    open_tag, inner, close_tag = m.group(1), m.group(3), m.group(4)
+    if _PAGE_BREAK_ATTR_RE.search(open_tag):
+        return None  # 换页占位块不是段落
+    if _NOTE_ATTR_RE.search(open_tag):
+        if not note:
+            # 注释段被正文并入 → 整块降级为正文段，已并入的注释内容包成行内注释
+            open_tag = _strip_note_class(open_tag)
+            inner = _wrap_note_span(inner)
+    elif note:
+        # 正文段并入注释内容 → 该段内容包成行内注释，段落本身保持正文
+        html = _wrap_note_span(html)
+    return open_tag + inner + html + close_tag
 
 
 def _is_note_block(attrs: list[tuple[str, str | None]]) -> bool:
@@ -2550,20 +2626,22 @@ def _split_segments(
 
     - segments: [(内容 html, 段首标记列表), ...]，标记作用于紧随其后的内容段；
     - trailing: 最后一段内容之后的标记（段尾标记），作用于后续块的内容。
-    段内行内标签（strong/em）在标记处保持闭合平衡：标记切在行内标签内部时，
-    前段自动补闭合、后段重新打开，保证每段都是合法片段。
+    段内行内标签（strong/em/span，见 _INLINE_TAGS）在标记处保持闭合平衡：
+    标记切在行内标签内部时，前段自动补闭合、后段重新打开，保证每段都是合法
+    片段。（此前只跟踪 strong/em，注释 span 被标记切断时会漏掉 </span>，
+    合并段落后产生未闭合标签 → 导出 EPUB 后段落结构错乱。）
     """
     segments: list[tuple[str, list[tuple[str, str]]]] = []
     trailing: list[tuple[str, str]] = []
     buf: list[str] = []
-    stack: list[str] = []  # 当前段未闭合的行内标签（strong/em）
+    stack: list[tuple[str, str]] = []  # 未闭合的行内标签 [(标签名, 原始开标签)]
     pending: list[tuple[str, str]] = []  # 段首标记（位于当前内容之前）
 
-    def flush(reopen: bool = False) -> list[str]:
+    def flush(reopen: bool = False) -> list[tuple[str, str]]:
         """输出当前内容段；reopen=True 时返回需在下一段重新打开的行内标签。"""
         if not (buf or stack):
             return []
-        content = "".join(buf) + "".join(f"</{t}>" for t in reversed(stack))
+        content = "".join(buf) + "".join(f"</{t}>" for t, _o in reversed(stack))
         # 无可见文本（如连续标记之间的空行内标签）不产出段，标记继续累积；
         # 但纯图片块（<img> 无文字）必须保留——剥标签后为空但内容有效
         if re.sub(r"<[^>]+>", "", content).strip() or "<img" in content.lower():
@@ -2579,21 +2657,24 @@ def _split_segments(
             continue
         m = _MARKER_SPAN_RE.fullmatch(tok)
         if m:
-            for t in flush(reopen=True):
-                buf.append(f"<{t}>")
-                stack.append(t)
+            for name, open_html in flush(reopen=True):
+                buf.append(open_html)
+                stack.append((name, open_html))
             pending.append((m.group(1), m.group(2).strip()))
             continue
-        m = re.fullmatch(r"</?(?:strong|em)>", tok, flags=re.IGNORECASE)
-        if m:
-            if tok.startswith("</"):
-                if stack:
-                    stack.pop()
+        m = re.fullmatch(r"<(/)?([A-Za-z][\w:-]*)([^>]*)>", tok)
+        if m and m.group(2).lower() in _INLINE_TAGS:
+            tag = m.group(2).lower()
+            if m.group(1):  # 闭标签：弹出到最近的同名标签（容忍交叉闭合）
+                for i in range(len(stack) - 1, -1, -1):
+                    if stack[i][0] == tag:
+                        del stack[i:]
+                        break
             else:
-                stack.append(tok[1:-1].lower())
+                stack.append((tag, tok))
             buf.append(tok)
             continue
-        buf.append(tok)  # 文本 / <br/> / 其他（清洗后只可能是合法内容）
+        buf.append(tok)  # 文本 / <br/> / <img/> / 其他（清洗后只可能是合法内容）
     flush()
     trailing = pending
     return segments, trailing
@@ -2607,7 +2688,13 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
     所在位置决定（段首=块内内容之前的标记，段尾=块内最后一段内容之后的标记）：
     - 段落标记（join）：段首 → 本段与上一段合并为一个 <p>；
       段尾 → 本段与下一段合并为一个 <p>（OCR 把一整段拆成几段时，在断口处
-      放一个段落标记即可拼回整段；标记在段中同样按该语义在标记处拼接）；
+      放一个段落标记即可拼回整段；标记在段中同样按该语义在标记处拼接）。
+      **合并与段落是否为注释无关**（2026-09 统一）：任一侧是注释段落都会正常
+      合并，合并结果保留前一段的对齐等属性；合并后是否为注释段取决于参与者
+      ——各段都是注释才是注释段，只要混入正文段就合并为正文段，其中的注释内容
+      用行内 <span class="ptoe-note"> 包起来，保证标记两侧的字号与矫正界面里
+      各自设置的格式一致（整段被染成注释会让标记前的正文也变成小字灰字）；
+      仅换页占位块（ptoe-page-break）与标题不参与合并；
     - 章节标记（chapter:N）：段尾 → 后续内容前插入 <h2>标签文本</h2>；
       段首 → 本段内容前插入 <h2>（旧数据兼容，界面已移除章节标记）；
     - 全文标记（full）：段尾 → 后续内容属于新文章（新的一页）；
@@ -2620,7 +2707,8 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
       数量不匹配时抛 ValueError 提示）；注释同样支持段落标记合并（因分页
       被折断的注释，后半段加段落标记即可与前半段合并为一条后再插入正文）。
       **文中没有任何注释标记时**：不做数量校验、不移动位置，注释段落原位
-      保留（仅套用注释格式/小字），块内的段落标记按切段语义消费。
+      保留（仅套用注释格式/小字），块内的段落标记按切段语义消费——
+      注释段落的段落标记与正文段落同等生效，且可与正文段落合并。
     没有标记时返回单篇文章（等价于把所有 <p> 顺序拼接）。
     """
     # 1) 全书按页解析为块流（跨页连续处理，段落标记可跨页合并）
@@ -2650,7 +2738,11 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
                     note = False
                     attrs = ""
                 if not tok.startswith("</"):
-                    kind = m.group(1).lower()
+                    tag = m.group(1).lower()
+                    # div 一律按 <p> 处理（与 sanitize_html 一致）：块流只产出
+                    # <p>/<h1-6>，不会出现 <p><div>…</div></p> 非法嵌套；
+                    # 注释段落（ptoe-note）在 div 上同样能被正确识别。
+                    kind = "p" if tag == "div" else tag
                     tag_attrs = m.group(2) or ""
                     note = _NOTE_CLASS in tag_attrs
                     attrs = _block_class_html(tag_attrs)
@@ -2753,8 +2845,13 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
             articles.append({"text": "".join(cur_article)})
             cur_article = []
 
-    def push_content(kind: str, html: str, attrs: str = "") -> None:
-        """把一段内容渲染进当前文章：先应用全文/章节/换页/段落合并标记。"""
+    def push_content(kind: str, html: str, attrs: str = "", note: bool = False) -> None:
+        """把一段内容渲染进当前文章：先应用全文/章节/换页/段落合并标记。
+
+        note：本段是否为注释段落（block class="ptoe-note"）。合并时注释属性取并集，
+        与"只允许注释↔注释合并"的旧行为不同——段落标记的核心语义是「标记处没有
+        段落边界」，两侧是不是注释段落不影响是否合并。
+        """
         nonlocal deferred_full, deferred_chapter, deferred_join, deferred_page
         if deferred_full:
             flush_article()
@@ -2768,19 +2865,15 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
             cur_article.append('<p class="ptoe-page-break"> </p>')
             deferred_page = False
         if deferred_join:
-            # 只合并 段落+段落；目标块必须是当前文章最后的 <p>（可带 class）
-            if (
-                kind == "p"
-                and cur_article
-                and cur_article[-1].startswith("<p")
-                and cur_article[-1].endswith("</p>")
-            ):
-                cur_article[-1] = cur_article[-1][: -len("</p>")] + html + "</p>"
-            else:
-                cur_article.append(render_block(kind, html, attrs))
+            # 段落标记合并：仅"段落+段落"，换页占位块/标题不参与合并
+            merged = None
+            if kind == "p" and cur_article:
+                merged = _merge_paragraph(cur_article[-1], html, note=note)
             deferred_join = False
-        else:
-            cur_article.append(render_block(kind, html, attrs))
+            if merged is not None:
+                cur_article[-1] = merged
+                return
+        cur_article.append(render_block(kind, html, attrs))
 
     def defer(markers: list[tuple[str, str]]) -> None:
         nonlocal deferred_full, deferred_chapter, deferred_join, deferred_page
@@ -2811,60 +2904,31 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
         return "".join(parts)
 
     note_idx = 0
-    pending_notes: list[str] = []  # 段尾注释在无可依附段落时顺延到下一段内容
-    prev_note_joinable = False  # 上一渲染块是否为可合并的注释段落（无注释标记路径）
-    note_join_prev = False  # 上一注释块的段尾是否带段落标记（join）
+    pending_notes: list[str] = []  # 段尾注释标记在无可依附段落时顺延到下一段内容
     for item in parsed:
-        if item["note"]:
-            if not note_markers:
-                # 无注释标记：注释段落原位保留（仅套用注释格式，不移动位置）；
-                # 段落标记（join）仍然生效——把前后两个相邻注释段落合并为一个 <p>
-                html = "".join(h for h, _m in item["segments"]).strip()
-                first_join = any(
-                    t == "join" for _h, ms in item["segments"][:1] for t, _l in ms
-                )
-                if html:
-                    # join 可来自：上一注释段段尾标记（note_join_prev）、本段首标记
-                    #（first_join）、或前一纯标记块的独立 join 标记（deferred_join）。
-                    # 取走后一律清空（防误并入前一正文段落，prev_note_joinable 兜底）
-                    join_pending = deferred_join or note_join_prev or first_join
-                    deferred_join = False
-                    if (
-                        join_pending
-                        and prev_note_joinable
-                        and cur_article
-                        and cur_article[-1].startswith("<p")
-                        and cur_article[-1].endswith("</p>")
-                    ):
-                        cur_article[-1] = (
-                            cur_article[-1][: -len("</p>")] + html + "</p>"
-                        )
-                    else:
-                        push_content(item["kind"], html, item.get("attrs", ""))
-                    prev_note_joinable = True
-                note_join_prev = any(t == "join" for t, _l in item["trailing"])
-            else:
-                # 有正文注释标记时，注释段已被上方 annotations 收集并替换进正文，
-                # 不再参与正文排版。注释段附近/独立 join 块只用于注解合并，不能把
-                # join 顺延到正文流，否则会误合并注释段之后的正文段落。
-                deferred_join = False
-
+        is_note = bool(item.get("note"))
+        if is_note and note_markers:
+            # 有正文注释标记时，注释段已被上方 annotations 收集并替换进正文，
+            # 不再参与正文排版。注释段附近的段落标记只用于注释合并，不得顺延进
+            # 正文流，否则会误合并注释段之后的正文段落。
+            deferred_join = False
             continue
-        # 非注释块：重置注释段落合并状态（段落标记不跨非注释块生效）；
-        # 纯标记块（无可视内容段，如单独一段 段落标记 <p><span join/>…）不打断
-        # 注释合并链——其 join 经 deferred_join 顺延到下一个注释段落
-        if any(seg_html for seg_html, _m in item["segments"]):
-            prev_note_joinable = False
-            note_join_prev = False
+        # 段落标记（join）语义统一 —— 注释段落与正文段落一视同仁：
+        #   段首 join / 上一块段尾 join → 与上一段合并；
+        #   段尾 join                     → 与下一段合并；
+        #   段中 join                     → 标记前后拼接为同一段。
+        # 纯标记块（无可视内容段，如跨页单独放一个段落标记）不打断合并链：
+        # 其 join 经 defer → deferred_join 顺延到下一个内容段。
         for html, markers in item["segments"]:
             seg_notes: list[str] = []
             rest: list[tuple[str, str]] = []
             for t, label in markers:
-                if t == "note":
+                if t != "note":
+                    rest.append((t, label))
+                elif not is_note:
                     seg_notes.append(annotations[note_idx])
                     note_idx += 1
-                else:
-                    rest.append((t, label))
+                # 注释段内部的「注释标记」无意义（该段自身就是注释内容），忽略
             defer(rest)
             if html:
                 if pending_notes:
@@ -2874,41 +2938,43 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
                     # 注释标记不打断段落：本段并入上一段，注释插在标记处
                     deferred_join = True
                 push_content(
-                    item["kind"], note_spans(seg_notes) + html, item.get("attrs", "")
+                    item["kind"],
+                    note_spans(seg_notes) + html,
+                    item.get("attrs", ""),
+                    is_note,
                 )
             else:
                 pending_notes.extend(seg_notes)
         tail_notes: list[str] = []
         rest_tail: list[tuple[str, str]] = []
         for t, label in item["trailing"]:
-            if t == "note":
+            if t != "note":
+                rest_tail.append((t, label))
+            elif not is_note:
                 tail_notes.append(annotations[note_idx])
                 note_idx += 1
-            else:
-                rest_tail.append((t, label))
         defer(rest_tail)
         if tail_notes:
             spans = note_spans(tail_notes)
-            if (
-                cur_article
-                and cur_article[-1].startswith("<p")
-                and cur_article[-1].endswith("</p>")
-            ):
-                cur_article[-1] = cur_article[-1][: -len("</p>")] + spans + "</p>"
+            merged = (
+                _merge_paragraph(cur_article[-1], spans, note=False)
+                if cur_article
+                else None
+            )
+            if merged is not None:
+                cur_article[-1] = merged
             else:
                 pending_notes.extend(tail_notes)
     if pending_notes:
         # 极少数：注释标记悬空（其后没有内容段），补到当前文章末尾
-        if (
-            cur_article
-            and cur_article[-1].startswith("<p")
-            and cur_article[-1].endswith("</p>")
-        ):
-            cur_article[-1] = (
-                cur_article[-1][: -len("</p>")] + note_spans(pending_notes) + "</p>"
-            )
+        spans = note_spans(pending_notes)
+        merged = (
+            _merge_paragraph(cur_article[-1], spans, note=False) if cur_article else None
+        )
+        if merged is not None:
+            cur_article[-1] = merged
         else:
-            cur_article.append(f"<p>{note_spans(pending_notes)}</p>")
+            cur_article.append(f"<p>{spans}</p>")
     if deferred_chapter is not None:
         cur_article.append(f"<h2>{deferred_chapter}</h2>")
     flush_article()
@@ -4245,6 +4311,7 @@ _RICH_INLINE_TAGS = ("span", "strong", "b", "em", "i")
 # 新增 7 种行内格式类（2026-09）：下划线/删除线/字符边框/底纹/突显/上标/下标
 _RICH_INLINE_FORMAT_CLASSES = {
     "ptoe-underline",
+    "ptoe-underdot",
     "ptoe-strike",
     "ptoe-charbox",
     "ptoe-shade",
@@ -4335,6 +4402,7 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             bold = False
             italic = False
             underline = False
+            underdot = False
             strike = False
             charbox = False
             shade = False
@@ -4350,6 +4418,8 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                     italic = True
                 if fmt.get("underline"):
                     underline = True
+                if fmt.get("underdot"):
+                    underdot = True
                 if fmt.get("strike"):
                     strike = True
                 if fmt.get("charbox"):
@@ -4366,6 +4436,7 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                 "bold": bold,
                 "italic": italic,
                 "underline": underline,
+                "underdot": underdot,
                 "strike": strike,
                 "charbox": charbox,
                 "shade": shade,
@@ -4485,6 +4556,8 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                     for c in cls:
                         if c == "ptoe-underline":
                             fmt["underline"] = True
+                        elif c == "ptoe-underdot":
+                            fmt["underdot"] = True
                         elif c == "ptoe-strike":
                             fmt["strike"] = True
                         elif c == "ptoe-charbox":
@@ -4864,6 +4937,8 @@ def _build_docx(blocks: list[Any], path: str) -> None:
                 rpr += '<w:color w:val="808080"/>'
             if r.get("underline"):
                 rpr += '<w:u w:val="single"/>'
+            if r.get("underdot"):
+                rpr += '<w:u w:val="dotted"/>'
             if r.get("strike"):
                 rpr += "<w:strike/>"
             if r.get("sup"):
@@ -4873,7 +4948,7 @@ def _build_docx(blocks: list[Any], path: str) -> None:
             if r.get("shade"):
                 rpr += '<w:shd w:val="clear" w:fill="EEF1F4"/>'
             if r.get("highlight"):
-                rpr += '<w:shd w:val="clear" w:fill="FFE45E"/>'
+                rpr += '<w:shd w:val="clear" w:fill="E0E0E0"/>'
             if r.get("charbox"):
                 rpr += '<w:bdr w:val="single" w:sz="4" w:space="1" w:color="333333"/>'
             if sz:
@@ -4927,7 +5002,7 @@ def _build_md(blocks: list[Any], path: str) -> None:
 
     def _has_inline_formats(inner: str) -> bool:
         """检查 inner HTML 是否包含新增的行内格式类。"""
-        for cls in ("ptoe-underline", "ptoe-strike", "ptoe-charbox",
+        for cls in ("ptoe-underline", "ptoe-underdot", "ptoe-strike", "ptoe-charbox",
                       "ptoe-shade", "ptoe-highlight", "ptoe-sup", "ptoe-sub"):
             if f'class="{cls}"' in inner or f"class='{cls}'" in inner:
                 return True
@@ -5121,6 +5196,214 @@ def _ui_js_path() -> str:
     if base:
         return os.path.join(base, "ui", "app.js")
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "app.js")
+
+
+# ---------------------------------------------------------------------------
+# 系统剪贴板（Windows）：右键菜单「复制 / 粘贴」的可靠通路
+#
+# 浏览器 Clipboard API 的限制：navigator.clipboard.read()/readText() 需要
+# clipboard-read 权限（WebView2 与未授权环境会直接拒绝，非安全上下文连
+# navigator.clipboard 都不存在），writeText() 还要求焦点 + 用户激活——只用
+# 浏览器 API 时，右键菜单的复制/粘贴会"点了没反应"。
+# 本服务运行在本机（127.0.0.1），直接读写 Windows 系统剪贴板即可 100% 可用，
+# 并且与 Word / 记事本等程序互通。非 Windows 或调用失败时返回空结果，
+# 由前端回退到 Clipboard API / Ctrl+V 提示。
+# ---------------------------------------------------------------------------
+_CF_UNICODETEXT = 13
+_CLIP_RETRY = 8          # OpenClipboard 被其他程序占用时的重试次数
+_CLIP_RETRY_SLEEP = 0.05
+_CF_HTML_PRE = "<html><body><!--StartFragment-->"
+_CF_HTML_POST = "<!--EndFragment--></body></html>"
+
+
+def _clip_api() -> tuple[Any, Any]:
+    """返回 (user32, kernel32)；非 Windows 或初始化失败 → (None, None)。
+
+    **必须同时声明 argtypes 与 restype**：句柄是指针，ctypes 默认按 32 位 int
+    传递/返回，64 位下会被截断（SetClipboardData/GlobalLock 静默失败）。
+    """
+    if sys.platform != "win32":
+        return None, None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        user32.OpenClipboard.argtypes = [wintypes.HWND]
+        user32.OpenClipboard.restype = wintypes.BOOL
+        user32.EmptyClipboard.restype = wintypes.BOOL
+        user32.CloseClipboard.restype = wintypes.BOOL
+        user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+        user32.SetClipboardData.restype = wintypes.HANDLE
+        user32.GetClipboardData.argtypes = [wintypes.UINT]
+        user32.GetClipboardData.restype = wintypes.HANDLE
+        user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+        user32.RegisterClipboardFormatW.restype = wintypes.UINT
+        kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        kernel32.GlobalAlloc.restype = wintypes.HANDLE
+        kernel32.GlobalLock.argtypes = [wintypes.HANDLE]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalUnlock.argtypes = [wintypes.HANDLE]
+        kernel32.GlobalUnlock.restype = wintypes.BOOL
+        kernel32.GlobalFree.argtypes = [wintypes.HANDLE]
+        kernel32.GlobalFree.restype = wintypes.HANDLE
+        kernel32.GlobalSize.argtypes = [wintypes.HANDLE]
+        kernel32.GlobalSize.restype = ctypes.c_size_t
+        return user32, kernel32
+    except Exception:
+        return None, None
+
+
+def _clip_open(user32: Any) -> bool:
+    """打开剪贴板（被其他程序占用时短暂重试）。"""
+    for _ in range(_CLIP_RETRY):
+        try:
+            if user32.OpenClipboard(None):
+                return True
+        except Exception:
+            return False
+        time.sleep(_CLIP_RETRY_SLEEP)
+    return False
+
+
+def _cf_html_bytes(fragment: str) -> bytes:
+    """构造 CF_HTML 载荷（头部偏移按规范用 UTF-8 字节数，必须准确）。"""
+    frag = fragment.encode("utf-8")
+    header = (
+        "Version:0.9\r\n"
+        "StartHTML:{0:010d}\r\n"
+        "EndHTML:{1:010d}\r\n"
+        "StartFragment:{2:010d}\r\n"
+        "EndFragment:{3:010d}\r\n"
+    )
+    head_len = len(header.format(0, 0, 0, 0).encode("utf-8"))
+    pre = _CF_HTML_PRE.encode("utf-8")
+    post = _CF_HTML_POST.encode("utf-8")
+    start_frag = head_len + len(pre)
+    end_frag = start_frag + len(frag)
+    end_html = end_frag + len(post)
+    return (
+        header.format(head_len, end_html, start_frag, end_frag).encode("utf-8")
+        + pre
+        + frag
+        + post
+    )
+
+
+def _cf_html_fragment(raw: bytes) -> str:
+    """从 CF_HTML 载荷中取出片段（偏移不合法时回退整体内容）。"""
+    if not raw:
+        return ""
+    text = raw.decode("utf-8", errors="replace")
+    start = re.search(r"StartFragment:(\d+)", text)
+    end = re.search(r"EndFragment:(\d+)", text)
+    if start and end:
+        try:
+            return raw[int(start.group(1)): int(end.group(1))].decode(
+                "utf-8", errors="replace"
+            )
+        except Exception:
+            pass
+    return text if "<" in text else ""
+
+
+def _clip_set_data(user32: Any, kernel32: Any, fmt: int, data: bytes) -> bool:
+    """把字节写入 HGLOBAL 并 SetClipboardData（成功后内存所有权移交系统）。"""
+    import ctypes
+
+    size = len(data) + 2  # 结尾双字节 NUL
+    handle = kernel32.GlobalAlloc(0x0002, size)  # GMEM_MOVEABLE
+    if not handle:
+        return False
+    ptr = kernel32.GlobalLock(handle)
+    if not ptr:
+        kernel32.GlobalFree(handle)
+        return False
+    ctypes.memmove(ptr, data, len(data))
+    ctypes.memset(ptr + len(data), 0, 2)
+    kernel32.GlobalUnlock(handle)
+    if not user32.SetClipboardData(fmt, handle):
+        kernel32.GlobalFree(handle)
+        return False
+    return True
+
+
+def clipboard_write(text: str, html: str = "") -> bool:
+    """写系统剪贴板：text → CF_UNICODETEXT，html → CF_HTML（可选）。"""
+    user32, kernel32 = _clip_api()
+    if user32 is None:
+        return False
+    if not _clip_open(user32):
+        return False
+    try:
+        user32.EmptyClipboard()
+        ok = False
+        if text:
+            ok = _clip_set_data(
+                user32, kernel32, _CF_UNICODETEXT, text.encode("utf-16-le") + b"\x00\x00"
+            ) or ok
+        if html:
+            fmt = user32.RegisterClipboardFormatW("HTML Format")
+            if fmt:
+                ok = _clip_set_data(
+                    user32, kernel32, fmt, _cf_html_bytes(html) + b"\x00"
+                ) or ok
+        return ok
+    except Exception:
+        return False
+    finally:
+        try:
+            user32.CloseClipboard()
+        except Exception:
+            pass
+
+
+def clipboard_snapshot(rich: bool = False) -> tuple[str, str]:
+    """读系统剪贴板：返回 (纯文本, HTML 片段)；rich=False 时不读 HTML。"""
+    user32, kernel32 = _clip_api()
+    if user32 is None:
+        return "", ""
+    if not _clip_open(user32):
+        return "", ""
+    try:
+        import ctypes
+
+        text = ""
+        handle = user32.GetClipboardData(_CF_UNICODETEXT)
+        if handle:
+            ptr = kernel32.GlobalLock(handle)
+            if ptr:
+                try:
+                    text = ctypes.wstring_at(ptr)
+                finally:
+                    kernel32.GlobalUnlock(handle)
+        html = ""
+        if rich:
+            fmt = user32.RegisterClipboardFormatW("HTML Format")
+            if fmt:
+                h2 = user32.GetClipboardData(fmt)
+                if h2:
+                    ptr2 = kernel32.GlobalLock(h2)
+                    if ptr2:
+                        try:
+                            size = int(kernel32.GlobalSize(h2) or 0)
+                            raw = (
+                                ctypes.string_at(ptr2, size)
+                                if size
+                                else ctypes.string_at(ptr2)
+                            )
+                            html = _cf_html_fragment(raw)
+                        finally:
+                            kernel32.GlobalUnlock(h2)
+        return text, html
+    except Exception:
+        return "", ""
+    finally:
+        try:
+            user32.CloseClipboard()
+        except Exception:
+            pass
 
 
 class _CorrectionHandler(BaseHTTPRequestHandler):
@@ -5318,12 +5601,14 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "err_hover_delay": 1500,
                     "editor_font_size": 14,
                     "img_mode": "",
+                    "rule_all_pages_confirm": True,
                 })
                 merged = {
                     "tip_delay": stored.get("tip_delay", defaults["tip_delay"]),
                     "err_hover_delay": stored.get("err_hover_delay", defaults["err_hover_delay"]),
                     "editor_font_size": stored.get("editor_font_size", defaults["editor_font_size"]),
                     "img_mode": stored.get("img_mode", defaults["img_mode"]),
+                    "rule_all_pages_confirm": stored.get("rule_all_pages_confirm", defaults["rule_all_pages_confirm"]),
                 }
                 self._send(
                     200,
@@ -5381,6 +5666,12 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     self._send(400, self._json({"ok": False, "error": "img_mode 取值无效"}), "application/json; charset=utf-8")
                     return
                 clean["img_mode"] = v
+            if "rule_all_pages_confirm" in ui:
+                v = ui["rule_all_pages_confirm"]
+                if not isinstance(v, bool):
+                    self._send(400, self._json({"ok": False, "error": "rule_all_pages_confirm 必须是布尔值"}), "application/json; charset=utf-8")
+                    return
+                clean["rule_all_pages_confirm"] = v
             set_ui_settings(clean)
             self._send(200, self._json({"ok": True}), "application/json; charset=utf-8")
         except Exception as e:  # noqa: BLE001
@@ -5496,6 +5787,18 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
             # 轻量存活探测：仅返回 ok，不修改任何状态。供外部（如 GUI）
             # 发现并恢复已存活的矫正界面。
             self._send(200, self._json({"ok": True}), "application/json; charset=utf-8")
+            return
+        if path == "/api/clipboard":
+            # 读系统剪贴板：右键菜单「粘贴」的兜底通路（浏览器 Clipboard API 的
+            # read()/readText() 需要 clipboard-read 权限，WebView2/未授权环境会被拒，
+            # 表现为"点了粘贴没反应"）。?rich=1 时同时返回 HTML 片段。
+            query = self.path.split("?", 1)[1] if "?" in self.path else ""
+            text, html = clipboard_snapshot(rich="rich=1" in query)
+            self._send(
+                200,
+                self._json({"ok": bool(text or html), "text": text, "html": html}),
+                "application/json; charset=utf-8",
+            )
             return
         if path == "/api/pages":
             state = self.server.state
@@ -5769,6 +6072,25 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
             st = self.server.state
             st["gone_at"] = st.get("gone_at") or time.monotonic()
             self._send(204, b"", "text/plain")
+            return
+        if path == "/api/clipboard":
+            # 写系统剪贴板：右键菜单「复制」的兜底通路（浏览器侧 copy 失败时用）。
+            # body: {text: str, html?: str}
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b"{}"
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except Exception as e:  # noqa: BLE001
+                self._send(
+                    400,
+                    self._json({"ok": False, "error": f"请求体解析失败：{e}"}),
+                    "application/json; charset=utf-8",
+                )
+                return
+            ok = clipboard_write(
+                str(body.get("text") or ""), str(body.get("html") or "")
+            )
+            self._send(200, self._json({"ok": ok}), "application/json; charset=utf-8")
             return
         if path == "/api/history/delete":
             try:
@@ -6305,7 +6627,8 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
         if path == "/api/format_rules/apply":
             # 应用格式规则到指定页 HTML（任务 B：服务端应用引擎）
             # body: {page:int, html:str, rule_id?:str, all?:bool, sel_start?:int, sel_end?:int}
-            # 返回: {ok:bool, html:str} 或 {ok:false, error:str}
+            #       或全部页模式 {mode:'all_pages', pages:{页码:html}, rules:[...], rule_id:str}
+            # 单页返回: {ok:bool, html:str}；全部页返回: {ok:bool, results:[{page:int, html:str}]}
             try:
                 if rulemanage is None:
                     self._send(
@@ -6318,6 +6641,81 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 raw = self.rfile.read(length) if length else b"{}"
                 body = json.loads(raw.decode("utf-8"))
 
+                # ---- 全部页模式（条件 scope=all_pages）：跨页逐页应用，一次操作处理所有页面 ----
+                if body.get("mode") == "all_pages":
+                    pages_in = body.get("pages")
+                    if not isinstance(pages_in, dict) or not pages_in:
+                        self._send(
+                            400,
+                            self._json({"ok": False, "error": "pages 必须为非空对象（页码 -> HTML）"}),
+                            "application/json; charset=utf-8",
+                        )
+                        return
+                    rules = _validate_format_rules(body.get("rules") or [])
+                    if not rules:
+                        self._send(
+                            400,
+                            self._json({"ok": False, "error": "规则列表为空或全部无效"}),
+                            "application/json; charset=utf-8",
+                        )
+                        return
+                    rule_id = body.get("rule_id")
+                    if not isinstance(rule_id, str) or not rule_id:
+                        self._send(
+                            400,
+                            self._json({"ok": False, "error": "rule_id 必须为字符串"}),
+                            "application/json; charset=utf-8",
+                        )
+                        return
+                    # 归一化 scope：全部页模式下 all_pages 与 selection 条件都按整页文本求值
+                    # （等价于该页的 page 语义；不要在全部页模式依赖 sel_start/sel_end）
+                    for rf in rules:
+                        for c in rf.get("conditions", []):
+                            if c.get("scope") in ("all_pages", "selection"):
+                                c["scope"] = "page"
+                    results = []
+                    for page_no, html_text in pages_in.items():
+                        try:
+                            n = int(page_no)
+                        except (TypeError, ValueError):
+                            continue
+                        if not isinstance(html_text, str):
+                            continue
+                        try:
+                            new_html, err = rulemanage.apply_rules(
+                                html_text,
+                                rules,
+                                rule_id=rule_id,
+                                all_rules=False,
+                                sel_start=None,
+                                sel_end=None,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            self._send(
+                                400,
+                                self._json({"ok": False, "error": f"应用格式规则失败: {e}"}),
+                                "application/json; charset=utf-8",
+                            )
+                            return
+                        if err:
+                            self._send(
+                                400,
+                                self._json({"ok": False, "error": err}),
+                                "application/json; charset=utf-8",
+                            )
+                            return
+                        new_html = sanitize_html(new_html)
+                        # 只返回内容实际变化的页（前后 html 不等才列入，减少前端开销）
+                        if new_html != html_text:
+                            results.append({"page": n, "html": new_html})
+                    self._send(
+                        200,
+                        self._json({"ok": True, "results": results}),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+
+                # ---- 单页模式（原有行为保持不变）----
                 # 校验参数
                 page = body.get("page")
                 html_text = body.get("html")
@@ -7980,10 +8378,12 @@ body.paint-mode{cursor:copy;}
 .ptoe-fix{color:#080;font-size:0.9em;}
 /* 7 new inline format classes (2026-09) */
 .ptoe-underline{text-decoration:underline;}
+/* 下加点：整条虚线式下划线（2026-09） */
+.ptoe-underdot{text-decoration:underline dotted;}
 .ptoe-strike{text-decoration:line-through;}
 .ptoe-charbox{border:1px solid #333;padding:0 .15em;border-radius:2px;}
 .ptoe-shade{background:#eef1f4;}
-.ptoe-highlight{background:#ffe45e;}
+.ptoe-highlight{background:#e0e0e0;}
 .ptoe-sup{vertical-align:super;font-size:.7em;line-height:1;}
 .ptoe-sub{vertical-align:sub;font-size:.7em;line-height:1;}
 #errPopup{position:fixed;z-index:65;display:none;background:#fff;border:1px solid #ccc;border-radius:6px;padding:4px;box-shadow:0 2px 8px rgba(0,0,0,.2);gap:6px;}
@@ -8353,6 +8753,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   </div>
   <div class="ctx-sep"></div>
   <button type="button" class="ctx-item" data-ctx="reocr">重识别</button>
+  <button type="button" class="ctx-item" data-ctx="insertimg">插入图片</button>
   <button type="button" class="ctx-item" data-ctx="clear">清除</button>
   <div class="ctx-item ctx-sub" data-ctx="marker">插入标记 <span class="ctx-arrow">▸</span>
     <div class="ctx-submenu" id="ctxMarkerSub">
@@ -8360,6 +8761,15 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <button type="button" class="ctx-item" data-ctx-marker="page">换页标记</button>
       <button type="button" class="ctx-item" data-ctx-marker="full">全文标记</button>
       <button type="button" class="ctx-item" data-ctx-marker="note">注释标记</button>
+    </div>
+  </div>
+  <div class="ctx-item ctx-sub" data-ctx="wrap">文字包围 <span class="ctx-arrow">▸</span>
+    <div class="ctx-submenu" id="ctxWrapSub">
+      <button type="button" class="ctx-item" data-ctx-wrap="underline">下划线</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="underdot">下加点</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="strike">删除线</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="charbox">字符边框</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="shade">底纹</button>
     </div>
   </div>
   <div class="ctx-item ctx-sub" data-ctx="export">导出 <span class="ctx-arrow">▸</span>
@@ -8400,6 +8810,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
 </div>
 <div id="charWrapMenu" class="tb-menu">
   <button type="button" data-wrap="underline" role="menuitem">下划线</button>
+  <button type="button" data-wrap="underdot" role="menuitem">下加点</button>
   <button type="button" data-wrap="strike" role="menuitem">删除线</button>
   <button type="button" data-wrap="charbox" role="menuitem">字符边框</button>
   <button type="button" data-wrap="shade" role="menuitem">底纹</button>
@@ -8516,6 +8927,12 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <h4 style="margin:16px 0 4px;">编辑器字号</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">调整编辑区显示字号（视图偏好，不写入保存内容）。</p>
       <label style="font-size:13px;">字号（px） <input type="number" id="editorFontSizeInput" min="10" max="28" step="1" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
+      <h4 style="margin:16px 0 4px;">格式规则</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">把规则应用到全部页前先弹出确认，防止误操作大范围改动。</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
+        <input type="checkbox" id="ruleAllPagesConfirm" style="width:16px;height:16px;">
+        格式规则应用到全部页前需确认
+      </label>
       <div style="margin-top:12px;"><button type="button" id="resetUiSettingsBtn">恢复默认</button></div>
     </div>
   </div>

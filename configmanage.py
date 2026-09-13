@@ -232,6 +232,8 @@ DEFAULT_CONFIG = {
         "err_hover_delay": 1500,
         "editor_font_size": 14,
         "img_mode": "",
+        # 格式规则应用到全部页前是否弹确认（bool，默认 true；非 bool 输入归一为 true）
+        "rule_all_pages_confirm": True,
     },
     # 图片预处理（2026-08，OpenCV）：PDF 分割图片时启用，提高 OCR 识别率。
     # enabled 开关；gray 灰度 / denoise 中值去噪 / sharpen 锐化 / binarize 自适应二值化；
@@ -600,6 +602,14 @@ def set_format_rules(rules: list) -> dict:
                         [str(x) for x in (sub if isinstance(sub, list) else [])]
                         for sub in gf
                     ]
+                # 正则条件可携带 match_formats：同一正则的多次匹配各自独立格式列表
+                # （与 group_formats 同构，2026-09：曾因缺失导致保存后 reload 丢失）
+                mf = c.get("match_formats")
+                if isinstance(mf, list) and mf:
+                    cond_out["match_formats"] = [
+                        [str(x) for x in (sub if isinstance(sub, list) else [])]
+                        for sub in mf
+                    ]
                 item["conditions"].append(cond_out)
         else:
             # 旧模型：原样保留（读取时迁移）
@@ -692,6 +702,10 @@ def set_ui_settings(ui: dict) -> dict:
     if "img_mode" in ui:
         v = str(ui["img_mode"])
         clean["img_mode"] = v if v in ("", "full", "fit", "inline") else ""
+    if "rule_all_pages_confirm" in ui:
+        # 类型归一：非 bool 输入统一回退 true（与既有数值/枚举键 clamp 写法一致）
+        v = ui["rule_all_pages_confirm"]
+        clean["rule_all_pages_confirm"] = v if isinstance(v, bool) else True
     with _CFG_LOCK:
         try:
             if os.path.exists(_CONFIG_PATH):

@@ -392,9 +392,12 @@ class CSSManager:
         .ptoe-citation {
           font-style: italic;
         }
-        /* 新增行内格式（2026-09）：下划线/删除线/字符边框/底纹/突显/上标/下标 */
+        /* 新增行内格式（2026-09）：下划线/下加点/删除线/字符边框/底纹/突显/上标/下标 */
         .ptoe-underline {
           text-decoration: underline;
+        }
+        .ptoe-underdot {
+          text-decoration: underline dotted;
         }
         .ptoe-strike {
           text-decoration: line-through;
@@ -408,7 +411,7 @@ class CSSManager:
           background: #eef1f4;
         }
         .ptoe-highlight {
-          background: #ffe45e;
+          background: #e0e0e0;
         }
         .ptoe-sup {
           vertical-align: super;

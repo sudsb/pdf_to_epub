@@ -30,7 +30,8 @@ const OP_ICON = {
   remove:'<span class="ic-t">清</span>', note:'注',
   align_left:'左', align_center:'中', align_right:'右',
   centerbold:'中粗', merge:'合',
-  marker_full:'篇', marker_note:'释', marker_join:'段', marker_page:'页'
+  marker_full:'篇', marker_note:'释', marker_join:'段', marker_page:'页',
+  sup:'上标', sub:'下标'
 };
 const OP_TIP = {
   bold:'粗体', italic:'斜体', heading:'标题（循环 H1→H6→正文）', p:'正文',
@@ -97,12 +98,20 @@ function errHoverDelay() { return uiv('err_hover_delay', 1500); }
 // 设置「界面」页偏好：服务端持久化到 config.json（/api/ui_settings）。
 // correct_pages 每运行随机端口 → localStorage 按 origin 隔离每次失效，
 // 故以内存 uiSettings 为准、服务端为准，localStorage 仅作加载前的同步兜底。
-const UI_SETTINGS_DEFAULTS = { tip_delay: 600, err_hover_delay: 1500, editor_font_size: 14, img_mode: '' };
+const UI_SETTINGS_DEFAULTS = { tip_delay: 600, err_hover_delay: 1500, editor_font_size: 14, img_mode: '', rule_all_pages_confirm: true };
 let uiSettings = null; // 服务端加载前为 null → 读 localStorage 兜底；加载后为完整对象
 function uiv(key, def) {
   if (uiSettings && key in uiSettings && uiSettings[key] !== undefined && uiSettings[key] !== null) return uiSettings[key];
   const lk = key === 'editor_font_size' ? 'ptoe_font_size' : 'ptoe_' + key;
   return loadInt(lk, def);
+}
+// 布尔型 UI 偏好读取（uiSettings 优先，localStorage '1'/'0'/'true'/'false' 兜底）
+function uiBool(key, def) {
+  if (uiSettings && key in uiSettings && uiSettings[key] !== undefined && uiSettings[key] !== null) return !!uiSettings[key];
+  const v = localStorage.getItem('ptoe_' + key);
+  if (v === '1' || v === 'true') return true;
+  if (v === '0' || v === 'false') return false;
+  return def;
 }
 async function loadUiSettingsFromServer() {
   try {
@@ -115,6 +124,8 @@ async function loadUiSettingsFromServer() {
     if (bg && bg.style.display === 'flex') { // 设置弹窗开着时同步界面页输入框
       document.getElementById('tipDelayInput').value = uiSettings.tip_delay;
       document.getElementById('errHoverDelayInput').value = uiSettings.err_hover_delay;
+      const rac = document.getElementById('ruleAllPagesConfirm');
+      if (rac) rac.checked = !!uiSettings.rule_all_pages_confirm;
     }
   } catch (e) { console.warn('loadUiSettingsFromServer failed: ' + e.message); }
 }
@@ -124,6 +135,7 @@ function saveUIMirror() {
     localStorage.setItem('ptoe_err_hover_delay', String(uiSettings.err_hover_delay));
     localStorage.setItem('ptoe_font_size', String(uiSettings.editor_font_size));
     localStorage.setItem('ptoe_img_mode', String(uiSettings.img_mode));
+    localStorage.setItem('ptoe_rule_all_pages_confirm', uiSettings.rule_all_pages_confirm ? '1' : '0');
   } catch (e) {}
 }
 function saveUiSettings() {
@@ -1367,10 +1379,10 @@ function toggleNote(ed) {
 }
 
 // ---------- 新增内联格式工具（2026-09） ----------
-// 7 种内联 span 类：下划线、删除线、字符边框、底纹、突显、上标、下标
-const INLINE_CLASSES = ['ptoe-underline','ptoe-strike','ptoe-charbox','ptoe-shade','ptoe-highlight','ptoe-sup','ptoe-sub'];
+// 8 种内联 span 类：下划线、下加点、删除线、字符边框、底纹、突显、上标、下标
+const INLINE_CLASSES = ['ptoe-underline','ptoe-underdot','ptoe-strike','ptoe-charbox','ptoe-shade','ptoe-highlight','ptoe-sup','ptoe-sub'];
 const INLINE_CLASS_LABEL = {
-  underline:'下划线', strike:'删除线', charbox:'字符边框',
+  underline:'下划线', underdot:'下加点', strike:'删除线', charbox:'字符边框',
   shade:'底纹', highlight:'突显', sup:'上标', sub:'下标'
 };
 // 上/下标互斥：同一区域不能同时是上标和下标
@@ -1407,7 +1419,24 @@ function applyInlineClass(ed, cls, opts) {
 
   histRun(label, [i], function () {
     applyToSelectedBlocks(ed, function(block, range) {
-      // 互斥处理：上/下标不能共存
+      // 先基于原 DOM 判断本 class 是否与选区相交（互斥解包前）：
+      // 互斥表含本 class 自身——若先解包再查“现有”，toggle 关闭时会被判定为
+      // “无现有”而重新包裹（上标/下标点两次永远关不掉，2026-09 修复）。
+      let hasCls = false;
+      if (toggle) {
+        const existing = block.querySelectorAll('span.' + cls);
+        for (const span of existing) {
+          const spanRange = document.createRange();
+          spanRange.selectNodeContents(span);
+          if (range.compareBoundaryPoints(Range.START_TO_END, spanRange) >= 0 &&
+              range.compareBoundaryPoints(Range.END_TO_START, spanRange) <= 0) {
+            hasCls = true;
+            break;
+          }
+        }
+      }
+
+      // 互斥处理：上/下标不能共存（同步清除本 class 自身，实现解包）
       if (INLINE_MUTEX[cls]) {
         for (const mCls of INLINE_MUTEX[cls]) {
           unwrapSpans(block, mCls, range);
@@ -1415,21 +1444,8 @@ function applyInlineClass(ed, cls, opts) {
       }
 
       if (toggle) {
-        // 切换模式：若选区内已有该 class 的 span 相交 → 解包；否则包裹
-        const existing = block.querySelectorAll('span.' + cls);
-        let hasIntersect = false;
-        for (const span of existing) {
-          const spanRange = document.createRange();
-          spanRange.selectNodeContents(span);
-          if (range.compareBoundaryPoints(Range.START_TO_END, spanRange) >= 0 &&
-              range.compareBoundaryPoints(Range.END_TO_START, spanRange) <= 0) {
-            hasIntersect = true;
-            break;
-          }
-        }
-        if (hasIntersect) {
-          unwrapSpans(block, cls, range);
-        } else {
+        // 切换模式：原选区内已有该 class → 已由互斥解包移除（关闭）；否则包裹（打开）
+        if (!hasCls) {
           wrapRange(block, range, cls);
         }
       } else {
@@ -1696,7 +1712,45 @@ function applyOp(op) { const ed = currentEditable(); if (!ed) return;
      // the change propagates to all selected lines/blocks.
      if (op === 'bold') applyToSelectedBlocks(ed, function() { withScrollStable(() => document.execCommand('bold')); });
      else if (op === 'italic') applyToSelectedBlocks(ed, function() { withScrollStable(() => document.execCommand('italic')); });
-     else if (op === 'remove') applyToSelectedBlocks(ed, function() { withScrollStable(() => document.execCommand('removeFormat')); });
+     else if (op === 'remove') applyToSelectedBlocks(ed, function(block, r) {
+  // 清除选区全部文本格式（2026-09）：粗体/斜体/旧式下划线走 execCommand('removeFormat')；
+  // 文字包围（下划线/下加点/删除线/字符边框/底纹/突显/上标/下标）逐类解包；
+  // 块级格式（标题/注释/引用/对齐/顶格缩进）一并清除。
+  // 保护：ptoe-marker 标记 span（不在 INLINE_CLASSES，天然不触碰）；
+  // 图片段落 ptoe-img-* 类与非文本 <img> 元素原样保留（图片布局不是文本格式）。
+  const sel = window.getSelection();
+  // 折叠/无选中文字：按“光标所在整块”清除——把 range 扩为整块（行为可预期）
+  const range = (r && !r.collapsed) ? r : (function () {
+    const rr = document.createRange();
+    rr.setStart(block, 0);
+    rr.setEnd(block, block.childNodes.length);
+    return rr;
+  })();
+  withScrollStable(function () {
+    sel.removeAllRanges();
+    sel.addRange(range);
+    document.execCommand('removeFormat');
+    // 8 类行内格式 span：逐个解包与 range 相交者（文本留在原位）
+    for (const cls of INLINE_CLASSES) unwrapSpans(block, cls, range);
+    // 块级标签：H1-H6 / DIV → 归一 <p>（_convertBlockTag 保留 class/data-*，
+    // 图片段落若在 DIV 内其 ptoe-img-* 类随之保留）
+    if (/^H[1-6]$/.test(block.tagName) || block.tagName === 'DIV') {
+      block = _convertBlockTag(block, 'p');
+    }
+    // 文本格式块类清除（ptoe-img-* 图片段落布局类例外保留）
+    const imgClasses = [];
+    for (const c of block.classList) {
+      if (c.indexOf('ptoe-img-') === 0) imgClasses.push(c);
+    }
+    for (const c of ['ptoe-note', 'ptoe-citation', 'ptoe-align-left', 'ptoe-align-center', 'ptoe-align-right', 'ptoe-flush', 'ptoe-indent']) {
+      block.classList.remove(c);
+    }
+    for (const c of imgClasses) block.classList.add(c);
+    // 缩进 data 属性与内联 style（缩进样式）一并移除
+    for (const a of _IND_ATTRS) block.removeAttribute(a);
+    if (block.hasAttribute('style')) block.removeAttribute('style');
+  });
+});
       else if (op === 'p') applyToSelectedBlocks(ed, function(block) { _convertBlockTag(block, 'p'); }); // 与 heading 一致逐块转换（execCommand formatBlock 对跨块选区只转起始块）
       else if (op === 'centerbold') applyToSelectedBlocks(ed, function(block) {
         // 顺序：先设对齐（_convertBlockTag 会保留 class）→ 再加粗（selection 仍指向原 block）→ 最后转 <p>
@@ -2841,8 +2895,8 @@ function buildPopup() {
   popup.appendChild(paintBtn);
   // 分隔
   const sep1 = document.createElement('div'); sep1.className = 'sep'; popup.appendChild(sep1);
-  // Row2：对齐 + 中粗 + 合并
-  const row2Ops = ['align_left','align_center','align_right','centerbold','merge'];
+  // Row2：对齐 + 中粗 + 合并 + 上标/下标（2026-09：上标/下标位于「合」之后，经 applyOp→applyInlineClass 走 ptoe-sup/ptoe-sub toggle）
+  const row2Ops = ['align_left','align_center','align_right','centerbold','merge','sup','sub'];
   row2Ops.forEach(function(op) { popup.appendChild(_makePopBtn(op)); });
   // 分隔
   const sep2 = document.createElement('div'); sep2.className = 'sep'; popup.appendChild(sep2);
@@ -3100,37 +3154,152 @@ function ctxMarkerInsert(type) {
   });
 }
 function ctxExportRun(fmt) { ctxRun(() => exportFile(fmt)); }
-// 右键菜单「复制/粘贴」二级菜单（2026-09）：
-// 格式复制 = execCommand('copy')（复制 HTML 格式到系统剪贴板）；
-// 纯文本复制 = navigator.clipboard.writeText（仅文字）；
-// 格式粘贴 = 读取剪贴板 HTML 后 insertHTML（无 HTML 则回退纯文本 insertText）；
-// 纯文本粘贴 = 读取剪贴板纯文本后 insertText。
-// paste 为异步操作（Clipboard API），不走 ctxRun（try/catch 仅捕获同步），
-// 改为 closeContextMenu 前预捕获目标页/行号/光标位置。
-function ctxCopyFormat() {
+// 右键菜单「插入图片」（2026-09）：插入到右键目标页（_ctxEditable）而非当前光标页。
+// 光标/选区可能停留在别的页面；先把插入点固定到右键目标页（优先 _ctxRange，
+// 否则页首），并同步 _lastEditableRange（insertImageDataUrl 会用它恢复选区），
+// 再复用 toolbar「图」按钮的 insertImage(row, i) 走同一 fetch→dataURI 路径。
+function ctxInsertImage() {
+  const ed = ctxTargetEditable();
+  if (!ed) { showToast('未找到可插入图片的页面', 'warn'); return; }
+  const row = ed.closest('.page-row');
+  if (!row) { showToast('未找到可插入图片的页面', 'warn'); return; }
+  const i = Number(row.dataset.i);
+  ed.focus();
   const sel = window.getSelection();
-  const hasLiveSel = sel && sel.rangeCount > 0 && !sel.isCollapsed;
-  const clipText = (hasLiveSel ? sel.toString() : '') || _ctxClipText;
-  if (!clipText) { showToast('请先选中要复制的文字', 'warn'); return; }
-  // 尝试 execCommand 复制富文本格式
-  if (hasLiveSel) {
-    try {
-      if (document.execCommand('copy')) { showToast('已复制格式', 'ok'); return; }
-    } catch (e) {}
-  }
-  // fallback：写入纯文本（writeText 需用户激活 + 安全上下文，在 localhost 下可靠）
-  navigator.clipboard.writeText(clipText).then(() => {
-    showToast('已复制纯文本', 'ok');
-  }).catch(() => { showToast('复制失败', 'fail'); });
+  const range = (_ctxRange && ed.contains(_ctxRange.startContainer)) ? _ctxRange : (() => {
+    const r = document.createRange();
+    r.selectNodeContents(ed);
+    r.collapse(true);
+    return r;
+  })();
+  if (sel) { sel.removeAllRanges(); sel.addRange(range); }
+  _lastEditableRange = range.cloneRange();
+  insertImage(row, i);
 }
-function ctxCopyText() {
+// ---------------------------------------------------------------------------
+// 右键菜单「复制 / 粘贴」（2026-09-13 重写）
+//
+// 旧实现只走浏览器 Clipboard API：navigator.clipboard.read()/readText() 需要
+// clipboard-read 权限（WebView2 / 未授权环境直接拒绝，非安全上下文连
+// navigator.clipboard 都不存在），writeText() 还要求焦点 + 用户激活 —— 结果就是
+// "点了复制/粘贴没反应"。
+//
+// 现在按可靠性递降分三条通路：
+//   1) 选区仍在时用原生 execCommand('copy')（保真最好，含格式）；
+//   2) copy 事件覆盖写剪贴板（无需任何权限、用户手势内可靠）；再退到
+//      Clipboard API write()/writeText()（需权限）；
+//   3) 服务端 /api/clipboard（本机服务直接读写 Windows 系统剪贴板，最可靠，
+//      且与 Word/记事本互通）。
+// 粘贴同理：Clipboard API → 服务端系统剪贴板 → 提示改用 Ctrl+V。
+// 复制/粘贴是异步操作（不走 ctxRun，其 try/catch 只覆盖同步段），
+// 目标页/行号/光标位置由调用方在关闭菜单前预捕获后传入。
+// ---------------------------------------------------------------------------
+function _ctxSelectionText() {
   const sel = window.getSelection();
-  const hasLiveSel = sel && sel.rangeCount > 0 && !sel.isCollapsed;
-  const text = (hasLiveSel ? sel.toString() : '') || _ctxClipText;
+  const live = sel && sel.rangeCount > 0 && !sel.isCollapsed ? sel.toString() : '';
+  return live || _ctxClipText || '';
+}
+function _ctxSelectionHtml() {
+  // 右键时捕获的选区快照（点击菜单项后选区可能被折叠，故用 _ctxRange 克隆）
+  try {
+    if (_ctxRange) {
+      const wrap = document.createElement('div');
+      wrap.appendChild(_ctxRange.cloneContents());
+      return wrap.innerHTML;
+    }
+  } catch (e) {}
+  return '';
+}
+// copy 事件覆盖法：不依赖剪贴板权限，在用户手势内可靠（Chromium/Firefox 均支持）
+function _copyViaEvent(html, text) {
+  let done = false;
+  const onCopy = (e) => {
+    try {
+      if (!e.clipboardData) return;
+      e.clipboardData.setData('text/plain', text || '');
+      if (html) e.clipboardData.setData('text/html', html);
+      e.preventDefault();
+      done = true;
+    } catch (err) {}
+  };
+  document.addEventListener('copy', onCopy, true);
+  try { document.execCommand('copy'); } catch (e) {}
+  document.removeEventListener('copy', onCopy, true);
+  return done;
+}
+async function _clipboardWrite(html, text) {
+  if (_copyViaEvent(html, text)) return true;
+  try {
+    if (navigator.clipboard) {
+      if (html && window.ClipboardItem) {
+        await navigator.clipboard.write([new ClipboardItem({
+          'text/html': new Blob([html], { type: 'text/html' }),
+          'text/plain': new Blob([text || ''], { type: 'text/plain' }),
+        })]);
+        return true;
+      }
+      if (text) { await navigator.clipboard.writeText(text); return true; }
+    }
+  } catch (e) {}
+  // 兜底：服务端写 Windows 系统剪贴板
+  try {
+    const r = await fetchJSON('/api/clipboard', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ html: html || '', text: text || '' }),
+    });
+    return !!(r && r.ok);
+  } catch (e) {}
+  return false;
+}
+async function _clipboardRead(wantHtml) {
+  // 1) 浏览器 Clipboard API（有权限时最直接）
+  try {
+    if (navigator.clipboard) {
+      if (wantHtml && navigator.clipboard.read) {
+        const items = await navigator.clipboard.read();
+        let html = '', text = '';
+        for (const item of items) {
+          if (!html && item.types.includes('text/html')) {
+            html = await (await item.getType('text/html')).text();
+          }
+          if (!text && item.types.includes('text/plain')) {
+            text = await (await item.getType('text/plain')).text();
+          }
+        }
+        if (html || text) return { html, text };
+      } else if (navigator.clipboard.readText) {
+        const t = await navigator.clipboard.readText();
+        if (t) return { html: '', text: t };
+      }
+    }
+  } catch (e) {}
+  // 2) 服务端系统剪贴板
+  try {
+    const r = await fetchJSON('/api/clipboard' + (wantHtml ? '?rich=1' : ''));
+    if (r && r.ok) return { html: r.html || '', text: r.text || '' };
+  } catch (e) {}
+  return null;
+}
+async function ctxCopyFormat() {
+  const text = _ctxSelectionText();
+  const html = _ctxSelectionHtml();
+  if (!text && !html) { showToast('请先选中要复制的文字', 'warn'); return; }
+  // 选区还在 → 原生复制保真最好；失败（选区失效/无焦点）再走兜底通路
+  const sel = window.getSelection();
+  if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) {}
+    if (ok) { showToast('已复制（含格式）', 'ok'); return; }
+  }
+  if (await _clipboardWrite(html, text)) showToast('已复制（含格式）', 'ok');
+  else showToast('复制失败：请在编辑区选中文字后按 Ctrl+C', 'fail');
+}
+async function ctxCopyText() {
+  const text = _ctxSelectionText();
   if (!text) { showToast('请先选中要复制的文字', 'warn'); return; }
-  navigator.clipboard.writeText(text).then(() => {
-    showToast('已复制纯文本', 'ok');
-  }).catch(() => { showToast('复制失败', 'fail'); });
+  if (await _clipboardWrite('', text)) showToast('已复制纯文本', 'ok');
+  else showToast('复制失败：请在编辑区选中文字后按 Ctrl+C', 'fail');
 }
 // paste 辅助：定位光标到右键位置并插入内容
 function _ctxPastePosition(ed, range) {
@@ -3143,52 +3312,83 @@ function _ctxPastePosition(ed, range) {
   }
   return true;
 }
-// 剪贴板读取 fallback：navigator.clipboard.readText() 需 clipboard-read 权限（浏览器不自动授予），
-// 隐藏 textarea + execCommand('paste') 在现代浏览器同样不可靠，兜底返回 null 让调用方提示 Ctrl+V。
-function _ctxReadClipboard() {
-  return navigator.clipboard.readText().catch(() => null);
+// （剪贴板读取统一走 _clipboardRead：浏览器 Clipboard API → 服务端系统剪贴板）
+// 光标处插入：insertHTML（保格式）→ insertText → Range.insertNode 兜底。
+// 个别浏览器/富文本上下文下 execCommand 会返回 false，只走一条路时表现为
+// "点了粘贴没反应"，这里逐级降级保证一定插进去。
+function _insertAtCaret(html, text) {
+  if (html) {
+    const ok = withScrollStable(() => {
+      try { return document.execCommand('insertHTML', false, html); } catch (e) { return false; }
+    });
+    if (ok) return true;
+  }
+  if (text) {
+    const ok = withScrollStable(() => {
+      try { return document.execCommand('insertText', false, text); } catch (e) { return false; }
+    });
+    if (ok) return true;
+    try {
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount) {
+        const r = sel.getRangeAt(0);
+        r.deleteContents();
+        const node = document.createTextNode(text);
+        r.insertNode(node);
+        r.setStartAfter(node);
+        r.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(r);
+        return true;
+      }
+    } catch (e) {}
+  }
+  return false;
 }
 function _ctxPasteHtml(html, ed, ri, range) {
-  if (!_ctxPastePosition(ed, range)) { showToast('请先点击某一页的文字', 'warn'); return; }
-  histRun('粘贴（格式）', [ri], () => {
-    withScrollStable(() => document.execCommand('insertHTML', false, html));
+  if (!_ctxPastePosition(ed, range)) { showToast('请先点击某一页的文字', 'warn'); return false; }
+  return histRun('粘贴（格式）', [ri], () => {
+    const wrap = document.createElement('div');
+    wrap.innerHTML = html;
+    const ok = _insertAtCaret(html, wrap.textContent || '');
     syncContent(ed);
     markDirty(ri);
     scheduleRemeasure(ri);
+    return ok;
   });
 }
 function _ctxPasteTextInsert(text, ed, ri, range) {
-  if (!_ctxPastePosition(ed, range)) { showToast('请先点击某一页的文字', 'warn'); return; }
-  histRun('粘贴（纯文本）', [ri], () => {
-    withScrollStable(() => document.execCommand('insertText', false, text));
+  if (!_ctxPastePosition(ed, range)) { showToast('请先点击某一页的文字', 'warn'); return false; }
+  return histRun('粘贴（纯文本）', [ri], () => {
+    const ok = _insertAtCaret('', text);
     syncContent(ed);
     markDirty(ri);
     scheduleRemeasure(ri);
+    return ok;
   });
 }
 async function ctxPasteFormat(ed, ri, range) {
   if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
-  // 优先用 read() 读 HTML（需 clipboard-read 权限）
-  try {
-    const items = await navigator.clipboard.read();
-    for (const item of items) {
-      if (item.types.includes('text/html')) {
-        const blob = await item.getType('text/html');
-        const html = await blob.text();
-        if (html) { _ctxPasteHtml(html, ed, ri, range); showToast('已粘贴格式', 'ok'); return; }
-      }
-    }
-  } catch (e) {}
-  // read() 失败或无 HTML → 尝试 readText
-  const text = await _ctxReadClipboard();
-  if (text) { _ctxPasteTextInsert(text, ed, ri, range); showToast('已粘贴纯文本', 'ok'); }
-  else showToast('粘贴失败：请使用 Ctrl+V 粘贴', 'warn');
+  const clip = await _clipboardRead(true);
+  if (clip && (clip.html || clip.text)) {
+    const ok = clip.html
+      ? _ctxPasteHtml(clip.html, ed, ri, range)
+      : _ctxPasteTextInsert(clip.text, ed, ri, range);
+    if (ok) showToast(clip.html ? '已粘贴（含格式）' : '已粘贴纯文本', 'ok');
+    else showToast('粘贴失败：请在编辑区按 Ctrl+V', 'warn');
+    return;
+  }
+  showToast('粘贴失败：请在编辑区按 Ctrl+V', 'warn');
 }
 async function ctxPasteText(ed, ri, range) {
   if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
-  const text = await _ctxReadClipboard();
-  if (text) { _ctxPasteTextInsert(text, ed, ri, range); showToast('已粘贴纯文本', 'ok'); }
-  else showToast('粘贴失败：请使用 Ctrl+V 粘贴', 'warn');
+  const clip = await _clipboardRead(false);
+  if (clip && clip.text) {
+    if (_ctxPasteTextInsert(clip.text, ed, ri, range)) showToast('已粘贴纯文本', 'ok');
+    else showToast('粘贴失败：请在编辑区按 Ctrl+V', 'warn');
+    return;
+  }
+  showToast('粘贴失败：请在编辑区按 Ctrl+V', 'warn');
 }
 // 右键菜单「添加规则」二级菜单：列出已保存格式规则，点击即应用到右键目标页。
 // 每次打开菜单时刷新（fetch /api/format_rules，fire-and-forget）；子菜单 hover
@@ -3281,6 +3481,8 @@ ctxMenu.addEventListener('click', (e) => {
     }
     const mk = subBtn.dataset.ctxMarker;
     if (mk) { ctxMarkerInsert(mk); return; }
+    const wr = subBtn.dataset.ctxWrap;
+    if (wr) { ctxRun(() => applyInlineClass(ctxTargetEditable(), 'ptoe-' + wr, {toggle: true})); return; }
     const ex = subBtn.dataset.ctxExport;
     if (ex) { ctxExportRun(ex); return; }
     return;
@@ -3292,6 +3494,7 @@ ctxMenu.addEventListener('click', (e) => {
   if (!item) return;
   const kind = item.dataset.ctx;
   if (kind === 'reocr') ctxRun(runReocr);
+  else if (kind === 'insertimg') ctxRun(ctxInsertImage);
   else if (kind === 'clear') ctxRun(proofreadClearCurrent);
   else if (kind === 'clearpage') ctxRun(function () {
     // 清空当前页内容（2026-08-23：替代原 Markdown 占位项）
@@ -4603,7 +4806,7 @@ function condSummary(rule) {
   const tmap = { contains: '包含', prefix: '开头', suffix: '结尾', regex: '正则匹配' };
   return conds.map(function (c) {
     const t = tmap[c.type] || c.type;
-    const scope = c.scope === 'paragraph' ? '整段' : (c.scope === 'page' ? '当前页' : '选中');
+    const scope = c.scope === 'paragraph' ? '整段' : (c.scope === 'page' ? '当前页' : (c.scope === 'all_pages' ? '全部页' : '选中'));
     const tgtMap = { before: '之前', after: '之后' };
     const tgtLabel = c.target === 'between' ? '之间「' + (c.between_end_pattern || '?') + '」' : (tgtMap[c.target] || '');
     const cond = c.pattern ? t + '「' + c.pattern + '」/' + scope + (tgtLabel ? '→' + tgtLabel : '') : '无条件';
@@ -4819,7 +5022,7 @@ function renderConditions(conds) {
     patInput.value = c.pattern || '';
     const scopeSel = document.createElement('select');
     scopeSel.className = 'frCondScope';
-    [['selection','选中文字'], ['paragraph','光标所在段落'], ['page','当前页面']].forEach(function (t) {
+    [['selection','选中文字'], ['paragraph','光标所在段落'], ['page','当前页面'], ['all_pages','全部页']].forEach(function (t) {
       const opt = document.createElement('option');
       opt.value = t[0]; opt.textContent = t[1];
       if (t[0] === (c.scope || 'selection')) opt.selected = true;
@@ -5168,6 +5371,10 @@ function _textFromNodes(textNodes) {
 // 任务 C：改为调用后端 /api/format_rules/apply，浏览器只负责发请求和渲染结果。
 async function applyFormatRule(rule, edArg) {
   if (!rule || !rule.id) { showToast('规则缺少 id，无法单条应用', 'warn'); return false; }
+  // 全部页模式：任一条件的范围下拉选了「全部页」→ 整条规则应用到所有页面（2026-09-13）
+  if ((rule.conditions || []).some(function (c) { return c.scope === 'all_pages'; })) {
+    return applyFormatRuleAllPages(rule);
+  }
   const ed = edArg || currentEditable();
   if (!ed) { showToast('请先选中文字或把光标放入段落', 'warn'); return false; }
   if (!edArg) restoreFrRange();
@@ -5232,6 +5439,70 @@ async function applyFormatRule(rule, edArg) {
     return true;
   } catch (e) {
     showToast('应用格式规则失败: ' + e, 'fail');
+    return false;
+  }
+}
+
+// 全部页模式：把整条规则逐页应用到所有页面。一次操作 = 一步撤销；只更新内容实际
+// 变化的页；应用前按界面设置 uiBool('rule_all_pages_confirm') 决定是否弹确认。
+// 服务端 /api/format_rules/apply（mode:'all_pages'）负责逐页应用并归一化条件 scope。
+async function applyFormatRuleAllPages(rule) {
+  if (!rule || !rule.id) { showToast('规则缺少 id，无法全部页应用', 'warn'); return false; }
+  if (mdMode) { showToast('Markdown 模式下不支持「全部页」格式规则', 'warn'); return false; }
+  if (!pages.length) { showToast('没有可应用的页面', 'warn'); return false; }
+  if (uiBool('rule_all_pages_confirm', true)) {
+    const yes = window.confirm('将把规则「' + (rule.name || rule.id) + '」应用到全部 ' + pages.length + ' 页，是否继续？');
+    if (!yes) return false;
+  }
+  // payload 复用 collect() 口径（剥纠错标注/搜索高亮，md 模式已排除）；键 = 1-based 页码
+  const filtered = collect().filter(function (item) {
+    return typeof item.html === 'string' && item.html.length > 0;
+  });
+  if (!filtered.length) { showToast('没有可应用的内容', 'warn'); return false; }
+  const pagesIn = {};
+  filtered.forEach(function (item) { pagesIn[String(item.page)] = item.html; });
+  // 异步多页操作：histBegin(null) 全页快照 = 一步撤销；errBefore 捕获全页纠错标注，
+  // histEnd 只保留实际变化页并对称恢复标注
+  const errBefore = new Map();
+  for (let i = 0; i < pages.length; i++) errBefore.set(i, _copyErrors(i));
+  const before = histBegin('格式规则（全部页）', null);
+  try {
+    const res = await fetchJSON('/api/format_rules/apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mode: 'all_pages',
+        pages: pagesIn,
+        rule_id: rule.id,
+        rules: [rule],
+      }),
+    });
+    if (!res.ok) {
+      showToast('应用格式规则到全部页失败: ' + (res.error || '未知错误'), 'fail');
+      return false;
+    }
+    const results = res.results || [];
+    results.forEach(function (r) {
+      const idx = pages.findIndex(function (p) { return p.page === r.page; });
+      if (idx < 0 || typeof r.html !== 'string') return;
+      contentMap.set(idx, r.html);
+      markDirty(idx);
+      // 只重渲染已挂载行（与 restoreHistorySnapshot 相同路径）；未挂载行滚动到时自然呈现
+      const row = host.querySelector('.page-row[data-i="' + idx + '"]');
+      if (row) {
+        const ed = row.querySelector('.editable');
+        if (ed) { ed.innerHTML = displayHtml(idx); _reapplyProofread(idx); remeasure(idx); }
+      }
+    });
+    histEnd(before, '格式规则（全部页）', errBefore);
+    if (results.length) {
+      showToast('已应用格式规则「' + (rule.name || '') + '」到 ' + results.length + ' 页', 'ok');
+    } else {
+      showToast('格式规则「' + (rule.name || '') + '」未改变任何页面', 'warn');
+    }
+    return true;
+  } catch (e) {
+    showToast('应用格式规则到全部页失败: ' + e, 'fail');
     return false;
   }
 }
@@ -5513,6 +5784,8 @@ function openSettings() {
   document.getElementById('errHoverDelayInput').value = errHoverDelay();
   loadFontSettings();
   document.getElementById('editorFontSizeInput').value = parseInt(document.documentElement.style.getPropertyValue('--editor-font-size') || '14', 10);
+  const rac = document.getElementById('ruleAllPagesConfirm');
+  if (rac) rac.checked = !!uiBool('rule_all_pages_confirm', true);
   document.getElementById('modalBg').style.display = 'flex';
   // 默认激活快捷键标签
   document.querySelectorAll('.settings-tab').forEach(b => b.classList.remove('active'));
@@ -6174,6 +6447,8 @@ document.getElementById('resetUiSettingsBtn').addEventListener('click', () => {
   document.getElementById('tipDelayInput').value = uiSettings.tip_delay;
   document.getElementById('errHoverDelayInput').value = uiSettings.err_hover_delay;
   document.getElementById('editorFontSizeInput').value = uiSettings.editor_font_size;
+  const rac = document.getElementById('ruleAllPagesConfirm');
+  if (rac) rac.checked = true;
   applyFontSize(uiSettings.editor_font_size);
   showToast('界面设置已恢复默认', 'ok');
 });
@@ -6199,6 +6474,10 @@ document.getElementById('tipDelayInput').addEventListener('change', (e) => {
   const v = parseInt(e.target.value, 10);
   const d = isFinite(v) ? Math.max(0, Math.min(5000, v)) : 600;
   if (uiSettings) { uiSettings.tip_delay = d; saveUiSettings(); }
+});
+// 格式规则应用到全部页前需确认（2026-09-13 新增；服务端持久化 config.json ui_settings）
+document.getElementById('ruleAllPagesConfirm').addEventListener('change', (e) => {
+  if (uiSettings) { uiSettings.rule_all_pages_confirm = e.target.checked; saveUiSettings(); }
 });
 // 暂存/保存/完成并转换/快捷键设置（2026-08-07 修复：四个绑定曾整块丢失 → 按钮点击无响应）
 document.getElementById('saveBtn').addEventListener('click', save);
@@ -6286,7 +6565,7 @@ _backdropClickClose('finishConfirmBg', () => {
 
 // 新增下拉菜单绑定（2026-09）：文/背/X 三个菜单 —— 空守卫，另一车道在 correctmanage.py 注入 DOM
 (function bindDropMenus() {
-  // 文字包围：charWrapBtn -> charWrapMenu（data-wrap: underline/strike/charbox/shade）
+  // 文字包围：charWrapBtn -> charWrapMenu（data-wrap: underline/underdot/strike/charbox/shade）
   const cwBtn = document.getElementById('charWrapBtn');
   const cwMenu = document.getElementById('charWrapMenu');
   if (cwBtn && cwMenu) {
