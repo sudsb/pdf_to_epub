@@ -5949,7 +5949,17 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
         隔离会导致设置每运行失效（与 shortcuts / proofread_settings 同因）。
         """
         try:
-            from configmanage import get_config, set_ui_settings, DEFAULT_CONFIG
+            from configmanage import (
+                get_config,
+                set_ui_settings,
+                DEFAULT_CONFIG,
+                POPUP_ELIGIBLE_OPS,
+                POPUP_ROW1_DEFAULT,
+                POPUP_ROW2_DEFAULT,
+                POPUP_RULE_COUNT_DEFAULT,
+                POPUP_RULE_COUNT_MIN,
+                POPUP_RULE_COUNT_MAX,
+            )
 
             if self.command == "GET":
                 cfg = get_config(show_dialogs=False) or {}
@@ -5962,6 +5972,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "editor_font_size": 14,
                     "img_mode": "",
                     "rule_all_pages_confirm": True,
+                    "popup_row1": POPUP_ROW1_DEFAULT,
+                    "popup_row2": POPUP_ROW2_DEFAULT,
+                    "popup_rule_count": POPUP_RULE_COUNT_DEFAULT,
                 })
                 merged = {
                     "tip_delay": stored.get("tip_delay", defaults["tip_delay"]),
@@ -5969,6 +5982,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "editor_font_size": stored.get("editor_font_size", defaults["editor_font_size"]),
                     "img_mode": stored.get("img_mode", defaults["img_mode"]),
                     "rule_all_pages_confirm": stored.get("rule_all_pages_confirm", defaults["rule_all_pages_confirm"]),
+                    "popup_row1": stored.get("popup_row1", defaults["popup_row1"]),
+                    "popup_row2": stored.get("popup_row2", defaults["popup_row2"]),
+                    "popup_rule_count": stored.get("popup_rule_count", defaults["popup_rule_count"]),
                 }
                 self._send(
                     200,
@@ -6032,6 +6048,38 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     self._send(400, self._json({"ok": False, "error": "rule_all_pages_confirm 必须是布尔值"}), "application/json; charset=utf-8")
                     return
                 clean["rule_all_pages_confirm"] = v
+            if "popup_row1" in ui:
+                v = ui["popup_row1"]
+                if not (
+                    isinstance(v, list)
+                    and all(isinstance(x, str) and x in POPUP_ELIGIBLE_OPS for x in v)
+                    and len(v) == len(set(v))
+                    and len(v) <= 25
+                ):
+                    self._send(400, self._json({"ok": False, "error": "弹出菜单第一行按钮配置无效"}), "application/json; charset=utf-8")
+                    return
+                clean["popup_row1"] = list(v)
+            if "popup_row2" in ui:
+                v = ui["popup_row2"]
+                if not (
+                    isinstance(v, list)
+                    and all(isinstance(x, str) and x in POPUP_ELIGIBLE_OPS for x in v)
+                    and len(v) == len(set(v))
+                    and len(v) <= 25
+                ):
+                    self._send(400, self._json({"ok": False, "error": "弹出菜单第二行按钮配置无效"}), "application/json; charset=utf-8")
+                    return
+                clean["popup_row2"] = list(v)
+            if "popup_rule_count" in ui:
+                v = ui["popup_rule_count"]
+                if not (
+                    isinstance(v, int)
+                    and not isinstance(v, bool)
+                    and POPUP_RULE_COUNT_MIN <= v <= POPUP_RULE_COUNT_MAX
+                ):
+                    self._send(400, self._json({"ok": False, "error": "弹出菜单规则按钮数量无效（需为 0-10 的整数）"}), "application/json; charset=utf-8")
+                    return
+                clean["popup_rule_count"] = v
             set_ui_settings(clean)
             self._send(200, self._json({"ok": True}), "application/json; charset=utf-8")
         except Exception as e:  # noqa: BLE001
@@ -8914,6 +8962,22 @@ body.paint-mode{cursor:copy;}
 .modal{background:#fff;border-radius:10px;padding:18px 22px;max-width:520px;width:92%;max-height:80vh;overflow:auto;}
 .modal h3{margin:0 0 10px;}
 .modal h4{margin:14px 0 6px;font-size:14px;color:#1c2733;}
+/* 设置弹窗标签栏（JS-only 切换，样式补全局按钮默认外观） */
+.settings-tabs{display:flex;gap:2px;border-bottom:1px solid var(--border);margin-bottom:10px;}
+.settings-tab{flex:1;padding:7px 8px;border:none;background:transparent;color:var(--text-muted);font-size:13px;border-bottom:2px solid transparent;border-radius:6px 6px 0 0;cursor:pointer;white-space:nowrap;}
+.settings-tab:hover{background:#f4f7fb;color:var(--accent);}
+.settings-tab.active{color:var(--accent);border-bottom-color:var(--accent);background:#eef3fb;}
+/* 设置-弹出菜单：两行按钮 chips 编辑器 */
+.pop-edit-list{display:flex;flex-wrap:wrap;gap:6px;padding:8px;border:1px solid var(--border);border-radius:6px;background:#fafbfd;min-height:38px;margin-top:6px;}
+.pop-edit-chip{display:inline-flex;align-items:center;gap:5px;padding:2px 3px 2px 8px;background:#fff;border:1px solid var(--border);border-radius:14px;font-size:13px;color:#1c2733;box-shadow:0 1px 2px rgba(0,0,0,.04);}
+.pop-edit-chip .pe-ico{color:var(--accent);font-weight:600;min-width:1em;text-align:center;}
+.pop-edit-chip .pe-label{line-height:1.6;}
+.pop-edit-chip .pe-acts{display:inline-flex;border-left:1px solid var(--border);margin-left:1px;padding-left:1px;}
+.pop-edit-chip .pe-act{width:20px;height:20px;padding:0;border:none;background:transparent;color:#8a97a6;font-size:11px;line-height:1;border-radius:3px;cursor:pointer;}
+.pop-edit-chip .pe-act:hover{background:#eef3fb;color:var(--accent);}
+.pop-edit-chip .pe-act[data-pe-act="del"]:hover{color:#c0392b;background:#fdeeee;}
+.pop-edit-add{display:flex;gap:8px;align-items:center;margin-top:8px;}
+.pop-edit-add select{flex:0 0 auto;min-width:180px;max-width:240px;}
 .help-table{width:100%;border-collapse:collapse;font-size:13px;}
 .help-table td{padding:4px 8px;border-bottom:1px solid var(--border);vertical-align:top;}
 .help-table td:first-child{white-space:nowrap;color:#33414f;font-weight:600;}
@@ -9316,6 +9380,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
     <button type="button" class="settings-tab active" data-tab="shortcuts">快捷键</button>
     <button type="button" class="settings-tab" data-tab="fonts">字体</button>
     <button type="button" class="settings-tab" data-tab="ui">界面</button>
+    <button type="button" class="settings-tab" data-tab="popup">弹出菜单</button>
   </div>
   <div class="settings-panels">
     <div class="settings-panel" id="panel-shortcuts">
@@ -9364,6 +9429,27 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
         格式规则应用到全部页前需确认
       </label>
       <div style="margin-top:12px;"><button type="button" id="resetUiSettingsBtn">恢复默认</button></div>
+    </div>
+    <div class="settings-panel" id="panel-popup" style="display:none;">
+      <p style="font-size:12px;color:#5a6b7c;margin:8px 0;">选中文字时弹出的快捷菜单分两行按钮，第三行是格式规则快捷按钮。每行可自由调整顺序、移出或加回按钮；改动即时生效并保存到配置文件。</p>
+      <h4 style="margin:14px 0 4px;">第一行按钮</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 2px;">▲/▼ 调整顺序，✕ 移出菜单；移出的按钮回到下方下拉框中，可随时加回。</p>
+      <div id="popupRow1List" class="pop-edit-list"></div>
+      <div class="pop-edit-add">
+        <select id="popupRow1AddSel" title="从备选操作中添加按钮到第一行"></select>
+        <button type="button" id="popupRow1AddBtn">添加</button>
+      </div>
+      <h4 style="margin:18px 0 4px;">第二行按钮</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 2px;">同上：调整顺序或移出菜单。</p>
+      <div id="popupRow2List" class="pop-edit-list"></div>
+      <div class="pop-edit-add">
+        <select id="popupRow2AddSel" title="从备选操作中添加按钮到第二行"></select>
+        <button type="button" id="popupRow2AddBtn">添加</button>
+      </div>
+      <h4 style="margin:18px 0 4px;">规则快捷按钮</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">第三行显示格式规则菜单前 N 项（设置为 0 则不显示规则按钮）。</p>
+      <label style="font-size:13px;">规则按钮数量 <input type="number" id="popupRuleCountInput" min="0" max="10" step="1" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
+      <div style="margin-top:12px;"><button type="button" id="resetPopupSettingsBtn">恢复默认</button></div>
     </div>
   </div>
   <button type="button" id="closeSettings" class="primary" style="margin-top:12px;">关闭</button>

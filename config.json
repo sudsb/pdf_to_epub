@@ -294,7 +294,26 @@
     "err_hover_delay": 500,
     "editor_font_size": 14,
     "img_mode": "",
-    "rule_all_pages_confirm": true
+    "rule_all_pages_confirm": true,
+    "popup_row1": [
+      "bold",
+      "italic",
+      "heading",
+      "p",
+      "note",
+      "paint",
+      "remove"
+    ],
+    "popup_rule_count": 5,
+    "popup_row2": [
+      "align_left",
+      "align_center",
+      "align_right",
+      "centerbold",
+      "merge",
+      "sup",
+      "sub"
+    ]
   },
   "proofread_engine": "llama",
   "mouse_shortcuts": {}

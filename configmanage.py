@@ -96,6 +96,21 @@ def _atomic_write_json(path: str, obj: dict) -> None:
         except Exception:
             pass
         raise
+# 弹出菜单（选中文字快捷菜单）可配置按钮候选池：(ui/app.js POPUP_ELIGIBLE_OPS 需与此保持同步)
+POPUP_ELIGIBLE_OPS = [
+    "bold", "italic", "underline", "strike", "highlight", "charbox", "shade",
+    "sup", "sub", "heading", "p", "remove", "note",
+    "align_left", "align_center", "align_right", "centerbold",
+    "flush", "indent", "merge",
+    "marker_full", "marker_note", "marker_join", "marker_page",
+    "paint",  # 格式刷（特殊按钮，非 OPS 项）
+]
+POPUP_ROW1_DEFAULT = ["bold", "italic", "heading", "p", "note", "paint", "remove"]
+POPUP_ROW2_DEFAULT = ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"]
+POPUP_RULE_COUNT_DEFAULT = 5
+POPUP_RULE_COUNT_MIN = 0
+POPUP_RULE_COUNT_MAX = 10
+
 DEFAULT_CONFIG = {
     "llama_server": "E:/xox/Tools/llama-c/llama-server.exe",
     "models_dir": "E:/xox/Tools/llama-c/models",
@@ -237,6 +252,10 @@ DEFAULT_CONFIG = {
         "img_mode": "",
         # 格式规则应用到全部页前是否弹确认（bool，默认 true；非 bool 输入归一为 true）
         "rule_all_pages_confirm": True,
+        # 弹出菜单（选中文字快捷菜单）行1/行2按钮配置 + 行3规则按钮数量（2026-09）
+        "popup_row1": POPUP_ROW1_DEFAULT,
+        "popup_row2": POPUP_ROW2_DEFAULT,
+        "popup_rule_count": POPUP_RULE_COUNT_DEFAULT,
     },
     # 图片预处理（2026-08，OpenCV）：PDF 分割图片时启用，提高 OCR 识别率。
     # enabled 开关；gray 灰度 / denoise 中值去噪 / sharpen 锐化 / binarize 自适应二值化；
@@ -740,6 +759,40 @@ def set_ui_settings(ui: dict) -> dict:
         # 类型归一：非 bool 输入统一回退 true（与既有数值/枚举键 clamp 写法一致）
         v = ui["rule_all_pages_confirm"]
         clean["rule_all_pages_confirm"] = v if isinstance(v, bool) else True
+    if "popup_row1" in ui:
+        # 弹出菜单第一行按钮：仅接受全为候选池内字符串的无重复小列表；
+        # 结构性非法（非列表/含非法项/重复/超长）→ 回退默认，合法空列表保留。
+        v = ui["popup_row1"]
+        if (
+            isinstance(v, list)
+            and all(isinstance(x, str) and x in POPUP_ELIGIBLE_OPS for x in v)
+            and len(v) == len(set(v))
+            and len(v) <= 25
+        ):
+            clean["popup_row1"] = list(v)
+        else:
+            clean["popup_row1"] = list(POPUP_ROW1_DEFAULT)
+    if "popup_row2" in ui:
+        v = ui["popup_row2"]
+        if (
+            isinstance(v, list)
+            and all(isinstance(x, str) and x in POPUP_ELIGIBLE_OPS for x in v)
+            and len(v) == len(set(v))
+            and len(v) <= 25
+        ):
+            clean["popup_row2"] = list(v)
+        else:
+            clean["popup_row2"] = list(POPUP_ROW2_DEFAULT)
+    if "popup_rule_count" in ui:
+        v = ui["popup_rule_count"]
+        if (
+            isinstance(v, int)
+            and not isinstance(v, bool)
+            and POPUP_RULE_COUNT_MIN <= v <= POPUP_RULE_COUNT_MAX
+        ):
+            clean["popup_rule_count"] = v
+        else:
+            clean["popup_rule_count"] = POPUP_RULE_COUNT_DEFAULT
     with _CFG_LOCK:
         try:
             if os.path.exists(_CONFIG_PATH):

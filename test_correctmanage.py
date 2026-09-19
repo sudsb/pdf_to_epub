@@ -6790,14 +6790,33 @@ class TestUiSettingsEndpoint(unittest.TestCase):
     def test_get_returns_ui_settings(self):
         import requests
 
-        self._patch_cfg({"tip_delay": 500, "err_hover_delay": 1000, "editor_font_size": 16, "img_mode": "full"})
+        self._patch_cfg(
+            {
+                "tip_delay": 500,
+                "err_hover_delay": 1000,
+                "editor_font_size": 16,
+                "img_mode": "full",
+                "popup_row1": ["bold", "p"],
+                "popup_row2": ["note"],
+                "popup_rule_count": 3,
+            }
+        )
         server, base = self._start()
         try:
             res = requests.get(base + "/api/ui_settings").json()
             self.assertTrue(res["ok"])
             self.assertEqual(
                 res["ui_settings"],
-                {"tip_delay": 500, "err_hover_delay": 1000, "editor_font_size": 16, "img_mode": "full", "rule_all_pages_confirm": True},
+                {
+                    "tip_delay": 500,
+                    "err_hover_delay": 1000,
+                    "editor_font_size": 16,
+                    "img_mode": "full",
+                    "rule_all_pages_confirm": True,
+                    "popup_row1": ["bold", "p"],
+                    "popup_row2": ["note"],
+                    "popup_rule_count": 3,
+                },
             )
         finally:
             self._stop(server)
@@ -6810,10 +6829,19 @@ class TestUiSettingsEndpoint(unittest.TestCase):
         try:
             res = requests.get(base + "/api/ui_settings").json()
             self.assertTrue(res["ok"])
-            # All five keys present with default values
+            # All eight keys present with default values
             self.assertEqual(
                 res["ui_settings"],
-                {"tip_delay": 600, "err_hover_delay": 1500, "editor_font_size": 14, "img_mode": "", "rule_all_pages_confirm": True},
+                {
+                    "tip_delay": 600,
+                    "err_hover_delay": 1500,
+                    "editor_font_size": 14,
+                    "img_mode": "",
+                    "rule_all_pages_confirm": True,
+                    "popup_row1": ["bold", "italic", "heading", "p", "note", "paint", "remove"],
+                    "popup_row2": ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"],
+                    "popup_rule_count": 5,
+                },
             )
         finally:
             self._stop(server)
@@ -7015,6 +7043,157 @@ class TestUiSettingsEndpoint(unittest.TestCase):
         finally:
             self._stop(server)
 
+    def test_get_popup_defaults(self):
+        import requests
+
+        self._patch_cfg({})  # 空 ui_settings → 三个弹窗键全部回退默认
+        server, base = self._start()
+        try:
+            res = requests.get(base + "/api/ui_settings").json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(
+                res["ui_settings"]["popup_row1"],
+                ["bold", "italic", "heading", "p", "note", "paint", "remove"],
+            )
+            self.assertEqual(
+                res["ui_settings"]["popup_row2"],
+                ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"],
+            )
+            self.assertEqual(res["ui_settings"]["popup_rule_count"], 5)
+        finally:
+            self._stop(server)
+
+    def test_post_popup_valid_round_trip(self):
+        import json as _json
+
+        import configmanage
+        import requests
+
+        # 真实持久化（临时 _CONFIG_PATH），验证 POST → GET 往返
+        tmp = tempfile.mkdtemp(prefix="ptoe_uis_")
+        path = str(Path(tmp) / "config.json")
+        orig_path = configmanage._CONFIG_PATH
+        configmanage._CONFIG_PATH = path
+        self.addCleanup(lambda: setattr(configmanage, "_CONFIG_PATH", orig_path))
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump({"model_choices": {}, "selected_model": None}, f)
+
+        server, base = self._start()
+        try:
+            payload = {
+                "ui_settings": {
+                    "popup_row1": ["bold", "p"],
+                    "popup_row2": ["note"],
+                    "popup_rule_count": 3,
+                }
+            }
+            res = requests.post(base + "/api/ui_settings", data=_json.dumps(payload)).json()
+            self.assertTrue(res["ok"])
+            res = requests.get(base + "/api/ui_settings").json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["ui_settings"]["popup_row1"], ["bold", "p"])
+            self.assertEqual(res["ui_settings"]["popup_row2"], ["note"])
+            self.assertEqual(res["ui_settings"]["popup_rule_count"], 3)
+        finally:
+            self._stop(server)
+
+    def test_post_popup_row_invalid_op_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"popup_row1": ["bold", "not_an_op"]}}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("弹出菜单第一行按钮配置无效", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+    def test_post_popup_row_not_list_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"popup_row2": "bold"}}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("弹出菜单第二行按钮配置无效", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+    def test_post_popup_row_duplicates_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"popup_row1": ["bold", "bold"]}}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("弹出菜单第一行按钮配置无效", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+    def test_post_popup_rule_count_invalid_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            for bad in (-1, 11, "5", True, None):
+                with self.subTest(bad=bad):
+                    res = requests.post(
+                        base + "/api/ui_settings",
+                        data=_json.dumps({"ui_settings": {"popup_rule_count": bad}}),
+                    ).json()
+                    self.assertFalse(res["ok"])
+                    self.assertIn("弹出菜单规则按钮数量无效", res["error"])
+                    self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+    def test_post_popup_paint_allowed(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"popup_row1": ["paint"]}}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(calls, [{"popup_row1": ["paint"]}])
+        finally:
+            self._stop(server)
+
 
 class TestSetShortcutsConfig(unittest.TestCase):
     """configmanage.set_shortcuts：原子写 + 无变更不写盘。"""
@@ -7183,8 +7362,59 @@ class TestSetUiSettingsConfig(unittest.TestCase):
         patched = self.cm.validate_and_patch_config({"llama_server": "x", "models_dir": "y"})
         self.assertEqual(
             patched["ui_settings"],
-            {"tip_delay": 600, "err_hover_delay": 1500, "editor_font_size": 14, "img_mode": "", "rule_all_pages_confirm": True},
+            {
+                "tip_delay": 600,
+                "err_hover_delay": 1500,
+                "editor_font_size": 14,
+                "img_mode": "",
+                "rule_all_pages_confirm": True,
+                "popup_row1": ["bold", "italic", "heading", "p", "note", "paint", "remove"],
+                "popup_row2": ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"],
+                "popup_rule_count": 5,
+            },
         )
+
+    def test_popup_defensive_fallback(self):
+        # 结构性非法（非列表 / 含非法项 / 越界数值 / 布尔）→ 回退默认
+        cfg = self.cm.set_ui_settings({"popup_row1": "bold"})
+        self.assertEqual(
+            cfg["ui_settings"]["popup_row1"],
+            ["bold", "italic", "heading", "p", "note", "paint", "remove"],
+        )
+        cfg = self.cm.set_ui_settings({"popup_row2": ["bogus", "note"]})
+        self.assertEqual(
+            cfg["ui_settings"]["popup_row2"],
+            ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"],
+        )
+        cfg = self.cm.set_ui_settings({"popup_row1": ["bold", "bold"]})  # 重复
+        self.assertEqual(
+            cfg["ui_settings"]["popup_row1"],
+            ["bold", "italic", "heading", "p", "note", "paint", "remove"],
+        )
+        for bad in (99, -1, True, "5", None):
+            cfg = self.cm.set_ui_settings({"popup_rule_count": bad})
+            self.assertEqual(cfg["ui_settings"]["popup_rule_count"], 5)
+        # 合法精简列表保留；合法空列表保留
+        cfg = self.cm.set_ui_settings(
+            {"popup_row1": ["bold", "p"], "popup_row2": ["note"], "popup_rule_count": 3}
+        )
+        self.assertEqual(cfg["ui_settings"]["popup_row1"], ["bold", "p"])
+        self.assertEqual(cfg["ui_settings"]["popup_row2"], ["note"])
+        self.assertEqual(cfg["ui_settings"]["popup_rule_count"], 3)
+        cfg = self.cm.set_ui_settings({"popup_row1": []})
+        self.assertEqual(cfg["ui_settings"]["popup_row1"], [])
+
+    def test_popup_defaults_match_current_layout(self):
+        # 稳定性守卫：默认值与矫正界面弹出菜单当前硬编码布局一致
+        from configmanage import (
+            POPUP_ROW1_DEFAULT,
+            POPUP_ROW2_DEFAULT,
+            POPUP_RULE_COUNT_DEFAULT,
+        )
+
+        self.assertEqual(POPUP_ROW1_DEFAULT, ["bold", "italic", "heading", "p", "note", "paint", "remove"])
+        self.assertEqual(POPUP_ROW2_DEFAULT, ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"])
+        self.assertEqual(POPUP_RULE_COUNT_DEFAULT, 5)
 
 
 class TestConfigEndpoint(unittest.TestCase):

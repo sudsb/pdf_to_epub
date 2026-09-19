@@ -106,11 +106,21 @@ function errHoverDelay() { return uiv('err_hover_delay', 1500); }
 // 设置「界面」页偏好：服务端持久化到 config.json（/api/ui_settings）。
 // correct_pages 每运行随机端口 → localStorage 按 origin 隔离每次失效，
 // 故以内存 uiSettings 为准、服务端为准，localStorage 仅作加载前的同步兜底。
-const UI_SETTINGS_DEFAULTS = { tip_delay: 600, err_hover_delay: 1500, editor_font_size: 14, img_mode: '', rule_all_pages_confirm: true };
+// 弹出菜单可选操作池（与后端 correctmanage.POPUP_ELIGIBLE_OPS 保持一致；paint = 格式刷，不在 OPS 数组中）
+const POPUP_ELIGIBLE_OPS = ['bold','italic','underline','strike','highlight','charbox','shade','sup','sub','heading','p','remove','note','align_left','align_center','align_right','centerbold','flush','indent','merge','marker_full','marker_note','marker_join','marker_page','paint'];
+const UI_SETTINGS_DEFAULTS = { tip_delay: 600, err_hover_delay: 1500, editor_font_size: 14, img_mode: '', rule_all_pages_confirm: true,
+  popup_row1: ['bold','italic','heading','p','note','paint','remove'],
+  popup_row2: ['align_left','align_center','align_right','centerbold','merge','sup','sub'],
+  popup_rule_count: 5 };
 let uiSettings = null; // 服务端加载前为 null → 读 localStorage 兜底；加载后为完整对象
 function uiv(key, def) {
   if (uiSettings && key in uiSettings && uiSettings[key] !== undefined && uiSettings[key] !== null) return uiSettings[key];
   const lk = key === 'editor_font_size' ? 'ptoe_font_size' : 'ptoe_' + key;
+  // 弹出菜单行是数组：localStorage 兜底须按 JSON 解析（loadInt 只适合数值键）
+  if (key === 'popup_row1' || key === 'popup_row2') {
+    try { const v = JSON.parse(localStorage.getItem(lk) || 'null'); if (Array.isArray(v)) return v; } catch (e) {}
+    return def;
+  }
   return loadInt(lk, def);
 }
 // 布尔型 UI 偏好读取（uiSettings 优先，localStorage '1'/'0'/'true'/'false' 兜底）
@@ -134,6 +144,7 @@ async function loadUiSettingsFromServer() {
       document.getElementById('errHoverDelayInput').value = uiSettings.err_hover_delay;
       const rac = document.getElementById('ruleAllPagesConfirm');
       if (rac) rac.checked = !!uiSettings.rule_all_pages_confirm;
+      if (document.getElementById('popupRow1List')) initPopupSettings(); // 弹出菜单编辑器同步
     }
   } catch (e) { console.warn('loadUiSettingsFromServer failed: ' + e.message); }
 }
@@ -144,6 +155,9 @@ function saveUIMirror() {
     localStorage.setItem('ptoe_font_size', String(uiSettings.editor_font_size));
     localStorage.setItem('ptoe_img_mode', String(uiSettings.img_mode));
     localStorage.setItem('ptoe_rule_all_pages_confirm', uiSettings.rule_all_pages_confirm ? '1' : '0');
+    localStorage.setItem('ptoe_popup_row1', JSON.stringify(uiSettings.popup_row1 || UI_SETTINGS_DEFAULTS.popup_row1));
+    localStorage.setItem('ptoe_popup_row2', JSON.stringify(uiSettings.popup_row2 || UI_SETTINGS_DEFAULTS.popup_row2));
+    localStorage.setItem('ptoe_popup_rule_count', String(uiSettings.popup_rule_count != null ? uiSettings.popup_rule_count : UI_SETTINGS_DEFAULTS.popup_rule_count));
   } catch (e) {}
 }
 function saveUiSettings() {
@@ -3188,12 +3202,33 @@ function _makePopBtn(op) {
   });
   return b;
 }
-function buildPopup() {
-  popup.innerHTML = '';
-  // Row1：格式按钮 + 格式刷
-  const row1Ops = ['bold','italic','heading','p','remove','note'];
-  row1Ops.forEach(function(op) { popup.appendChild(_makePopBtn(op)); });
-  // 格式刷（单次模式）
+// 弹出菜单行配置归一化：只保留合法操作（与后端 POPUP_ELIGIBLE_OPS 同步，剔除历史脏值）、截断防超长
+function normalizePopupRow(list) {
+  if (!Array.isArray(list)) return [];
+  return list.filter(function (op) { return POPUP_ELIGIBLE_OPS.indexOf(op) !== -1; }).slice(0, 25);
+}
+// 规则快捷按钮数量：0-10 整数，非法（含 NaN/空）回退 5
+function normalizeRuleCount(v) {
+  var n = parseInt(v, 10);
+  if (isNaN(n)) n = 5;
+  return Math.max(0, Math.min(10, n));
+}
+// 弹出菜单操作的中文名（paint = 格式刷，不在 OPS 数组中，特例处理）
+function popupOpLabel(op) {
+  if (op === 'paint') return '格式刷';
+  for (var i = 0; i < OPS.length; i++) { if (OPS[i][0] === op) return OPS[i][1]; }
+  return op;
+}
+// 弹出菜单操作的按钮字形（OP_ICON 用 <span class="ic-*"> 包裹的部分取纯文本）
+function popupOpIcon(op) {
+  if (op === 'paint') return '刷';
+  var ic = OP_ICON[op];
+  if (ic) return String(ic).replace(/<[^>]*>/g, '');
+  return popupOpLabel(op).charAt(0);
+}
+// 格式刷按钮（id=popPaint，单次模式，Word 风格）：从 buildPopup 抽出以支持两行可配置复用。
+// 语义与旧版一致：点击 → paintActive ? applyPaint() : activatePaint()，mouseenter/leave 走提示。
+function _makePaintBtn() {
   const paintBtn = document.createElement('button');
   paintBtn.type = 'button'; paintBtn.className = 'pop-btn'; paintBtn.id = 'popPaint';
   paintBtn.textContent = '刷';
@@ -3207,15 +3242,32 @@ function buildPopup() {
     suppressPopupUntil = performance.now() + 250;
     if (paintActive) applyPaint(); else activatePaint();
   });
-  popup.appendChild(paintBtn);
-  // 分隔
-  const sep1 = document.createElement('div'); sep1.className = 'sep'; popup.appendChild(sep1);
-  // Row2：对齐 + 中粗 + 合并 + 上标/下标（2026-09：上标/下标位于「合」之后，经 applyOp→applyInlineClass 走 ptoe-sup/ptoe-sub toggle）
-  const row2Ops = ['align_left','align_center','align_right','centerbold','merge','sup','sub'];
-  row2Ops.forEach(function(op) { popup.appendChild(_makePopBtn(op)); });
-  // 分隔
-  const sep2 = document.createElement('div'); sep2.className = 'sep'; popup.appendChild(sep2);
-  // Row3：规则按钮 + 内联规则快捷按钮（最多5个，单行显示，优先显示 pinned 规则）
+  return paintBtn;
+}
+function buildPopup() {
+  popup.innerHTML = '';
+  // 行内容来自 ui_settings（popup_row1/popup_row2 可调顺序、增删；popup_rule_count 控第三行规则快捷数）。
+  // 默认配置下与旧版逐字节一致：Row1 = 格式 5 钮 + 刷 + 清；Row2 = 对齐/中粗/合/上标/下标；Row3 = 规 + 5 个规则快捷钮。
+  const row1 = normalizePopupRow(uiv('popup_row1', UI_SETTINGS_DEFAULTS.popup_row1));
+  const row2 = normalizePopupRow(uiv('popup_row2', UI_SETTINGS_DEFAULTS.popup_row2));
+  const nRules = normalizeRuleCount(uiv('popup_rule_count', UI_SETTINGS_DEFAULTS.popup_rule_count));
+  const renderRow = function (ops) {
+    ops.forEach(function (op) {
+      if (op === 'paint') popup.appendChild(_makePaintBtn());
+      else popup.appendChild(_makePopBtn(op));
+    });
+  };
+  const addSep = function () {
+    const s = document.createElement('div'); s.className = 'sep'; popup.appendChild(s);
+  };
+  // 只在相邻出现的非空行之间插分隔线：用户清空某行后不残留孤立分隔线或顶部空隙
+  if (row1.length) renderRow(row1);
+  if (row1.length && row2.length) addSep();
+  if (row2.length) renderRow(row2);
+  if ((row1.length || row2.length) && nRules > 0) addSep();
+  // Row3：规则按钮 + 内联规则快捷按钮（最多 nRules 个，单行显示，优先显示 pinned 规则）。
+  // 规则数量为 0 → 整行不渲染（无「规」按钮、无快捷按钮）。
+  if (nRules <= 0) return;
   const ruleWrap = document.createElement('div');
   ruleWrap.className = 'pop-rule-wrap';
   const ruleBtn = document.createElement('button');
@@ -3223,17 +3275,17 @@ function buildPopup() {
   ruleBtn.textContent = '规'; ruleBtn.title = '应用格式规则';
   ruleBtn.setAttribute('aria-label', '应用格式规则');
   ruleWrap.appendChild(ruleBtn);
-  // Fetch rules and render up to 5 buttons (pinned first)
+  // Fetch rules and render up to nRules buttons (pinned first)
   fetchJSON('/api/format_rules').then(function (res) {
     const rules = (res && res.rules) || [];
     if (!rules.length) return;
-    // Select rules to show: pinned ones first, up to 5; if none pinned, then first 5 rules.
+    // Select rules to show: pinned ones first, up to nRules; if none pinned, then first nRules rules.
     const pinnedRules = rules.filter(function (rule) { return rule.pin === true; });
     let rulesToShow;
     if (pinnedRules.length > 0) {
-      rulesToShow = pinnedRules.slice(0, 5);
+      rulesToShow = pinnedRules.slice(0, nRules);
     } else {
-      rulesToShow = rules.slice(0, 5);
+      rulesToShow = rules.slice(0, nRules);
     }
     rulesToShow.forEach(function (rule) {
       const btn = document.createElement('button');
@@ -3954,9 +4006,17 @@ function _focusMidTarget(ed, x, y) {
       if (p) { range = document.createRange(); range.setStart(p.offsetNode, p.offset); range.collapse(true); }
     }
     if (range && ed.contains(range.startContainer)) {
-      const sel = window.getSelection();
-      sel.removeAllRanges();
-      sel.addRange(range);
+      // 仅当落点解析到编辑区内的真实块（p/div/h1-h6）时才移动光标；落点在块间空隙
+      // /编辑区根部（closest 命中 ed 自身）时不移动，保持原光标。否则折叠选区落在根部
+      // 会让 applyToSelectedBlocks 的 startBlock===ed → 恒收集整页所有块，格式溢出到
+      // 无关段落（含“下一段”被误格式化）。
+      const el = range.startContainer.nodeType === 3 ? range.startContainer.parentElement : range.startContainer;
+      const blk = el && el.closest ? el.closest('p,div,h1,h2,h3,h4,h5,h6') : null;
+      if (blk && blk !== ed && ed.contains(blk)) {
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
     }
   } catch (e) { /* 定位失败时保持原光标 */ }
 }
@@ -4018,7 +4078,10 @@ document.addEventListener('mouseup', (e) => {
     runOp(op);
     return;
   }
-  _focusMidTarget(g0.ed, e.clientX, e.clientY);
+  // 目标段落按「中键按下点」解析（用户瞄准的地方），而非 mouseup 释放点：滑动手势
+  // 释放点相对按下点位移 ≥30px，可能越过段落边界（下划落进下一段/上划落进上一段）
+  // ——按释放点定位会把格式落到相邻段落（“光标在当前段落、下一段却被格式化”根因）。
+  _focusMidTarget(g0.ed, g0.x, g0.y);
   runOp(op);
 });
 
@@ -6529,8 +6592,72 @@ function openSettings() {
   document.querySelector('.settings-tab[data-tab="shortcuts"]').classList.add('active');
   document.querySelectorAll('.settings-panel').forEach(p => p.style.display = 'none');
   document.getElementById('panel-shortcuts').style.display = 'block';
+  initPopupSettings();
 }
 function closeSettings() { capturingOp = null; mouseCapturingOp = null; document.getElementById('modalBg').style.display = 'none'; }
+
+// ---------- 设置-弹出菜单：第一/二行按钮序列 + 第三行规则快捷数量 ----------
+// 编辑态与 uiSettings 分离：chips 操作只改编辑态，随改随存（savePopupSettings → saveUiSettings）。
+let popupRow1Edit = [];   // 编辑态第一行操作序列
+let popupRow2Edit = [];   // 编辑态第二行操作序列
+let popupRuleCountEdit = 5;
+function initPopupSettings() {
+  popupRow1Edit = normalizePopupRow(uiv('popup_row1', UI_SETTINGS_DEFAULTS.popup_row1));
+  popupRow2Edit = normalizePopupRow(uiv('popup_row2', UI_SETTINGS_DEFAULTS.popup_row2));
+  popupRuleCountEdit = normalizeRuleCount(uiv('popup_rule_count', UI_SETTINGS_DEFAULTS.popup_rule_count));
+  renderPopupEditors();
+}
+// 备选池：合法操作中两行均未使用的（同一操作不允许出现在两行 → 无重复）
+function _popEditPool() {
+  const used = new Set(popupRow1Edit.concat(popupRow2Edit));
+  return POPUP_ELIGIBLE_OPS.filter(function (op) { return !used.has(op); });
+}
+function renderPopupEditors() {
+  const renderList = function (listId, ops) {
+    const list = document.getElementById(listId);
+    if (!list) return;
+    list.innerHTML = '';
+    ops.forEach(function (op) {
+      const chip = document.createElement('div');
+      chip.className = 'pop-edit-chip'; chip.dataset.op = op;
+      chip.innerHTML = '<span class="pe-ico">' + esc(popupOpIcon(op)) + '</span>' +
+        '<span class="pe-label">' + esc(popupOpLabel(op)) + '</span>' +
+        '<span class="pe-acts">' +
+        '<button type="button" class="pe-act" data-pe-act="up" title="上移" aria-label="上移">▲</button>' +
+        '<button type="button" class="pe-act" data-pe-act="down" title="下移" aria-label="下移">▼</button>' +
+        '<button type="button" class="pe-act" data-pe-act="del" title="移出菜单" aria-label="移出菜单">✕</button>' +
+        '</span>';
+      list.appendChild(chip);
+    });
+  };
+  renderList('popupRow1List', popupRow1Edit);
+  renderList('popupRow2List', popupRow2Edit);
+  const pool = _popEditPool();
+  [['popupRow1AddSel', 'popupRow1AddBtn'], ['popupRow2AddSel', 'popupRow2AddBtn']].forEach(function (pair) {
+    const sel = document.getElementById(pair[0]);
+    const btn = document.getElementById(pair[1]);
+    if (sel) {
+      sel.innerHTML = '';
+      pool.forEach(function (op) {
+        const opt = document.createElement('option');
+        opt.value = op;
+        const ic = popupOpIcon(op), lb = popupOpLabel(op);
+        opt.textContent = (ic && ic !== lb) ? ic + ' ' + lb : lb;
+        sel.appendChild(opt);
+      });
+      if (btn) btn.disabled = !pool.length; // 池空 → 添加按钮禁用
+    }
+  });
+  const rc = document.getElementById('popupRuleCountInput');
+  if (rc) rc.value = popupRuleCountEdit;
+}
+function savePopupSettings() {
+  if (!uiSettings) return;
+  uiSettings.popup_row1 = popupRow1Edit.slice();
+  uiSettings.popup_row2 = popupRow2Edit.slice();
+  uiSettings.popup_rule_count = popupRuleCountEdit;
+  saveUiSettings();
+}
 
 async function loadFontSettings() {
   try {
@@ -7212,6 +7339,59 @@ document.getElementById('resetUiSettingsBtn').addEventListener('click', () => {
   if (rac) rac.checked = true;
   applyFontSize(uiSettings.editor_font_size);
   showToast('界面设置已恢复默认', 'ok');
+});
+// 设置-弹出菜单：chips 事件委托（不逐按钮绑监听，避免每次重渲染泄漏）
+['popupRow1List', 'popupRow2List'].forEach(function (listId) {
+  const list = document.getElementById(listId);
+  if (!list) return;
+  list.addEventListener('click', function (e) {
+    const t = e.target;
+    if (!t || t.tagName !== 'BUTTON') return;
+    const chipEl = t.closest('.pop-edit-chip');
+    if (!chipEl) return;
+    const op = chipEl.dataset.op;
+    const row = listId === 'popupRow1List' ? popupRow1Edit : popupRow2Edit;
+    const idx = row.indexOf(op);
+    if (idx < 0) return;
+    const act = t.getAttribute('data-pe-act');
+    if (act === 'up' && idx > 0) { row.splice(idx, 1); row.splice(idx - 1, 0, op); }
+    else if (act === 'down' && idx < row.length - 1) { row.splice(idx, 1); row.splice(idx + 1, 0, op); }
+    else if (act === 'del') { row.splice(idx, 1); }
+    else return;
+    savePopupSettings();
+    renderPopupEditors();
+  });
+});
+// 设置-弹出菜单：添加按钮 → 把备选池中选中项追加到对应行末尾
+[['popupRow1AddSel', 'popupRow1AddBtn', 'popupRow1Edit'], ['popupRow2AddSel', 'popupRow2AddBtn', 'popupRow2Edit']].forEach(function (cfg) {
+  const sel = document.getElementById(cfg[0]);
+  const btn = document.getElementById(cfg[1]);
+  if (!sel || !btn) return;
+  btn.addEventListener('click', function () {
+    const op = sel.value;
+    const row = cfg[2] === 'popupRow1Edit' ? popupRow1Edit : popupRow2Edit;
+    if (!op || row.indexOf(op) !== -1) return;
+    row.push(op);
+    savePopupSettings();
+    renderPopupEditors();
+  });
+});
+// 设置-弹出菜单：规则快捷按钮数量（0-10，留空/非法回退 5，改后即存）
+const _popRuleCountInput = document.getElementById('popupRuleCountInput');
+if (_popRuleCountInput) _popRuleCountInput.addEventListener('change', function (e) {
+  popupRuleCountEdit = normalizeRuleCount(e.target.value);
+  _popRuleCountInput.value = popupRuleCountEdit;
+  savePopupSettings();
+});
+// 设置-弹出菜单：恢复默认（回到 UI_SETTINGS_DEFAULTS 三键并立即生效下一处选区）
+const _resetPopupBtn = document.getElementById('resetPopupSettingsBtn');
+if (_resetPopupBtn) _resetPopupBtn.addEventListener('click', function () {
+  popupRow1Edit = UI_SETTINGS_DEFAULTS.popup_row1.slice();
+  popupRow2Edit = UI_SETTINGS_DEFAULTS.popup_row2.slice();
+  popupRuleCountEdit = UI_SETTINGS_DEFAULTS.popup_rule_count;
+  savePopupSettings();
+  renderPopupEditors();
+  showToast('弹出菜单设置已恢复默认', 'ok');
 });
 // 字体设置保存
 ['fontBody','fontHeading','fontNote','fontCitation'].forEach(id => {
