@@ -121,19 +121,48 @@ _NOTE_CLASS = "ptoe-note"
 _ALIGN_CLASSES = {"ptoe-align-center", "ptoe-align-left", "ptoe-align-right"}
 # 行内对齐样式正则：style="text-align:left|center|right"（含空格容忍）
 _ALIGN_STYLE_RE = re.compile(r"text-align\s*:\s*(left|center|right)\s*(?:;|$)")
-# 行内格式类白名单：note/citation 等由规则引擎产生的行内 span 类
-_INLINE_FORMAT_CLASSES = {
-    "ptoe-note",
-    "ptoe-citation",
-    "ptoe-underline",
-    "ptoe-underdot",
-    "ptoe-strike",
-    "ptoe-charbox",
-    "ptoe-shade",
-    "ptoe-highlight",
-    "ptoe-sup",
-    "ptoe-sub",
+
+# ---------------------------------------------------------------------------
+# 行内格式「不静默丢失」归一（2026-09-16）
+#
+# 症状：某一句/某几个字在界面上设置了「文字包围」（下划线/删除线/上标/下标…），
+#      编辑器里显示正常，但保存或导出 EPUB 后效果消失。
+# 根因：多条链路会产出**不在白名单里的原生/外部标签**（浏览器原生
+#      execCommand('underline'/'strikeThrough'/'superscript'/'subscript')、
+#      粘贴自 Word/网页的 HTML），sanitize_html 只保留白名单标签，于是这些
+#      格式被静默丢弃——界面（未清洗的 DOM）看得到，落盘与导出（清洗后）没有。
+# 归一：把这些标签/样式折成应用自身的行内格式类（CSS 已在矫正界面与 EPUB 样式表
+#      中定义），格式因此全程可保留。
+# ---------------------------------------------------------------------------
+_ALIAS_INLINE_TAGS = {
+    "u": "ptoe-underline",
+    "s": "ptoe-strike",
+    "strike": "ptoe-strike",
+    "del": "ptoe-strike",
+    "sup": "ptoe-sup",
+    "sub": "ptoe-sub",
+    "mark": "ptoe-highlight",
 }
+# 外部行内样式 → 等价格式类（顺序即优先级；循环会追加每个命中 pattern 的类，
+# 故 underline 的实线 pattern 用负向前瞻排除 dotted/dashed/double/wavy 变体，
+# 避免 text-decoration 虚线（下加点）同时折出 ptoe-underdot + ptoe-underline 两个类 —— 2026-09-19）
+_STYLE_TO_INLINE_CLASS = (
+    # 下加点（dotted 变体优先匹配，互斥于实线下划线）
+    (re.compile(r"text-decoration[^;]*\bdotted\b", re.IGNORECASE), "ptoe-underdot"),
+    (re.compile(r"text-decoration[^;]*\bunderline\b(?!\s*(?:dotted|dashed|double|wavy))", re.IGNORECASE), "ptoe-underline"),
+    (re.compile(r"text-decoration[^;]*line-through", re.IGNORECASE), "ptoe-strike"),
+    (re.compile(r"vertical-align\s*:\s*super", re.IGNORECASE), "ptoe-sup"),
+    (re.compile(r"vertical-align\s*:\s*sub\b", re.IGNORECASE), "ptoe-sub"),
+    # 背景色无法区分底纹/突显，统一折为突显（有颜色总比被丢弃更接近用户意图）
+    (re.compile(r"background(?:-color)?\s*:", re.IGNORECASE), "ptoe-highlight"),
+)
+# font color 取值白名单（#rrggbb / 颜色名），其余丢弃
+_COLOR_VALUE_RE = re.compile(r"^#[0-9a-fA-F]{3,8}$|^[a-zA-Z]{3,20}$")
+# 行内格式类白名单：note/citation 等由规则引擎产生的行内 span 类 + 8 种统一行内包装格式
+# （单一事实来源 = rulemanage.INLINE_FORMAT_CLASSES；2026-09-19 防漂移）
+_INLINE_FORMAT_CLASSES = {"ptoe-note", "ptoe-citation"} | set(
+    getattr(rulemanage, "INLINE_FORMAT_CLASSES", ()) or ()
+)
 
 # 块级标签：p / h1-6 / div。div 与 sanitize_html 的处理保持一致（统一按 <p> 处理）：
 # 若把 <div> 当行内内容，未清洗数据（历史版本/外部直接调用 apply_markers）会被
@@ -270,6 +299,20 @@ def _clean_format_ops(value) -> list:
     return seen
 
 
+def _regex_valid(pattern: str) -> bool:
+    """条件正则合法性：与规则引擎同一编译口径。
+
+    必须复用 rulemanage.compile_pattern（而不是裸 re.compile），否则
+    `/pattern/flags` 写法（USAGE.md 中文档化的写法，如 `/^(〔\\d+〕)/m`）
+    会被误判为非法 → 整条条件被静默丢弃，用户看到"规则保存了却不生效"。
+    """
+    try:
+        rulemanage.compile_pattern(pattern)
+    except Exception:  # noqa: BLE001 — re.error 以及危险模式拦截
+        return False
+    return True
+
+
 def _validate_format_rules(rules) -> list:
     """校验前端提交的格式规则列表；非法项丢弃，返回干净列表。
 
@@ -310,11 +353,8 @@ def _validate_format_rules(rules) -> list:
                     scope = "selection"
                 if not pattern:
                     continue  # 启用了条件但没写内容：整条丢弃（与旧行为一致）
-                if ctype == "regex":
-                    try:
-                        re.compile(pattern)
-                    except re.error:
-                        continue  # 非法正则：整条丢弃
+                if ctype == "regex" and not _regex_valid(pattern):
+                    continue  # 非法正则：整条丢弃（支持 /pattern/flags 写法）
                 conditions.append(
                     {
                         "type": ctype,
@@ -350,11 +390,8 @@ def _validate_format_rules(rules) -> list:
                 scope = str(c.get("scope") or "selection")
                 if scope not in ("selection", "paragraph", "page", "all_pages"):
                     scope = "selection"
-                if ctype == "regex" and pattern:
-                    try:
-                        re.compile(pattern)
-                    except re.error:
-                        continue  # 非法正则：该条件丢弃
+                if ctype == "regex" and pattern and not _regex_valid(pattern):
+                    continue  # 非法正则：该条件丢弃（支持 /pattern/flags 写法）
                 # target: 匹配对象——决定格式作用于匹配文本/之前/之后/两条件之间
                 target = str(c.get("target") or "match")
                 if target not in ("match", "before", "after", "between"):
@@ -368,11 +405,8 @@ def _validate_format_rules(rules) -> list:
                 }
                 if target == "between":
                     between_end = str(c.get("between_end_pattern") or "")
-                    if between_end and ctype == "regex":
-                        try:
-                            re.compile(between_end)
-                        except re.error:
-                            between_end = ""  # 非法正则：清空
+                    if between_end and ctype == "regex" and not _regex_valid(between_end):
+                        between_end = ""  # 非法正则：清空（支持 /pattern/flags 写法）
                     cond_d["between_end_pattern"] = between_end
                 # 正则条件可携带 group_formats：每个捕获组独立格式列表
                 if ctype == "regex" and isinstance(c.get("group_formats"), list):
@@ -414,6 +448,27 @@ def _validate_format_rules(rules) -> list:
         if "pin" in r:  # only include if present in input (even if False)
             rule_out["pin"] = pin_val
         out.append(rule_out)
+    return out
+
+
+def _filter_rules_selection_only(rules: list) -> list:
+    """过滤规则列表：仅保留 scope=selection 的条件，丢弃其余条件的规则。
+
+    用于 sel_ranges 多区间选区的后续区间——page/paragraph 作用域条件已在首个区间
+    完整应用，后续区间重复应用会导致双重包裹（<strong><strong>）。
+    空条件列表的规则保留（rule_id/mode 语义不变，引擎视为空操作）。
+    """
+    out: list[dict] = []
+    for r in rules:
+        if not isinstance(r, dict):
+            continue
+        filtered_conds = [
+            c for c in r.get("conditions", [])
+            if isinstance(c, dict) and c.get("scope", "selection") == "selection"
+        ]
+        r_copy = dict(r)
+        r_copy["conditions"] = filtered_conds
+        out.append(r_copy)
     return out
 
 
@@ -1154,16 +1209,19 @@ class _Sanitizer(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.blocks: list[str] = []
         self.buf: list[str] = []
-        self.stack: list[str] = []  # 未闭合的行内标签（strong/em/span）
+        self.stack: list[tuple[str, str]] = []  # 未闭合的行内标签 [(名, 原开标签)]
         self.block: tuple[str, int] | None = None  # ('p', 0) | ('h', level)
         self.classes: list[str] = []  # 当前块保留的 class（ptoe-note + 对齐类）
         self.data_attrs: list[tuple[str, str]] = []  # 当前块保留的缩进/间距 data 属性
         self.skip: int = 0  # 非内容标签嵌套深度
+        self._reopen: list[tuple[str, str]] = []  # 跨块未闭合的行内标签（顺延重开）
 
     def _flush(self) -> None:
         if self.block is None:
             return
-        closes = "".join(f"</{t}>" for t in reversed(self.stack))
+        closes = "".join(
+            f"</{t}>" for t, _ in reversed(self.stack) if t != "__skip_mark__"
+        )
         content = "".join(self.buf) + closes
         if content.strip():
             cls = f' class="{" ".join(self.classes)}"' if self.classes else ""
@@ -1175,6 +1233,16 @@ class _Sanitizer(HTMLParser):
             else:
                 lv = self.block[1]
                 self.blocks.append(f"<h{lv}{cls}{dattr}>{content}</h{lv}>")
+        # 跨块未闭合的行内格式 span：本块补闭合，同时在下一块开头重新打开——
+        # 否则「选中跨段文字设格式」时从第二块起格式被静默丢弃（2026-09-16）。
+        # 只顺延本应用的行内格式 span（ptoe-*，不含 data-ptoe-marker 标记 span，
+        # 标记顺延会污染下一块）；strong/em 不顺延：外部脏数据里一个未闭合的
+        # <b> 会把后续所有段落都变粗（旧行为更安全，且界面自身的加粗按块应用）。
+        self._reopen = [
+            (t, o)
+            for t, o in self.stack
+            if t == "span" and "data-ptoe-marker" not in o
+        ]
         self.buf = []
         self.stack = []
         self.block = None
@@ -1192,6 +1260,12 @@ class _Sanitizer(HTMLParser):
         self.block = (kind, level)
         self.classes = list(classes) if classes else []
         self.data_attrs = list(data_attrs) if data_attrs else []
+        # 承接上一块跨块未闭合的行内标签：在新块开头重新打开
+        if self._reopen:
+            for name, open_html in self._reopen:
+                self.buf.append(open_html)
+                self.stack.append((name, open_html))
+            self._reopen = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
@@ -1202,10 +1276,28 @@ class _Sanitizer(HTMLParser):
             return
         if tag in ("b", "strong"):
             self.buf.append("<strong>")
-            self.stack.append("strong")
+            self.stack.append(("strong", "<strong>"))
         elif tag in ("i", "em"):
             self.buf.append("<em>")
-            self.stack.append("em")
+            self.stack.append(("em", "<em>"))
+        elif tag in _ALIAS_INLINE_TAGS:
+            # 原生/外部标签（<u>/<s>/<strike>/<del>/<sup>/<sub>/<mark>）→ 等价格式类，
+            # 避免「界面有格式、导出后丢失」（2026-09-16）。
+            # 例外：<mark class="ptoe-search"> 是搜索高亮（临时视图态），仍按原样剥掉标签。
+            # 压入占位栈项，保证对应的 </mark> 只弹栈、不误关其它行内标签。
+            if "ptoe-search" in (dict(attrs).get("class") or "").split():
+                self.stack.append(("__skip_mark__", ""))
+                return
+            open_html = f'<span class="{_ALIAS_INLINE_TAGS[tag]}">'
+            self.buf.append(open_html)
+            self.stack.append(("span", open_html))
+        elif tag == "font":
+            # <font color="...">（浏览器 execCommand('foreColor') / 粘贴内容）→ 内联样式 span
+            color = (dict(attrs).get("color") or "").strip()
+            if _COLOR_VALUE_RE.match(color):
+                open_html = f'<span style="color:{_html.escape(color, quote=True)}">'
+                self.buf.append(open_html)
+                self.stack.append(("span", open_html))
         elif tag == "br":
             self.buf.append("<br/>")
         elif tag in ("p", "div"):
@@ -1233,29 +1325,46 @@ class _Sanitizer(HTMLParser):
                     else ""
                 )
                 cls_html = f' class="{cls}"' if cls else ""
-                self.buf.append(f'<span data-ptoe-marker="{v}"{cls_html}>')
-                self.stack.append("span")
+                open_html = f'<span data-ptoe-marker="{v}"{cls_html}>'
+                self.buf.append(open_html)
+                self.stack.append(("span", open_html))
             else:
-                # 保留行内格式 span：对齐样式、注释类、引用类
-                # 这些由规则引擎产生，需在 sanitize 后保留以便前端渲染
+                # 保留行内格式 span：对齐内联样式 + 白名单格式类；
+                # 外部/粘贴样式按等价语义折成格式类（2026-09-16 修复：原先只保留第一个
+                # 匹配的格式类，且 style 里的下划线/上下标被整条丢弃 → 导出后格式消失）
                 style = attrs_d.get("style", "")
-                cls_attr = attrs_d.get("class", "")
-                keep = False
+                classes = [
+                    c
+                    for c in (attrs_d.get("class") or "").split()
+                    if c in _INLINE_FORMAT_CLASSES
+                ]
+                for pat, cls in _STYLE_TO_INLINE_CLASS:
+                    if cls not in classes and pat.search(style):
+                        classes.append(cls)
                 keep_attrs = []
+                style_parts: list[str] = []
                 if _ALIGN_STYLE_RE.search(style):
                     # 规则引擎用内联样式实现多对齐共存：style="text-align:center"
-                    keep = True
-                    keep_attrs.append(f'style="{_html.escape(style, quote=True)}"')
-                cls_list = (cls_attr or "").split()
-                for c in cls_list:
-                    if c in _INLINE_FORMAT_CLASSES:
-                        keep = True
-                        keep_attrs.append(f'class="{_html.escape(c, quote=True)}"')
-                        break  # 只保留第一个匹配的格式类
-                if keep:
-                    attrs_html = " ".join(keep_attrs)
-                    self.buf.append(f"<span {attrs_html}>")
-                    self.stack.append("span")
+                    style_parts.append(style.strip().rstrip(";"))
+                # 文本颜色（浏览器 execCommand('foreColor') 可能产出 span style="color:..."）：
+                # 只保留经过校验的 color 声明，其余样式一律丢弃（防注入）。
+                # 注意：行内样式仅 text-align（对齐）与 color 按设计存活；其余粘贴进来的
+                # 行内样式（font-size/letter-spacing/…）一律丢弃 —— EPUB 便携性取舍（2026-09-19）
+                m_color = re.search(r"(?<![-\w])color\s*:\s*([^;\"]+)", style)
+                if m_color and _COLOR_VALUE_RE.match(m_color.group(1).strip()):
+                    style_parts.append(f"color:{m_color.group(1).strip()}")
+                if style_parts:
+                    keep_attrs.append(
+                        f'style="{_html.escape(";".join(style_parts), quote=True)}"'
+                    )
+                if classes:
+                    keep_attrs.append(
+                        f'class="{_html.escape(" ".join(classes), quote=True)}"'
+                    )
+                if keep_attrs:
+                    open_html = f"<span {' '.join(keep_attrs)}>"
+                    self.buf.append(open_html)
+                    self.stack.append(("span", open_html))
                 # 其余 span 丢弃，仅保留文本内容
         elif tag == "img":
             # 插入的图片：仅保留 src（data URI 或相对路径）、alt 与显示模式 class
@@ -1289,13 +1398,21 @@ class _Sanitizer(HTMLParser):
             return
         if self.skip:
             return
-        if tag in ("strong", "b") and "strong" in self.stack:
+        # 搜索高亮 <mark class="ptoe-search"> 只压了占位栈项：这里只弹栈
+        if tag == "mark" and self.stack and self.stack[-1][0] == "__skip_mark__":
+            self.stack.pop()
+            return
+        # 原生/外部行内标签已归一为 span（见 _ALIAS_INLINE_TAGS / font 分支）
+        if tag in _ALIAS_INLINE_TAGS:
+            tag = "span"
+        names = [n for n, _ in self.stack]
+        if tag in ("strong", "b") and "strong" in names:
             self.buf.append("</strong>")
             self.stack.pop()
-        elif tag in ("em", "i") and "em" in self.stack:
+        elif tag in ("em", "i") and "em" in names:
             self.buf.append("</em>")
             self.stack.pop()
-        elif tag == "span" and self.stack and self.stack[-1] == "span":
+        elif tag in ("span", "font") and self.stack and self.stack[-1][0] == "span":
             self.buf.append("</span>")
             self.stack.pop()
         elif (
@@ -2570,6 +2687,25 @@ def _headings_to_body(raw: str) -> str:
     return _HEADING_TAG_RE.sub(_repl, str(raw))
 
 
+# 块级元素开标签：p / div / h1-h6。属性部分用「非引号内 > 才算结束」的
+# 保守写法（属性里可能含 >，如 data-x="a>b"），避免把标签切断。
+_BLOCK_OPEN_TAG_RE = re.compile(
+    r"<(p|div|h[1-6])((?:[^>\"']|\"[^\"]*\"|'[^']*')*)>(?![ \t]*\r?\n)",
+    re.IGNORECASE,
+)
+
+
+def _ensure_block_newlines(html: str) -> str:
+    """历史遗留/无换行 HTML 归一：每个块级开标签后补一个换行。
+
+    rulemanage 的页面纯文本约定是「段与段的边界就是换行符 \n」（测试
+    TestParagraphStartExclusion）。旧版本矫正界面生成的页面 HTML（\u201c\u201d.join
+    的 <div> 行）与部分历史缓存没有该换行，导致 [^\\n] 类规则正则跨越块边界
+    （行首引注〔n〕被误判为行内引注）。幂等：已紧跟换行/空白+换行的块不动。
+    """
+    return _BLOCK_OPEN_TAG_RE.sub(lambda m: f"{m.group(0)}\n", str(html))
+
+
 def _page_text(raw: str, *, normalize_headings: bool = True) -> str:
     """矫正界面初始内容：普通 OCR 文本按行转 <div>；已清洗的 HTML 原样返回。
 
@@ -2588,6 +2724,9 @@ def _page_text(raw: str, *, normalize_headings: bool = True) -> str:
         # 只动文本节点）——历史版本可能保存过 \\〔^{x〕}\\ 之类大模型杂符包裹，
         # 不清理则界面正文与 reocr 的 current_text 基准不一致、diff 偏移错位。
         cleaned = _clean_bracket_junk_html(raw)
+        # 2026-09-15：历史/已存 HTML 也可能缺块间换行（旧 initial_html 输出），
+        # 统一归一，保证 rulemanage 正则的行边界语义对存储内容也成立。
+        cleaned = _ensure_block_newlines(cleaned)
         if normalize_headings:
             return _headings_to_body(cleaned)
         return cleaned
@@ -2611,7 +2750,10 @@ def initial_html(text: str) -> str:
         line = _normalize_brackets(line.strip())
         if line:
             out.append(f"<div>{_html.escape(line, quote=False)}</div>")
-    return "".join(out)
+    # 2026-09-15：块之间以 \n 分隔（rulemanage 的页面纯文本约定：段与段的边界
+    # 就是换行符）。若无换行，[^\n] 类正则会把相邻 <div> 视作同一行，导致
+    # 「行首引注被误判为行内引注」（如正文 2 处〔n〕+ 注释 2 处〔n〕共匹配 4 处）。
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -4105,6 +4247,70 @@ def _delete_history(ids: list[str], all_: bool = False) -> int:
     return deleted
 
 
+def export_history_backup(
+    ids: list[str] | None, save_path: str | None = None
+) -> dict[str, Any]:
+    """把选中的历史版本打包为 ZIP 并写入磁盘，返回 {ok, path, count}。
+
+    为什么不用浏览器下载（2026-09-16）：pywebview WebView2 默认
+    ALLOW_DOWNLOADS=False 会取消 blob/附件下载。主界面「矫正历史」页原先用
+    <a download href="/api/history/export?id=..."> 触发下载，文件被静默取消，
+    界面却照样提示"已开始导出"——即用户报的"提示已导出、实际没有文件"。
+    这里统一改成服务端写盘并回传路径，前端提示保存位置（与矫正界面历史弹窗
+    「导出」同一实现，两处共用本函数）。
+
+    save_path：用户「另存为」指定路径（来自主线程保存对话框）。为空/None 时
+    回退默认位置 data/data/ptoe_history_<时间戳>.zip。
+
+    失败语义：未选择版本 → ValueError；选中项都不存在 → LookupError；
+    save_path 不可写 → OSError（上游转 500）。
+    """
+    wanted = [str(i) for i in (ids or []) if str(i or "")]
+    if not wanted:
+        raise ValueError("未选择要导出的历史版本")
+    import io
+    import time as _time
+    import zipfile
+
+    from pdfmanage import app_base_dir
+
+    hist_dir = Path(str(_history_dir()))
+    buf = io.BytesIO()
+    count = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for pid in wanted:
+            fp = hist_dir / f"{pid}.json"
+            if not fp.is_file():
+                continue
+            try:
+                data = json.loads(fp.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    data = {"pages": {}}
+                images = data.get("images") or _load_images_cache(
+                    _version_prefix(pid)
+                )
+                data["images"] = images or {}
+                zf.writestr(
+                    f"{pid}.json", json.dumps(data, ensure_ascii=False, indent=2)
+                )
+                count += 1
+            except Exception:  # noqa: BLE001
+                continue
+    if count == 0:
+        raise LookupError("没有可导出的历史版本")
+    if save_path:
+        # 「另存为」：用户从保存对话框指定的路径
+        out_path = Path(str(save_path))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        data_dir = app_base_dir() / "data" / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        stamp = _time.strftime("%Y%m%d%H%M%S")
+        out_path = data_dir / f"ptoe_history_{stamp}.zip"
+    out_path.write_bytes(buf.getvalue())
+    return {"ok": True, "path": str(out_path), "count": count}
+
+
 def _import_history(
     content: dict[str, Any], filename: str = ""
 ) -> tuple[bool, str, str]:
@@ -4308,17 +4514,11 @@ def _html_to_export_blocks(html: str) -> list[tuple]:
 
 # 富文本块的行内标签集合（加粗/斜体/通用 span）
 _RICH_INLINE_TAGS = ("span", "strong", "b", "em", "i")
-# 新增 7 种行内格式类（2026-09）：下划线/删除线/字符边框/底纹/突显/上标/下标
-_RICH_INLINE_FORMAT_CLASSES = {
-    "ptoe-underline",
-    "ptoe-underdot",
-    "ptoe-strike",
-    "ptoe-charbox",
-    "ptoe-shade",
-    "ptoe-highlight",
-    "ptoe-sup",
-    "ptoe-sub",
-}
+# 新增 8 种行内格式类（2026-09）：下划线/下加点/删除线/字符边框/底纹/突显/上标/下标
+# 单一事实来源 = rulemanage.INLINE_FORMAT_CLASSES（2026-09-19）；保留既有成员经并集合入
+_RICH_INLINE_FORMAT_CLASSES = set(
+    getattr(rulemanage, "INLINE_FORMAT_CLASSES", ()) or ()
+)
 
 
 def _rich_parse_indent(attrs_d: dict[str, str]) -> dict[str, Any]:
@@ -5124,6 +5324,101 @@ def _ask_export_path(
     return req["result"]
 
 
+def export_content_to_file(
+    items: list[dict], fmt: str, out_path: str, title: str = "矫正导出"
+) -> str:
+    """把已排序的 {page, html} 页面列表导出为 fmt(txt/docx/md/epub)，写入 out_path。
+
+    与矫正界面 /api/export 同一转换链路（同一份实现，保证两边输出一致）：
+    - txt/md/docx 走 _html_to_rich_blocks → _apply_join_marks → 各格式写入器；
+    - epub 走 apply_markers → HTMLConverter.convert_document → 复制到 out_path。
+    items 须含 'page'/'html' 且已排序。返回实际写出路径。
+
+    供两处复用：矫正界面工具栏「完成并转换」旁导出下拉，以及主界面
+    「矫正历史」行的「另存为」（多格式，弹窗选保存位置）。
+    """
+    if fmt not in ("txt", "docx", "epub", "md"):
+        raise ValueError(f"不支持的导出格式：{fmt}")
+    blocks: list[dict] = []
+    for item in items:
+        # 应用加粗注释标签转换（注　　释：）
+        html_text = transform_note_labels(str(item.get("html") or ""))
+        blocks.extend(_html_to_rich_blocks(html_text))
+    blocks = _apply_join_marks(blocks)
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if fmt == "txt":
+
+        def _txt_line(b: dict) -> str:
+            # 图片块以 [图片] 占位符表示；首行缩进（data-ind=first）
+            # 以全角空格前缀近似（纯文本唯一能承载的版式信息）
+            if b["kind"] == "img":
+                return "[图片]"
+            line = "".join(r["text"] for r in b["runs"])
+            ind = b.get("indent") or {}
+            if ind.get("ind") == "first":
+                n = int(ind.get("indv") or 2)
+                line = "\u3000" * max(1, min(8, n)) + line
+            return line
+
+        text = "\n\n".join(_txt_line(b) for b in blocks) + "\n"
+        out.write_text(text, encoding=_TXT_ENCODING)
+    elif fmt == "md":
+        # Markdown 导出：与前端 htmlToMd 规则一致（见 _build_md）
+        _build_md(blocks, str(out))
+    elif fmt == "epub":
+        # epub：标记→文章结构→XHTML→打包（临时目录隔离，完成后清理）
+        import shutil as _sh
+        import tempfile as _tf
+        from htmlmanage import HTMLConverter
+
+        tmp_dir = _tf.mkdtemp(prefix="ptoe_export_epub_")
+        try:
+            # 浏览器/历史提交的 html 可能含 <div> 块（Chrome contenteditable
+            # 回车产生），apply_markers 只认 p/h1-6——先 sanitize 归一为
+            # <p>（保留对齐/注释/图片 class），与「完成并转换」路径一致；
+            # 否则产出 <p><div class="ptoe-align-center">…</div></p>
+            # 非法嵌套、对齐丢失（2026-08-15）
+            src_items = [
+                {"page": p["page"], "text": sanitize_html(str(p["html"] or ""))}
+                for p in items
+            ]
+            articles = apply_markers(src_items)
+            structured = {
+                "articles": articles,
+                "pages": src_items,
+                "body": "\n\n".join(
+                    (p.get("text") or "").strip()
+                    for p in src_items
+                    if (p.get("text") or "").strip()
+                ),
+                "paragraphs": [
+                    {"page": p["page"], "text": p["text"]}
+                    for p in src_items
+                    if (p.get("text") or "").strip()
+                ],
+                "meta": {
+                    "title": title,
+                    "author": "",
+                    "language": "zh-CN",
+                    "package_epub": True,
+                    "epub_version": "3.0",
+                },
+            }
+            result = HTMLConverter(
+                output_dir=tmp_dir, epub_version="3.0"
+            ).convert_document(structured)
+            generated = result.get("epub")
+            if not generated or not Path(generated).is_file():
+                raise RuntimeError(result.get("epub_error") or "EPUB 打包失败")
+            _sh.copy2(generated, str(out))
+        finally:
+            _sh.rmtree(tmp_dir, ignore_errors=True)
+    else:
+        _build_docx(blocks, str(out))
+    return str(out)
+
+
 def _drain_dialog_queue(state: dict[str, Any]) -> None:
     """主线程循环调用：取出待弹的保存对话框请求，逐个弹框并回填结果。
 
@@ -5582,6 +5877,71 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 "application/json; charset=utf-8",
             )
 
+    def _mouse_shortcuts(self) -> None:
+        """鼠标手势绑定：GET 读取 / POST 写入 config.json 顶层 mouse_shortcuts。
+
+        服务端持久化 —— correct_pages 每次运行随机端口，localStorage 按 origin
+        隔离会导致设置每运行失效（与快捷键绑定同因）。
+        """
+        try:
+            from configmanage import get_config, set_mouse_shortcuts
+
+            if self.command == "GET":
+                cfg = get_config(show_dialogs=False) or {}
+                sc = cfg.get("mouse_shortcuts")
+                if not isinstance(sc, dict):
+                    sc = {}
+                self._send(
+                    200,
+                    self._json({"ok": True, "mouse_shortcuts": sc}),
+                    "application/json; charset=utf-8",
+                )
+                return
+            # POST: {mouse_shortcuts: {op: gesture}}
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            body = json.loads(raw.decode("utf-8"))
+            sc = body.get("mouse_shortcuts")
+            if not isinstance(sc, dict):
+                self._send(
+                    400,
+                    self._json(
+                        {
+                            "ok": False,
+                            "error": "mouse_shortcuts 必须是对象（op -> 手势）",
+                        }
+                    ),
+                    "application/json; charset=utf-8",
+                )
+                return
+            if len(sc) > 100:
+                self._send(
+                    400,
+                    self._json(
+                        {"ok": False, "error": "鼠标动作条目过多（上限 100 条）"}
+                    ),
+                    "application/json; charset=utf-8",
+                )
+                return
+            for k, v in sc.items():
+                if not isinstance(k, str) or not isinstance(v, str):
+                    self._send(
+                        400,
+                        self._json(
+                            {"ok": False, "error": "鼠标动作键值必须均为字符串"}
+                        ),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+            set_mouse_shortcuts(sc)
+            self._send(200, self._json({"ok": True}), "application/json; charset=utf-8")
+        except Exception as e:  # noqa: BLE001
+            self._send(
+                500,
+                self._json({"ok": False, "error": str(e)}),
+                "application/json; charset=utf-8",
+            )
+
     def _ui_settings(self) -> None:
         """矫正界面 UI 偏好：GET 读取 / POST 写入 config.json 顶层 ui_settings。
 
@@ -5926,6 +6286,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
         if path == "/api/shortcuts":
             self._shortcuts()
             return
+        if path == "/api/mouse_shortcuts":
+            self._mouse_shortcuts()
+            return
         if path == "/api/ui_settings":
             self._ui_settings()
             return
@@ -6180,8 +6543,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
         if path == "/api/history/export/backup":
             # 导出为备份文件：把选中的历史版本打包为 ZIP 并直接保存到
             # data/data/ 目录（不走浏览器下载——pywebview WebView2 默认
-            # ALLOW_DOWNLOADS=False 会取消 blob 下载，导致导出静默失败）。
-            # 返回 {ok, path}，前端提示已保存位置。
+            # ALLOW_DOWNLOADS=False 会取消 blob/附件下载，导致导出静默失败）。
+            # 返回 {ok, path, count}，前端提示已保存位置。
+            # 打包逻辑见 export_history_backup（与主界面「矫正历史」页共用）。
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length else b"{}"
@@ -6194,53 +6558,17 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                         "application/json; charset=utf-8",
                     )
                     return
-                import io
-                import time as _time
-                import zipfile
-
-                from pdfmanage import app_base_dir
-
-                buf = io.BytesIO()
-                count = 0
-                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for pid in ids:
-                        fp = _history_dir() / f"{pid}.json"
-                        if not fp.is_file():
-                            continue
-                        try:
-                            data = json.loads(fp.read_text(encoding="utf-8"))
-                            if not isinstance(data, dict):
-                                data = {"pages": {}}
-                            images = data.get("images") or _load_images_cache(
-                                _version_prefix(pid)
-                            )
-                            data["images"] = images or {}
-                            zf.writestr(
-                                f"{pid}.json",
-                                json.dumps(data, ensure_ascii=False, indent=2),
-                            )
-                            count += 1
-                        except Exception:  # noqa: BLE001
-                            continue
-                if count == 0:
+                try:
+                    result = export_history_backup(ids)
+                except LookupError as e:
                     self._send(
                         404,
-                        self._json({"ok": False, "error": "没有可导出的历史版本"}),
+                        self._json({"ok": False, "error": str(e)}),
                         "application/json; charset=utf-8",
                     )
                     return
-                # 默认导出到程序 data/data/ 目录
-                data_dir = app_base_dir() / "data" / "data"
-                data_dir.mkdir(parents=True, exist_ok=True)
-                stamp = _time.strftime("%Y%m%d%H%M%S")
-                out_path = data_dir / f"ptoe_history_{stamp}.zip"
-                out_path.write_bytes(buf.getvalue())
                 self._send(
-                    200,
-                    self._json(
-                        {"ok": True, "path": str(out_path), "count": count}
-                    ),
-                    "application/json; charset=utf-8",
+                    200, self._json(result), "application/json; charset=utf-8"
                 )
             except Exception as e:  # noqa: BLE001
                 self._send(
@@ -6668,7 +6996,8 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                         )
                         return
                     # 归一化 scope：全部页模式下 all_pages 与 selection 条件都按整页文本求值
-                    # （等价于该页的 page 语义；不要在全部页模式依赖 sel_start/sel_end）
+                    # （等价于该页的 page 语义；不要在全部页模式依赖 sel_start/sel_end，
+                    # sel_ranges 多区间选区同样只服务单页分支——此处静默忽略，不报错）
                     for rf in rules:
                         for c in rf.get("conditions", []):
                             if c.get("scope") in ("all_pages", "selection"):
@@ -6723,6 +7052,32 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 all_rules = bool(body.get("all"))
                 sel_start = body.get("sel_start")
                 sel_end = body.get("sel_end")
+                # 可选多区间选区（2026-09）：[[起,止], ...] 相对整页纯文本偏移，
+                # 一次请求对多个不连续区间应用格式规则（多段选中）。sel_start/sel_end 保留兼容。
+                sel_ranges = body.get("sel_ranges")
+                if sel_ranges is not None:
+                    if (
+                        not isinstance(sel_ranges, list)
+                        or not sel_ranges
+                        or len(sel_ranges) > 64
+                        or not all(
+                            isinstance(rng, (list, tuple))
+                            and len(rng) == 2
+                            and isinstance(rng[0], int)
+                            and not isinstance(rng[0], bool)
+                            and isinstance(rng[1], int)
+                            and not isinstance(rng[1], bool)
+                            and rng[0] < rng[1]
+                            for rng in sel_ranges
+                        )
+                    ):
+                        self._send(
+                            400,
+                            self._json({"ok": False, "error": "sel_ranges 格式错误：应为 [[起,止], ...] 的整数区间列表"}),
+                            "application/json; charset=utf-8",
+                        )
+                        return
+                    sel_ranges = [tuple(rng) for rng in sel_ranges]
 
                 if not isinstance(page, int) or page < 1:
                     self._send(
@@ -6746,33 +7101,176 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 rules = _validate_format_rules(rules)
 
                 # 调用 rulemanage 引擎
-                new_html, err = rulemanage.apply_rules(
-                    html_text,
-                    rules,
-                    rule_id=rule_id,
-                    all_rules=all_rules,
-                    sel_start=sel_start if isinstance(sel_start, int) else None,
-                    sel_end=sel_end if isinstance(sel_end, int) else None,
-                )
-                if err:
+                if sel_ranges is not None:
+                    # 多区间选区：逐区间应用。首区间跑全量规则；后续区间仅保留
+                    # selection 作用域条件——page/paragraph 作用域会重复应用导致
+                    # 双重包裹（<strong><strong>），故在后续区间过滤掉。
+                    cur_html = html_text
+                    err = None
+                    for idx, (s, e) in enumerate(sel_ranges):
+                        iter_rules = rules if idx == 0 else _filter_rules_selection_only(rules)
+                        cur_html, err = rulemanage.apply_rules(
+                            cur_html,
+                            iter_rules,
+                            rule_id=rule_id,
+                            all_rules=all_rules,
+                            sel_start=s,
+                            sel_end=e,
+                        )
+                        if err:
+                            break
+                    if err:
+                        self._send(
+                            400,
+                            self._json({"ok": False, "error": err}),
+                            "application/json; charset=utf-8",
+                        )
+                        return
+                    new_html = sanitize_html(cur_html)
                     self._send(
-                        400,
-                        self._json({"ok": False, "error": err}),
+                        200,
+                        self._json({"ok": True, "html": new_html}),
+                        "application/json; charset=utf-8",
+                    )
+                else:
+                    new_html, err = rulemanage.apply_rules(
+                        html_text,
+                        rules,
+                        rule_id=rule_id,
+                        all_rules=all_rules,
+                        sel_start=sel_start if isinstance(sel_start, int) else None,
+                        sel_end=sel_end if isinstance(sel_end, int) else None,
+                    )
+                    if err:
+                        self._send(
+                            400,
+                            self._json({"ok": False, "error": err}),
+                            "application/json; charset=utf-8",
+                        )
+                        return
+
+                    # 结果过一遍 sanitize_html 再返回
+                    new_html = sanitize_html(new_html)
+                    self._send(
+                        200,
+                        self._json({"ok": True, "html": new_html}),
+                        "application/json; charset=utf-8",
+                    )
+            except Exception as e:  # noqa: BLE001
+                self._send(
+                    500,
+                    self._json({"ok": False, "error": f"应用格式规则失败: {e}"}),
+                    "application/json; charset=utf-8",
+                )
+            return
+        if path == "/api/format_rules/preview":
+            # 规则匹配预览：把条件的正则作用于当前页文本，返回匹配清单（含各捕获组文本），
+            # 供规则编辑器在「应用」之前核对「到底匹配到几个对象、每处的分组是什么」。
+            # 背景（2026-09-13）：贪婪前缀写法（如 `[\t\S]+(〔\d+〕)`）会把同一行里后面
+            # 出现的对象一并吞进本次匹配，用户以为匹配了 4 个对象、实际只匹配到 2 个
+            # （只有这 2 处的分组被套格式），表现为"只有最后一个匹配对象应用了规则格式"。
+            # 预览把真实匹配数与每个匹配的捕获组显式摊开，避免这类误判反复出现。
+            # body: {html:str, type?:str, pattern:str, max?:int}
+            try:
+                if rulemanage is None:
+                    self._send(
+                        500,
+                        self._json({"ok": False, "error": "rulemanage 模块未加载"}),
                         "application/json; charset=utf-8",
                     )
                     return
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b"{}"
+                body = json.loads(raw.decode("utf-8") or "{}")
+                html_text = body.get("html")
+                if not isinstance(html_text, str):
+                    self._send(
+                        400,
+                        self._json({"ok": False, "error": "html 必须为字符串"}),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+                ctype = str(body.get("type") or "regex")
+                if ctype not in ("regex", "contains", "prefix", "suffix"):
+                    ctype = "regex"
+                pattern = str(body.get("pattern") or "")
+                try:
+                    limit = int(body.get("max") or 20)
+                except (TypeError, ValueError):
+                    limit = 20
+                limit = max(1, min(limit, 100))
+                if not pattern:
+                    self._send(
+                        200,
+                        self._json({
+                            "ok": True, "count": 0, "shown": 0, "matches": [],
+                            "hint": "条件内容为空 = 无条件恒匹配（不逐个匹配对象）",
+                        }),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+                if ctype == "regex":
+                    try:
+                        # 与引擎同一编译口径：支持 /pattern/flags 写法（i/m/s）
+                        rulemanage.compile_pattern(pattern)
+                    except Exception as e:  # noqa: BLE001 — re.error 及危险模式拦截
+                        self._send(
+                            400,
+                            self._json({"ok": False, "error": f"正则表达式无效：{e}"}),
+                            "application/json; charset=utf-8",
+                        )
+                        return
 
-                # 结果过一遍 sanitize_html 再返回
-                new_html = sanitize_html(new_html)
+                cond = rulemanage.Condition(
+                    type=ctype, pattern=pattern, scope="page", formats=[], target="match"
+                )
+                page_text, _ni = rulemanage.collect_text_nodes(
+                    rulemanage.parse_html(sanitize_html(html_text))
+                )
+
+                def _clip(text: str, n: int = 60) -> str:
+                    text = text.replace("\n", "⏎")
+                    return text if len(text) <= n else text[:n] + "…"
+
+                spans: list[tuple[int, int, list[str | None]]] = []
+                if ctype == "regex":
+                    for m in rulemanage.find_matches(cond, page_text):
+                        spans.append((
+                            m.start(),
+                            m.end(),
+                            [
+                                (page_text[gs:ge] if gs >= 0 else None)
+                                for gs, ge in list(m.regs)[1:]
+                            ],
+                        ))
+                else:
+                    for s, e in rulemanage._pattern_match_ranges(cond, page_text):
+                        spans.append((s, e, []))
+
+                matches = [
+                    {
+                        "index": i + 1,
+                        "text": _clip(page_text[s:e]),
+                        "groups": [_clip(g, 30) if g is not None else None for g in groups],
+                        "start": s,
+                        "end": e,
+                    }
+                    for i, (s, e, groups) in enumerate(spans[:limit])
+                ]
                 self._send(
                     200,
-                    self._json({"ok": True, "html": new_html}),
+                    self._json({
+                        "ok": True,
+                        "count": len(spans),
+                        "shown": len(matches),
+                        "matches": matches,
+                    }),
                     "application/json; charset=utf-8",
                 )
             except Exception as e:  # noqa: BLE001
                 self._send(
                     500,
-                    self._json({"ok": False, "error": f"应用格式规则失败: {e}"}),
+                    self._json({"ok": False, "error": f"匹配预览失败: {e}"}),
                     "application/json; charset=utf-8",
                 )
             return
@@ -6781,6 +7279,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/shortcuts":
             self._shortcuts()
+            return
+        if path == "/api/mouse_shortcuts":
+            self._mouse_shortcuts()
             return
         if path == "/api/ui_settings":
             self._ui_settings()
@@ -7426,12 +7927,6 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     (x for x in (body.get("pages") or []) if isinstance(x, dict)),
                     key=lambda x: _safe_int(x.get("page")),
                 )
-                blocks: list[dict] = []
-                for item in items:
-                    # 应用加粗注释标签转换（注　　释：）
-                    html_text = transform_note_labels(str(item.get("html") or ""))
-                    blocks.extend(_html_to_rich_blocks(html_text))
-                blocks = _apply_join_marks(blocks)
                 st = self.server.state
                 explicit = body.get("path")
                 used_dialog = False
@@ -7468,88 +7963,18 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                         ).removesuffix(".pdf")
                         base = (base or "矫正导出").strip() or "矫正导出"
                         out_path = _default_export_path(f"{base}.{fmt}")
-                out = Path(out_path)
-                out.parent.mkdir(parents=True, exist_ok=True)
-                if fmt == "txt":
-
-                    def _txt_line(b: dict) -> str:
-                        # 图片块以 [图片] 占位符表示；首行缩进（data-ind=first）
-                        # 以全角空格前缀近似（纯文本唯一能承载的版式信息）
-                        if b["kind"] == "img":
-                            return "[图片]"
-                        line = "".join(r["text"] for r in b["runs"])
-                        ind = b.get("indent") or {}
-                        if ind.get("ind") == "first":
-                            n = int(ind.get("indv") or 2)
-                            line = "\u3000" * max(1, min(8, n)) + line
-                        return line
-
-                    text = "\n\n".join(_txt_line(b) for b in blocks) + "\n"
-                    out.write_text(text, encoding=_TXT_ENCODING)
-                elif fmt == "md":
-                    # Markdown 导出：与前端 htmlToMd 规则一致（见 _build_md）
-                    _build_md(blocks, str(out))
-                elif fmt == "epub":
-                    # epub：标记→文章结构→XHTML→打包（临时目录隔离，完成后清理）
-                    import shutil as _sh
-                    import tempfile as _tf
-
-                    tmp_dir = _tf.mkdtemp(prefix="ptoe_export_epub_")
-                    try:
-                        # 浏览器提交的 html 可能含 <div> 块（Chrome contenteditable
-                        # 回车产生），apply_markers 只认 p/h1-6——先 sanitize 归一为
-                        # <p>（保留对齐/注释/图片 class），与「完成并转换」路径一致；
-                        # 否则产出 <p><div class="ptoe-align-center">…</div></p>
-                        # 非法嵌套、对齐丢失（2026-08-15）
-                        src_items = [
-                            {
-                                "page": p["page"],
-                                "text": sanitize_html(str(p["html"] or "")),
-                            }
-                            for p in items
-                        ]
-                        articles = apply_markers(src_items)
-                        title = st.get("display_name") or (st.get("history_name") or "矫正导出")
-                        structured = {
-                            "articles": articles,
-                            "pages": src_items,
-                            "body": "\n\n".join(
-                                (p.get("text") or "").strip()
-                                for p in src_items
-                                if (p.get("text") or "").strip()
-                            ),
-                            "paragraphs": [
-                                {"page": p["page"], "text": p["text"]}
-                                for p in src_items
-                                if (p.get("text") or "").strip()
-                            ],
-                            "meta": {
-                                "title": title,
-                                "author": "",
-                                "language": "zh-CN",
-                                "package_epub": True,
-                                "epub_version": "3.0",
-                            },
-                        }
-                        from htmlmanage import HTMLConverter
-
-                        result = HTMLConverter(
-                            output_dir=tmp_dir, epub_version="3.0"
-                        ).convert_document(structured)
-                        generated = result.get("epub")
-                        if not generated or not Path(generated).is_file():
-                            raise RuntimeError(
-                                result.get("epub_error") or "EPUB 打包失败"
-                            )
-                        _sh.copy2(generated, str(out))
-                    finally:
-                        _sh.rmtree(tmp_dir, ignore_errors=True)
-                else:
-                    _build_docx(blocks, str(out))
+                # 与「矫正历史」另存为共用同一转换链路（保证两边输出一致）
+                export_content_to_file(
+                    items,
+                    fmt,
+                    str(out_path),
+                    title=st.get("display_name")
+                    or (st.get("history_name") or "矫正导出"),
+                )
                 self._send(
                     200,
                     self._json(
-                        {"ok": True, "path": str(out), "used_dialog": used_dialog}
+                        {"ok": True, "path": str(out_path), "used_dialog": used_dialog}
                     ),
                     "application/json; charset=utf-8",
                 )
@@ -8378,8 +8803,9 @@ body.paint-mode{cursor:copy;}
 .ptoe-fix{color:#080;font-size:0.9em;}
 /* 7 new inline format classes (2026-09) */
 .ptoe-underline{text-decoration:underline;}
-/* 下加点：整条虚线式下划线（2026-09） */
-.ptoe-underdot{text-decoration:underline dotted;}
+/* 下加点：整条虚线式下划线（2026-09）；text-decoration 虚线属 CSS3，
+   部分阅读器整条丢弃 → 改用 border-bottom（CJK 无 descender，视觉一致；2026-09-19） */
+.ptoe-underdot{border-bottom:1px dotted #333;}
 .ptoe-strike{text-decoration:line-through;}
 .ptoe-charbox{border:1px solid #333;padding:0 .15em;border-radius:2px;}
 .ptoe-shade{background:#eef1f4;}
@@ -8896,6 +9322,10 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <p style="font-size:12px;color:#5a6b7c;margin:8px 0;">每个操作绑定一个组合键；点击某行后按下新组合键完成绑定，Del/Backspace 清除，Esc 取消。绑定保存在本浏览器（localStorage）并同步到配置文件。</p>
       <table id="shortcutTable"></table>
       <div style="margin-top:8px;"><button type="button" id="resetShortcutsBtn">恢复默认</button></div>
+      <h4 style="margin:18px 0 4px;">鼠标动作</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">按住鼠标中键滑动触发对应操作（如中键上滑 = 居中）。点击某行后按住中键滑动完成绑定，Del/Backspace 清除，Esc 取消。绑定保存在配置文件。</p>
+      <table id="mouseShortcutTable"></table>
+      <div style="margin-top:8px;"><button type="button" id="resetMouseShortcutsBtn">恢复默认</button></div>
     </div>
     <div class="settings-panel" id="panel-fonts" style="display:none;">
       <p style="font-size:12px;color:#5a6b7c;margin:8px 0;">设置各类文本的字体族（CSS font-family），留空则使用浏览器默认。修改后实时生效，保存到配置文件。</p>

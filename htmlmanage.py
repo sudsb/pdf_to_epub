@@ -356,10 +356,21 @@ class CSSManager:
           text-indent: 0;
         }
         /* 注释视觉样式（2026-08-23）：块级与行内注释均为小号灰字，
-           导出后仍可辨识「注」格式（此前仅缩进覆盖，视觉样式丢失） */
-        p.ptoe-note, span.ptoe-note {
+           导出后仍可辨识「注」格式（此前仅缩进覆盖，视觉样式丢失）。
+           2026-09-16 修复「注释字号大小不一」：原选择器只写 p/span，
+           而注释类也可能落在标题块上（规则「标题1 + 注释」叠加、手工先设
+           标题再设注释）→ h1.ptoe-note 不被匹配，注释保持标题字号（UA 2em），
+           与其它注释的 0.85em 差一倍。这里改为对任意承载 ptoe-note 的元素生效
+           （与矫正界面 .editable .ptoe-note{font-size:12px} 的口径一致：
+           界面里也是任何元素都吃注释字号，所以编辑器看不出一致性问题）。 */
+        .ptoe-note {
           font-size: 0.85em;
           color: #555555;
+        }
+        /* 嵌套注释不再逐层缩小：注释段落内再套注释 span、注释合并或注释标记插入
+           时会出现 0.85em×0.85em=0.72em（越套越小）→ 统一按 1em 继承外层注释字号 */
+        .ptoe-note .ptoe-note {
+          font-size: 1em;
         }
         /* 正文/注释默认顶格（2026-08-23 用户要求）：不再全局首行缩进；
            需要缩进的段落用「缩进」格式（p.ptoe-indent）或段落设置面板显式指定 */
@@ -396,8 +407,10 @@ class CSSManager:
         .ptoe-underline {
           text-decoration: underline;
         }
+        /* 下加点：text-decoration 虚线属 CSS3，部分阅读器整条丢弃 →
+           改用 border-bottom（CJK 无 descender，视觉一致；2026-09-19） */
         .ptoe-underdot {
-          text-decoration: underline dotted;
+          border-bottom: 1px dotted #333;
         }
         .ptoe-strike {
           text-decoration: line-through;

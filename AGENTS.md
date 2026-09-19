@@ -48,6 +48,7 @@
   - python extract_js.py && node --check extracted_ui.js
 - Packaging (Windows):
   - powershell -ExecutionPolicy Bypass -File .\0pack.ps1  # builds onedir PyInstaller package (dist\ptoe\)
+  - 0pack.bat  # 双击启动器：显式 -ExecutionPolicy Bypass 调 0pack.ps1，失败时窗口保持打开（本机 .ps1 关联缺失/被文本编辑器接管，双击 .ps1 不会走打包流程）
 
 (Repository uses `uv run ...` wrappers in developer scripts; plain `python` commands work too.)
 

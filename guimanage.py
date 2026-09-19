@@ -194,6 +194,7 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
     <div class="nav-item" data-page="llama" onclick="switchPage('llama')"><span class="nav-icon">▶</span> llama 参数</div>
     <div class="nav-item" data-page="vllm" onclick="switchPage('vllm')"><span class="nav-icon">▶</span> vLLM 参数</div>
     <div class="nav-item" data-page="proofread" onclick="switchPage('proofread')"><span class="nav-icon">✎</span> 校对参数</div>
+    <div class="nav-item" data-page="epubedit" onclick="switchPage('epubedit')"><span class="nav-icon">▤</span> EPUB 编辑</div>
     <div class="nav-item" data-page="shortcuts" onclick="switchPage('shortcuts')"><span class="nav-icon">⌨</span> 快捷键</div>
     <div class="nav-item" data-page="rules" onclick="switchPage('rules')"><span class="nav-icon">☰</span> 格式规则</div>
     <div class="nav-item" data-page="history" onclick="switchPage('history')"><span class="nav-icon">↺</span> 历史记录</div>
@@ -417,7 +418,7 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
       </div>
       <div class="card">
         <table class="dyn-table" style="width:100%;">
-          <thead><tr><th>标题</th><th>PDF</th><th>更新时间</th><th style="width:52px;">页数</th><th style="width:80px;">最后校正页</th><th style="width:128px;">操作</th></tr></thead>
+          <thead><tr><th>标题</th><th>PDF</th><th>更新时间</th><th style="width:52px;">页数</th><th style="width:80px;">最后校正页</th><th style="width:186px;">操作</th></tr></thead>
           <tbody id="historyTbody"><tr><td colspan="6" class="empty-state">加载中...</td></tr></tbody>
         </table>
       </div>
@@ -455,6 +456,35 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
       <div class="card">
         <div class="card-title"><span class="ct-icon">✒</span> 运行日志</div>
         <pre id="mergeLog" class="log-box">等待合并任务...</pre>
+      </div>
+    </div>
+    <!-- 12. EPUB 编辑 -->
+    <div class="page" id="page-epubedit">
+      <h2 class="page-title">EPUB 编辑</h2>
+      <p class="page-desc">在浏览器中打开 EPUB，按一级标题分篇编辑章节内容后写回原文件。</p>
+      <div class="card">
+        <div class="card-title"><span class="ct-icon">▤</span> 编辑任务</div>
+        <p class="page-desc" style="margin:0 0 12px;">编辑过程在独立进程中运行，可随时停止。缺省路径可通过「选择文件」打开对话框。</p>
+        <div class="form-row">
+          <span class="form-label">EPUB 路径</span>
+          <div class="form-ctrl">
+            <div class="pick-row">
+              <input type="text" id="epubeditPath" placeholder="选择要编辑的 EPUB 文件..." readonly>
+              <button class="btn-small" onclick="pickEpubEdit()">选择文件…</button>
+            </div>
+            <div class="form-hint" id="epubeditPathHint"></div>
+          </div>
+        </div>
+        <div class="form-row"><span class="form-label">空闲超时（秒）</span><div class="form-ctrl"><input type="number" id="epubeditTimeout" value="600" min="30" max="7200"></div></div>
+        <div class="action-row">
+          <button class="btn-start" id="epubeditStartBtn" onclick="startEpubEdit()">启动编辑</button>
+          <button class="btn-stop-convert" id="epubeditStopBtn" onclick="stopEpubEdit()" style="display:none;">停止</button>
+          <span id="epubeditStatus" style="font-size:12px;color:var(--text-dim);"></span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="ct-icon">✒</span> 运行日志</div>
+        <pre id="epubeditLines" class="log-box">等待 EPUB 编辑任务...</pre>
       </div>
     </div>
   </main>
@@ -556,6 +586,16 @@ function selectCorrect(){var sel=document.getElementById("correctSel");if(!sel||
 function pollCorrectStatus(){apiGet("/api/correct/status").then(function(res){if(!res||!res.ok)return;correctInstances=res.instances||[];renderCorrectSel(correctInstances);var inst=null;for(var i=0;i<correctInstances.length;i++){if(correctInstances[i].id===selectedCorrectId){inst=correctInstances[i];break}}if(!inst&&correctInstances.length){inst=correctInstances[correctInstances.length-1];selectedCorrectId=inst.id;var selEl=document.getElementById("correctSel");if(selEl&&selEl.style.display!=="none")selEl.value=inst.id}if(inst){renderCorrectLog(inst.lines||[])}var running=false;for(var j=0;j<correctInstances.length;j++){if(correctInstances[j].running){running=true;break}}if(!running){stopPollCorrect();setCorrectBusy(false)}})}
 function renderCorrectLog(lines){var el=document.getElementById("correctLog");if(!lines.length)return;el.textContent=lines.join("\n");el.scrollTop=el.scrollHeight}
 function stopCorrect(){apiPost("/api/correct/stop",{id:selectedCorrectId||undefined}).then(function(res){if(res&&res.ok){toast("已请求停止","warn");addLog("已请求停止矫正","log-warn")}else{var msg=res&&res.error?res.error:"停止失败";toast(msg,"fail")}})}
+/* ===== EPUB 编辑（独立进程，单实例） ===== */
+var epubeditPollTimer=null;
+function setEpubEditBusy(busy){var start=document.getElementById("epubeditStartBtn"),stop=document.getElementById("epubeditStopBtn"),st=document.getElementById("epubeditStatus");if(busy){start.disabled=true;start.classList.add("running");start.textContent="\u7f16\u8f91\u4e2d\u2026";stop.style.display="";stop.disabled=false;if(st)st.textContent="\u8fd0\u884c\u4e2d\u2026"}else{start.disabled=false;start.classList.remove("running");start.textContent="\u542f\u52a8\u7f16\u8f91";stop.style.display="none";stop.disabled=true;if(st)st.textContent=""}}
+function pickEpubEdit(){apiPost("/api/pick",{kind:"file",filter:"epub",title:"\u9009\u62e9 EPUB \u6587\u4ef6"}).then(function(res){if(res&&res.ok&&!res.cancelled&&res.path){document.getElementById("epubeditPath").value=res.path;var hint=document.getElementById("epubeditPathHint");if(!res.path.toLowerCase().endsWith(".epub")){hint.textContent="\u26a0 \u6587\u4ef6\u540e\u7f00\u4e0d\u662f .epub";hint.style.color="var(--red)"}else{hint.textContent=""}}else if(res&&res.cancelled){toast("\u5df2\u53d6\u6d88\u9009\u62e9","warn")}})}
+function startEpubEdit(){var epub=document.getElementById("epubeditPath").value.trim();if(!epub){toast("\u8bf7\u5148\u9009\u62e9 EPUB \u6587\u4ef6","warn");return}if(!epub.toLowerCase().endsWith(".epub")){toast("\u6587\u4ef6\u540e\u7f00\u4e0d\u662f .epub\uff0c\u8bf7\u9009\u62e9\u6b63\u786e\u7684 EPUB","warn");return}var timeout=parseInt(document.getElementById("epubeditTimeout").value,10);if(isNaN(timeout)||timeout<30)timeout=600;setEpubEditBusy(true);var log=document.getElementById("epubeditLines");log.textContent="";addLog("\u542f\u52a8 EPUB \u7f16\u8f91: "+epub,"log-info");apiPost("/api/epubedit/start",{epub:epub,idle_timeout:timeout}).then(function(res){if(res&&res.ok){toast("EPUB \u7f16\u8f91\u5df2\u542f\u52a8","ok");addLog("EPUB \u7f16\u8f91\u5df2\u542f\u52a8","log-ok");startPollEpubEdit()}else{var msg=res&&res.error?res.error:"\u542f\u52a8\u5931\u8d25";toast(msg,"fail");addLog("\u542f\u52a8\u5931\u8d25: "+msg,"log-err");setEpubEditBusy(false)}})}
+function startPollEpubEdit(){if(epubeditPollTimer)clearInterval(epubeditPollTimer);epubeditPollTimer=setInterval(pollEpubEditStatus,500)}
+function stopPollEpubEdit(){if(epubeditPollTimer){clearInterval(epubeditPollTimer);epubeditPollTimer=null}}
+function pollEpubEditStatus(){apiGet("/api/epubedit/status").then(function(res){if(!res||!res.ok)return;var insts=res.instances||[];if(insts.length){var inst=insts[insts.length-1];renderEpubEditLog(inst.lines||[])}var running=false;for(var i=0;i<insts.length;i++){if(insts[i].running){running=true;break}}if(!running){stopPollEpubEdit();setEpubEditBusy(false);var st=document.getElementById("epubeditStatus");if(st&&insts.length){var last=insts[insts.length-1];st.textContent=last.url?("\u5df2\u7ed3\u675f\uff1a"+last.url):"\u5df2\u7ed3\u675f"}}})}
+function renderEpubEditLog(lines){var el=document.getElementById("epubeditLines");if(!lines.length)return;el.textContent=lines.join("\n");el.scrollTop=el.scrollHeight}
+function stopEpubEdit(){apiPost("/api/epubedit/stop",{id:undefined}).then(function(res){if(res&&res.ok){toast("\u5df2\u8bf7\u6c42\u505c\u6b62","warn");addLog("\u5df2\u8bf7\u6c42\u505c\u6b62 EPUB \u7f16\u8f91","log-warn");setEpubEditBusy(false);stopPollEpubEdit()}else{var msg=res&&res.error?res.error:"\u505c\u6b62\u5931\u8d25";toast(msg,"fail")}})}
 /* ===== 工具页：多 EPUB 合并 ===== */
 var mergePollTimer=null;
 var mergeFiles=[];
@@ -577,11 +617,13 @@ function clearCaches(){var scopes=[];if(document.getElementById("ccPreview").che
 function createBackup(){var params={include_history_images:document.getElementById("bkImages").checked,include_epubs:document.getElementById("bkEpubs").checked};var btn=document.getElementById("bkBtn"),out=document.getElementById("bkResult");btn.disabled=true;btn.textContent="备份中…";apiPost("/api/backup/create",params).then(function(res){btn.disabled=false;btn.textContent="立即备份";if(res&&res.ok){var mb=(res.size/1048576).toFixed(1);out.textContent="已备份 "+res.files+" 个文件："+res.path+"（"+mb+" MB）";toast("备份完成","ok")}else{var msg=res&&res.error?res.error:"备份失败";out.textContent=msg;toast(msg,"fail")}})}
 /* ===== 历史记录页 ===== */
 var historyLoaded=false;
-function renderHistory(){apiGet("/api/history").then(function(res){if(!res||!res.ok){toast("加载历史记录失败","fail");return}historyLoaded=true;var tbody=document.getElementById("historyTbody");var entries=res.entries||[];if(!entries.length){tbody.innerHTML='<tr><td colspan="6" class="empty-state">暂无历史记录</td></tr>';return}tbody.innerHTML="";entries.forEach(function(e){var tr=document.createElement("tr");var title=escH(e.display_name||e.name||(e.pdf?basename(e.pdf):"(未命名)"));var pdf=escH(e.pdf?basename(e.pdf):"");var upd=escH(e.updated||"");var pages=e.pages!=null?e.pages:"";var pr=e.last_proofread_page!=null?e.last_proofread_page:"";tr.innerHTML='<td>'+title+'</td><td style="font-size:12px;">'+pdf+'</td><td style="font-size:12px;">'+upd+'</td><td>'+pages+'</td><td>'+pr+'</td>';var ops=document.createElement("td");ops.style.cssText="white-space:nowrap;";var openBtn=document.createElement("button");openBtn.className="btn-small";openBtn.textContent="矫正";openBtn.onclick=function(){openHistoryCorrect(e)};var delBtn=document.createElement("button");delBtn.className="btn-small";delBtn.textContent="删除";delBtn.style.cssText="margin-left:6px;color:var(--red);border-color:var(--red);";delBtn.onclick=function(){deleteHistory(e)};ops.appendChild(openBtn);ops.appendChild(delBtn);tr.appendChild(ops);tbody.appendChild(tr)})})}
+function renderHistory(){apiGet("/api/history").then(function(res){if(!res||!res.ok){toast("加载历史记录失败","fail");return}historyLoaded=true;var tbody=document.getElementById("historyTbody");var entries=res.entries||[];if(!entries.length){tbody.innerHTML='<tr><td colspan="6" class="empty-state">暂无历史记录</td></tr>';return}tbody.innerHTML="";entries.forEach(function(e){var tr=document.createElement("tr");var title=escH(e.display_name||e.name||(e.pdf?basename(e.pdf):"(未命名)"));var pdf=escH(e.pdf?basename(e.pdf):"");var upd=escH(e.updated||"");var pages=e.pages!=null?e.pages:"";var pr=e.last_proofread_page!=null?e.last_proofread_page:"";tr.innerHTML='<td>'+title+'</td><td style="font-size:12px;">'+pdf+'</td><td style="font-size:12px;">'+upd+'</td><td>'+pages+'</td><td>'+pr+'</td>';var ops=document.createElement("td");ops.style.cssText="white-space:nowrap;";var openBtn=document.createElement("button");openBtn.className="btn-small";openBtn.textContent="矫正";openBtn.onclick=function(){openHistoryCorrect(e)};var delBtn=document.createElement("button");delBtn.className="btn-small";delBtn.textContent="删除";delBtn.style.cssText="margin-left:6px;color:var(--red);border-color:var(--red);";delBtn.onclick=function(){deleteHistory(e)};var expBtn=document.createElement("button");expBtn.className="btn-small";expBtn.textContent="导出";expBtn.title="导出该版本为备份 ZIP（含内嵌预览图，保存到程序 data/data 目录），可在矫正界面「导入」恢复";expBtn.style.cssText="margin-left:6px;";expBtn.onclick=function(){exportHistory(e)};var saveAsSel=document.createElement("select");saveAsSel.className="btn-small";saveAsSel.style.cssText="margin-left:6px;height:26px;";saveAsSel.title="另存为：选择格式后弹窗选保存位置（TXT / MD / DOCX / EPUB）";var so0=document.createElement("option");so0.value="";so0.textContent="另存为 ▾";saveAsSel.appendChild(so0);[["txt","txt"],["md","md"],["docx","docx"],["epub","epub"]].forEach(function(f){var o=document.createElement("option");o.value=f[0];o.textContent="导出 "+f[1].toUpperCase();saveAsSel.appendChild(o)});saveAsSel.onchange=function(){var f=saveAsSel.value;saveAsSel.value="";if(f){exportHistorySaveAs(e,f)}};ops.appendChild(openBtn);ops.appendChild(expBtn);ops.appendChild(saveAsSel);ops.appendChild(delBtn);tr.appendChild(ops);tbody.appendChild(tr)})})}
 function openHistoryCorrect(e){apiPost("/api/correct/start",{pdf:e.pdf||null,history_id:e.id}).then(function(res){if(res&&res.ok){toast("矫正已启动","ok")}else{var msg=res&&res.error?res.error:"启动失败";toast(msg,"fail")}})}
+function exportHistory(e){apiPost("/api/history/export/backup",{ids:[e.id||""]}).then(function(res){if(res&&res.ok){toast("已导出备份："+(res.path||""),"ok")}else{toast((res&&res.error)||"导出失败","fail")}})}
+function exportHistorySaveAs(e,fmt){var extMap={txt:".txt",md:".md",docx:".docx",epub:".epub"};var ftMap={txt:[["文本文件","*.txt"],["所有文件","*.*"]],md:[["Markdown 文件","*.md"],["所有文件","*.*"]],docx:[["Word 文档","*.docx"],["所有文件","*.*"]],epub:[["EPUB 电子书","*.epub"],["所有文件","*.*"]]};function _p2(n){return(n<10?"0":"")+n}var d=new Date();var stamp=""+d.getFullYear()+_p2(d.getMonth()+1)+_p2(d.getDate())+_p2(d.getHours())+_p2(d.getMinutes())+_p2(d.getSeconds());var t=(e.display_name||e.name||(e.pdf?basename(e.pdf):"历史")||"历史").replace(/\.[^.]+$/,"");var def=t+"_"+stamp+(extMap[fmt]||".txt");apiPost("/api/pick",{kind:"save",title:"导出为 "+(fmt||"").toUpperCase(),default:def,ext:extMap[fmt]||".txt",filetypes:ftMap[fmt]||[["所有文件","*.*"]]}).then(function(r){if(!r)return;if(r.cancelled){toast("已取消保存","warn");return}if(r.error){toast(r.error,"fail");return}var path=r.path;apiPost("/api/history/export/file",{id:e.id||"",format:fmt,save_path:path}).then(function(res){if(res&&res.ok){toast("已导出："+(res.path||""),"ok")}else{toast((res&&res.error)||"导出失败","fail")}})})}
 function deleteHistory(e){if(!confirm("确定删除历史记录「"+(e.display_name||e.name||e.id)+"」？"))return;apiPost("/api/history/delete",{id:e.id}).then(function(res){if(res&&res.ok){toast("已删除","ok");renderHistory()}else{toast((res&&res.error)||"删除失败","fail")}})}
 setInterval(function(){fetch("/api/ping").catch(function(){})},30000);
-window.addEventListener("pagehide",function(){stopPollConvert();stopPollCorrect();stopPollMerge();navigator.sendBeacon("/api/bye")});
+window.addEventListener("pagehide",function(){stopPollConvert();stopPollCorrect();stopPollMerge();stopPollEpubEdit();navigator.sendBeacon("/api/bye")});
 window.addEventListener("pageshow",function(){fetch("/api/ping").catch(function(){})});
 fetchConfig().then(function(){fetchStatus()});
 </script>
@@ -708,6 +750,19 @@ def _correct_argv(
         argv += ["--epub-path", epub_path]
     if correct_timeout is not None:
         argv += ["--correct-timeout", str(correct_timeout)]
+    return argv
+
+
+def _epubedit_argv(epub: str, idle_timeout: int = 600) -> list[str]:
+    """组装「epubedit」子命令的 argv（独立进程运行 EPUB 编辑器）。
+
+    冻结 exe：argv 以自身为可执行文件；开发环境：python -u + mian.py。
+    """
+    if getattr(sys, "frozen", False):
+        argv = [sys.executable, "epubedit"]
+    else:
+        argv = [sys.executable, "-u", os.path.join(ROOT, "mian.py"), "epubedit"]
+    argv += [epub, "--idle-timeout", str(idle_timeout)]
     return argv
 
 
@@ -892,6 +947,11 @@ def _correct_instances(state: dict) -> list:
     return state.setdefault("correct_instances", [])
 
 
+def _epubedit_instances(state: dict) -> list:
+    """取 state 的 EPUB 编辑实例列表（同 _correct_instances 的 setdefault 防御）。"""
+    return state.setdefault("epubedit_instances", [])
+
+
 def _correct_monitor(inst: dict, proc) -> None:
     """矫正子进程监控线程：流式收集 stdout，解析矫正界面地址，退出收尾。
 
@@ -942,6 +1002,69 @@ def _correct_monitor(inst: dict, proc) -> None:
                             extra = lines_q.get(timeout=0.1)
                         except queue.Empty:
                             continue
+                        if extra is None:
+                            break
+                        _handle_line(extra)
+                    break
+                continue
+            if line is None:
+                break  # stdout 已 EOF（子进程未继承管道或已全部关闭）
+            _handle_line(line)
+        rc = proc.wait()
+        inst["running"] = False
+        inst["finalized"] = True
+        inst["exit_code"] = rc
+    except Exception:  # noqa: BLE001  监控线程异常不崩溃服务
+        inst["running"] = False
+        inst["finalized"] = True
+
+
+def _epubedit_monitor(inst: dict, proc) -> None:
+    """EPUB 编辑子进程监控线程：流式收集 stdout，解析编辑地址，退出收尾。
+
+    与 _correct_monitor 同构（epubedit 子进程也会拉起浏览器/服务并可能
+    继承 stdout 管道）：stdout 由独立读线程搬进队列，主循环以 proc.poll()
+    兜底收尾，绝不死等 EOF。日志中首个 `http://127.0.0.1:<port>/` 行记为
+    编辑界面地址（复用 _CORRECT_URL_RE——URL 格式一致）。
+    """
+    lines_q = queue.Queue()
+
+    def _reader() -> None:
+        """后台读线程：逐行搬进队列；stdout EOF/异常时放 None 哨兵。"""
+        try:
+            for line in proc.stdout:
+                lines_q.put(line)
+        except Exception:  # noqa: BLE001  读取异常按 EOF 处理
+            pass
+        finally:
+            lines_q.put(None)
+
+    threading.Thread(target=_reader, daemon=True).start()
+
+    def _handle_line(text: str) -> None:
+        line = text.rstrip("\n")
+        if inst.get("port") is None:
+            m = _CORRECT_URL_RE.search(line)
+            if m:
+                port = int(m.group(1))
+                inst["port"] = port
+                inst["url"] = f"http://127.0.0.1:{port}/"
+        inst.setdefault("lines", []).append(line)
+        if len(inst["lines"]) > _CORRECT_MAX_LINES:
+            del inst["lines"][: len(inst["lines"]) - _CORRECT_MAX_LINES]
+
+    try:
+        while True:
+            try:
+                line = lines_q.get(timeout=0.5)
+            except queue.Empty:
+                if proc.poll() is not None:
+                    # 主进程已退出：排空读线程已搬入的剩余缓冲后收尾
+                    while True:
+                        try:
+                            extra = lines_q.get_nowait()
+                        except queue.Empty:
+                            break
                         if extra is None:
                             break
                         _handle_line(extra)
@@ -1047,11 +1170,23 @@ def _browser_gone(
     return False, None
 
 
-def _pick_path(kind: str, title: str | None, filt: str | None = None, multiple: bool = False) -> dict:
+def _pick_path(
+    kind: str,
+    title: str | None,
+    filt: str | None = None,
+    multiple: bool = False,
+    default: str | None = None,
+    initialdir: str | None = None,
+    save_ext: str | None = None,
+    save_filetypes: list | None = None,
+) -> dict:
     """弹 tkinter 文件/目录选择对话框（仅主线程调用）。
 
+    kind："file" 选文件（filt 限定 pdf/epub）、"dir" 选目录、"save" 保存对话框
+    （默认 *.zip，导出历史内容时可按格式传 save_ext/save_filetypes，如 .txt/.epub）。
     filt 仅对 kind=="file" 生效："pdf" 限定 PDF，"epub" 限定 EPUB。
-    multiple=True 时多选，返回 {ok, paths:[...]}。
+    multiple=True 时多选，返回 {ok, paths:[...]}；default/initialdir 仅对
+    "save" 生效（默认文件名 / 起始目录）；save_ext/save_filetypes 仅对 "save" 生效。
     返回 {ok: True, path}（单选选中）| {ok: True, paths:[...]}（多选）|
     {ok: True, cancelled: True}（取消）| {ok: False, error}（tkinter 不可用）。
     """
@@ -1071,6 +1206,19 @@ def _pick_path(kind: str, title: str | None, filt: str | None = None, multiple: 
         try:
             if kind == "dir":
                 path = filedialog.askdirectory(title=title or "选择文件夹")
+            elif kind == "save":
+                _ext = save_ext or ".zip"
+                _ftypes = save_filetypes or [
+                    ("ZIP 备份文件", "*.zip"),
+                    ("所有文件", "*.*"),
+                ]
+                path = filedialog.asksaveasfilename(
+                    title=title or "另存为",
+                    defaultextension=_ext,
+                    filetypes=_ftypes,
+                    initialfile=default or "",
+                    initialdir=initialdir or "",
+                )
             elif multiple:
                 ftypes = {
                     "pdf": [("PDF 文件", "*.pdf"), ("所有文件", "*.*")],
@@ -1121,6 +1269,10 @@ def _drain_dialog_queue(state: dict) -> None:
                 req.get("title"),
                 req.get("filter"),
                 req.get("multiple", False),
+                default=req.get("default"),
+                initialdir=req.get("initialdir"),
+                save_ext=req.get("save_ext"),
+                save_filetypes=req.get("save_filetypes"),
             )
         except Exception:  # noqa: BLE001
             req["result"] = {"ok": False, "error": "无法弹出文件选择对话框"}
@@ -1329,11 +1481,18 @@ class _GuiHandler(BaseHTTPRequestHandler):
         if path == "/api/correct/status":
             self._api_correct_status()
             return
+        if path == "/api/epubedit/status":
+            self._api_epubedit_status()
+            return
         if path == "/api/tools/merge/status":
             self._api_tools_merge_status()
             return
         if path == "/api/history":
             self._api_history_get()
+            return
+        if path == "/api/history/export":
+            # 注意：path 已去掉查询串（do_GET 里 split("?",1)[0]），导出 id 从查询串取
+            self._api_history_export()
             return
         self._send(404, self._json({"ok": False, "error": "未找到"}))
 
@@ -1442,14 +1601,18 @@ class _GuiHandler(BaseHTTPRequestHandler):
     def _api_pick(self, body) -> None:
         """POST /api/pick：把文件/目录选择请求交给主线程弹框并等待结果。
 
-        multiple=true 时多选，返回 {ok, paths:[...]}；否则单选 {ok, path}。
+        kind：file（文件，filter 限定 pdf/epub）/ dir（目录）/ save（保存对话框，
+        默认 *.zip；导出历史内容时按格式传 ext/filetypes，如 txt/epub）。
+        multiple=true 时多选，返回 {ok, paths:[...]}；否则单选 {ok, path}；
+        save 可附带 default（默认文件名）/ initialdir（起始目录）/ ext（默认扩展名）
+        / filetypes（[["描述","*.ext"],...]）。
         """
         if not isinstance(body, dict):
             self._send(400, self._json({"ok": False, "error": "无效的 JSON"}))
             return
         kind = body.get("kind")
-        if kind not in ("file", "dir"):
-            self._send(400, self._json({"ok": False, "error": "kind 仅支持 file / dir"}))
+        if kind not in ("file", "dir", "save"):
+            self._send(400, self._json({"ok": False, "error": "kind 仅支持 file / dir / save"}))
             return
         multiple = body.get("multiple", False)
         if not isinstance(multiple, bool):
@@ -1459,11 +1622,23 @@ class _GuiHandler(BaseHTTPRequestHandler):
         if filt is not None and filt not in ("pdf", "epub"):
             self._send(400, self._json({"ok": False, "error": "filter 仅支持 pdf / epub"}))
             return
+        save_ext = body.get("ext") if kind == "save" else None
+        if save_ext is not None and not isinstance(save_ext, str):
+            self._send(400, self._json({"ok": False, "error": "ext 必须是字符串"}))
+            return
+        save_filetypes = body.get("filetypes") if kind == "save" else None
+        if save_filetypes is not None and not isinstance(save_filetypes, list):
+            self._send(400, self._json({"ok": False, "error": "filetypes 必须是数组"}))
+            return
         req = {
             "kind": kind,
             "title": body.get("title"),
             "filter": filt if kind == "file" else None,
-            "multiple": multiple,
+            "multiple": multiple if kind != "save" else False,
+            "default": body.get("default") if kind == "save" else None,
+            "initialdir": body.get("initialdir") if kind == "save" else None,
+            "save_ext": save_ext,
+            "save_filetypes": save_filetypes,
             "done": threading.Event(),
             "result": None,
             "aborted": False,
@@ -1889,6 +2064,150 @@ class _GuiHandler(BaseHTTPRequestHandler):
         inst["finalized"] = True
         self._send(200, self._json({"ok": True, "message": "已请求停止"}))
 
+    def _api_epubedit_start(self, body) -> None:
+        """POST /api/epubedit/start：子进程启动 EPUB 编辑器（独立进程，单飞）。
+
+        body: {epub: str, idle_timeout?: int}。epub 必须存在且以 .epub 结尾；
+        转换或已有编辑实例运行中 → 409。
+        """
+        if not isinstance(body, dict):
+            self._send(400, self._json({"ok": False, "error": "无效的 JSON"}))
+            return
+        epub = body.get("epub") or body.get("path")
+        if not isinstance(epub, str) or not epub:
+            self._send(400, self._json({"ok": False, "error": "请选择有效的 EPUB 文件"}))
+            return
+        if not os.path.isfile(epub):
+            self._send(400, self._json({"ok": False, "error": f"文件不存在：{epub}"}))
+            return
+        if not epub.lower().endswith(".epub"):
+            self._send(400, self._json({"ok": False, "error": "请选择有效的 EPUB 文件"}))
+            return
+        idle_timeout = body.get("idle_timeout") or 600
+        if type(idle_timeout) is not int or idle_timeout < 1:
+            self._send(400, self._json({"ok": False, "error": "idle_timeout 必须 >= 1"}))
+            return
+        st = self.server.state
+        cv = st["convert"]
+        with cv["lock"]:
+            if cv["running"]:
+                self._send(409, self._json({"ok": False, "error": "已有转换在运行"}))
+                return
+        if any(x.get("running") for x in _epubedit_instances(st)):
+            self._send(409, self._json({"ok": False, "error": "已有 EPUB 编辑在运行"}))
+            return
+        inst = {
+            "id": uuid.uuid4().hex[:12],
+            "epub": epub,
+            "proc": None,
+            "port": None,
+            "url": None,
+            "running": True,
+            "lines": [],
+            "finalized": False,
+            "exit_code": None,
+        }
+        argv = _epubedit_argv(epub, idle_timeout=idle_timeout)
+        try:
+            env = dict(os.environ)
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUNBUFFERED"] = "1"
+            kwargs = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "bufsize": 1,
+                "env": env,
+            }
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            if flags:
+                kwargs["creationflags"] = flags
+            proc = subprocess.Popen(argv, **kwargs)
+        except Exception as e:
+            inst["running"] = False
+            inst["finalized"] = True
+            inst["lines"].append(f"启动 EPUB 编辑失败：{e}")
+            self._send(500, self._json({"ok": False, "error": f"启动 EPUB 编辑失败：{e}"}))
+            return
+        inst["proc"] = proc
+        _epubedit_instances(st).append(inst)
+        threading.Thread(target=_epubedit_monitor, args=(inst, proc), daemon=True).start()
+        self._send(200, self._json({"ok": True, "id": inst["id"], "message": "EPUB 编辑已启动", "argv": argv}))
+
+    def _api_epubedit_status(self) -> None:
+        """GET /api/epubedit/status：EPUB 编辑实例列表快照（前端回显日志/按钮态）。"""
+        instances = []
+        for inst in list(_epubedit_instances(self.server.state)):
+            proc = inst.get("proc")
+            if proc is not None and proc.poll() is not None and inst.get("running"):
+                inst["running"] = False
+                inst["finalized"] = True
+            instances.append(
+                {
+                    "id": inst.get("id"),
+                    "epub": inst.get("epub"),
+                    "running": bool(inst.get("running")),
+                    "port": inst.get("port"),
+                    "url": inst.get("url"),
+                    "lines": inst.get("lines", [])[-500:],
+                }
+            )
+        self._send(200, self._json({"ok": True, "instances": instances, "count": len(instances)}))
+
+    def _api_epubedit_stop(self, body) -> None:
+        """POST /api/epubedit/stop：停止 EPUB 编辑实例（body.id 指定，缺省最新实例）。
+
+        先 terminate 优雅退出，最多等 5s 再 kill；Windows 下 taskkill /T 树杀兜底。
+        """
+        if body is not None and not isinstance(body, dict):
+            self._send(400, self._json({"ok": False, "error": "无效的 JSON"}))
+            return
+        body = body or {}
+        inst_id = body.get("id")
+        if inst_id is not None and not isinstance(inst_id, str):
+            self._send(400, self._json({"ok": False, "error": "id 必须是字符串"}))
+            return
+        insts = _epubedit_instances(self.server.state)
+        if inst_id is None:
+            inst = insts[-1] if insts else None
+        else:
+            inst = next((x for x in insts if x.get("id") == inst_id), None)
+        if inst is None:
+            self._send(400, self._json({"ok": False, "error": "没有正在运行的 EPUB 编辑"}))
+            return
+        proc = inst.get("proc")
+        if proc is None:
+            inst["running"] = False
+            inst["finalized"] = True
+            self._send(200, self._json({"ok": True, "message": "已请求停止"}))
+            return
+        try:
+            proc.terminate()
+        except Exception:  # noqa: BLE001  进程可能已退出，忽略
+            pass
+        deadline = time.time() + 5.0
+        while time.time() < deadline and proc.poll() is None:
+            time.sleep(0.05)
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            if proc.poll() is None and getattr(proc, "pid", None):
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True,
+                    timeout=8,
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        inst["running"] = False
+        inst["finalized"] = True
+        self._send(200, self._json({"ok": True, "message": "已请求停止"}))
+
     # -- 缓存管理 / 数据备份 / 历史记录 --
 
     def _api_cache_clear(self, body) -> None:
@@ -2049,12 +2368,165 @@ class _GuiHandler(BaseHTTPRequestHandler):
             self._send(500, self._json({"ok": False, "error": str(e)}))
 
     def _api_history_get(self) -> None:
-        """GET /api/history：矫正历史条目（透传 correctmanage._history_entries）。"""
+        """GET /api/history：矫正历史条目（透传 correctmanage._history_entries）。
+
+        _history_entries 按文件名倒序返回（文件名以 pdf 路径哈希为前缀，跨书时
+        ≈ 哈希序，与新旧无关）；历史页默认以「最近更新时间」排序展示，故在此
+        按 updated 倒序重排（仅影响本页展示，不影响版本编号等其它调用方）。
+        """
         try:
             import correctmanage
             entries = correctmanage._history_entries()
+            entries.sort(key=lambda x: str(x.get("updated") or ""), reverse=True)
             self._send(200, self._json({"ok": True, "entries": entries}))
         except Exception as e:
+            self._send(500, self._json({"ok": False, "error": str(e)}))
+
+    def _api_history_export(self) -> None:
+        """GET /api/history/export?id=<版本id>：导出矫正历史为 JSON 下载。
+
+        与矫正界面（correctmanage 服务）的 /api/history/export 载荷完全同构：
+        版本原始内容 + images 键（本机共享 sidecar 合并；旧版本文件自带 images
+        键则直接用）。导出文件可在矫正界面「导入」恢复，供跨电脑继续矫正。
+        """
+        import urllib.parse as _up
+
+        try:
+            qs = _up.parse_qs(_up.urlsplit(self.path).query)
+            pid = str((qs.get("id") or [""])[0])
+            # id 仅允许文件名安全字符，防止路径穿越
+            if not pid or not re.fullmatch(r"[A-Za-z0-9_\-]+", pid):
+                self._send(404, self._json({"ok": False, "error": "历史版本不存在"}))
+                return
+            import correctmanage
+
+            fp = correctmanage._history_dir() / f"{pid}.json"
+            if not fp.is_file():
+                self._send(404, self._json({"ok": False, "error": "历史版本不存在"}))
+                return
+            data = json.loads(fp.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {"pages": {}}
+            if not data.get("images"):
+                images = correctmanage._load_images_cache(
+                    correctmanage._version_prefix(pid)
+                )
+                data["images"] = images or {}
+            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            self._send(
+                200,
+                body,
+                "application/json; charset=utf-8",
+                {"Content-Disposition": f'attachment; filename="{pid}.json"'},
+            )
+        except Exception as e:  # noqa: BLE001
+            self._send(500, self._json({"ok": False, "error": str(e)}))
+
+    def _api_history_export_backup(self, body) -> None:
+        """POST /api/history/export/backup：把选中的历史版本打包为 ZIP 写入磁盘。
+
+        为什么不再走浏览器下载（2026-09-16 修复）：历史页原先用
+        `<a download href="/api/history/export?id=...">` 触发下载，而 pywebview
+        WebView2 默认 ALLOW_DOWNLOADS=False 会**静默取消**附件/blob 下载——
+        于是界面提示"已开始导出"、实际一个文件都没有。改为服务端写盘并回传路径
+        （与矫正界面历史弹窗「导出」同一实现 correctmanage.export_history_backup，
+        提示语也一致："已导出备份：<路径>"）。
+
+        body: {ids:[str], save_path?:str}；save_path 由前端「另存为」经 /api/pick
+        取得，为空时回退默认位置 data/data/ptoe_history_<时间戳>.zip。
+        返回 {ok, path, count}。
+        """
+        if not isinstance(body, dict):
+            self._send(400, self._json({"ok": False, "error": "无效的 JSON"}))
+            return
+        ids = body.get("ids")
+        if not isinstance(ids, list) or not ids:
+            self._send(400, self._json({"ok": False, "error": "未选择要导出的历史版本"}))
+            return
+        save_path = body.get("save_path")
+        if save_path is not None and not isinstance(save_path, str):
+            self._send(400, self._json({"ok": False, "error": "save_path 必须是字符串"}))
+            return
+        try:
+            import correctmanage
+
+            clean_ids = [str(i) for i in ids if str(i or "")]
+            try:
+                result = correctmanage.export_history_backup(
+                    clean_ids, save_path=(save_path or None)
+                )
+            except ValueError as e:
+                self._send(400, self._json({"ok": False, "error": str(e)}))
+                return
+            except LookupError as e:
+                self._send(404, self._json({"ok": False, "error": str(e)}))
+                return
+            self._send(200, self._json(result))
+        except Exception as e:  # noqa: BLE001
+            self._send(500, self._json({"ok": False, "error": str(e)}))
+
+    def _api_history_export_file(self, body) -> None:
+        """POST /api/history/export/file：把单个历史版本的内容导出为 txt/docx/md/epub。
+
+        与矫正界面工具栏导出下拉**同一转换链路**（correctmanage.export_content_to_file），
+        保证历史版本内容与矫正界面导出输出一致。前端「另存为」先经 /api/pick 选
+        保存位置（按格式传 ext/filetypes），再把路径带来这里落盘。
+
+        body: {id:str, format:str, save_path:str}；返回 {ok, path}。
+        """
+        if not isinstance(body, dict):
+            self._send(400, self._json({"ok": False, "error": "无效的 JSON"}))
+            return
+        hid = body.get("id")
+        if not isinstance(hid, str) or not hid:
+            self._send(400, self._json({"ok": False, "error": "缺少历史版本 id"}))
+            return
+        fmt = str(body.get("format") or "")
+        if fmt not in ("txt", "docx", "epub", "md"):
+            self._send(400, self._json({"ok": False, "error": f"不支持的导出格式：{fmt}"}))
+            return
+        save_path = body.get("save_path")
+        if not isinstance(save_path, str) or not save_path:
+            self._send(400, self._json({"ok": False, "error": "缺少保存路径 save_path"}))
+            return
+        try:
+            import correctmanage
+
+            # _history_dir() 返回 Path，但测试里会被 mock 成 str——统一用 Path() 包裹，
+            # 避免 str / str 报错（与 export_history_backup 取目录后 Path() 同风格）
+            fp = Path(correctmanage._history_dir()) / f"{hid}.json"
+            if not fp.is_file():
+                self._send(404, self._json({"ok": False, "error": "历史版本不存在"}))
+                return
+            data = json.loads(fp.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {"pages": {}}
+            pages = data.get("pages") or {}
+            # 历史页 pages 为 {页码(str): html(str)} → 已排序的 {page, html} 列表
+            items = [
+                {"page": n, "html": str(pages[str(n)])}
+                for n in sorted(
+                    (int(k) for k in pages if str(k).isdigit()),
+                    key=lambda x: x,
+                )
+            ]
+            if not items:
+                self._send(400, self._json({"ok": False, "error": "该版本没有可导出的页面内容"}))
+                return
+            title = (
+                data.get("display_name")
+                or (data.get("pdf") or "")
+                or "历史导出"
+            )
+            try:
+                out = correctmanage.export_content_to_file(
+                    items, fmt, save_path, title=str(title)
+                )
+            except ValueError as e:
+                self._send(400, self._json({"ok": False, "error": str(e)}))
+                return
+            self._send(200, self._json({"ok": True, "path": out}))
+        except Exception as e:  # noqa: BLE001
             self._send(500, self._json({"ok": False, "error": str(e)}))
 
     def _api_history_delete(self, body) -> None:
@@ -2215,11 +2687,23 @@ class _GuiHandler(BaseHTTPRequestHandler):
         if path == "/api/correct/stop":
             self._api_correct_stop(body)
             return
+        if path == "/api/epubedit/start":
+            self._api_epubedit_start(body)
+            return
+        if path == "/api/epubedit/stop":
+            self._api_epubedit_stop(body)
+            return
         if path == "/api/cache/clear":
             self._api_cache_clear(body)
             return
         if path == "/api/backup/create":
             self._api_backup_create(body)
+            return
+        if path == "/api/history/export/backup":
+            self._api_history_export_backup(body)
+            return
+        if path == "/api/history/export/file":
+            self._api_history_export_file(body)
             return
         if path == "/api/history/delete":
             self._api_history_delete(body)

@@ -1403,6 +1403,98 @@ class TestGuiConvert(GuiServerTestBase):
         self.assertFalse(data["ok"])
         self.assertIn("filter", data["error"])
 
+    def test_pick_save_forwards_default(self):
+        """/api/pick kind=save：透传 default/initialdir（不真弹 tkinter）。"""
+        captured = {}
+
+        def fake_drain(state):
+            while True:
+                try:
+                    req = state["dlg_queue"].get_nowait()
+                except queue.Empty:
+                    time.sleep(0.01)
+                    continue
+                captured.update(req)
+                req["result"] = {"ok": True, "path": "C:/out/ptoe_history.zip"}
+                req["done"].set()
+                return
+
+        orig = guimanage._drain_dialog_queue
+        guimanage._drain_dialog_queue = fake_drain
+        drainer = threading.Thread(
+            target=lambda: guimanage._drain_dialog_queue(self._state), daemon=True
+        )
+        try:
+            drainer.start()
+            status, raw = self._post(
+                "/api/pick",
+                {"kind": "save", "title": "另存历史备份为 ZIP", "default": "ptoe_history_1.zip"},
+            )
+        finally:
+            guimanage._drain_dialog_queue = orig
+            drainer.join(timeout=5)
+        self.assertEqual(status, 200)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["path"], "C:/out/ptoe_history.zip")
+        self.assertEqual(captured.get("kind"), "save")
+        self.assertEqual(captured.get("default"), "ptoe_history_1.zip")
+        self.assertFalse(captured.get("multiple"))  # save 强制单选
+
+    def test_pick_save_ext_forwarded(self):
+        """/api/pick kind=save 按格式传 ext/filetypes → 透传到主线程弹框。"""
+        captured = {}
+
+        def fake_drain(state):
+            while True:
+                try:
+                    req = state["dlg_queue"].get_nowait()
+                except queue.Empty:
+                    time.sleep(0.01)
+                    continue
+                captured.update(req)
+                req["result"] = {"ok": True, "path": "C:/out/book.epub"}
+                req["done"].set()
+                return
+
+        orig = guimanage._drain_dialog_queue
+        guimanage._drain_dialog_queue = fake_drain
+        drainer = threading.Thread(
+            target=lambda: guimanage._drain_dialog_queue(self._state), daemon=True
+        )
+        try:
+            drainer.start()
+            status, raw = self._post(
+                "/api/pick",
+                {
+                    "kind": "save",
+                    "title": "导出为 EPUB",
+                    "default": "book.epub",
+                    "ext": ".epub",
+                    "filetypes": [["EPUB 电子书", "*.epub"], ["所有文件", "*.*"]],
+                },
+            )
+        finally:
+            guimanage._drain_dialog_queue = orig
+            drainer.join(timeout=5)
+        self.assertEqual(status, 200)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"])
+        self.assertEqual(captured.get("save_ext"), ".epub")
+        self.assertEqual(
+            captured.get("save_filetypes"),
+            [["EPUB 电子书", "*.epub"], ["所有文件", "*.*"]],
+        )
+
+    def test_pick_save_ext_invalid_type_400(self):
+        """/api/pick ext/filetypes 类型错误 → 400。"""
+        status, raw = self._post("/api/pick", {"kind": "save", "ext": 123})
+        self.assertEqual(status, 400)
+        status, raw = self._post(
+            "/api/pick", {"kind": "save", "filetypes": "*.zip"}
+        )
+        self.assertEqual(status, 400)
+
 
 class TestConvertArgv(unittest.TestCase):
     """_convert_argv 组装逻辑（不依赖 HTTP 服务）。"""
@@ -1490,7 +1582,7 @@ class TestMianWiring(unittest.TestCase):
         self.assertEqual(cm.exception.code, 0)
 
     def test_menu_8_calls_gui_serve(self):
-        """终端菜单输入 '8' 时调用 guimanage.gui_serve（mian 惰性 import）。"""
+        """终端菜单输入 '9' 时调用 guimanage.gui_serve（mian 惰性 import；2026-09-13 起配置界面为第 9 项）。"""
         import contextlib
         import io
 
@@ -1499,7 +1591,7 @@ class TestMianWiring(unittest.TestCase):
                 return True
 
         old_stdin = sys.stdin
-        sys.stdin = _TTY("8\n0\n")
+        sys.stdin = _TTY("9\n0\n")
         try:
             with mock.patch("guimanage.gui_serve") as gs:
                 with contextlib.redirect_stdout(io.StringIO()) as buf:
@@ -1640,6 +1732,148 @@ class TestCorrectMultiInstance(GuiServerTestBase):
         data = json.loads(raw)
         self.assertFalse(data["ok"])
         self.assertIn("没有正在运行的矫正", data["error"])
+
+
+class TestEpubEditInstances(GuiServerTestBase):
+    """EPUB 编辑实例：/api/epubedit/start|status|stop（mock Popen，不真起进程）。"""
+
+    def _wait_until(self, cond, timeout=4.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if cond():
+                return True
+            time.sleep(0.05)
+        return cond()
+
+    def _mk_epub(self, name="a.epub"):
+        p = _Path(tempfile.mkdtemp(prefix="test_gui_epub_")) / name
+        p.write_bytes(b"PK\x03\x04minimal-epub-stub")
+        self.addCleanup(lambda: shutil.rmtree(p.parent, ignore_errors=True))
+        return p
+
+    def test_epubedit_start_ok_single_instance(self):
+        """POST /api/epubedit/start + 状态轮询 → 实例完成、地址已解析。"""
+        epub = self._mk_epub("a.epub")
+        with mock.patch.object(
+            guimanage.subprocess, "Popen",
+            return_value=_FakeCorrectProc(["http://127.0.0.1:8231/\n", "启动完成\n"]),
+        ) as pop:
+            status, raw = self._post("/api/epubedit/start", {"epub": str(epub)})
+        self.assertEqual(status, 200)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"])
+        self.assertIn("argv", data)
+        self.assertTrue(pop.called)
+        # dev argv 形状：sys.executable -u ROOT/mian.py epubedit <path> --idle-timeout 600
+        argv = data["argv"]
+        self.assertEqual(argv[0], sys.executable)
+        self.assertEqual(argv[2].endswith("mian.py"), True)
+        self.assertIn("epubedit", argv)
+        self.assertIn(str(epub), argv)
+        self.assertIn("--idle-timeout", argv)
+        self.assertEqual(argv[argv.index("--idle-timeout") + 1], "600")
+
+        ok = self._wait_until(
+            lambda: len(guimanage._epubedit_instances(self._state)) == 1
+            and not guimanage._epubedit_instances(self._state)[0]["running"]
+            and guimanage._epubedit_instances(self._state)[0].get("url") is not None
+        )
+        self.assertTrue(ok, "EPUB 编辑实例未进入完成态/未解析 URL")
+        inst = guimanage._epubedit_instances(self._state)[0]
+        self.assertEqual(inst["epub"], str(epub))
+        self.assertEqual(inst["port"], 8231)
+        self.assertEqual(inst["url"], "http://127.0.0.1:8231/")
+        self.assertGreaterEqual(len(inst["lines"]), 2)
+
+        # GET /api/epubedit/status 快照（含实例列表）
+        status2, _, raw2 = self._get("/api/epubedit/status")
+        self.assertEqual(status2, 200)
+        snap = json.loads(raw2)
+        self.assertTrue(snap["ok"])
+        self.assertEqual(snap["count"], 1)
+        self.assertEqual(snap["instances"][0]["url"], "http://127.0.0.1:8231/")
+
+    def test_epubedit_start_bad_path_400(self):
+        """路径不存在/非 .epub → 400 中文错误，不 Popen。"""
+        # 文件不存在 → 文件不存在
+        missing = _Path(self._cfg_path).parent / "nope_missing.epub"
+        with mock.patch.object(guimanage.subprocess, "Popen") as pop:
+            status, raw = self._post("/api/epubedit/start", {"epub": str(missing)})
+        self.assertEqual(status, 400)
+        data = json.loads(raw)
+        self.assertFalse(data["ok"])
+        self.assertIn("文件不存在", data["error"])
+        pop.assert_not_called()
+        # 存在但非 .epub 后缀 → 请选择有效的 EPUB
+        not_epub = self._mk_epub("book.txt")
+        with mock.patch.object(guimanage.subprocess, "Popen") as pop2:
+            status2, raw2 = self._post("/api/epubedit/start", {"epub": str(not_epub)})
+        self.assertEqual(status2, 400)
+        self.assertIn("有效的 EPUB", json.loads(raw2)["error"])
+        pop2.assert_not_called()
+
+    def test_epubedit_start_rejects_when_convert_running(self):
+        """转换运行中 → 409（转换与 EPUB 编辑互斥）。"""
+        self._state["convert"]["running"] = True
+        epub = self._mk_epub("b.epub")
+        with mock.patch.object(guimanage.subprocess, "Popen") as pop:
+            status, raw = self._post("/api/epubedit/start", {"epub": str(epub)})
+        self.assertEqual(status, 409)
+        data = json.loads(raw)
+        self.assertFalse(data["ok"])
+        self.assertIn("已有转换在运行", data["error"])
+        pop.assert_not_called()
+
+    def test_epubedit_start_single_flight_409(self):
+        """已有编辑实例运行中 → 409（EPUB 编辑单实例）。"""
+        epub = self._mk_epub("c.epub")
+        with mock.patch.object(
+            guimanage.subprocess, "Popen",
+            return_value=_FakeCorrectProc(block=True),
+        ):
+            s1, _ = self._post("/api/epubedit/start", {"epub": str(epub)})
+            s2, raw2 = self._post("/api/epubedit/start", {"epub": str(epub)})
+        self.assertEqual(s1, 200)
+        self.assertEqual(s2, 409)
+        self.assertIn("已有 EPUB 编辑在运行", json.loads(raw2)["error"])
+
+    def test_epubedit_stop_with_id(self):
+        """body.id 指定实例 → 停止后 finalized 且不再 running。"""
+        epub = self._mk_epub("d.epub")
+        with mock.patch.object(
+            guimanage.subprocess, "Popen",
+            return_value=_FakeCorrectProc(block=True),
+        ):
+            _, raw = self._post("/api/epubedit/start", {"epub": str(epub)})
+        inst = guimanage._epubedit_instances(self._state)[0]
+        self.assertTrue(inst["running"])
+        status, resp = self._post("/api/epubedit/stop", {"id": inst["id"]})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(resp)["ok"])
+        self.assertFalse(inst["running"])
+        self.assertTrue(inst["finalized"])
+
+    def test_epubedit_stop_none_running_400(self):
+        """无运行实例 → 400 中文错误。"""
+        status, raw = self._post("/api/epubedit/stop", {})
+        self.assertEqual(status, 400)
+        self.assertIn("没有正在运行的 EPUB 编辑", json.loads(raw)["error"])
+
+    def test_epubedit_argv_shapes(self):
+        """_epubedit_argv：dev 走 mian.py，frozen 走自身可执行文件。"""
+        dev = guimanage._epubedit_argv("C:/x/book.epub", idle_timeout=120)
+        self.assertEqual(dev[0], sys.executable)
+        self.assertEqual(dev[1], "-u")
+        self.assertTrue(dev[2].endswith("mian.py"))
+        self.assertEqual(dev[3], "epubedit")
+        self.assertIn("C:/x/book.epub", dev)
+        self.assertEqual(dev[dev.index("--idle-timeout") + 1], "120")
+        with mock.patch.object(sys, "frozen", True, create=True):
+            fro = guimanage._epubedit_argv("C:/x/book.epub", idle_timeout=60)
+        self.assertEqual(fro[:2], [sys.executable, "epubedit"])
+        self.assertEqual(fro[2], "C:/x/book.epub")
+        self.assertEqual(fro[fro.index("--idle-timeout") + 1], "60")
+        self.assertNotIn("mian.py", fro)
 
 
 class TestCacheBackupHistory(GuiServerTestBase):
@@ -1791,6 +2025,173 @@ class TestCacheBackupHistory(GuiServerTestBase):
         status, raw = self._post("/api/history/delete", {"id": ""})
         self.assertEqual(status, 400)
         self.assertIn("缺少 id", json.loads(raw)["error"])
+
+    def test_history_export_backup_ok(self):
+        """POST /api/history/export/backup：版本打包成 ZIP 写入 data/data/ 并回传路径。
+
+        回归（2026-09-16）：历史页「导出」原先用 <a download href="/api/history/export">
+        触发浏览器下载，而 pywebview WebView2 默认 ALLOW_DOWNLOADS=False 会**静默取消**
+        附件下载 → 界面提示「已开始导出」却没有任何文件。现改为服务端写盘并回传路径
+        （与矫正界面历史弹窗「导出」同一实现 correctmanage.export_history_backup）。
+        """
+        import correctmanage
+
+        hist = self._data_root / "correction_history"
+        hist.mkdir(parents=True)
+        pid = "abc_20260101000000_0001"
+        (hist / f"{pid}.json").write_text(
+            json.dumps({"pages": {"1": "<p>正文</p>"}}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        base_dir = _Path(tempfile.mkdtemp(prefix="test_gui_base_"))
+        self.addCleanup(shutil.rmtree, base_dir, ignore_errors=True)
+        with mock.patch.object(correctmanage, "_history_dir", return_value=str(hist)), \
+                mock.patch("pdfmanage.app_base_dir", return_value=base_dir):
+            status, raw = self._post("/api/history/export/backup", {"ids": [pid]})
+        self.assertEqual(status, 200, raw)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"], data)
+        self.assertEqual(data["count"], 1)
+        out = _Path(data["path"])
+        # 必须真的落盘（旧实现只有浏览器下载，产物为空）
+        self.assertTrue(out.is_file(), data)
+        self.assertEqual(out.parent, base_dir / "data" / "data")
+        with zipfile.ZipFile(out) as zf:
+            self.assertIn(f"{pid}.json", zf.namelist())
+            payload = json.loads(zf.read(f"{pid}.json").decode("utf-8"))
+        self.assertEqual(payload["pages"]["1"], "<p>正文</p>")
+        self.assertIn("images", payload)  # 内嵌预览图，供跨机导入
+
+    def test_history_export_backup_bad_requests(self):
+        """空 ids → 400；版本不存在 → 404（错误信息中文可读）。"""
+        import correctmanage
+
+        hist = self._data_root / "correction_history"
+        hist.mkdir(parents=True)
+        status, raw = self._post("/api/history/export/backup", {"ids": []})
+        self.assertEqual(status, 400)
+        self.assertIn("未选择", json.loads(raw)["error"])
+        with mock.patch.object(correctmanage, "_history_dir", return_value=str(hist)):
+            status, raw = self._post("/api/history/export/backup", {"ids": ["nope"]})
+        self.assertEqual(status, 404)
+        self.assertIn("没有可导出", json.loads(raw)["error"])
+
+    def test_history_export_backup_save_path(self):
+        """POST /api/history/export/backup 带 save_path → 写入用户指定位置（另存为）。"""
+        import correctmanage
+
+        hist = self._data_root / "correction_history"
+        hist.mkdir(parents=True)
+        pid = "abc_20260101000000_0002"
+        (hist / f"{pid}.json").write_text(
+            json.dumps({"pages": {"1": "<p>正文2</p>"}}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        dest = self._data_root / "用户选择" / "我的备份.zip"
+        with mock.patch.object(correctmanage, "_history_dir", return_value=str(hist)):
+            status, raw = self._post(
+                "/api/history/export/backup", {"ids": [pid], "save_path": str(dest)}
+            )
+        self.assertEqual(status, 200, raw)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"], data)
+        # 落盘在用户指定位置（而非默认的 data/data），且自动建父目录
+        self.assertEqual(_Path(data["path"]), dest)
+        self.assertTrue(dest.is_file())
+        with zipfile.ZipFile(dest) as zf:
+            self.assertIn(f"{pid}.json", zf.namelist())
+
+    def _write_version(self, hist, pid, pages, display_name="测试书.pdf"):
+        (hist / f"{pid}.json").write_text(
+            json.dumps(
+                {"display_name": display_name, "pages": pages}, ensure_ascii=False
+            ),
+            encoding="utf-8",
+        )
+
+    def test_history_export_file_txt(self):
+        """POST /api/history/export/file format=txt → 把版本内容导出为 txt（指定位置）。"""
+        import correctmanage
+
+        hist = self._data_root / "correction_history"
+        hist.mkdir(parents=True)
+        pid = "abc_20260101000000_0002"
+        self._write_version(
+            hist, pid, {"1": "<h1>标题</h1>", "2": "<p>正文段落</p>"}
+        )
+        dest = self._data_root / "out" / "测试书_20260101.txt"
+        with mock.patch.object(correctmanage, "_history_dir", return_value=str(hist)):
+            status, raw = self._post(
+                "/api/history/export/file",
+                {"id": pid, "format": "txt", "save_path": str(dest)},
+            )
+        self.assertEqual(status, 200, raw)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"], data)
+        self.assertTrue(dest.is_file())
+        self.assertIn("标题", dest.read_bytes().decode("utf-8-sig"))
+
+    def test_history_export_file_epub(self):
+        """POST /api/history/export/file format=epub → 导出合法 EPUB（指定位置）。"""
+        import correctmanage
+
+        hist = self._data_root / "correction_history"
+        hist.mkdir(parents=True)
+        pid = "abc_20260101000000_0002"
+        self._write_version(
+            hist, pid, {"1": "<h1>标题</h1>", "2": "<p>正文段落</p>"}
+        )
+        dest = self._data_root / "out.epub"
+        with mock.patch.object(correctmanage, "_history_dir", return_value=str(hist)):
+            status, raw = self._post(
+                "/api/history/export/file",
+                {"id": pid, "format": "epub", "save_path": str(dest)},
+            )
+        self.assertEqual(status, 200, raw)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"], data)
+        self.assertTrue(dest.is_file())
+        with zipfile.ZipFile(dest) as zf:
+            self.assertIn("mimetype", zf.namelist())
+
+    def test_history_export_file_bad_format_400(self):
+        """format 非法 → 400。"""
+        status, raw = self._post(
+            "/api/history/export/file",
+            {"id": "x", "format": "pdf", "save_path": "z.pdf"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("格式", json.loads(raw)["error"])
+
+    def test_history_export_file_missing_version_404(self):
+        """版本不存在 → 404。"""
+        import correctmanage
+
+        hist = self._data_root / "correction_history"
+        hist.mkdir(parents=True)
+        with mock.patch.object(correctmanage, "_history_dir", return_value=str(hist)):
+            status, raw = self._post(
+                "/api/history/export/file",
+                {"id": "nope", "format": "txt", "save_path": "z.txt"},
+            )
+        self.assertEqual(status, 404)
+        self.assertIn("不存在", json.loads(raw)["error"])
+
+    def test_history_export_file_empty_pages_400(self):
+        """版本没有页面内容 → 400。"""
+        import correctmanage
+
+        hist = self._data_root / "correction_history"
+        hist.mkdir(parents=True)
+        pid = "abc_20260101000000_0002"
+        self._write_version(hist, pid, {})
+        with mock.patch.object(correctmanage, "_history_dir", return_value=str(hist)):
+            status, raw = self._post(
+                "/api/history/export/file",
+                {"id": pid, "format": "txt", "save_path": "z.txt"},
+            )
+        self.assertEqual(status, 400)
+        self.assertIn("没有可导出", json.loads(raw)["error"])
 
 
 if __name__ == "__main__":

@@ -109,7 +109,23 @@ window.__SCOPE = {
   FORMAT_RULE_OPTS: FORMAT_RULE_OPTS,
   FORMAT_OP_GROUPS: FORMAT_OP_GROUPS,
   reverseBindings: reverseBindings
-};`;
+};
+// 本文件直接使用 w.xxx 调用内部函数：app.js 首行是 'use strict'，
+// 严格模式下的 eval 声明不会挂到 window（旧版本不是严格模式，故此前可用），
+// 这里显式导出（2026-09-13 修复，否则整个测试在 (c2) 就中断、后面的断言全部不跑）。
+window.applyInlineClass = applyInlineClass;
+window.unwrapSpans = unwrapSpans;
+window.wrapRange = wrapRange;
+window.captureFormatFromSelection = captureFormatFromSelection;
+window.applyOp = applyOp;
+window.applySingleFormat = applySingleFormat;
+window.toggleNote = toggleNote;
+window.applyFormat = applyFormat;
+window.collect = collect;
+window.reverseBindings = reverseBindings;
+window.INLINE_CLASSES = INLINE_CLASSES;
+window.INLINE_CLASS_LABEL = INLINE_CLASS_LABEL;
+window.INLINE_MUTEX = INLINE_MUTEX;`;
 
   w.eval(combinedScript);
   console.log('[main] app.js evaluated successfully with bridge');
@@ -257,8 +273,10 @@ function runTests() {
   assert(typeof w.wrapRange === 'function', 'wrapRange function exists');
   console.log('Inline helpers: all present');
 
-  // (e) Setup a test page with editable content
-  if (!w.pages.length) {
+  // (e) 页面行由 app 自身 init 按 /api/pages 数据挂载。旧版这里手工注入内部状态
+  //     （w.pages/w.heights/w.rebuildPrefix），但 app.js 首行是 'use strict'，
+  //     内部 let/函数不一定在 window 上（2026-09-13）。保留兜底但全部加存在性判断。
+  if ((!w.pages || !w.pages.length) && w.heights && typeof w.rebuildPrefix === 'function') {
     w.pages = [{ page: 1, text: '<p>测试文本</p>', w: 800, h: 1200 }];
     w.heights.length = 1; w.heights.fill(0);
     w.est = 420;
@@ -266,12 +284,18 @@ function runTests() {
     w.updateViewport();
   }
 
-  // Wait for virtual list to attach first row
+  // 等待虚拟列表挂载首个页面行（轮询，机器慢时也能等到）
   return new Promise((resolve, reject) => {
-    setTimeout(() => {
+    const deadline = Date.now() + 5000;
+    const start = () => {
+      const host = doc.getElementById('pages');
+      const row = host && host.querySelector('.page-row');
+      if (!row) {
+        if (Date.now() > deadline) { reject(new Error('page-row 未在 5s 内挂载')); return; }
+        setTimeout(start, 50);
+        return;
+      }
       try {
-        const host = doc.getElementById('pages');
-        const row = host.querySelector('.page-row');
         assert(row, 'page-row attached');
         const ed = row.querySelector('.editable');
         assert(ed, 'editable exists');
@@ -407,12 +431,132 @@ function runTests() {
         assert(usup, 'dropdown sup item applies format');
         console.log('Dropdown supSubMenu: wiring works');
 
+        // (r) 修复回归（2026-09-13）：规则引擎套上的格式必须能被界面改回/清除。
+        //     规则「匹配对象/分组」路径的 note 落在行内 <span class="ptoe-note">；
+        //     块级路径的 note 落在块的 class。三条撤销路径：清除格式/再次点注释/设置正文。
+        // (r0) 前置：整块 range 也能解包相交 span（unwrapSpans 相交语义）
+        ed.innerHTML = '<p>文字<span class="ptoe-underline">下划</span>尾部</p>';
+        {
+          const blk = ed.firstChild;
+          const rAll = doc.createRange();
+          rAll.setStart(blk, 0);
+          rAll.setEnd(blk, blk.childNodes.length);
+          const n = w.unwrapSpans(blk, 'ptoe-underline', rAll);
+          assert(n === 1 && !ed.querySelector('span.ptoe-underline'), '整块 range 可解包相交 span');
+        }
+
+        // (r1) 清除格式 → 行内注释 span 解包、文字保留
+        ed.innerHTML = '<p>正文<span class="ptoe-note">〔1〕注释内容</span>尾部</p>';
+        let range7 = doc.createRange();
+        range7.selectNodeContents(ed.firstChild);
+        sel.removeAllRanges();
+        sel.addRange(range7);
+        w.applyOp('remove');
+        assert(!ed.querySelector('span.ptoe-note'), '清除格式解包规则行内注释 span');
+        assert(ed.textContent.includes('〔1〕注释内容'), '清除格式保留注释文字');
+
+        // (r2) 再次点「注释」（规则行内注释）→ 关闭；再点 → 应用块级注释；再点 → 关闭
+        ed.innerHTML = '<p>正文<span class="ptoe-note">注释内容</span>尾部</p>';
+        range7 = doc.createRange();
+        range7.selectNodeContents(ed.firstChild);
+        sel.removeAllRanges();
+        sel.addRange(range7);
+        w.applyOp('note');
+        assert(!ed.querySelector('span.ptoe-note'), '点注释解包规则行内注释 span');
+        assert(!ed.firstChild.classList.contains('ptoe-note'), '关闭时不再叠加块级注释类');
+        range7 = doc.createRange();
+        range7.selectNodeContents(ed.firstChild);
+        sel.removeAllRanges();
+        sel.addRange(range7);
+        w.applyOp('note');
+        assert(ed.firstChild.classList.contains('ptoe-note'), '再点注释应用块级注释类');
+        sel.removeAllRanges();
+        sel.addRange(range7);
+        w.applyOp('note');
+        assert(!ed.firstChild.classList.contains('ptoe-note'), '再点注释关闭块级注释类');
+
+        // (r3) 正文 → 清块级注释/引用类 + 解包行内注释 span，保留对齐/图片段落类
+        ed.innerHTML = '<p class="ptoe-note ptoe-citation ptoe-align-center ptoe-img-wide">正文<span class="ptoe-note">注</span></p>';
+        range7 = doc.createRange();
+        range7.selectNodeContents(ed.firstChild);
+        sel.removeAllRanges();
+        sel.addRange(range7);
+        w.applyOp('p');
+        {
+          const p = ed.firstChild;
+          assert(p.tagName === 'P', '正文仍为 <p>');
+          assert(!p.classList.contains('ptoe-note'), '正文清掉块级 ptoe-note');
+          assert(!p.classList.contains('ptoe-citation'), '正文清掉块级 ptoe-citation');
+          assert(p.classList.contains('ptoe-align-center'), '正文保留对齐类');
+          assert(p.classList.contains('ptoe-img-wide'), '正文保留图片段落类');
+          assert(!p.querySelector('span.ptoe-note'), '正文解包行内注释 span');
+        }
+
+        // (r4) 标题块带注释类 → 正文可恢复为纯 <p>
+        ed.innerHTML = '<h2 class="ptoe-note">标题文本</h2>';
+        range7 = doc.createRange();
+        range7.selectNodeContents(ed.firstChild);
+        sel.removeAllRanges();
+        sel.addRange(range7);
+        w.applyOp('p');
+        assert(ed.firstChild.tagName === 'P' && !ed.firstChild.classList.contains('ptoe-note'),
+          'h2+注释 可恢复为正文 <p>');
+
+        // (r5) applySingleFormat('p') 路径同样清注释样式
+        ed.innerHTML = '<p class="ptoe-note">块级注释</p>';
+        range7 = doc.createRange();
+        range7.selectNodeContents(ed.firstChild);
+        sel.removeAllRanges();
+        sel.addRange(range7);
+        w.applySingleFormat('p', ed);
+        assert(!ed.firstChild.classList.contains('ptoe-note'), 'applySingleFormat("p") 也清注释样式');
+
+        // (s) 弹窗格式刷：文字包围必须落成应用类（2026-09-16）。
+        //     原生 execCommand('underline'/'strikeThrough'/'superscript'/'subscript')
+        //     产出 <u>/<strike>/<sup>/<sub>，这些标签会被 sanitize_html 丢弃 →
+        //     "编辑器里有效果、保存与导出 EPUB 后格式丢失"。
+        ed.innerHTML = '<p>目标文字</p>';
+        {
+          const r8 = doc.createRange();
+          r8.selectNodeContents(ed.firstChild);
+          sel.removeAllRanges();
+          sel.addRange(r8);
+          w.applyFormat(
+            { bold: false, italic: false, underline: true, strike: true, sup: false, sub: false, note: false },
+            r8
+          );
+          assert(ed.querySelector('span.ptoe-underline'), '格式刷下划线落成 span.ptoe-underline');
+          assert(ed.querySelector('span.ptoe-strike'), '格式刷删除线落成 span.ptoe-strike');
+          assert(!ed.querySelector('u, strike, sup, sub, font'), '格式刷不产出原生标签（会被清洗丢弃）');
+          const payload = (w.collect() || []).find(function (p) { return p.page === 1; });
+          assert(
+            payload && payload.html.indexOf('ptoe-underline') >= 0 && payload.html.indexOf('ptoe-strike') >= 0,
+            'collect() 载荷带格式类（保存/导出入口）'
+          );
+        }
+
+        // (t) 上标/下标同理（互斥：先后应用只保留一种）
+        ed.innerHTML = '<p>上下标目标</p>';
+        {
+          const r9 = doc.createRange();
+          r9.selectNodeContents(ed.firstChild);
+          sel.removeAllRanges();
+          sel.addRange(r9);
+          w.applyFormat(
+            { bold: false, italic: false, underline: false, strike: false, sup: true, sub: false, note: false },
+            r9
+          );
+          assert(ed.querySelector('span.ptoe-sup'), '格式刷上标落成 span.ptoe-sup');
+          assert(!ed.querySelector('sup'), '不产出原生 <sup>');
+        }
+
         console.log('\n✅ ALL ASSERTIONS PASSED');
         resolve();
       } catch (e) {
         reject(e);
       }
-    }, 100);
+    };
+    start();
   });
 }
 

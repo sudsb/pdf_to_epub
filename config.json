@@ -296,5 +296,6 @@
     "img_mode": "",
     "rule_all_pages_confirm": true
   },
-  "proofread_engine": "llama"
+  "proofread_engine": "llama",
+  "mouse_shortcuts": {}
 }

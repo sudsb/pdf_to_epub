@@ -12,7 +12,7 @@ CLI:
 --correct 开启手动矫正：在浏览器中逐页对照原图与识别文字（默认关闭）。
 
 无参数 + 交互终端（含打包 exe 双击启动）进入终端菜单 _run_menu：
-PDF→EPUB 转换 / 手动矫正 / 配置 / 模型管理 / 退出。
+PDF→EPUB 转换 / 矫正界面 / EPUB 编辑 / 配置 / 模型管理 / 帮助 / 退出。
 非交互 stdin（管道/重定向）保持打印 "nothing to do"。
 """
 
@@ -23,6 +23,7 @@ import re
 import sys
 import time
 import tomllib
+from itertools import zip_longest
 from pathlib import Path
 from typing import Any
 
@@ -399,6 +400,45 @@ def correct_pdf(
     elif result.get("epub_error"):
         print(f"EPUB packaging failed: {result['epub_error']}", file=sys.stderr)
     return result
+
+
+def _cmd_epubedit(args) -> int:
+    """epubedit 子命令：打开 EPUB 编辑器（浏览器按一级标题分篇编辑后保存回 EPUB）。
+
+    不带 EPUB 路径时弹出 tkinter 文件选择框（headless 下 TclError 吞掉并报错）。
+    返回 0 成功 / 1 失败。阻塞至编辑器浏览器标签关闭或 idle_timeout 超时。
+    """
+    epub = args.epub
+    if epub is None:
+        try:
+            import tkinter as tk  # noqa: F401
+            from tkinter import filedialog
+
+            epub = filedialog.askopenfilename(
+                title="选择 EPUB 文件",
+                filetypes=[("EPUB 文件", "*.epub"), ("所有文件", "*.*")],
+            )
+        except Exception as e:
+            print(f"错误：{e}", file=sys.stderr)
+            return 1
+    if not epub:
+        print("已取消")
+        return 0
+    if not Path(epub).is_file():
+        print(f"错误：文件不存在：{epub}", file=sys.stderr)
+        return 1
+    try:
+        from epubeditmanage import epub_edit
+
+        epub_edit(
+            epub,
+            idle_timeout=args.idle_timeout,
+            open_browser=not getattr(args, "no_browser", False),
+        )
+    except Exception as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 1
+    return 0
 
 
 # 各流程阶段的中文名（输出顺序 = 流水线顺序）；未执行的阶段不输出
@@ -1083,7 +1123,7 @@ def _menu_epub(cfg: dict) -> None:
 
 
 def _menu_resume() -> None:
-    """菜单项 5：继续上次中断的 OCR 转换（断点续传）。"""
+    """菜单项 6：继续上次中断的 OCR 转换（断点续传）。"""
     pdf = _ask("PDF 路径：")
     if not pdf:
         print("已取消（未输入路径）。")
@@ -1105,7 +1145,7 @@ def _menu_resume() -> None:
 
 
 def _menu_stop() -> None:
-    """菜单项 7：停止推理服务（llama-server / vLLM）。"""
+    """菜单项 8：停止推理服务（llama-server / vLLM）。"""
     from llamamanage import _active_engine, stopserver
 
     eng = _active_engine()
@@ -1116,7 +1156,7 @@ def _menu_stop() -> None:
 
 
 def _menu_gui() -> None:
-    """菜单项 8：启动 HTML 配置操作界面（GUI）。"""
+    """菜单项 9：启动 HTML 配置操作界面（GUI）。"""
     try:
         from guimanage import gui_serve
 
@@ -1140,8 +1180,19 @@ def _menu_correct() -> None:
     _pause()
 
 
+def _menu_epubedit() -> None:
+    """菜单项 3：EPUB 编辑（打开 EPUB 文件，按一级标题分篇编辑后保存回 EPUB）。"""
+    epub = _ask("EPUB 路径（留空=弹出文件选择框）：")
+    rc = _cmd_epubedit(
+        argparse.Namespace(epub=epub or None, idle_timeout=600, no_browser=False)
+    )
+    if rc == 0:
+        print("EPUB 编辑已结束。")
+    _pause()
+
+
 def _menu_config() -> None:
-    """菜单项 3：查看/修改配置（engine / llama_server / models_dir / selected_model / browser / gui_display / window_maximized / tabs_position）。"""
+    """菜单项 4：查看/修改配置（engine / llama_server / models_dir / selected_model / browser / gui_display / window_maximized / tabs_position）。"""
     from configmanage import get_config, update_config
 
     cfg = get_config()
@@ -1196,7 +1247,7 @@ def _menu_config() -> None:
 
 
 def _menu_model() -> None:
-    """菜单项 4：模型管理（列出并切换默认模型）。"""
+    """菜单项 5：模型管理（列出并切换默认模型）。"""
     from configmanage import get_config, update_config
 
     cfg = get_config()
@@ -1229,18 +1280,19 @@ def _run_menu(name: str, version: str) -> int:
     _MENU_ITEMS = [
         ("1", "PDF → EPUB 转换"),
         ("2", "矫正界面"),
-        ("3", "配置信息"),
-        ("4", "模型管理"),
-        ("5", "中断重试"),
-        ("6", "帮助信息"),
-        ("7", "关闭引擎"),
-        ("8", "配置界面"),
+        ("3", "EPUB 编辑"),
+        ("4", "配置信息"),
+        ("5", "模型管理"),
+        ("6", "中断重试"),
+        ("7", "帮助信息"),
+        ("8", "关闭引擎"),
+        ("9", "配置界面"),
     ]
 
-    # 两列布局：左列 1-4，右列 5-8；第 0 项单独居中
+    # 两列布局：左列 1-5，右列 6-9；第 0 项单独居中
     # 计算左列最大显示宽度用于对齐
-    left_items = _MENU_ITEMS[:4]
-    right_items = _MENU_ITEMS[4:]
+    left_items = _MENU_ITEMS[:5]
+    right_items = _MENU_ITEMS[5:]
 
     def _fmt_item(key: str, text: str) -> str:
         return f"  {key}) {text}"
@@ -1249,13 +1301,19 @@ def _run_menu(name: str, version: str) -> int:
 
     while True:
         print("请选择操作：")
-        # 打印两列
-        for (lk, lt), (rk, rt) in zip(left_items, right_items):
-            left_str = _fmt_item(lk, lt)
-            right_str = _fmt_item(rk, rt)
-            # 左列左对齐，按显示宽度补空格
-            pad = left_width - _display_width(left_str) + 4  # 列间距 4 空格
-            print(f"{left_str}{' ' * pad}{right_str}")
+        # 打印两列（左列多于右列时右列留空）
+        for (lk, lt), (rk, rt) in zip_longest(
+            left_items, right_items, fillvalue=("", "")
+        ):
+            left_str = _fmt_item(lk, lt) if lk else ""
+            right_str = _fmt_item(rk, rt) if rk else ""
+            if left_str:
+                # 左列左对齐，按显示宽度补空格
+                pad = left_width - _display_width(left_str) + 4  # 列间距 4 空格
+                print(f"{left_str}{' ' * pad}{right_str}")
+            else:
+                # 左列已空（右列仍有项）：缩进到右列起点
+                print(f"{' ' * (left_width + 4)}{right_str}")
         # 第 0 项单独居中打印
         exit_str = _fmt_item("0", "退出")
         exit_pad = (78 - _display_width(exit_str)) // 2
@@ -1263,7 +1321,7 @@ def _run_menu(name: str, version: str) -> int:
 
         # 使用原始 readline 区分 EOF（line==""）与空回车（line=="\n"）
         try:
-            print("请输入序号 [0-8]：", end="", flush=True)
+            print("请输入序号 [0-9]：", end="", flush=True)
             line = sys.stdin.readline()
         except Exception:
             line = ""
@@ -1286,28 +1344,31 @@ def _run_menu(name: str, version: str) -> int:
             elif choice == "2":
                 _menu_correct()
             elif choice == "3":
-                _menu_config()
+                _menu_epubedit()
             elif choice == "4":
-                _menu_model()
+                _menu_config()
             elif choice == "5":
-                _menu_resume()
+                _menu_model()
             elif choice == "6":
+                _menu_resume()
+            elif choice == "7":
                 print("  命令行用法（功能与菜单相同）：")
                 print(
                     "    mian.py epub <pdf> [--dpi 0-4] [--model KEY] [--workers N] [--thinking] [--correct] [--resume|--restart]"
                 )
                 print("    mian.py resume <pdf> [--restart]")
                 print("    mian.py correct [<pdf>]")
+                print("    mian.py epubedit [<epub>] [--idle-timeout N] [--no-browser]")
                 print("    mian.py config show|set <key> <value>")
                 print("    mian.py model list|show|set|add|remove")
                 print("    mian.py stop [--engine llama|vllm]")
                 print("  详见 USAGE.md 或 mian.py <子命令> --help")
-            elif choice == "7":
-                _menu_stop()
             elif choice == "8":
+                _menu_stop()
+            elif choice == "9":
                 _menu_gui()
             else:
-                print("无效输入，请输入 0-8。")
+                print("无效输入，请输入 0-9。")
         except Exception as e:
             # 单个业务崩溃不杀菜单：打印错误后回到循环
             print(f"错误：{e}")
@@ -1493,6 +1554,31 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="打开指定历史版本矫正（版本 id = data/correction_history/ 下文件名的 stem，"
         "可用矫正界面的历史列表查看）；指定后初始内容直接载入该版本，保存定向覆盖原版本",
+    )
+
+    epubedit_p = sub.add_parser(
+        "epubedit",
+        help="打开 EPUB 编辑器（按一级标题分篇编辑后保存回 EPUB）",
+        description="启动本地浏览器编辑界面，把 EPUB 按一级标题拆成可编辑章节，"
+        "保存时写回 EPUB 文件。阻塞至编辑器浏览器标签关闭或 --idle-timeout 超时。",
+    )
+    epubedit_p.add_argument(
+        "epub",
+        nargs="?",
+        default=None,
+        help="Path to the source EPUB（缺省弹出文件选择框）",
+    )
+    epubedit_p.add_argument(
+        "--idle-timeout",
+        type=int,
+        default=600,
+        dest="idle_timeout",
+        help="浏览器标签关闭/无操作后自动结束的等待秒数（默认 600）",
+    )
+    epubedit_p.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="不自动打开浏览器（测试/headless 用），仅打印 URL",
     )
 
     resume_p = sub.add_parser(
@@ -2011,6 +2097,8 @@ def main(argv: list[str] | None = None) -> int:
         if result.get("epub_error"):
             return 1
         return 0
+    if args.command == "epubedit":
+        return _cmd_epubedit(args)
     if args.version:
         print(f"{name} {version}")
         return 0

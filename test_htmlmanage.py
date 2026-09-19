@@ -136,6 +136,25 @@ class TestCSSManagerStylesheet(unittest.TestCase):
         # 2026-08-23 修复：h3-h6 也需居中（CSS 与内联保持一致）
         self.assertIn('h3, h4, h5, h6 {', css)
 
+    def test_note_font_size_rule_covers_all_elements(self):
+        """注释字号：对任意承载 ptoe-note 的元素生效 + 嵌套不复合（2026-09-16）。
+
+        症状：导出 EPUB 后「注释格式文本大小不一」——注释类也会落在标题块
+        （h1.ptoe-note：规则「标题1 + 注释」叠加，或先设标题再设注释），
+        原先选择器只写 p/span，h1 上的注释不匹配 → 保持标题字号（UA 2em），
+        与其它注释 0.85em 差一倍；嵌套注释还会 0.85em 逐层缩小（0.72em）。
+        编辑器用 .editable .ptoe-note{font-size:12px} 匹配任何元素，故界面看不出。
+        """
+        cssm = htmlmanage.CSSManager()
+        css = cssm.generate_stylesheet()
+        # 通用规则（不再限定 p/span）
+        self.assertIn(".ptoe-note {", css)
+        self.assertNotIn("p.ptoe-note, span.ptoe-note {", css)
+        self.assertIn("font-size: 0.85em", css)
+        # 嵌套保护
+        self.assertIn(".ptoe-note .ptoe-note {", css)
+        self.assertIn("font-size: 1em", css)
+
     def test_default_text_indent(self):
         """测试正文/注释默认顶格（2026-08-23 用户要求：不再全局缩进）"""
         cssm = htmlmanage.CSSManager()
@@ -354,7 +373,7 @@ class TestNewInlineFormatCSS(unittest.TestCase):
             self.assertIn(selector, css, f"Missing selector {selector}")
         # 检查关键属性存在（CSS 输出含空格和分号，做宽松匹配）
         self.assertIn('text-decoration: underline', css)
-        self.assertIn('text-decoration: underline dotted', css)
+        self.assertIn('border-bottom: 1px dotted #333', css)
         self.assertIn('text-decoration: line-through', css)
         self.assertIn('border: 1px solid #333', css)
         self.assertIn('padding: 0 .15em', css)

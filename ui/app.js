@@ -66,6 +66,14 @@ const DEFAULTS = {
   proofread_clear:'Ctrl+Shift+X', proofread_revert:'Ctrl+Shift+Z',
   proofread_accept: 'Enter', proofread_ignore: 'Escape',
 };
+// 鼠标中键手势（与键盘快捷键同一套操作体系）：手势是稀缺资源，默认只绑定对齐三件套。
+const MOUSE_GESTURES = [
+  ['Middle+Up','中键上滑'], ['Middle+Down','中键下滑'],
+  ['Middle+Left','中键左滑'], ['Middle+Right','中键右滑'],
+];
+const MOUSE_DEFAULTS = { align_center:'Middle+Up', align_left:'Middle+Left', align_right:'Middle+Right' };
+let mouseBindings = loadMouseBindings();
+let mouseCapturingOp = null;   // 正在等待中键滑动绑定的操作（null = 未捕获）
 let pages = [];
 let contentMap = new Map();     // index -> 该行最近一次 innerHTML（虚拟列表离屏保留）
 let editedSet = new Set();
@@ -220,10 +228,171 @@ function saveBindings() {
   }).catch(function () {});
 }
 function reverseBindings() { const m = {}; for (const op in bindings) if (bindings[op]) m[bindings[op]] = op; return m; }
+// ---------- 鼠标手势绑定（中键滑动；与键盘快捷键同构，服务端持久化 config.json mouse_shortcuts） ----------
+function loadMouseBindings() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem('ptoe_mouse_shortcuts') || '{}'); } catch (e) {}
+  return Object.assign({}, MOUSE_DEFAULTS, saved);
+}
+async function loadMouseBindingsFromServer() {
+  try {
+    const res = await fetchJSON('/api/mouse_shortcuts');
+    if (!res || !res.ok) return;
+    const ms = res.mouse_shortcuts;
+    if (!ms || typeof ms !== 'object' || !Object.keys(ms).length) return;
+    mouseBindings = Object.assign({}, MOUSE_DEFAULTS, ms);
+    try { localStorage.setItem('ptoe_mouse_shortcuts', JSON.stringify(mouseBindings)); } catch (e) {}
+    // 设置弹窗已打开时刷新表格（手势分发在派发时读 mouseBindings 变量，无需额外处理）
+    const bg = document.getElementById('modalBg');
+    if (bg && bg.style.display === 'flex') renderMouseShortcutTable();
+  } catch (e) { console.warn('loadMouseBindingsFromServer failed: ' + e.message); }
+}
+function saveMouseBindings() {
+  try { localStorage.setItem('ptoe_mouse_shortcuts', JSON.stringify(mouseBindings)); } catch (e) {}
+  // fire-and-forget 持久化到 config.json（失败静默，localStorage 仍生效）
+  fetch('/api/mouse_shortcuts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mouse_shortcuts: mouseBindings }),
+  }).catch(function () {});
+}
+function mouseReverseBindings() { const m = {}; for (const op in mouseBindings) if (mouseBindings[op]) m[mouseBindings[op]] = op; return m; }
+
+// ---------- Ctrl+点击 多段选择（非连续多选；2026-09-19） ----------
+// 按住 Ctrl/Meta 点击任意段落 → 加入/移出选择集合（可跨页、中间可隔其他段落）；
+// 集合非空时任何格式操作（工具栏/快捷键/中键手势/格式规则）都作用于全部集合段落。
+// 高亮类 ptoe-multi-sel 只含 background + inset box-shadow——纯视觉、零布局位移
+// （本界面有严格滚动稳定性不变量，任何行高变化都会触发跳页补偿）。
+const _multiSelBlocks = new Set();   // 块元素（.editable 的直属 P/DIV/H1-6）
+const _MULTI_SEL_CLASS = 'ptoe-multi-sel';
+let _multiSelStatusEl = null;        // 状态徽标（惰性创建；空集时 display:none 不占布局）
+
+(function injectMultiSelStyles() {
+  if (document.getElementById('multiSelStyles')) return;
+  const st = document.createElement('style');
+  st.id = 'multiSelStyles';
+  st.textContent = '.ptoe-multi-sel{background-color:rgba(59,111,255,.10) !important;box-shadow:inset 3px 0 0 rgba(59,111,255,.55) !important;}';
+  document.head.appendChild(st);
+})();
+
+// 集合成员在 .editable 的直属块里逐级上爬，直到父级是 .editable 且自身是 P/DIV/H1-6
+function _multiSelBlockFromEvent(e) {
+  const t = e && e.target;
+  if (!t || !t.closest) return null;
+  if (t.closest('#contextMenu')) return null;
+  if (t.closest('button, a, [role="button"], input, select, textarea, .ic-btn')) return null;
+  let el = t;
+  while (el && el !== document.body && el.parentNode) {
+    if (el.parentNode.classList && el.parentNode.classList.contains('editable')) {
+      const tag = el.tagName;
+      if (tag === 'P' || tag === 'DIV' || /^H[1-6]$/.test(tag)) return el;
+      return null; // 爬到 .editable 直属位置但类型不是块（如空白文本）→ 不切换
+    }
+    el = el.parentNode;
+  }
+  return null;
+}
+
+// 丢弃已脱离文档/不再属于 .editable 的成员（虚拟列表滚动会卸下整行 → 重挂载是新元素，
+// 旧对象 isConnected=false 自然淘汰）；顺带清掉陈旧高亮类。
+function _multiSelPrune() {
+  for (const b of Array.from(_multiSelBlocks)) {
+    const par = b.parentNode;
+    if (!b.isConnected || !par || !par.classList || !par.classList.contains('editable')) {
+      b.classList.remove(_MULTI_SEL_CLASS);
+      _multiSelBlocks.delete(b);
+    }
+  }
+  if (_multiSelBlocks.size === 0) _multiSelUpdateStatus();
+}
+
+function _multiSelToggle(block) {
+  if (_multiSelBlocks.has(block)) {
+    _multiSelBlocks.delete(block);
+    block.classList.remove(_MULTI_SEL_CLASS);
+  } else {
+    _multiSelBlocks.add(block);
+    block.classList.add(_MULTI_SEL_CLASS);
+  }
+  _multiSelUpdateStatus();
+}
+
+function _multiSelClear() {
+  if (!_multiSelBlocks.size) return;
+  for (const b of _multiSelBlocks) b.classList.remove(_MULTI_SEL_CLASS);
+  _multiSelBlocks.clear();
+  _multiSelUpdateStatus();
+}
+
+// 状态徽标：插在工具栏 #status 前的小段文本，空集时 display:none（不改变任何布局尺寸）
+function _multiSelEnsureStatusEl() {
+  if (_multiSelStatusEl && _multiSelStatusEl.isConnected) return _multiSelStatusEl;
+  const statusEl = document.getElementById('status');
+  if (!statusEl || !statusEl.parentNode) return null;
+  const el = document.createElement('span');
+  el.id = 'multiSelStatus';
+  el.style.cssText = 'color:var(--accent,#3B6FFF);font-size:12px;margin-right:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:250px;';
+  statusEl.parentNode.insertBefore(el, statusEl);
+  _multiSelStatusEl = el;
+  return el;
+}
+function _multiSelUpdateStatus() {
+  const n = _multiSelBlocks.size;
+  const el = n ? _multiSelEnsureStatusEl() : _multiSelStatusEl;
+  if (!el) return;
+  if (n) {
+    el.textContent = '已选 ' + n + ' 段 — Ctrl+点击增删，Esc 取消';
+    el.style.display = 'inline-block';
+  } else {
+    el.textContent = '';
+    el.style.display = 'none';
+  }
+}
+
+// 弹窗开着时不响应 Esc 清除（各弹窗自己的 Esc/关闭优先）
+function _multiSelAnyModalOpen() {
+  const ids = ['modalBg','searchModalBg','exportModalBg','indentModalBg','finishModalBg','finishConfirmBg','formatRulesModalBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg'];
+  for (let k = 0; k < ids.length; k++) {
+    const el = document.getElementById(ids[k]);
+    if (el && el.style.display === 'flex') return true;
+  }
+  return false;
+}
+
+// 序列化卫生：.ptoe-multi-sel 是视图层高亮类，绝不进入保存/导出内容
+function _stripMultiSelClass(html) {
+  const s = String(html == null ? '' : html);
+  if (s.indexOf('ptoe-multi-sel') < 0) return s;
+  const d = document.createElement('div');
+  d.innerHTML = s;
+  d.querySelectorAll('.ptoe-multi-sel').forEach(function (el) {
+    el.classList.remove(_MULTI_SEL_CLASS);
+    if (!el.getAttribute('class')) el.removeAttribute('class');
+  });
+  return d.innerHTML;
+}
+
 function loadBool(key) { try { return localStorage.getItem(key) === '1'; } catch (e) { return false; } }
 function saveStr(key, v) { try { localStorage.setItem(key, String(v)); } catch (e) {} }
 function loadInt(key, def) { try { const v = parseInt(localStorage.getItem(key), 10); return isFinite(v) ? v : def; } catch (e) { return def; } }
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// 快捷键表内的中键标签样式（HTML/CSS 由 correctmanage 维护，这里注入以免依赖其改动）
+(function injectMouseShortcutStyles() {
+  if (document.getElementById('mouseShortcutStyles')) return;
+  const st = document.createElement('style');
+  st.id = 'mouseShortcutStyles';
+  st.textContent = [
+    '#shortcutTable .mouse-badge{display:inline-block;margin-top:4px;padding:1px 6px;border:1px solid var(--border,#d6dde5);border-radius:3px;font-size:12px;color:#5a6b7c;cursor:pointer;}',
+    '#shortcutTable .mouse-badge:hover{background:#eef4ff;border-color:#3B6FFF;color:#3B6FFF;}',
+    '#shortcutTable .mouse-badge.unbound{color:#9aa7b4;border-style:dashed;}',
+    '#mouseShortcutTable{width:100%;border-collapse:collapse;}',
+    '#mouseShortcutTable td{padding:6px 8px;border-bottom:1px solid var(--border,#d6dde5);font-size:14px;}',
+    '#mouseShortcutTable tr{cursor:pointer;}',
+    '#mouseShortcutTable tr:hover td{background:#f7fafd;}',
+  ].join('');
+  document.head.appendChild(st);
+})();
 
 async function fetchJSON(url, opts) {
   const r = await fetch(url, opts);
@@ -331,19 +500,32 @@ function editableSource(ed) {
   // 源码模式：取编辑区各子块/文本节点的纯文本（按行拼接）
   const lines = [];
   for (const c of ed.childNodes) {
-    if (c.nodeType === 3) lines.push(c.textContent);
+    if (c.nodeType === 3) lines.push((c.textContent || '').replace(/^\n/, ''));
     else if (c.tagName === 'BR') lines.push('');
-    else lines.push(c.textContent || '');
+    else lines.push((c.textContent || '').replace(/^\n/, ''));
   }
   return lines.join('\n');
+}
+// 2026-09-15：块级元素开标签后补 \n（与 correctmanage._ensure_block_newlines
+// 语义一致）。rulemanage 的页面纯文本约定是「段与段的边界就是换行符」；
+// 历史/无换行 HTML（旧 initial_html 输出、mdMode 按行 div）不做归一会让
+// [^\n] 类规则正则在引擎侧跨越块边界多匹配（行首引注〔n〕被误判为行内）。
+// 幂等：开标签后已紧跟空白+换行则不动。
+function _ensureBlockNewlines(html) {
+  const h = String(html == null ? '' : html);
+  return h.replace(/<(p|div|h[1-6])((?:"[^"]*"|'[^']*'|[^>"'])*)>(?![ \t]*\r?\n)/gi, function (m) { return m + '\n'; });
 }
 function displayHtml(i) {
   let base;
   if (!mdMode) base = contentMap.has(i) ? contentMap.get(i) : pages[i].text;
   else {
     const src = mdSourceMap.has(i) ? mdSourceMap.get(i) : htmlToMd(pages[i].text);
-    base = String(src).split('\n').map(function(l) { return '<div>' + esc(l) + '</div>'; }).join('');
+    base = String(src).split('\n').map(function(l) { return '<div>' + esc(l) + '</div>'; }).join('\n');
   }
+  // 2026-09-15：块间 \n 归一（见 _ensureBlockNewlines）。放在搜索高亮注入前，
+  // 返回的 html（含 \n）用于 pageRow 渲染/格式规则应用，引擎与浏览器 textContent
+  // 两侧同时获得换行，选区偏移契约保持一致。
+  base = _ensureBlockNewlines(base);
   // If there's an active search highlight query, inject highlights into the
   // rendered HTML. Do NOT mutate underlying stored source (collect/pageSource
   // uses raw content). Regex validity already handled upstream; guard anyway.
@@ -414,7 +596,7 @@ function collect() {
   const out = [];
   for (let i = 0; i < pages.length; i++) {
     const src = pageSource(i);
-    const html = mdMode ? mdToHtml(src) : stripProofreadMarkup(_stripSearchMarks(src));
+    const html = mdMode ? mdToHtml(src) : stripProofreadMarkup(_stripSearchMarks(_stripMultiSelClass(src)));
     out.push({ page: pages[i].page, html: html });
   }
   return out;
@@ -582,7 +764,7 @@ function syncContent(ed) {
   if (!row) return;
   const i = Number(row.dataset.i);
   if (mdMode) mdSourceMap.set(i, editableSource(ed));
-  else contentMap.set(i, _stripSearchMarks(ed.innerHTML));
+  else contentMap.set(i, _stripSearchMarks(_stripMultiSelClass(ed.innerHTML)));
 }
 let _lastFocusedEd = null; // 最近聚焦过的编辑区（2026-08-23：点击工具栏按钮夺焦后仍能定位目标页）
 function currentEditable() {
@@ -1313,6 +1495,12 @@ function applyToSelectedBlocks(ed, fn) {
     showToast('输入法中，已将操作排队，输入结束后自动应用', 'warn');
     return [];
   }
+  // 多段选择（Ctrl+点击）模式：集合非空 → 跳过选区解析，对集合内所有块逐一应用。
+  // 块可跨页（同一文档内），每块全量 range 作为 live selection；集合保留、不恢复选区。
+  _multiSelPrune();
+  if (_multiSelBlocks.size > 0) {
+    return _applyToMultiSelBlocks(ed, fn);
+  }
   const sel = window.getSelection();
   if (!sel || sel.rangeCount === 0) { return []; }
   const origRanges = [];
@@ -1341,6 +1529,81 @@ function applyToSelectedBlocks(ed, fn) {
   for (const rr of origRanges) sel.addRange(rr);
   return blocks;
 }
+// 多段选择集合的应用执行体（applyToSelectedBlocks 的 set 分支）：
+// 逐块 selectNodeContents 设为 live selection 后调用 fn，全程不恢复选区（集合保留）。
+// 跨页时调用方 histRun 只快照了 ed 页，这里为其余页补一份撤销快照（独立一步）。
+function _applyToMultiSelBlocks(ed, fn) {
+  const sel = window.getSelection();
+  const blocks = Array.from(_multiSelBlocks);
+  const applied = [];
+  const edRow = ed && ed.closest ? ed.closest('.page-row') : null;
+  const edPage = edRow ? Number(edRow.dataset.i) : -1;
+  const extraBefore = new Map(), extraErrBefore = new Map();
+  for (const b of blocks) {
+    const row = b.closest ? b.closest('.page-row') : null;
+    if (!row) continue;
+    const pi = Number(row.dataset.i);
+    if (pi !== edPage && !extraBefore.has(pi)) {
+      extraBefore.set(pi, pageSource(pi));
+      extraErrBefore.set(pi, _copyErrors(pi));
+    }
+  }
+  const withExtra = extraBefore.size > 0;
+  for (const b0 of blocks) {
+    const parent = b0.parentNode;
+    const idx = parent ? Array.prototype.indexOf.call(parent.children, b0) : -1;
+    let block = b0;
+    try {
+      const r = document.createRange();
+      r.selectNodeContents(block);
+      if (sel) { sel.removeAllRanges(); sel.addRange(r); }
+      fn(block, r);
+      // 整块换标签的操作（heading/p/remove/centerbold → _convertBlockTag）会替换块元素：
+      // 按父级子元素位置找回新块并同步集合成员（className 随 _convertBlockTag 一并拷贝，
+      // 高亮类天然延续到新元素）。
+      if (!block.isConnected && parent && parent.isConnected && parent.classList &&
+          parent.classList.contains('editable') && idx >= 0) {
+        const repl = parent.children[idx];
+        if (repl && /^(P|DIV|H[1-6])$/.test(repl.tagName)) {
+          _multiSelBlocks.delete(block);
+          _multiSelBlocks.add(repl);
+          block = repl;
+        }
+      }
+      applied.push(block);
+    } catch (e) {
+      // best-effort: skip problematic block
+      continue;
+    }
+  }
+  // 同步所有受影响页（调用方只 sync ed 页——跨页集合其余页若不 sync，保存会丢改动）
+  const touched = new Set();
+  for (const b of applied) {
+    const row = b.closest ? b.closest('.page-row') : null;
+    if (row) touched.add(row);
+  }
+  for (const row of touched) {
+    const e2 = row.querySelector('.editable');
+    if (e2) syncContent(e2);
+    const pi = Number(row.dataset.i);
+    if (pi >= 0) { markDirty(pi); scheduleRemeasure(pi); }
+  }
+  // 跨页撤销补账：histEnd 只保留实际变化页
+  if (withExtra) {
+    const extraAfter = new Map(), extraErrAfter = new Map();
+    for (const [pi, src] of extraBefore) {
+      const now = pageSource(pi);
+      if (now !== src) {
+        extraAfter.set(pi, now);
+        if (extraErrBefore.has(pi)) extraErrAfter.set(pi, _copyErrors(pi));
+      } else {
+        extraBefore.delete(pi);
+      }
+    }
+    if (extraBefore.size) histPush(extraBefore, extraAfter, extraErrBefore, extraErrAfter, '多段格式');
+  }
+  return applied;
+}
 // Capture basic inline/block formatting attributes from selection (for 格式刷)
 let _formatBrush = null;
 let _brushBefore = null; // aggregated history snapshot for persistent brush
@@ -1364,14 +1627,37 @@ function _convertBlockTag(block, newTag) {
   block.parentNode.replaceChild(newEl, block);
   return newEl;
 }
+// 正文（2026-09-13 修复）：转 <p> 的同时清掉「段落文本样式」——块级 ptoe-note/ptoe-citation
+// 与行内 <span class="ptoe-note">（规则引擎「匹配对象/分组」路径把注释落成行内 span）。
+// 保留对齐/缩进/图片段落类：centerbold 与「段落设置」依赖 _convertBlockTag 保类。
+function _toBodyParagraph(block) {
+  const p = _convertBlockTag(block, 'p') || block;
+  p.classList.remove('ptoe-note', 'ptoe-citation');
+  const whole = document.createRange();
+  whole.selectNodeContents(p);
+  unwrapSpans(p, 'ptoe-note', whole);
+  return p;
+}
 
 function toggleNote(ed) {
-  // Toggle ptoe-note on all blocks in selection
+  // 注释：块级切换 ptoe-note；规则引擎「匹配对象/分组」路径会把注释落成行内
+  // <span class="ptoe-note">…</span>（见 rulemanage._INLINE_LEAF_OPS_M），必须一并处理。
+  // 2026-09-13 修复：老实现只 toggle 块的 class，导致规则套上的注释点「注释」关不掉
+  // ——第二次点击反而又给整块加了一层注释样式。
   const row = ed.closest('.page-row');
   const i = row ? Number(row.dataset.i) : -1;
   histRun('注释格式', [i], function () {
-    applyToSelectedBlocks(ed, function(block) {
-      block.classList.toggle('ptoe-note');
+    applyToSelectedBlocks(ed, function (block, range) {
+      const r = (range && !range.collapsed) ? range : (function () {
+        const rr = document.createRange();
+        rr.selectNodeContents(block);
+        return rr;
+      })();
+      if (unwrapSpans(block, 'ptoe-note', r) > 0) {
+        block.classList.remove('ptoe-note'); // 行内注释已关 → 块级注释一并关掉
+      } else {
+        block.classList.toggle('ptoe-note');
+      }
     });
     syncContent(ed);
     if (row) { markDirty(i); scheduleRemeasure(i); }
@@ -1381,6 +1667,10 @@ function toggleNote(ed) {
 // ---------- 新增内联格式工具（2026-09） ----------
 // 8 种内联 span 类：下划线、下加点、删除线、字符边框、底纹、突显、上标、下标
 const INLINE_CLASSES = ['ptoe-underline','ptoe-underdot','ptoe-strike','ptoe-charbox','ptoe-shade','ptoe-highlight','ptoe-sup','ptoe-sub'];
+// 「清除格式」需要解包的行内类：8 项字符格式 + 规则引擎落在行内的注释 span
+// （2026-09-13 修复：规则「匹配对象」路径的 note 是 <span class="ptoe-note">，
+//  原先只解包 8 类 → 规则套上的注释文本点「清除格式」清不掉）
+const INLINE_TEXT_CLASSES = ['ptoe-note'].concat(INLINE_CLASSES);
 const INLINE_CLASS_LABEL = {
   underline:'下划线', underdot:'下加点', strike:'删除线', charbox:'字符边框',
   shade:'底纹', highlight:'突显', sup:'上标', sub:'下标'
@@ -1392,8 +1682,10 @@ const INLINE_MUTEX = {
 };
 
 // 解包与给定 range 相交的指定 class 的 span：把子节点移回父节点，保持顺序
+// 返回实际解包的个数（调用方据此判断"本次是关闭还是应用"，如 toggleNote）
 function unwrapSpans(block, cls, range) {
   const spans = block.querySelectorAll('span.' + cls);
+  let unwrapped = 0;
   for (const span of spans) {
     // 判断 span 是否与 range 相交
     const spanRange = document.createRange();
@@ -1404,8 +1696,10 @@ function unwrapSpans(block, cls, range) {
       const frag = document.createDocumentFragment();
       while (span.firstChild) frag.appendChild(span.firstChild);
       span.parentNode.replaceChild(frag, span);
+      unwrapped += 1;
     }
   }
+  return unwrapped;
 }
 
 // 应用/切换内联 class（用于 toolbar/menu/brush/rules）
@@ -1419,6 +1713,13 @@ function applyInlineClass(ed, cls, opts) {
 
   histRun(label, [i], function () {
     applyToSelectedBlocks(ed, function(block, range) {
+      // 折叠选区（只有光标、没选文字）→ 统一按"光标所在整块"处理：判断与包裹/解包都用整块
+      // range。否则光标位于块尾等位置时判断不到"本块已有该格式"，再点一次会重复包裹
+      // （2026-09-13 修复；与「清除格式」的折叠语义一致）。
+      if (range.collapsed) {
+        range = document.createRange();
+        range.selectNodeContents(block);
+      }
       // 先基于原 DOM 判断本 class 是否与选区相交（互斥解包前）：
       // 互斥表含本 class 自身——若先解包再查“现有”，toggle 关闭时会被判定为
       // “无现有”而重新包裹（上标/下标点两次永远关不掉，2026-09 修复）。
@@ -1444,8 +1745,13 @@ function applyInlineClass(ed, cls, opts) {
       }
 
       if (toggle) {
-        // 切换模式：原选区内已有该 class → 已由互斥解包移除（关闭）；否则包裹（打开）
-        if (!hasCls) {
+        // 切换模式：选区内已有该 class → 解包（关闭）；否则包裹（打开）。
+        // 2026-09-13 修复：原实现把"关闭"完全交给上方 INLINE_MUTEX 解包，而互斥表只登记了
+        // 上/下标（INLINE_MUTEX 里只有 ptoe-sup/ptoe-sub）→ 下划线/下加点/删除线/字符边框/
+        // 底纹/突显 第二次点击时既不包裹也不解包，表现为"再点一次格式关不掉"。
+        if (hasCls) {
+          unwrapSpans(block, cls, range);
+        } else {
           wrapRange(block, range, cls);
         }
       } else {
@@ -1475,6 +1781,14 @@ function applyInlineClass(ed, cls, opts) {
 // 优先尝试整体包裹（extractContents + insertNode）；
 // 若 range 跨越嵌套元素/图片导致异常，回退到逐文本节点包裹
 function wrapRange(block, range, cls) {
+  // 折叠选区（只有光标、没有选中文字）：按"光标所在整块"包裹，与「清除格式」的折叠语义一致
+  // （见 applyToSelectedBlocks 的 collapsed 分支）。原实现直接 extractContents()：
+  // 折叠时提取到空片段 → 插入一个空 <span class="ptoe-xxx">，表现为"点了格式按钮
+  // 但文字没有任何变化"（2026-09-13 修复）。
+  if (range.collapsed) {
+    range = document.createRange();
+    range.selectNodeContents(block);
+  }
   try {
     const clone = range.cloneRange();
     const frag = clone.extractContents();
@@ -1730,8 +2044,9 @@ function applyOp(op) { const ed = currentEditable(); if (!ed) return;
     sel.removeAllRanges();
     sel.addRange(range);
     document.execCommand('removeFormat');
-    // 8 类行内格式 span：逐个解包与 range 相交者（文本留在原位）
-    for (const cls of INLINE_CLASSES) unwrapSpans(block, cls, range);
+    // 行内格式 span：逐个解包与 range 相交者（文本留在原位）
+    // INLINE_TEXT_CLASSES = 8 类字符格式 + 规则引擎的行内注释 span（2026-09-13 修复）
+    for (const cls of INLINE_TEXT_CLASSES) unwrapSpans(block, cls, range);
     // 块级标签：H1-H6 / DIV → 归一 <p>（_convertBlockTag 保留 class/data-*，
     // 图片段落若在 DIV 内其 ptoe-img-* 类随之保留）
     if (/^H[1-6]$/.test(block.tagName) || block.tagName === 'DIV') {
@@ -1751,7 +2066,7 @@ function applyOp(op) { const ed = currentEditable(); if (!ed) return;
     if (block.hasAttribute('style')) block.removeAttribute('style');
   });
 });
-      else if (op === 'p') applyToSelectedBlocks(ed, function(block) { _convertBlockTag(block, 'p'); }); // 与 heading 一致逐块转换（execCommand formatBlock 对跨块选区只转起始块）
+      else if (op === 'p') applyToSelectedBlocks(ed, function(block) { _toBodyParagraph(block); }); // 与 heading 一致逐块转换（execCommand formatBlock 对跨块选区只转起始块）；并清注释/引用样式与行内注释 span
       else if (op === 'centerbold') applyToSelectedBlocks(ed, function(block) {
         // 顺序：先设对齐（_convertBlockTag 会保留 class）→ 再加粗（selection 仍指向原 block）→ 最后转 <p>
         block.classList.remove('ptoe-align-left', 'ptoe-align-right');
@@ -3612,6 +3927,144 @@ ctxMenu.addEventListener('mousedown', (e) => {
   suppressPopupUntil = performance.now() + 300;
 });
 
+// ---------- 鼠标中键手势（与快捷键同一套操作体系） ----------
+// 中键按住滑动：上/下/左/右 四个方向各可绑定一个操作（默认 居中/居左/居右）。
+// 仅在 .editable 内起手时接管；编辑区外不干预（保留浏览器默认中键行为）。
+const MID_SWIPE_MIN = 30;   // 触发手势的最小滑动距离（px）
+let _midGesture = null;     // { x, y, ed } 当前中键按下起点（null = 无）
+let _midCapture = null;     // { x, y, ed } 绑定捕获模式下的中键按下起点（null = 无）
+
+// 方向判定：取绝对位移较大的轴；不足阈值返回 null
+function _midGestureDir(dx, dy) {
+  if (Math.max(Math.abs(dx), Math.abs(dy)) < MID_SWIPE_MIN) return null;
+  if (Math.abs(dx) >= Math.abs(dy)) return dx > 0 ? 'Middle+Right' : 'Middle+Left';
+  return dy > 0 ? 'Middle+Down' : 'Middle+Up';
+}
+
+// 中键不移动焦点：把光标放到指针所在段落，使 applyOp 作用于鼠标下的段落（尽力而为，绝不抛出）
+function _focusMidTarget(ed, x, y) {
+  try {
+    if (!ed || !ed.isConnected) return;
+    if (document.activeElement !== ed) ed.focus({ preventScroll: true });
+    let range = null;
+    if (document.caretRangeFromPoint) {
+      range = document.caretRangeFromPoint(x, y);
+    } else if (document.caretPositionFromPoint) {
+      const p = document.caretPositionFromPoint(x, y);
+      if (p) { range = document.createRange(); range.setStart(p.offsetNode, p.offset); range.collapse(true); }
+    }
+    if (range && ed.contains(range.startContainer)) {
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+  } catch (e) { /* 定位失败时保持原光标 */ }
+}
+
+document.addEventListener('mousedown', (e) => {
+  if (e.button !== 1) return;
+  // 绑定捕获模式：设置弹窗遮住页面，捕获必须全页面可用（不限编辑区内）
+  if (mouseCapturingOp) {
+    e.preventDefault();             // 阻止 Windows 中键自动滚动
+    _midCapture = { x: e.clientX, y: e.clientY, ed: null };
+    return;
+  }
+  const ed = e.target && e.target.closest ? e.target.closest('.editable') : null;
+  if (!ed) return;                  // 编辑区外不干预
+  e.preventDefault();               // 阻止 Windows 中键自动滚动
+  suppressPopupUntil = performance.now() + 300; // 中键不产生选区，抑制 mouseup 选中菜单
+  _midGesture = { x: e.clientX, y: e.clientY, ed: ed };
+});
+// 中键拖动期间不做任何事（方向在 mouseup 一次性判定）；preventDefault 兜底抑制中键自动滚动
+document.addEventListener('mousemove', (e) => {
+  if ((_midGesture || _midCapture) && (e.buttons & 4)) e.preventDefault();
+});
+// 抑制 Linux 中键粘贴（auxclick / click 的中键分支）
+document.addEventListener('auxclick', (e) => { if (e.button === 1) e.preventDefault(); });
+document.addEventListener('click', (e) => { if (e.button === 1) e.preventDefault(); });
+
+document.addEventListener('mouseup', (e) => {
+  if (e.button !== 1) return;
+  // 绑定捕获模式：中键滑动方向写入当前操作
+  if (_midCapture) {
+    const c = _midCapture; _midCapture = null;
+    e.preventDefault();
+    const g = _midGestureDir(e.clientX - c.x, e.clientY - c.y);
+    if (g && mouseCapturingOp) {
+      mouseBindings[mouseCapturingOp] = g;
+      saveMouseBindings();
+      mouseCapturingOp = null;
+      renderMouseShortcutTable();
+      renderShortcutTable();
+    }
+    return;
+  }
+  if (!_midGesture) return;
+  const g0 = _midGesture; _midGesture = null;
+  e.preventDefault();               // 是编辑区内的中键手势 → 消费掉
+  const g = _midGestureDir(e.clientX - g0.x, e.clientY - g0.y);
+  if (!g) return;
+  const op = mouseReverseBindings()[g];
+  if (!op) return;
+  // 集合激活或存在非折叠选区 → 保留它们，操作直接作用于集合/选区（不再 collapse 到指针处）。
+  // 修复：中键手势曾无条件 _focusMidTarget 折叠选区，多段 range 选择的格式只落到单块。
+  const selMid = window.getSelection();
+  // 浏览器拖选后 anchorNode 通常是文本节点（文本节点没有 closest）→ 取其父元素判定归属
+  const ancMid = selMid && selMid.anchorNode ? selMid.anchorNode : null;
+  const ancEl = ancMid ? (ancMid.nodeType === 1 ? ancMid : ancMid.parentElement) : null;
+  const liveSel = !!selMid && selMid.rangeCount > 0 && !selMid.isCollapsed &&
+    !!ancEl && !!ancEl.closest && !!ancEl.closest('.editable');
+  if (_multiSelBlocks.size > 0 || liveSel) {
+    runOp(op);
+    return;
+  }
+  _focusMidTarget(g0.ed, e.clientX, e.clientY);
+  runOp(op);
+});
+
+// ---------- Ctrl+点击 多段选择（非连续多选）事件 ----------
+document.addEventListener('mousedown', function (e) {
+  if (e.button === 0 && (e.ctrlKey || e.metaKey)) {
+    // 中键手势捕获/格式刷/输入法期间不介入
+    if (_midCapture || mouseCapturingOp || paintActive || (typeof isComposing !== 'undefined' && isComposing)) return;
+    const block = _multiSelBlockFromEvent(e);
+    if (!block) return;
+    e.preventDefault();             // 阻止默认选中文本/拖拽
+    const ed = block.parentNode;
+    if (ed && ed.focus) { try { ed.focus({ preventScroll: true }); } catch (err) {} }
+    _multiSelToggle(block);
+    // 折叠当前文本选区到目标块开头（点击即切换，选区不再干扰后续格式操作）
+    try {
+      const s2 = window.getSelection();
+      const rr = document.createRange();
+      rr.selectNodeContents(block);
+      rr.collapse(true);
+      s2.removeAllRanges();
+      s2.addRange(rr);
+    } catch (err) {}
+    suppressPopupUntil = performance.now() + 300;
+    hidePopup();
+    if (ctxMenuOpen) closeContextMenu();
+    return;
+  }
+  // 普通左键点击 #pages 内任意位置（含编辑区与页边距）→ 清除集合。
+  // 不清理工具栏/菜单/弹窗：工具按钮的 click 在 mousedown 之后触发，
+  // 集合激活时格式操作必须作用于整个集合（不能被提前清掉）。
+  if (e.button === 0 && !e.ctrlKey && !e.metaKey && _multiSelBlocks.size > 0) {
+    const t = e.target;
+    if (t && t.closest && t.closest('#pages')) _multiSelClear();
+  }
+});
+
+// Esc 清除多段选择：优先级低于纠错悬浮窗/弹出菜单/模态弹窗的既有处理；集合为空时不消费。
+document.addEventListener('keydown', function (e) {
+  if (e.key !== 'Escape' || _multiSelBlocks.size === 0) return;
+  if (errKey) return;
+  if (popup && popup.style.display === 'flex') return;
+  if (_multiSelAnyModalOpen()) return;
+  _multiSelClear();
+});
+
 // ---------- 格式刷（单次模式，Word 风格） ----------
 // 选中含格式的文本 → 点「刷」捕获格式 → 再选目标文字 → 再点「刷」应用（单次即止）
 let paintActive = false;
@@ -3646,8 +4099,13 @@ function captureFormat() {
   return fmt;
 }
 
-// 对目标 range 应用格式：行内格式走 execCommand（withScrollStable 防滚动跳页），
-// 注释走既有 applyToSelectedBlocks 机制（与「注释」按钮同路径）
+// 对目标 range 应用格式。
+// 粗体/斜体走 execCommand（withScrollStable 防滚动跳页；sanitize 会归一为 strong/em，导出无损）；
+// 文字包围（下划线/删除线/上标/下标）必须走本应用的 class 机制（2026-09-16 修复）：
+// 原生 execCommand('underline'/'strikeThrough'/'superscript'/'subscript') 产出
+// <u>/<strike>/<sup>/<sub>，这些标签不在 sanitize_html 白名单里 → 保存与导出 EPUB 时
+// 被静默丢弃，表现为「某句/某几个字的文字包围效果导出后丢失」（编辑器里看得到）。
+// 注释走既有 applyToSelectedBlocks 机制（与「注释」按钮同路径）。
 function applyFormat(fmt, range) {
   if (!fmt || !range) return;
   const sel = window.getSelection();
@@ -3656,13 +4114,15 @@ function applyFormat(fmt, range) {
   sel.addRange(range);
   if (fmt.bold) withScrollStable(() => document.execCommand('bold'));
   if (fmt.italic) withScrollStable(() => document.execCommand('italic'));
-  if (fmt.underline) withScrollStable(() => document.execCommand('underline'));
-  if (fmt.strike) withScrollStable(() => document.execCommand('strikeThrough'));
-  if (fmt.sup) withScrollStable(() => document.execCommand('superscript'));
-  if (fmt.sub) withScrollStable(() => document.execCommand('subscript'));
-  if (fmt.note) {
-    const ed = currentEditable();
-    if (ed) applyToSelectedBlocks(ed, function(block) { block.classList.add('ptoe-note'); });
+  const ed = currentEditable();
+  if (ed) {
+    if (fmt.underline) applyInlineClass(ed, 'ptoe-underline', { toggle: false });
+    if (fmt.strike) applyInlineClass(ed, 'ptoe-strike', { toggle: false });
+    if (fmt.sup) applyInlineClass(ed, 'ptoe-sup', { toggle: false });
+    if (fmt.sub) applyInlineClass(ed, 'ptoe-sub', { toggle: false });
+  }
+  if (fmt.note && ed) {
+    applyToSelectedBlocks(ed, function(block) { block.classList.add('ptoe-note'); });
   }
 }
 
@@ -4702,7 +5162,8 @@ document.addEventListener('keydown', function (e) {
   if (e.key === 'Escape' && _imgKey) { hideImgPopup(); }
 });
 
-// 字号下拉：仅调整编辑区显示字号（CSS 变量 --editor-font-size；视图偏好，不写入保存内容）
+// 字号下拉：仅调整编辑区显示字号（CSS 变量 --editor-font-size）；
+// 显示偏好，刻意不写入保存内容/导出 EPUB（阅读器自控字号，2026-09-19）
 function applyFontSize(v) {
   const fv = v || 14;
   document.documentElement.style.setProperty('--editor-font-size', fv + 'px');
@@ -4995,6 +5456,83 @@ function syncCondsFromDom() {
     };
   });
 }
+// 匹配预览（2026-09-13）：把条件的正则作用于当前页，列出「实际匹配几处 + 每处的捕获组」。
+// 用途：贪婪前缀写法（如 [\t\S]+(〔\d+〕)）会把同一行后面出现的对象一起吞进本次匹配，
+// 用户以为匹配了 4 个对象、实际只有 2 处（只有这 2 处的分组被套格式），
+// 应用后看起来像"只有最后一个匹配对象应用了规则格式"。预览把真实匹配数摊开。
+function _looksGreedyBeforeGroup(pat) {
+  return /(\+|\*)\s*\(/.test(pat) && !/(\+\?|\*\?)\s*\(/.test(pat);
+}
+function renderConditionPreview(panel, res, cond) {
+  const names = {};
+  for (const o of FORMAT_RULE_OPTS) names[o[0]] = o[1];
+  const gf = cond.group_formats || [];
+  panel.innerHTML = '';
+  const head = document.createElement('div');
+  head.style.cssText = 'font-weight:600;';
+  head.textContent = '本页匹配到 ' + res.count + ' 处'
+    + (res.shown < res.count ? '（仅列出前 ' + res.shown + ' 处）' : '');
+  panel.appendChild(head);
+  if (!res.count) {
+    const empty = document.createElement('div');
+    empty.textContent = res.hint || '没有匹配到内容：请检查条件内容（正则表达式）是否与正文一致。';
+    panel.appendChild(empty);
+    return;
+  }
+  (res.matches || []).forEach(function (m) {
+    const line = document.createElement('div');
+    line.style.cssText = 'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+    line.textContent = '匹配' + m.index + '：' + m.text;
+    line.title = m.text;
+    panel.appendChild(line);
+    (m.groups || []).forEach(function (g, gi) {
+      const ops = (gf[gi] || []).filter(function (o) { return o !== 'none'; });
+      const gLine = document.createElement('div');
+      gLine.style.cssText = 'padding-left:1.5em;color:#5a6b7c;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+      gLine.textContent = '组' + (gi + 1) + ' = ' + (g === null ? '（本次未匹配）' : g)
+        + (ops.length ? '  ［已设格式：' + ops.map(function (o) { return names[o] || o; }).join('/') + '］' : '');
+      gLine.title = gLine.textContent;
+      panel.appendChild(gLine);
+    });
+  });
+  if (_looksGreedyBeforeGroup(cond.pattern || '')) {
+    const tip = document.createElement('div');
+    tip.style.cssText = 'margin-top:4px;color:#8a6d00;';
+    tip.textContent = '提示：条件内容里 +/* 是贪婪量词，紧邻其后的分组会把同一行内后面出现的目标一起吞进本次匹配'
+      + '（本例即"每行只匹配到最后一个标记"）。若想逐个匹配，可改用 +? / *?，或直接写成 (〔\\d+〕) 这样只含分组的表达式。';
+    panel.appendChild(tip);
+  }
+}
+async function previewConditionMatches(idx, rowEl) {
+  syncCondsFromDom();
+  const c = _frConds[idx];
+  if (!c) return;
+  const ed = currentEditable() || document.querySelector('.editable');
+  if (!ed) { showToast('请先点击某一页的文字，再预览匹配', 'warn'); return; }
+  let panel = rowEl.nextElementSibling;
+  if (!panel || !panel.classList || !panel.classList.contains('fr-preview')) {
+    panel = document.createElement('div');
+    panel.className = 'fr-preview';
+    panel.style.cssText = 'margin:2px 0 6px 2em;padding:6px 8px;background:#f6f8fb;'
+      + 'border:1px solid #dde5ee;border-radius:6px;font-size:12px;color:#33414f;line-height:1.6;';
+    rowEl.insertAdjacentElement('afterend', panel);
+  }
+  panel.textContent = '预览中…';
+  try {
+    const res = await fetchJSON('/api/format_rules/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ html: ed.innerHTML, type: c.type, pattern: c.pattern, max: 20 }),
+    });
+    if (!res || !res.ok) {
+      panel.textContent = '预览失败：' + ((res && res.error) || '未知错误');
+      return;
+    }
+    renderConditionPreview(panel, res, c);
+  } catch (e) {
+    panel.textContent = '预览失败：' + e;
+  }
+}
 function renderConditions(conds) {
   _frConds = conds;
   const box = document.getElementById('frConditions');
@@ -5050,7 +5588,7 @@ function renderConditions(conds) {
     const fmtBtn = document.createElement('button');
     fmtBtn.type = 'button'; fmtBtn.className = 'frFmtBtn';
     fmtBtn.textContent = '格式';
-    fmtBtn.title = '设置该条件的格式（含「无」= 不处理文本）';
+    fmtBtn.title = '设置该条件的格式（作用于全部匹配对象；含「无」= 不处理文本）';
     fmtBtn.addEventListener('click', function () { openFmtPopup(idx); });
     const tags = document.createElement('span');
     tags.className = 'fr-tags';
@@ -5085,7 +5623,13 @@ function renderConditions(conds) {
     row.appendChild(scopeSel);
     row.appendChild(targetSel);
     row.appendChild(endPatInput);
+    const prevBtn = document.createElement('button');
+    prevBtn.type = 'button'; prevBtn.className = 'frFmtBtn frPreviewBtn';
+    prevBtn.textContent = '预览';
+    prevBtn.title = '显示该条件在当前页实际匹配到几处、每处的捕获组是什么（应用前先核对，避免贪婪量词把多个对象吞成一处）';
+    prevBtn.addEventListener('click', function () { previewConditionMatches(idx, row); });
     row.appendChild(fmtBtn);
+    row.appendChild(prevBtn);
     row.appendChild(tags);
     row.appendChild(upBtn);
     row.appendChild(downBtn);
@@ -5145,7 +5689,7 @@ function renderConditions(conds) {
         var mFmtBtn = document.createElement('button');
         mFmtBtn.type = 'button'; mFmtBtn.className = 'frFmtBtn';
         mFmtBtn.textContent = '格式';
-        mFmtBtn.title = '设置第 ' + (mi + 1) + ' 次匹配的独立格式';
+        mFmtBtn.title = '设置第 ' + (mi + 1) + ' 次匹配的独立格式（在该条件的格式之上追加）';
         (function(mIdx) {
           mFmtBtn.addEventListener('click', function () { openFmtPopup(idx, -1, mIdx); });
         })(mi);
@@ -5377,6 +5921,12 @@ async function applyFormatRule(rule, edArg) {
   }
   const ed = edArg || currentEditable();
   if (!ed) { showToast('请先选中文字或把光标放入段落', 'warn'); return false; }
+  // 多段选择模式：集合非空 → 按块绝对偏移 sel_ranges 提交（服务端契约，
+  // sel_ranges 存在时忽略 sel_start/sel_end）。空集合走既有单选区流程。
+  _multiSelPrune();
+  if (_multiSelBlocks.size > 0) {
+    return _applyFormatRuleToMultiSel(rule, ed);
+  }
   if (!edArg) restoreFrRange();
 
   // 计算当前选区相对整页纯文本的偏移（用于 selection scope）
@@ -5441,6 +5991,126 @@ async function applyFormatRule(rule, edArg) {
     showToast('应用格式规则失败: ' + e, 'fail');
     return false;
   }
+}
+
+// 多段选择模式：把规则应用到集合全部段落。按 .editable 分组 → 每块绝对文本偏移
+// 合成 sel_ranges（升序、去重、重叠合并）。单页一次 POST（沿用既有单步撤销）；
+// 跨页逐页 POST + 整书快照（镜像 applyFormatRuleAllPages，一步撤销）。
+async function _applyFormatRuleToMultiSel(rule, ed) {
+  const groups = new Map();   // editable → blocks
+  for (const b of _multiSelBlocks) {
+    const par = b.parentNode;
+    if (!par) continue;
+    if (!groups.has(par)) groups.set(par, []);
+    groups.get(par).push(b);
+  }
+  const entries = [];
+  for (const [ed2, blocks] of groups) {
+    const row = ed2.closest ? ed2.closest('.page-row') : null;
+    const pi = row ? Number(row.dataset.i) : -1;
+    if (pi < 0) continue;
+    const ranges = _buildMultiSelRanges(ed2, blocks);
+    if (!ranges.length) continue;
+    // 记录块在可编辑区内的元素索引：服务端往返会整体替换 innerHTML，旧块随即脱离文档，
+    // 应用后按索引把集合成员替换绑定到新元素（保持「操作后集合保留」语义）
+    const idxs = blocks.map(function (b) { return Array.prototype.indexOf.call(ed2.children, b); });
+    entries.push({ ed: ed2, page: pi, ranges: ranges, idxs: idxs, oldBlocks: blocks.slice() });
+  }
+  if (!entries.length) { showToast('所选段落不含可应用文本', 'warn'); return false; }
+  const applyEntry = async function (ent) {
+    const res = await fetchJSON('/api/format_rules/apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        page: ent.page + 1,  // 页码从 1 开始
+        html: ent.ed.innerHTML,
+        rule_id: rule.id,
+        all: false,
+        sel_ranges: ent.ranges,   // 服务端契约：存在时忽略 sel_start/sel_end
+      }),
+    });
+    if (!res.ok) { showToast('应用格式规则失败: ' + (res.error || '未知错误'), 'fail'); return false; }
+    const prevEdScroll = ent.ed.scrollTop;
+    withScrollStable(() => {
+      ent.ed.innerHTML = res.html;
+      try { ent.ed.scrollTop = prevEdScroll; } catch (e) {}
+      // 集合成员替换绑定到新元素（旧块已脱离文档；高亮类同步补回）
+      for (const ob of ent.oldBlocks) _multiSelBlocks.delete(ob);
+      for (const bi of ent.idxs) {
+        const nb = ent.ed.children[bi];
+        if (!nb || nb.nodeType !== 1) continue;
+        _multiSelBlocks.add(nb);
+        nb.classList.add(_MULTI_SEL_CLASS);
+      }
+      // 集合模式不恢复选区
+      syncContent(ent.ed);
+      const r2 = ent.ed.closest('.page-row');
+      if (r2) { markDirty(ent.page); scheduleRemeasure(ent.page); }
+    });
+    return true;
+  };
+  if (entries.length === 1) {
+    const ent = entries[0];
+    const before = histBegin('格式规则', [ent.page]);
+    try {
+      const ok2 = await applyEntry(ent);
+      if (!ok2) return false;
+      histEnd(before, '格式规则');
+      showToast('已应用格式规则「' + rule.name + '」到 ' + _multiSelBlocks.size + ' 段', 'ok');
+      return true;
+    } catch (e) {
+      showToast('应用格式规则失败: ' + e, 'fail');
+      return false;
+    }
+  }
+  // 跨页：整书快照 = 一步撤销；errBefore 捕获全页纠错标注（镜像 applyFormatRuleAllPages）
+  const errBefore = new Map();
+  for (let i = 0; i < pages.length; i++) errBefore.set(i, _copyErrors(i));
+  const before = histBegin('格式规则', null);
+  try {
+    for (const ent of entries) {
+      const ok2 = await applyEntry(ent);
+      if (!ok2) return false;
+    }
+    histEnd(before, '格式规则', errBefore);
+    showToast('已应用格式规则「' + rule.name + '」到 ' + _multiSelBlocks.size + ' 段', 'ok');
+    return true;
+  } catch (e) {
+    showToast('应用格式规则失败: ' + e, 'fail');
+    return false;
+  }
+}
+
+// 集合块 → 相对整页纯文本的 [start,end] 偏移区间（服务端 selection scope 用的同一套偏移）。
+// 注意不能用 _getSelectionOffset(container=元素) 算块边界：其元素分支对「整块」range
+// 的 start/end 都落到块内第一个文本节点的 start（单文本节点块 end==start → 区间被丢弃）。
+// 这里按块内首个/末个文本节点在整页文本中的位置取 start/end。
+function _buildMultiSelRanges(ed2, blocks) {
+  const textNodes = _buildTextNodeList(ed2);
+  const ranges = [];
+  for (const block of blocks) {
+    let s = null, ee = null;
+    try {
+      const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, null, false);
+      let first = null, last = null, node;
+      while ((node = walker.nextNode())) { if (!first) first = node; last = node; }
+      if (first) {
+        for (const tn of textNodes) { if (tn.node === first) { s = tn.start; break; } }
+      }
+      if (last) {
+        for (const tn of textNodes) { if (tn.node === last) { ee = tn.end; break; } }
+      }
+    } catch (e) {}
+    if (s !== null && ee !== null && s < ee) ranges.push([s, ee]);
+  }
+  ranges.sort(function (a, b) { return a[0] - b[0] || a[1] - b[1]; });
+  // 去重 + 合并重叠区间（非重叠升序，符合服务端 ≤64 对校验）
+  const merged = [];
+  for (const rr of ranges) {
+    if (!merged.length || rr[0] > merged[merged.length - 1][1]) merged.push([rr[0], rr[1]]);
+    else if (rr[1] > merged[merged.length - 1][1]) merged[merged.length - 1][1] = rr[1];
+  }
+  return merged;
 }
 
 // 全部页模式：把整条规则逐页应用到所有页面。一次操作 = 一步撤销；只更新内容实际
@@ -5673,7 +6343,7 @@ function applySingleFormat(op, ed) {
   if (op === 'no_bold') { applyToSelectedBlocks(ed, function (block) { block.style.fontWeight = 'normal'; }); return; }
   if (op === 'italic') { applyInlineFormat(ed, 'italic'); return; }
   if (op === 'remove') { applyToSelectedBlocks(ed, function () { document.execCommand('removeFormat'); }); return; }
-  if (op === 'p') { applyToSelectedBlocks(ed, function (block) { _convertBlockTag(block, 'p'); }); return; }
+  if (op === 'p') { applyToSelectedBlocks(ed, function (block) { _toBodyParagraph(block); }); return; }
   if (op === 'merge') { _mergeSelectedBlocks(ed); return; }
   if (op === 'note') { toggleNote(ed); return; }
   if (op === 'citation') { toggleCitation(ed); return; }
@@ -5768,9 +6438,14 @@ function renderShortcutTable() {
     const tr = document.createElement('tr');
     tr.dataset.op = op;
     const combo = bindings[op];
-    tr.innerHTML = '<td>' + label + '</td><td>' + (combo ? '<kbd>' + combo.replace(/\+/g, '</kbd>+<kbd>') + '</kbd>' : '<span style="color:#9aa7b4">未绑定</span>') + '</td>';
+    // 鼠标手势为次要信息：放在操作名单元格内第二行，保持 td:nth-child(2)（组合键列）结构不变。
+    // 每行都显示，未绑定的操作也可点标签后按住中键滑动完成绑定。
+    const gest = mouseBindings[op];
+    const gestLine = '<div class="mouse-badge' + (gest ? '' : ' unbound') + '" data-op="' + op + '" title="点击后按住中键滑动，把该操作绑定到该方向的手势">中键：' + (gest ? gestureLabel(gest) : '未绑定') + '</div>';
+    tr.innerHTML = '<td>' + label + gestLine + '</td><td>' + (combo ? '<kbd>' + combo.replace(/\+/g, '</kbd>+<kbd>') + '</kbd>' : '<span style="color:#9aa7b4">未绑定</span>') + '</td>';
     tr.addEventListener('click', () => {
       capturingOp = op;
+      mouseCapturingOp = null;   // 键盘捕获与鼠标捕获互斥
       renderShortcutTable();
       const row = tbody.querySelector('tr[data-op="' + op + '"]');
       if (row) row.querySelector('td:nth-child(2)').textContent = '按下新组合键…（Esc 取消，Del 清除）';
@@ -5778,8 +6453,70 @@ function renderShortcutTable() {
     tbody.appendChild(tr);
   }
 }
+// 手势键 → 中文标签（未知手势原样显示）
+function gestureLabel(g) {
+  for (const [key, label] of MOUSE_GESTURES) if (key === g) return label;
+  return g || '';
+}
+// 操作键 → 中文标签（未知操作原样显示）
+function opLabel(op) {
+  for (const [key, label] of OPS) if (key === op) return label;
+  return op || '';
+}
+// 鼠标动作表：按手势逐行（手势是稀缺资源），显示该手势当前绑定的操作。
+// 点击已绑定行 → 进入捕获，按住中键滑到新方向即改绑（Esc 取消 / Del 清除）。
+function renderMouseShortcutTable() {
+  const tbody = document.getElementById('mouseShortcutTable');
+  if (!tbody) return;
+  tbody.innerHTML = '';
+  const rev = mouseReverseBindings();
+  for (const [g, glabel] of MOUSE_GESTURES) {
+    const tr = document.createElement('tr');
+    tr.dataset.gesture = g;
+    const op = rev[g];
+    tr.innerHTML = '<td>' + glabel + '</td><td>' + (op ? opLabel(op) : '<span style="color:#9aa7b4">未绑定</span>') + '</td>';
+    tr.addEventListener('click', () => {
+      if (!op) { showToast('该手势未绑定操作；可在上方「快捷键」表点击操作右侧的中键标签进行绑定', 'warn'); return; }
+      mouseCapturingOp = op;
+      capturingOp = null;   // 键盘捕获与鼠标捕获互斥
+      renderMouseShortcutTable();
+      const row = tbody.querySelector('tr[data-gesture="' + g + '"]');
+      if (row) row.querySelector('td:nth-child(2)').textContent = '按住中键滑动…（Esc 取消，Del 清除）';
+    });
+    tbody.appendChild(tr);
+  }
+}
+// 快捷键表中操作右侧的中键标签：点击进入鼠标手势捕获（捕获阶段拦截，避免触发行本身的键盘捕获）
+document.addEventListener('click', function (e) {
+  const badge = e.target && e.target.closest ? e.target.closest('.mouse-badge') : null;
+  if (!badge) {
+    // 点到别处 = 取消鼠标捕获（否则键盘输入会被捕获分支吞掉）。
+    // 例外：鼠标动作表内的行（点击即开始捕获，由行自身 handler 处理）。
+    const inMouseTable = e.target && e.target.closest && e.target.closest('#mouseShortcutTable');
+    if (mouseCapturingOp && !inMouseTable) {
+      mouseCapturingOp = null;
+      renderMouseShortcutTable();
+      renderShortcutTable();
+    }
+    return;
+  }
+  e.preventDefault();
+  e.stopPropagation();
+  const op = badge.dataset.op;
+  if (!op) return;
+  mouseCapturingOp = op;
+  capturingOp = null;   // 键盘捕获与鼠标捕获互斥
+  renderMouseShortcutTable();
+  renderShortcutTable();
+  const row = document.querySelector('#shortcutTable tr[data-op="' + op + '"]');
+  if (row) {
+    const cell = row.querySelector('td:nth-child(2)');
+    if (cell) cell.textContent = '按住中键滑动…（Esc 取消，Del 清除）';
+  }
+}, true);
 function openSettings() {
   renderShortcutTable();
+  renderMouseShortcutTable();
   document.getElementById('tipDelayInput').value = tipDelay();
   document.getElementById('errHoverDelayInput').value = errHoverDelay();
   loadFontSettings();
@@ -5793,7 +6530,7 @@ function openSettings() {
   document.querySelectorAll('.settings-panel').forEach(p => p.style.display = 'none');
   document.getElementById('panel-shortcuts').style.display = 'block';
 }
-function closeSettings() { capturingOp = null; document.getElementById('modalBg').style.display = 'none'; }
+function closeSettings() { capturingOp = null; mouseCapturingOp = null; document.getElementById('modalBg').style.display = 'none'; }
 
 async function loadFontSettings() {
   try {
@@ -6094,6 +6831,19 @@ const SHORTCUT_ACTIONS = {
   },
 };
 
+// 统一操作分发（键盘快捷键与鼠标手势共用）：返回 true = 已消费、调用方应 preventDefault。
+// 语义与旧内联分发一致：act() === false 或（无 act 且无编辑区）→ false。
+function runOp(op) {
+  const act = SHORTCUT_ACTIONS[op];
+  if (act) {
+    if (act() === false) return false;   // act 返回 false：不 preventDefault、不进 applyOp，交浏览器默认行为（如 contenteditable 换行）
+    return true;
+  }
+  if (!currentEditable()) return false;
+  applyOp(op);
+  return true;
+}
+
 // ---------- 全局事件（统一快捷键分发） ----------
 document.addEventListener('keydown', (e) => {
   if (capturingOp) {
@@ -6104,24 +6854,26 @@ document.addEventListener('keydown', (e) => {
     if (combo) { bindings[capturingOp] = combo; saveBindings(); capturingOp = null; renderShortcutTable(); }
     return;
   }
+  // 鼠标手势绑定捕获中：键盘只处理 Esc 取消 / Del 清除（滑动本身走 mousedown/mouseup）
+  if (mouseCapturingOp) {
+    e.preventDefault(); e.stopPropagation();
+    if (e.key === 'Escape') { mouseCapturingOp = null; renderMouseShortcutTable(); return; }
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      delete mouseBindings[mouseCapturingOp];
+      saveMouseBindings(); mouseCapturingOp = null; renderMouseShortcutTable(); return;
+    }
+    return;
+  }
   const combo = comboOf(e);
   if (!combo) return;
   const op = reverseBindings()[combo];
   if (!op) return;
-  const act = SHORTCUT_ACTIONS[op];
-  if (act) {
-      // 撤销/重做在 INPUT/TEXTAREA/SELECT 聚焦时不触发（避免与输入框原生行为冲突）
-      if (op === 'undo' || op === 'redo') {
-        const t = e.target;
-        if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
-      }
-      if (act() === false) return;   // act 返回 false：不 preventDefault、不进 applyOp，交浏览器默认行为（如 contenteditable 换行）
-      e.preventDefault();
-      return;
+  // 撤销/重做在 INPUT/TEXTAREA/SELECT 聚焦时不触发（避免与输入框原生行为冲突）——仅键盘守卫
+  if (op === 'undo' || op === 'redo') {
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
   }
-  if (!currentEditable()) return;
-  applyOp(op);
-  e.preventDefault();
+  if (runOp(op)) e.preventDefault();
   return;
 });
   document.getElementById('searchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') searchPages(); });
@@ -6428,6 +7180,15 @@ document.getElementById('resetShortcutsBtn').addEventListener('click', () => {
   renderShortcutTable();
   showToast('快捷键已恢复默认设置', 'ok');
 });
+// 设置-鼠标动作：恢复默认（guard：HTML 可能尚未包含该按钮）
+const _resetMouseBtn = document.getElementById('resetMouseShortcutsBtn');
+if (_resetMouseBtn) _resetMouseBtn.addEventListener('click', () => {
+  mouseBindings = Object.assign({}, MOUSE_DEFAULTS);
+  saveMouseBindings();
+  renderMouseShortcutTable();
+  renderShortcutTable();
+  showToast('鼠标动作已恢复默认设置', 'ok');
+});
 // 设置-字体：恢复默认（与 configmanage.DEFAULT_CONFIG fonts 一致）
 document.getElementById('resetFontsBtn').addEventListener('click', async () => {
   document.getElementById('fontBody').value = 'serif';
@@ -6728,6 +7489,7 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
   heights.length = pages.length; heights.fill(0);
   est = pages.length ? 420 : 420;
    loadBindingsFromServer();   // 服务端快捷键设置（异步覆盖，失败静默回退 localStorage/DEFAULTS）
+   loadMouseBindingsFromServer(); // 服务端鼠标手势设置（同因：随机端口下 localStorage 每运行失效）
    loadUiSettingsFromServer(); // 服务端界面设置（异步覆盖，失败静默回退 localStorage/DEFAULTS）
   mdMode = loadBool('ptoe_md_mode');
   if (mdMode) {

@@ -18,6 +18,7 @@ from rulemanage import (
     serialize_html,
     collect_text_nodes,
     apply_rules,
+    find_matches,
     VALID_FORMAT_OPS,
     parse_regex_pattern,
     Rule,
@@ -1139,6 +1140,210 @@ class TestApplyRules(unittest.TestCase):
             self.assertEqual(len(rulemanage._REGEX_CACHE), 16)  # 唯一模式各 1 条
         finally:
             rulemanage._REGEX_CACHE.clear()
+
+
+class TestConditionFormatsNotSwallowed(unittest.TestCase):
+    """回归（2026-09-13）：条件级 formats 与 match_formats/group_formats 叠加生效。
+
+    症状历史：一条正则匹配到多个对象，却只有最后一个匹配对象被改格式。
+    根因：eval_format_rule 用 elif 串联分类，只要条件带了 group/match 格式
+    （哪怕数组里只有一行填了格式、甚至全是空行），条件级 formats 就被整条丢弃。
+    """
+
+    def test_condition_formats_kept_with_match_formats(self):
+        rule = Rule(
+            id="r1",
+            name="T",
+            mode="all",
+            conditions=[
+                Condition(
+                    "regex", "〔\\d+〕", "page", ["underline"],
+                    match_formats=[[], [], [], ["bold"]],
+                )
+            ],
+        )
+        result = eval_format_rule(rule, "〔1〕〔2〕〔3〕〔4〕")
+        # 条件级 → pattern_conds（作用到全部匹配）；逐匹配 → match_conds（追加）
+        self.assertEqual(len(result.pattern_conds), 1)
+        self.assertEqual(result.pattern_conds[0].formats, ["underline"])
+        self.assertEqual(len(result.match_conds), 1)
+        self.assertEqual(result.match_conds[0].match_formats, [[], [], [], ["bold"]])
+
+    def test_condition_formats_kept_with_empty_match_formats(self):
+        rule = Rule(
+            id="r1",
+            name="T",
+            mode="all",
+            conditions=[
+                Condition(
+                    "regex", "〔\\d+〕", "page", ["underline"],
+                    match_formats=[[], [], [], []],
+                )
+            ],
+        )
+        result = eval_format_rule(rule, "〔1〕〔2〕")
+        self.assertEqual(len(result.pattern_conds), 1)
+
+    def test_condition_formats_kept_with_group_formats(self):
+        rule = Rule(
+            id="r1",
+            name="T",
+            mode="all",
+            conditions=[
+                Condition(
+                    "regex", "(〔\\d+〕)", "page", ["underline"],
+                    group_formats=[[]],
+                )
+            ],
+        )
+        result = eval_format_rule(rule, "〔1〕〔2〕")
+        self.assertEqual(len(result.pattern_conds), 1)
+        self.assertEqual(len(result.group_conds), 1)
+
+    def test_all_matches_formatted_when_match_formats_partial(self):
+        """端到端：条件级「下划线」必须作用于全部 4 个匹配，末行「加粗」额外追加。"""
+        html = "<p>〔1〕甲</p><p>〔2〕乙</p><p>〔3〕丙</p><p>〔4〕丁</p>"
+        rules = [
+            {
+                "id": "r1",
+                "name": "t",
+                "mode": "all",
+                "conditions": [
+                    {
+                        "type": "regex",
+                        "pattern": "〔\\d+〕",
+                        "scope": "page",
+                        "target": "match",
+                        "formats": ["underline"],
+                        "match_formats": [[], [], [], ["bold"]],
+                    }
+                ],
+            }
+        ]
+        new_html, err = apply_rules(html, rules, all_rules=True)
+        self.assertIsNone(err)
+        self.assertEqual(new_html.count('class="ptoe-underline"'), 4)
+        self.assertEqual(new_html.count("<strong>"), 1)
+
+    def test_all_matches_formatted_when_match_formats_all_empty(self):
+        """匹配行全是空行（界面里加了行但没填格式）：条件级格式仍须全部生效。"""
+        html = "<p>〔1〕甲〔2〕乙〔3〕丙〔4〕丁</p>"
+        rules = [
+            {
+                "id": "r1",
+                "name": "t",
+                "mode": "all",
+                "conditions": [
+                    {
+                        "type": "regex",
+                        "pattern": "〔\\d+〕",
+                        "scope": "page",
+                        "target": "match",
+                        "formats": ["underline"],
+                        "match_formats": [[], [], [], []],
+                    }
+                ],
+            }
+        ]
+        new_html, err = apply_rules(html, rules, all_rules=True)
+        self.assertIsNone(err)
+        self.assertEqual(new_html.count('class="ptoe-underline"'), 4)
+
+    def test_match_formats_only_still_per_match(self):
+        """未设置条件级格式时，逐匹配格式仍按索引各管各的（不改变原语义）。"""
+        html = "<p>〔1〕甲</p><p>〔2〕乙</p><p>〔3〕丙</p><p>〔4〕丁</p>"
+        rules = [
+            {
+                "id": "r1",
+                "name": "t",
+                "mode": "all",
+                "conditions": [
+                    {
+                        "type": "regex",
+                        "pattern": "〔\\d+〕",
+                        "scope": "page",
+                        "target": "match",
+                        "formats": [],
+                        "match_formats": [[], [], [], ["bold"]],
+                    }
+                ],
+            }
+        ]
+        new_html, err = apply_rules(html, rules, all_rules=True)
+        self.assertIsNone(err)
+        self.assertEqual(new_html.count("<strong>"), 1)
+        self.assertIn("<strong>〔4〕</strong>", new_html)
+
+
+class TestParagraphStartExclusion(unittest.TestCase):
+    r"""跳过"段首标记"的正则配方（2026-09-13）。
+
+    场景：正文里的引用标记〔1〕嵌在句中（应设上标），而"注释"区每条的〔n〕在段首
+    （不该设上标）。语料实测 8052 页：句中标记 7861 处、段首 5687 处、页首 192 处。
+
+    引擎口径：页面纯文本由各文本节点拼接，段与段的边界就是换行符 \n，
+    因此"段首/页首"等价于"标记前面没有本行的非空白字符"。
+
+    - 推荐 `(?:[^\n\s][^\n]*?)(〔\d+〕)`：分组号仍是组1，句中标记 100% 命中，
+      段首/页首 0 误套（前缀用非捕获组，不占用组号）；
+    - `(?<!\n)(〔\d+〕)`：只排除"紧跟换行"的段首，页首页首那 192 处仍会误套。
+    """
+
+    HTML = (
+        "<p>\n一月二十日二十四时来电〔3〕及两组〔4〕简报均悉。</p>"
+        "<p>\n注释</p>"
+        "<p>\n〔1〕李克农，当时任外交部副部长。</p>"
+        "<p>\n〔2〕金，指金日成。</p>"
+    )
+    # 首段本身就是标记开头（页首情形）
+    HTML_HEAD = "<p>〔9〕页首条目。</p><p>\n正文引用〔3〕在此。</p>"
+
+    def _sups(self, pattern: str, html: str | None = None) -> str:
+        rules = [{
+            "id": "r1", "name": "注释", "mode": "all",
+            "conditions": [{
+                "type": "regex", "pattern": pattern, "scope": "page", "target": "match",
+                "formats": [], "group_formats": [["sup"]],
+            }],
+        }]
+        out, err = apply_rules(html or self.HTML, rules, all_rules=True)
+        self.assertIsNone(err)
+        return out
+
+    def test_non_capturing_prefix_recipe(self):
+        """推荐配方：句中标记上标、段首标记（注释条目）跳过。"""
+        out = self._sups(r"(?:[^\n\s][^\n]*?)(〔\d+〕)")
+        for marker in ("〔3〕", "〔4〕"):
+            self.assertIn(f'<span class="ptoe-sup">{marker}</span>', out)
+        for marker in ("〔1〕", "〔2〕"):
+            self.assertNotIn(f'<span class="ptoe-sup">{marker}</span>', out)
+
+    def test_non_capturing_prefix_recipe_skips_page_head(self):
+        """页首（页首即段首）的标记同样跳过。"""
+        out = self._sups(r"(?:[^\n\s][^\n]*?)(〔\d+〕)", self.HTML_HEAD)
+        self.assertIn('<span class="ptoe-sup">〔3〕</span>', out)
+        self.assertNotIn('<span class="ptoe-sup">〔9〕</span>', out)
+
+    def test_lookbehind_recipe_leaks_page_head(self):
+        r"""`(?<!\n)` 只排除紧跟换行的段首：页首标记仍会被套（说明为何推荐上面的写法）。"""
+        out = self._sups(r"(?<!\n)(〔\d+〕)", self.HTML_HEAD)
+        self.assertIn('<span class="ptoe-sup">〔3〕</span>', out)
+        self.assertIn('<span class="ptoe-sup">〔9〕</span>', out)
+
+    def test_greedy_prefix_misses_inline_markers(self):
+        r"""对照：`[\t\S]+(〔\d+〕)` 贪婪前缀会吞掉同一行的后续标记。"""
+        out = self._sups(r"[\t\S]+(〔\d+〕)")
+        self.assertNotIn('<span class="ptoe-sup">〔3〕</span>', out)
+        self.assertIn('<span class="ptoe-sup">〔4〕</span>', out)
+
+    def test_slash_flags_recipe_matches_paragraph_start(self):
+        r"""反向需求（只处理段首条目）：`/^(〔\d+〕)/m` 靠 m 标志让 ^ 匹配每行行首。"""
+        cond = Condition("regex", r"/^(〔\d+〕)/m", "page", [])
+        found = find_matches(cond, "行内〔1〕引用。\n〔2〕段首条目。")
+        self.assertEqual([m.group(1) for m in found], ["〔2〕"])
+        # 不带 m 时 ^ 只匹配整页开头
+        cond2 = Condition("regex", r"^(〔\d+〕)", "page", [])
+        self.assertEqual(find_matches(cond2, "行内〔1〕引用。\n〔2〕段首条目。"), [])
 
 
 class TestNewInlineFormats(unittest.TestCase):

@@ -22,6 +22,7 @@ import correctmanage
 import htmlmanage
 import mian
 import pdfmanage
+import rulemanage
 from correctmanage import (
     sanitize_html,
     initial_html,
@@ -172,6 +173,100 @@ class TestSanitize(unittest.TestCase):
         out = sanitize_html('<p>a<mark class="ptoe-search">b</mark>c</p>')
         self.assertNotIn('<mark', out)
         self.assertIn('abc', out)
+
+    def test_native_inline_tags_normalized_to_format_classes(self):
+        r"""原生/外部行内标签折成应用的行内格式类（2026-09-16）。
+
+        浏览器原生 execCommand('underline'/'strikeThrough'/'superscript'/'subscript')、
+        粘贴自 Word/网页的内容会产出 <u>/<s>/<strike>/<del>/<sup>/<sub>/<mark>，
+        这些标签原先不在白名单里被静默丢弃——界面看得到效果、保存与导出 EPUB 后消失。
+        """
+        out = sanitize_html(
+            "<p>a<u>b</u><sup>c</sup><sub>d</sub><s>e</s><strike>f</strike>"
+            "<del>g</del><mark>h</mark></p>"
+        )
+        for cls, text in (
+            ("ptoe-underline", "b"),
+            ("ptoe-sup", "c"),
+            ("ptoe-sub", "d"),
+            ("ptoe-strike", "e"),
+            ("ptoe-strike", "f"),
+            ("ptoe-strike", "g"),
+            ("ptoe-highlight", "h"),
+        ):
+            self.assertIn(f'<span class="{cls}">{text}</span>', out)
+
+    def test_external_inline_styles_normalized(self):
+        """外部/粘贴的行内样式折成格式类；危险样式只保留经校验的 color。"""
+        self.assertEqual(
+            sanitize_html('<p>a<span style="text-decoration: underline">b</span>c</p>'),
+            '<p>a<span class="ptoe-underline">b</span>c</p>',
+        )
+        self.assertEqual(
+            sanitize_html('<p>a<span style="text-decoration:line-through">b</span>c</p>'),
+            '<p>a<span class="ptoe-strike">b</span>c</p>',
+        )
+        self.assertIn(
+            'class="ptoe-sup"',
+            sanitize_html('<p>a<span style="vertical-align:super">b</span></p>'),
+        )
+        self.assertEqual(
+            sanitize_html('<p>a<font color="#c00000">b</font>c</p>'),
+            '<p>a<span style="color:#c00000">b</span>c</p>',
+        )
+        self.assertEqual(
+            sanitize_html('<p>a<span style="position:fixed;color:red">b</span>c</p>'),
+            '<p>a<span style="color:red">b</span>c</p>',
+        )
+
+    def test_style_underdot_paste(self):
+        """粘贴 `text-decoration:underline dotted` 必须折为 ptoe-underdot 且不得
+        同时折出 ptoe-underline（两个 pattern 都命中会拼出双类；2026-09-19）。"""
+        self.assertEqual(
+            sanitize_html('<p>a<span style="text-decoration:underline dotted">b</span>c</p>'),
+            '<p>a<span class="ptoe-underdot">b</span>c</p>',
+        )
+        # 实线下划线仍折 ptoe-underline（负向前瞻排除 dotted/dashed/double/wavy 变体）
+        self.assertEqual(
+            sanitize_html('<p>a<span style="text-decoration:underline">b</span>c</p>'),
+            '<p>a<span class="ptoe-underline">b</span>c</p>',
+        )
+
+    def test_multiple_format_classes_kept(self):
+        """同一 span 上的多个白名单格式类全部保留（原先只保留第一个）。"""
+        out = sanitize_html('<p>a<span class="ptoe-underline ptoe-strike">b</span>c</p>')
+        self.assertEqual(
+            out, '<p>a<span class="ptoe-underline ptoe-strike">b</span>c</p>'
+        )
+
+    def test_cross_block_format_span_reopened(self):
+        """跨块未闭合的行内格式 span：两块都保留格式（第二块开头重新打开）。"""
+        out = sanitize_html(
+            '<p>前句<span class="ptoe-underline">跨块开始</p><p>跨块结束</span>后句</p>'
+        )
+        self.assertEqual(
+            out,
+            '<p>前句<span class="ptoe-underline">跨块开始</span></p>'
+            '<p><span class="ptoe-underline">跨块结束</span>后句</p>',
+        )
+
+    def test_marker_span_not_reopened_across_blocks(self):
+        """标记 span 不顺延：未闭合的标记只在原块补闭合，避免污染下一块。"""
+        out = sanitize_html(
+            '<p>前<span data-ptoe-marker="join" class="ptoe-marker">段落</p><p>后段</p>'
+        )
+        self.assertEqual(
+            out,
+            '<p>前<span data-ptoe-marker="join" class="ptoe-marker">段落</span></p>'
+            "<p>后段</p>",
+        )
+
+    def test_search_mark_inside_format_span_stripped(self):
+        """搜索高亮 <mark class="ptoe-search"> 仍被剥掉，且不误关外层格式 span。"""
+        out = sanitize_html(
+            '<p>a<span class="ptoe-underline">x<mark class="ptoe-search">y</mark>z</span>b</p>'
+        )
+        self.assertEqual(out, '<p>a<span class="ptoe-underline">xyz</span>b</p>')
 
     def test_inline_format_spans_preserved(self):
         # 行内对齐样式、注释类、引用类由规则引擎产生，需在 sanitize 后保留
@@ -372,33 +467,86 @@ class TestCleanPageHtml(unittest.TestCase):
 
 class TestInitialHtml(unittest.TestCase):
     def test_lines_become_divs(self):
-        self.assertEqual(initial_html("a\nb\n\nc"), "<div>a</div><div>b</div><div>c</div>")
+        # 2026-09-15：块与块之间以 \n 分隔（rulemanage 行边界约定；
+        # 否则 [^\n] 类正则跨 div 匹配，行首引注被误判为行内引注）
+        self.assertEqual(
+            initial_html("a\nb\n\nc"), "<div>a</div>\n<div>b</div>\n<div>c</div>"
+        )
 
     def test_escaped_and_empty(self):
         self.assertEqual(initial_html("a<b & c"), "<div>a&lt;b &amp; c</div>")
         self.assertEqual(initial_html("   \n \n"), "")
 
 
+class TestEnsureBlockNewlines(unittest.TestCase):
+    """_ensure_block_newlines：块级开标签后补 \n（幂等归一），
+    保证 rulemanage 正则的行边界语义对历史/无换行 HTML 也成立。"""
+
+    def test_plain_string_is_noop(self):
+        self.assertEqual(correctmanage._ensure_block_newlines(""), "")
+        self.assertEqual(correctmanage._ensure_block_newlines("abc"), "abc")
+
+    def test_inserts_after_bare_blocks(self):
+        self.assertEqual(
+            correctmanage._ensure_block_newlines("<p>a</p><p>b</p>"),
+            "<p>\na</p><p>\nb</p>",
+        )
+
+    def test_blocks_div_and_headings_covered(self):
+        self.assertEqual(
+            correctmanage._ensure_block_newlines("<div>x</div><h2>y</h2><p>z</p>"),
+            "<div>\nx</div><h2>\ny</h2><p>\nz</p>",
+        )
+
+    def test_quoted_attr_with_gt_not_truncated(self):
+        # 属性值内的 > 不得当作标签结束符（否则会把紧跟的正文切成标签外）
+        self.assertEqual(
+            correctmanage._ensure_block_newlines('<p data-x="a>b">c</p>'),
+            '<p data-x="a>b">\nc</p>',
+        )
+
+    def test_already_having_newline_is_noop(self):
+        self.assertEqual(
+            correctmanage._ensure_block_newlines("<p>\n正文</p>"),
+            "<p>\n正文</p>",
+        )
+        self.assertEqual(
+            correctmanage._ensure_block_newlines("<p> \n正文</p>"),
+            "<p> \n正文</p>",
+        )
+
+    def test_idempotent(self):
+        once = correctmanage._ensure_block_newlines("<p>a</p><div>b</div>")
+        twice = correctmanage._ensure_block_newlines(once)
+        self.assertEqual(once, twice)
+
+    def test_non_block_tags_untouched(self):
+        self.assertEqual(
+            correctmanage._ensure_block_newlines('<span>a</span><p>b</p>'),
+            '<span>a</span><p>\nb</p>',
+        )
+
+
 class TestPageText(unittest.TestCase):
     """矫正界面传入文本一律为正文：<h1>-<h6> 归一为 <p>，纯文本按行转 <div>。"""
 
     def test_plain_text_becomes_divs(self):
-        self.assertEqual(_page_text("a\nb"), "<div>a</div><div>b</div>")
+        self.assertEqual(_page_text("a\nb"), "<div>a</div>\n<div>b</div>")
 
     def test_headings_normalized_to_body(self):
         self.assertEqual(
             _page_text("<h1>标题</h1><p>正文</p>"),
-            "<p>标题</p><p>正文</p>",
+            "<p>\n标题</p><p>\n正文</p>",
         )
         self.assertEqual(
             _page_text("<h2>章标题</h2><p>正文</p>"),
-            "<p>章标题</p><p>正文</p>",
+            "<p>\n章标题</p><p>\n正文</p>",
         )
 
     def test_heading_attrs_preserved(self):
         self.assertEqual(
             _page_text('<h2 class="ptoe-align-center">标题</h2>'),
-            '<p class="ptoe-align-center">标题</p>',
+            '<p class="ptoe-align-center">\n标题</p>',
         )
 
     def test_markers_and_inline_preserved(self):
@@ -406,14 +554,15 @@ class TestPageText(unittest.TestCase):
             _page_text(
                 '<h1>a<span data-ptoe-marker="note">注</span><strong>b</strong></h1><p>正文</p>'
             ),
-            '<p>a<span data-ptoe-marker="note">注</span><strong>b</strong></p><p>正文</p>',
+            '<p>\na<span data-ptoe-marker="note">注</span><strong>b</strong></p>'
+            '<p>\n正文</p>',
         )
 
     def test_plain_p_and_marker_unchanged(self):
-        self.assertEqual(_page_text("<p>正文</p>"), "<p>正文</p>")
+        self.assertEqual(_page_text("<p>正文</p>"), "<p>\n正文</p>")
         self.assertEqual(
             _page_text('<p>正文<span data-ptoe-marker="full">全文</span></p>'),
-            '<p>正文<span data-ptoe-marker="full">全文</span></p>',
+            '<p>\n正文<span data-ptoe-marker="full">全文</span></p>',
         )
 
     def test_headings_to_body_direct(self):
@@ -427,20 +576,62 @@ class TestPageText(unittest.TestCase):
         # 用户手动设置的标题必须保留，否则「保存后重开，已设置的标题格式丢失」
         self.assertEqual(
             _page_text("<h1>用户标题</h1><p>正文</p>", normalize_headings=False),
-            "<h1>用户标题</h1><p>正文</p>",
+            "<h1>\n用户标题</h1><p>\n正文</p>",
         )
         self.assertEqual(
             _page_text(
                 '<h2 class="ptoe-align-center">居中标题</h2>',
                 normalize_headings=False,
             ),
-            '<h2 class="ptoe-align-center">居中标题</h2>',
+            '<h2 class="ptoe-align-center">\n居中标题</h2>',
         )
         # 纯文本仍按行转 <div>（与 normalize_headings 无关）
         self.assertEqual(
             _page_text("a\nb", normalize_headings=False),
-            "<div>a</div><div>b</div>",
+            "<div>a</div>\n<div>b</div>",
         )
+
+    def test_rule_regex_respects_line_boundaries_end_to_end(self):
+        """用户场景端到端回归（2026-09-15）：initial_html 输出（含块间 \n）
+        交给 rulemanage 后，行首注释引注不再被 [^\n]*? 前缀误判为行内引注——
+        正文 2 处〔n〕命中、注释行首 2 处〔n〕不命中。
+        """
+        from rulemanage import apply_rules
+
+        page = initial_html(
+            "西北军区关于三反运动的电报\n"
+            "一九五二年二月一日\n"
+            "张宗逊〔1〕同志，并告习仲勋〔2〕同志：\n"
+            "第一批打虎战果已经收到，望继续努力。\n"
+            "毛泽东\n"
+            "二月一日\n"
+            "\u2003注释\n"
+            "〔1〕张宗逊，当时任西北军区司令员。\n"
+            "〔2〕习仲勋，当时任中共中央西北局书记。"
+        )
+        rule = {
+            "id": "sup-markers",
+            "name": "引注上标",
+            "mode": "all",
+            "conditions": [
+                {
+                    "type": "regex",
+                    "pattern": r"(?:[^\n\s][^\n]*?)(〔\d+〕)",
+                    "scope": "page",
+                    "target": "match",
+                    "formats": [],
+                    "group_formats": [["sup"]],
+                }
+            ],
+        }
+        out, error = apply_rules(page, [rule], all_rules=True)
+        self.assertIsNone(error)
+        self.assertEqual(out.count('<span class="ptoe-sup">'), 2)
+        # 命中的必须是正文行内两处（1/2 号），注释行首两处不被包裹
+        self.assertIn("张宗逊<span class=\"ptoe-sup\">〔1〕</span>", out)
+        self.assertIn("习仲勋<span class=\"ptoe-sup\">〔2〕</span>", out)
+        self.assertIn("<div>〔1〕张宗逊", out)
+        self.assertIn("<div>〔2〕习仲勋", out)
 
 
 class TestPagesEndpoint(unittest.TestCase):
@@ -489,12 +680,15 @@ class TestPagesEndpoint(unittest.TestCase):
             # 2026-08-15 修复：已保存/历史内容按原样 serve——用户手动设置的标题
             # （<h1>-<h6>）必须保留，否则「保存后重开，已设置的标题格式丢失」；
             # OCR 自动标题的归一只在写入历史时做一次（_save_ocr_history）
-            self.assertEqual(pages[1], "<h1>第一章</h1><p>正文段落</p>")
+            # 2026-09-15：serve 前经 _ensure_block_newlines 归一，块开标签后带 \n
+            self.assertEqual(pages[1], "<h1>\n第一章</h1><p>\n正文段落</p>")
             self.assertEqual(
                 pages[2],
-                '<h2 class="ptoe-align-center">第二节</h2><p>内容</p>',
+                '<h2 class="ptoe-align-center">\n第二节</h2><p>\n内容</p>',
             )
-            self.assertEqual(pages[3], "<div>纯文本行一</div><div>纯文本行二</div>")
+            self.assertEqual(
+                pages[3], "<div>纯文本行一</div>\n<div>纯文本行二</div>"
+            )
         finally:
             self._stop(server)
 
@@ -2867,6 +3061,140 @@ class TestExportEpub(unittest.TestCase):
         finally:
             self._stop(server)
 
+    def test_epub_export_note_font_size_consistent(self):
+        """注释字号一致（2026-09-16）：注释落在标题块 / 注释嵌套时导出仍统一小字号。
+
+        端到端保证两点：XHTML 里注释类不丢（含 h1.ptoe-note），样式表里有
+        「任意元素生效 + 嵌套不复合」两条规则——否则阅读器里注释会一大一小。
+        """
+        import zipfile
+
+        server, base = self._start()
+        try:
+            out = Path(tempfile.mkdtemp(prefix="test_export_epub_note_")) / "note.epub"
+            html = (
+                '<h1 class="ptoe-note">标题上的注释</h1>'
+                '<p class="ptoe-note">普通注释段落</p>'
+                '<p class="ptoe-note">注释里又套了<span class="ptoe-note">嵌套注释</span></p>'
+                '<p>正文里的行内注释<span class="ptoe-note">行内注释</span></p>'
+            )
+            res = self._post(
+                base,
+                {"format": "epub", "path": str(out), "pages": [{"page": 1, "html": html}]},
+            )
+            self.assertTrue(res["ok"], f"export failed: {res.get('error')}")
+            with zipfile.ZipFile(out) as zf:
+                content_files = [n for n in zf.namelist() if n.startswith("OEBPS/Text/content_")]
+                self.assertTrue(content_files, "应生成内容页")
+                xml = "".join(zf.read(n).decode("utf-8") for n in content_files)
+                # 注释类必须保留（含标题块上的注释）
+                self.assertRegex(xml, r'<h1[^>]*class="ptoe-note"')
+                self.assertIn("标题上的注释", xml)
+                self.assertEqual(xml.count("ptoe-note"), 5, xml)
+                css = zf.read("OEBPS/Styles/style.css").decode("utf-8")
+                # 任意元素 + 嵌套不复合：保证标题上的注释与嵌套注释都按 0.85em 渲染
+                self.assertIn(".ptoe-note {", css)
+                self.assertIn("font-size: 0.85em", css)
+                self.assertIn(".ptoe-note .ptoe-note {", css)
+                self.assertIn("font-size: 1em", css)
+        finally:
+            self._stop(server)
+
+    def test_epub_export_inline_wrap_formats_preserved(self):
+        """文字包围（行内格式）导出 EPUB 后必须保留（2026-09-16）。
+
+        症状：某句/某几个字设置了文字包围，编辑器里正常，导出 EPUB 后效果丢失。
+        根因（本测试锁定的三点）：
+          1) 原生标签 <u>/<sup>/<sub>/<strike>/<mark> 与外部内联样式不在白名单 → 被丢弃；
+          2) 同一 span 多个格式类只保留第一个；
+          3) 跨块的行内格式 span 从第二块起丢失。
+        另外校验样式表里确实有这些类的规则（否则阅读器不生效）。
+        """
+        import zipfile
+
+        server, base = self._start()
+        try:
+            out = Path(tempfile.mkdtemp(prefix="test_export_epub_inline_")) / "inline.epub"
+            html = (
+                '<p>前句<span class="ptoe-underline">下划线</span><u>原生下划线</u>'
+                "<sup>上标</sup><sub>下标</sub>"
+                '<span class="ptoe-underdot">下加点</span><s>删除线</s>'
+                '<span style="text-decoration:line-through">样式删除线</span>'
+                '<span class="ptoe-charbox">边框</span>'
+                '<span class="ptoe-shade">底纹</span><mark>突显</mark>后句</p>'
+                '<p>第二段<span class="ptoe-underline">跨段</p><p>继续</span>结束</p>'
+            )
+            res = self._post(
+                base,
+                {"format": "epub", "path": str(out), "pages": [{"page": 1, "html": html}]},
+            )
+            self.assertTrue(res["ok"], f"export failed: {res.get('error')}")
+            with zipfile.ZipFile(out) as zf:
+                content_files = sorted(
+                    n for n in zf.namelist() if n.startswith("OEBPS/Text/content_")
+                )
+                self.assertTrue(content_files, "应生成内容页")
+                xml = "".join(zf.read(n).decode("utf-8") for n in content_files)
+                for cls in (
+                    "ptoe-underline",
+                    "ptoe-underdot",
+                    "ptoe-strike",
+                    "ptoe-charbox",
+                    "ptoe-shade",
+                    "ptoe-highlight",
+                    "ptoe-sup",
+                    "ptoe-sub",
+                ):
+                    self.assertIn(f'class="{cls}"', xml, f"导出后丢失格式类 {cls}")
+                # 下划线共 4 处：显式类 1 + 原生 <u> 归一 1 + 跨块两块各 1
+                self.assertEqual(
+                    xml.count('class="ptoe-underline"'), 4, f"跨块格式未保留：{xml}"
+                )
+                css = zf.read("OEBPS/Styles/style.css").decode("utf-8")
+                for cls in (
+                    "ptoe-underline",
+                    "ptoe-underdot",
+                    "ptoe-strike",
+                    "ptoe-charbox",
+                    "ptoe-shade",
+                    "ptoe-highlight",
+                    "ptoe-sup",
+                    "ptoe-sub",
+                ):
+                    self.assertIn(f".{cls}", css, f"样式表缺少 .{cls} 规则")
+        finally:
+            self._stop(server)
+
+    def test_epub_export_all_inline_classes(self):
+        """逐一导出 8 种行内包装格式（来源=rulemanage.INLINE_FORMAT_CLASSES），
+        每个格式类在内容页与样式表都保留（2026-09-19 防漂移护网）。"""
+        import zipfile
+
+        server, base = self._start()
+        try:
+            for cls in rulemanage.INLINE_FORMAT_CLASSES:
+                out = (
+                    Path(tempfile.mkdtemp(prefix="test_export_epub_cls_"))
+                    / f"{cls[5:]}.epub"
+                )
+                html = f'<p>前<span class="{cls}">中</span>后</p>'
+                res = self._post(
+                    base,
+                    {"format": "epub", "path": str(out), "pages": [{"page": 1, "html": html}]},
+                )
+                self.assertTrue(res["ok"], f"{cls} 导出失败: {res.get('error')}")
+                with zipfile.ZipFile(out) as zf:
+                    content_files = sorted(
+                        n for n in zf.namelist() if n.startswith("OEBPS/Text/content_")
+                    )
+                    self.assertTrue(content_files, f"{cls} 未生成内容页")
+                    xml = zf.read(content_files[0]).decode("utf-8")
+                    self.assertIn(f'class="{cls}"', xml, f"导出后内容页丢失格式类 {cls}")
+                    css = zf.read("OEBPS/Styles/style.css").decode("utf-8")
+                    self.assertIn(f".{cls}", css, f"样式表缺少 .{cls} 规则")
+        finally:
+            self._stop(server)
+
     def test_epub_export_div_blocks_alignment_preserved(self):
         # 浏览器编辑产生的 <div> 块（Chrome contenteditable 回车）导出 epub 时
         # 必须先 sanitize 归一为 <p>（保留对齐 class），否则产出 <p><div…> 非法
@@ -2977,6 +3305,46 @@ class TestExportEpub(unittest.TestCase):
             self.assertIsInstance(res, dict)
         finally:
             self._stop(server)
+
+
+class TestInlineFormatSingleSource(unittest.TestCase):
+    """行内包装格式类的单一事实来源（rulemanage.INLINE_FORMAT_CLASSES，2026-09-19）。
+
+    防护两类漂移：① remove 规则漏解某格式类；② 前端 JS/HTML 的 8 类清单与后端脱节。
+    """
+
+    def test_rule_remove_unwraps_all_inline_classes(self):
+        """remove 规则必须解掉全部 8 个行内包装格式 span（含曾被遗漏的 ptoe-underdot）。"""
+        html = "<p>前" + "".join(
+            f'<span class="{cls}">中</span>' for cls in rulemanage.INLINE_FORMAT_CLASSES
+        ) + "后</p>"
+        rules = [{
+            "id": "r1",
+            "name": "Remove全格式",
+            "mode": "first",
+            "conditions": [{
+                "type": "contains",
+                "pattern": "前",
+                "scope": "page",
+                "formats": ["remove"],
+            }],
+        }]
+        new_html, err = rulemanage.apply_rules(html, rules, all_rules=True)
+        self.assertIsNone(err)
+        # 文本内容全部保留、无任何 ptoe- 包装 span 残留
+        self.assertEqual(new_html.count("中"), 8)
+        self.assertIn("前", new_html)
+        self.assertIn("后", new_html)
+        for cls in rulemanage.INLINE_FORMAT_CLASSES:
+            self.assertNotIn(f'class="{cls}"', new_html, f"remove 未解开 {cls}")
+
+    def test_js_inline_classes_in_sync(self):
+        """前端资源必须包含后端清单里的全部 8 个类名（跨语言漂移护网）。"""
+        repo = Path(__file__).resolve().parent
+        for rel in ("ui/app.js", "ui/epubedit.js", "ui/epubedit.html"):
+            text = (repo / rel).read_text(encoding="utf-8")
+            for cls in rulemanage.INLINE_FORMAT_CLASSES:
+                self.assertIn(cls, text, f"{rel} 缺少 {cls}")
 
 
 class TestHistoryLoadEndpoint(unittest.TestCase):
@@ -6204,6 +6572,165 @@ class TestShortcutsEndpoint(unittest.TestCase):
             self._stop(server)
 
 
+class TestMouseShortcutsEndpoint(unittest.TestCase):
+    """/api/mouse_shortcuts：鼠标手势绑定服务端持久化（config.json 顶层 mouse_shortcuts）。
+
+    随机端口下 localStorage 每运行失效（与快捷键绑定同因）。
+    """
+
+    def _start(self):
+        import threading
+        from http.server import ThreadingHTTPServer
+
+        from correctmanage import _CorrectionHandler
+
+        state = {
+            "pages": {1: "<p>原文</p>"},
+            "finished": threading.Event(),
+            "preview_cache": {},
+            "pdf_path": None,
+            "img_dir": None,
+            "preview_dpi": 110,
+            "preview_quality": 82,
+            "last_heartbeat": 0.0,
+            "gone_at": None,
+            "idle_timeout": 600.0,
+            "auto_finished": False,
+        }
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _CorrectionHandler)
+        server.daemon_threads = True
+        server.state = state
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+    def _stop(self, server):
+        server.shutdown()
+        server.server_close()
+
+    def _patch_cfg(self, mouse_shortcuts=None):
+        import configmanage
+
+        cfg = {"model_choices": {}, "selected_model": None}
+        if mouse_shortcuts is not None:
+            cfg["mouse_shortcuts"] = mouse_shortcuts
+        orig = configmanage.get_config
+        configmanage.get_config = lambda *a, **k: cfg
+        self.addCleanup(lambda: setattr(configmanage, "get_config", orig))
+        return cfg
+
+    def _patch_setter(self):
+        import configmanage
+
+        calls = []
+        orig = configmanage.set_mouse_shortcuts
+        configmanage.set_mouse_shortcuts = lambda sc: calls.append(sc)
+        self.addCleanup(lambda: setattr(configmanage, "set_mouse_shortcuts", orig))
+        return calls
+
+    def test_get_returns_mouse_shortcuts(self):
+        import requests
+
+        self._patch_cfg({"center": "Middle+Up", "merge": "Middle+Left"})
+        server, base = self._start()
+        try:
+            res = requests.get(base + "/api/mouse_shortcuts").json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(
+                res["mouse_shortcuts"],
+                {"center": "Middle+Up", "merge": "Middle+Left"},
+            )
+        finally:
+            self._stop(server)
+
+    def test_get_missing_key_returns_empty(self):
+        import requests
+
+        self._patch_cfg(None)  # 配置无 mouse_shortcuts 键
+        server, base = self._start()
+        try:
+            res = requests.get(base + "/api/mouse_shortcuts").json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["mouse_shortcuts"], {})
+        finally:
+            self._stop(server)
+
+    def test_post_persists_via_set_mouse_shortcuts(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/mouse_shortcuts",
+                data=_json.dumps({"mouse_shortcuts": {"center": "Middle+Up"}}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(calls, [{"center": "Middle+Up"}])
+        finally:
+            self._stop(server)
+
+    def test_post_invalid_type_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/mouse_shortcuts",
+                data=_json.dumps({"mouse_shortcuts": "nope"}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("对象", res["error"])
+            self.assertEqual(calls, [], "非法载荷不应落盘")
+        finally:
+            self._stop(server)
+
+    def test_post_non_string_value_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/mouse_shortcuts",
+                data=_json.dumps({"mouse_shortcuts": {"center": 5}}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("字符串", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+    def test_post_too_many_entries_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            big = {f"op{i}": "Middle+Up" for i in range(101)}
+            res = requests.post(
+                base + "/api/mouse_shortcuts",
+                data=_json.dumps({"mouse_shortcuts": big}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("上限", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+
 class TestUiSettingsEndpoint(unittest.TestCase):
     """/api/ui_settings：矫正界面 UI 偏好服务端持久化（config.json 顶层 ui_settings）。
 
@@ -6535,6 +7062,49 @@ class TestSetShortcutsConfig(unittest.TestCase):
         self.assertIn("citationItalicEnabled", self.cm.DEFAULT_CONFIG)
         patched = self.cm.validate_and_patch_config({"llama_server": "x", "models_dir": "y"})
         self.assertTrue(patched["citationItalicEnabled"])
+
+
+class TestSetMouseShortcutsConfig(unittest.TestCase):
+    """configmanage.set_mouse_shortcuts：原子写 + 无变更不写盘。"""
+
+    def setUp(self):
+        import configmanage
+
+        self.cm = configmanage
+        self.tmp = tempfile.mkdtemp(prefix="ptoe_cfg_")
+        self.path = str(Path(self.tmp) / "config.json")
+        self._orig_path = configmanage._CONFIG_PATH
+        configmanage._CONFIG_PATH = self.path
+        self.addCleanup(lambda: setattr(configmanage, "_CONFIG_PATH", self._orig_path))
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+
+    def test_writes_mouse_shortcuts(self):
+        import json as _json
+
+        self.cm.set_mouse_shortcuts({"center": "Middle+Up"})
+        cfg = _json.loads(Path(self.path).read_text(encoding="utf-8"))
+        self.assertEqual(cfg["mouse_shortcuts"], {"center": "Middle+Up"})
+
+    def test_no_write_when_unchanged(self):
+        import os as _os
+
+        self.cm.set_mouse_shortcuts({"center": "Middle+Up"})
+        mtime1 = _os.stat(self.path).st_mtime_ns
+        self.cm.set_mouse_shortcuts({"center": "Middle+Up"})  # 无变更 → 不写盘
+        self.assertEqual(_os.stat(self.path).st_mtime_ns, mtime1)
+
+    def test_values_coerced_to_str(self):
+        cfg = self.cm.set_mouse_shortcuts({"center": "Middle+Up", "x": None})
+        self.assertEqual(cfg["mouse_shortcuts"]["x"], "")
+
+    def test_non_dict_raises(self):
+        with self.assertRaises(ValueError):
+            self.cm.set_mouse_shortcuts("nope")
+
+    def test_default_config_seeds_mouse_shortcuts(self):
+        self.assertIn("mouse_shortcuts", self.cm.DEFAULT_CONFIG)
+        patched = self.cm.validate_and_patch_config({"llama_server": "x", "models_dir": "y"})
+        self.assertEqual(patched["mouse_shortcuts"], {})
 
 
 class TestSetUiSettingsConfig(unittest.TestCase):
@@ -7469,6 +8039,200 @@ class TestFormatRules(unittest.TestCase):
         self.assertEqual(r["conditions"][1]["formats"], ["italic"])
 
 
+class TestFormatRulesPreview(unittest.TestCase):
+    """/api/format_rules/preview：匹配预览（匹配数 + 各捕获组文本）。
+
+    背景（2026-09-13）：贪婪前缀写法会把同一行里后面的对象一并吞进本次匹配，
+    用户以为匹配了多个对象、实际只匹配到少数几个（只有这几个的分组被套格式），
+    表现为"只有最后一个匹配对象应用了规则格式"。预览把真实匹配数摊开。
+    """
+
+    # 与真实页一致：块内首字符为 \n（正则里的 [\t\S] 不含换行，因此换行是"行"的边界）
+    HTML = (
+        "<p>\n李克农〔1〕同志，并告金、彭〔2〕：</p>"
+        "<p>\n一月二十日二十四时来电〔3〕及两组〔4〕简报均悉。</p>"
+    )
+
+    def _start(self):
+        import threading
+        from http.server import ThreadingHTTPServer
+
+        from correctmanage import _CorrectionHandler
+
+        state = {
+            "pages": {},
+            "finished": threading.Event(),
+            "preview_cache": {},
+            "pdf_path": None,
+            "img_dir": None,
+            "preview_dpi": 110,
+            "preview_quality": 82,
+            "last_heartbeat": 0.0,
+            "gone_at": None,
+            "idle_timeout": 600.0,
+            "auto_finished": False,
+        }
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _CorrectionHandler)
+        server.daemon_threads = True
+        server.state = state
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+    def test_greedy_prefix_swallows_objects(self):
+        r"""贪婪 `[\t\S]+` 把同一行的对象吞掉：只匹配到 2 处，分组分别是〔2〕/〔4〕。"""
+        import json as _json
+
+        import requests
+
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/format_rules/preview",
+                data=_json.dumps({
+                    "html": self.HTML, "type": "regex", "pattern": "[\t\\S]+(〔\\d+〕)",
+                }),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["count"], 2)
+            self.assertEqual([m["groups"] for m in res["matches"]], [["〔2〕"], ["〔4〕"]])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_non_greedy_prefix_matches_every_object(self):
+        """改成非贪婪（或只写分组）后 4 个对象都能匹配到 —— 这正是用户想要的效果。"""
+        import json as _json
+
+        import requests
+
+        server, base = self._start()
+        try:
+            for pattern in ("[\\t\\S]+?(〔\\d+〕)", "(〔\\d+〕)"):
+                res = requests.post(
+                    base + "/api/format_rules/preview",
+                    data=_json.dumps({"html": self.HTML, "type": "regex", "pattern": pattern}),
+                ).json()
+                self.assertEqual(res["count"], 4, pattern)
+                self.assertEqual(
+                    [m["groups"][0] for m in res["matches"]],
+                    ["〔1〕", "〔2〕", "〔3〕", "〔4〕"],
+                    pattern,
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_pattern_without_group_reports_no_groups(self):
+        """不带分组的条件：匹配到 4 处、无分组（可改用条件级格式作用于全部匹配）。"""
+        import json as _json
+
+        import requests
+
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/format_rules/preview",
+                data=_json.dumps({"html": self.HTML, "type": "regex", "pattern": "〔\\d+〕"}),
+            ).json()
+            self.assertEqual(res["count"], 4)
+            self.assertTrue(all(m["groups"] == [] for m in res["matches"]))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_invalid_regex_and_empty_pattern(self):
+        import json as _json
+
+        import requests
+
+        server, base = self._start()
+        try:
+            bad = requests.post(
+                base + "/api/format_rules/preview",
+                data=_json.dumps({"html": self.HTML, "type": "regex", "pattern": "("}),
+            )
+            self.assertEqual(bad.status_code, 400)
+            self.assertIn("正则表达式无效", bad.json()["error"])
+            empty = requests.post(
+                base + "/api/format_rules/preview",
+                data=_json.dumps({"html": self.HTML, "type": "regex", "pattern": ""}),
+            ).json()
+            self.assertEqual(empty["count"], 0)
+            self.assertIn("无条件", empty["hint"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_slash_flags_pattern_accepted(self):
+        r"""/pattern/flags 写法（USAGE.md 文档化）不被误判为非法。"""
+        import json as _json
+
+        import requests
+
+        server, base = self._start()
+        try:
+            html = "<p>\n〔1〕段首条目。</p><p>\n〔2〕段首条目。</p>"
+            res = requests.post(
+                base + "/api/format_rules/preview",
+                data=_json.dumps({"html": html, "type": "regex", "pattern": r"/^(〔\d+〕)/m"}),
+            )
+            self.assertEqual(res.status_code, 200, res.text)
+            body = res.json()
+            self.assertTrue(body["ok"])
+            self.assertEqual(body["count"], 2)
+            self.assertEqual([m["groups"][0] for m in body["matches"]], ["〔1〕", "〔2〕"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_validate_rules_keeps_slash_flags_pattern(self):
+        r"""`_validate_format_rules` 用引擎编译口径：/pattern/flags 不再被静默丢弃，非法写法仍丢弃。"""
+        from correctmanage import _validate_format_rules
+
+        good = [{
+            "id": "r1", "name": "段首条目", "mode": "all",
+            "conditions": [{
+                "type": "regex", "pattern": r"/^(〔\d+〕)/m", "scope": "page",
+                "target": "match", "formats": ["note"], "group_formats": [],
+            }],
+        }]
+        kept = _validate_format_rules(good)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["conditions"][0]["pattern"], r"/^(〔\d+〕)/m")
+
+        bad = [{
+            "id": "r2", "name": "坏正则", "mode": "all",
+            "conditions": [{
+                "type": "regex", "pattern": "(", "scope": "page",
+                "target": "match", "formats": ["note"], "group_formats": [],
+            }],
+        }]
+        self.assertEqual(_validate_format_rules(bad), [])
+
+    def test_contains_mode_and_max_limit(self):
+        import json as _json
+
+        import requests
+
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/format_rules/preview",
+                data=_json.dumps({"html": self.HTML, "type": "contains", "pattern": "〔"}),
+            ).json()
+            self.assertEqual(res["count"], 4)
+            limited = requests.post(
+                base + "/api/format_rules/preview",
+                data=_json.dumps({"html": self.HTML, "type": "regex", "pattern": "〔\\d+〕", "max": 2}),
+            ).json()
+            self.assertEqual(limited["count"], 4)
+            self.assertEqual(limited["shown"], 2)
+            self.assertEqual(len(limited["matches"]), 2)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 class TestFormatRulesAllPagesApply(unittest.TestCase):
     """/api/format_rules/apply（mode:'all_pages'）：跨页逐页应用 + scope 归一化（2026-09-13）。"""
 
@@ -7628,6 +8392,237 @@ class TestFormatRulesAllPagesApply(unittest.TestCase):
             )).json()
             self.assertFalse(res["ok"])
             self.assertIn("空或全部无效", res["error"])
+        finally:
+            self._stop(server)
+
+
+class TestFormatRulesSelRanges(unittest.TestCase):
+    """/api/format_rules/apply（单页 + sel_ranges 多区间选区）：逐区间应用，
+    后续区间仅保留 scope=selection 条件（page/paragraph 条件重复应用会双重包裹）。
+    sel_ranges 相对整页纯文本偏移，绝对偏移在格式操作下不位移（2026-09-19）。"""
+
+    # 三段纯文本偏移（无分隔符拼接）：
+    #   '<p>first abc</p><p>second def</p><p>third ghi</p>'
+    #   'first abc'[0,9)  'second def'[9,19)  'third ghi'[19,28)
+    HTML = "<p>first abc</p><p>second def</p><p>third ghi</p>"
+
+    def setUp(self):
+        import configmanage
+
+        self.cm = configmanage
+        self.tmp = tempfile.mkdtemp(prefix="ptoe_fr_sel_")
+        self.path = str(Path(self.tmp) / "config.json")
+        self._orig_path = configmanage._CONFIG_PATH
+        configmanage._CONFIG_PATH = self.path
+        self.addCleanup(lambda: setattr(configmanage, "_CONFIG_PATH", self._orig_path))
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+
+    def _set_rules(self, rules):
+        # 单页分支从 config 读 format_rules，经 _validate_format_rules 后应用
+        self.cm.set_format_rules(rules)
+
+    def _start(self):
+        import threading
+        from http.server import ThreadingHTTPServer
+
+        from correctmanage import _CorrectionHandler
+
+        state = {
+            "pages": {1: self.HTML},
+            "finished": threading.Event(),
+            "preview_cache": {},
+            "pdf_path": None,
+            "img_dir": None,
+            "preview_dpi": 110,
+            "preview_quality": 82,
+            "last_heartbeat": 0.0,
+            "gone_at": None,
+            "idle_timeout": 600.0,
+            "auto_finished": False,
+        }
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _CorrectionHandler)
+        server.daemon_threads = True
+        server.state = state
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+    def _stop(self, server):
+        server.shutdown()
+        server.server_close()
+
+    def _apply(self, base, html, rule_id, sel_ranges, extra=None):
+        import json as _json
+
+        import requests
+
+        payload = {
+            "page": 1,
+            "html": html,
+            "rule_id": rule_id,
+            "all": False,
+            "sel_ranges": sel_ranges,
+        }
+        if extra:
+            payload.update(extra)
+        return requests.post(base + "/api/format_rules/apply", data=_json.dumps(payload)).json()
+
+    def _uncond_selection_rule(self, rule_id="r-sel", formats=None, scope="selection", mode="first"):
+        return {
+            "id": rule_id,
+            "name": "选区笔",
+            "mode": mode,
+            "conditions": [
+                {
+                    "type": "contains", "pattern": "", "scope": scope,
+                    "formats": formats or ["bold"], "target": "match",
+                }
+            ],
+        }
+
+    def test_two_ranges_each_formatted_no_nesting(self):
+        # 两个相邻区间 [0,9) [9,19)：各自加粗、互不渗透、第三段不动、无 <strong><strong>
+        self._set_rules([self._uncond_selection_rule()])
+        server, base = self._start()
+        try:
+            res = self._apply(base, self.HTML, "r-sel", [[0, 9], [9, 19]])
+            self.assertTrue(res["ok"])
+            self.assertIn("<strong>first abc</strong>", res["html"])
+            self.assertIn("<strong>second def</strong>", res["html"])
+            self.assertNotIn("<strong>third ghi</strong>", res["html"])
+            self.assertIn("<p>third ghi</p>", res["html"])
+            self.assertNotIn("<strong><strong>", res["html"])
+            self.assertEqual(res["html"].count("<strong>"), 2)
+        finally:
+            self._stop(server)
+
+    def test_gap_between_ranges_middle_block_untouched(self):
+        # 真实跳缝语义：[[0,9) [19,28)) → 首尾两段加粗，中间段原样
+        self._set_rules([self._uncond_selection_rule()])
+        server, base = self._start()
+        try:
+            res = self._apply(base, self.HTML, "r-sel", [[0, 9], [19, 28]])
+            self.assertTrue(res["ok"])
+            self.assertIn("<strong>first abc</strong>", res["html"])
+            self.assertIn("<strong>third ghi</strong>", res["html"])
+            self.assertIn("<p>second def</p>", res["html"])
+            self.assertNotIn("<strong>second def</strong>", res["html"])
+            self.assertNotIn("<strong><strong>", res["html"])
+        finally:
+            self._stop(server)
+
+    def test_sanitize_applied_to_final_result(self):
+        # 最终结果仍过 sanitize_html：<div> 非白名单 → 归一为 <p>，加粗保留
+        self._set_rules([self._uncond_selection_rule()])
+        server, base = self._start()
+        try:
+            res = self._apply(
+                base, "<div>first abc</div><p>second def</p><p>third ghi</p>", "r-sel", [[0, 9], [9, 19]]
+            )
+            self.assertTrue(res["ok"])
+            self.assertNotIn("<div", res["html"])
+            self.assertIn("<p><strong>first abc</strong></p>", res["html"])
+        finally:
+            self._stop(server)
+
+    def _assert_sel_ranges_400(self, base, sel_ranges):
+        import json as _json
+
+        import requests
+
+        payload = {"page": 1, "html": self.HTML, "rule_id": "r-sel", "all": False, "sel_ranges": sel_ranges}
+        r = requests.post(base + "/api/format_rules/apply", data=_json.dumps(payload))
+        self.assertEqual(r.status_code, 400)
+        body = r.json()
+        self.assertFalse(body["ok"])
+        self.assertIn("sel_ranges", body["error"])
+
+    def test_validation_400s(self):
+        # 非列表 / 空列表 / 条目非二元组 / 非整数 / bool / 区间倒置 s>=e / 超过 64 条 → 400
+        self._set_rules([self._uncond_selection_rule()])
+        server, base = self._start()
+        try:
+            for bad in (
+                "nope",
+                [],
+                [[0]],
+                [["a", 9]],
+                [[0.5, 9]],
+                [[9, 9]],
+                [[5, 2]],
+                [[True, 9]],
+                [[0, 1]] * 65,
+            ):
+                with self.subTest(sel_ranges=bad):
+                    self._assert_sel_ranges_400(base, bad)
+            # 合法单区间不 400
+            res = self._apply(base, self.HTML, "r-sel", [[0, 9]])
+            self.assertTrue(res["ok"])
+            self.assertIn("<strong>first abc</strong>", res["html"])
+        finally:
+            self._stop(server)
+
+    def test_sel_ranges_preferred_over_sel_start_end(self):
+        # 同时携带 sel_ranges 与 sel_start/sel_end：显式以 sel_ranges 为准（向后兼容）
+        self._set_rules([self._uncond_selection_rule()])
+        server, base = self._start()
+        try:
+            res = self._apply(
+                base, self.HTML, "r-sel", [[0, 9], [9, 19]], extra={"sel_start": 19, "sel_end": 28}
+            )
+            self.assertTrue(res["ok"])
+            self.assertIn("<strong>first abc</strong>", res["html"])
+            self.assertIn("<strong>second def</strong>", res["html"])
+            # 若 sel_start=19/sel_end=28 被采纳会加粗 third ghi → 未被采纳
+            self.assertNotIn("<strong>third ghi</strong>", res["html"])
+        finally:
+            self._stop(server)
+
+    def test_all_pages_mode_ignores_sel_ranges(self):
+        # 全部页模式（mode:'all_pages'）不读取 sel_ranges——静默忽略（文档化选择），
+        # 非法值也不报错；与 sel_start/sel_end 在全部页模式被忽略的口径一致。
+        rule = self._uncond_selection_rule()
+        self._set_rules([rule])
+        server, base = self._start()
+        try:
+            import json as _json
+
+            import requests
+
+            payload = {
+                "mode": "all_pages",
+                "pages": {"1": "<p>正文甲</p>"},
+                "rule_id": "r-sel",
+                "rules": [rule],
+                "sel_ranges": [[0, 99]],
+            }
+            r = requests.post(base + "/api/format_rules/apply", data=_json.dumps(payload)).json()
+            self.assertTrue(r["ok"])
+            self.assertEqual(len(r["results"]), 1)
+            self.assertIn("<strong>", r["results"][0]["html"])
+        finally:
+            self._stop(server)
+
+    def test_page_scope_condition_applied_once(self):
+        # mode=all：page 加粗条件仅首区间跑一次（每段恰好一个 <strong>，无双重包裹）；
+        # selection 斜体条件逐区间应用（[0,9) 与 [9,19) 各一次，第三段无 <em>）。
+        rule = {
+            "id": "r-mix", "name": "页加粗+选区斜体", "mode": "all",
+            "conditions": [
+                {"type": "contains", "pattern": "", "scope": "page", "formats": ["bold"], "target": "match"},
+                {"type": "contains", "pattern": "", "scope": "selection", "formats": ["italic"], "target": "match"},
+            ],
+        }
+        self._set_rules([rule])
+        server, base = self._start()
+        try:
+            res = self._apply(base, self.HTML, "r-mix", [[0, 9], [9, 19]])
+            self.assertTrue(res["ok"])
+            html = res["html"]
+            self.assertEqual(html.count("<strong>"), 3)
+            self.assertNotIn("<strong><strong>", html)
+            self.assertIn("<em>first abc</em>", html)
+            self.assertIn("<em>second def</em>", html)
+            self.assertNotIn("<em>third ghi</em>", html)
         finally:
             self._stop(server)
 
@@ -9456,6 +10451,67 @@ class TestExportJoinMerge(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class TestExportContentToFile(unittest.TestCase):
+    """correctmanage.export_content_to_file：矫正界面与主界面历史「另存为」共用的
+    转换链路（单一实现，保证两边输出一致）。"""
+
+    def _items(self):
+        return [
+            {"page": 1, "html": "<h1>标题</h1>"},
+            {"page": 2, "html": "<p>第一段</p><p>第二段</p>"},
+        ]
+
+    def test_txt_export(self):
+        from correctmanage import export_content_to_file
+
+        out = Path(tempfile.mkdtemp(prefix="t_ecf_")) / "a.txt"
+        p = export_content_to_file(self._items(), "txt", str(out), title="书")
+        self.assertEqual(p, str(out))
+        self.assertTrue(out.is_file())
+        text = out.read_bytes().decode("utf-8-sig").replace("\r\n", "\n")
+        self.assertIn("标题", text)
+        self.assertIn("第一段", text)
+
+    def test_md_export(self):
+        from correctmanage import export_content_to_file
+
+        out = Path(tempfile.mkdtemp(prefix="t_ecf_")) / "a.md"
+        export_content_to_file(self._items(), "md", str(out), title="书")
+        self.assertTrue(out.is_file())
+        self.assertIn("# 标题", out.read_text(encoding="utf-8"))
+
+    def test_docx_export(self):
+        import zipfile
+
+        from correctmanage import export_content_to_file
+
+        out = Path(tempfile.mkdtemp(prefix="t_ecf_")) / "a.docx"
+        export_content_to_file(self._items(), "docx", str(out), title="书")
+        self.assertTrue(out.is_file())
+        with zipfile.ZipFile(out) as zf:
+            names = zf.namelist()
+        self.assertIn("word/document.xml", names)
+
+    def test_epub_export(self):
+        import zipfile
+
+        from correctmanage import export_content_to_file
+
+        out = Path(tempfile.mkdtemp(prefix="t_ecf_")) / "a.epub"
+        export_content_to_file(self._items(), "epub", str(out), title="书")
+        self.assertTrue(out.is_file())
+        with zipfile.ZipFile(out) as zf:
+            names = zf.namelist()
+        self.assertIn("mimetype", names)
+        self.assertIn("application/epub+zip", out.read_bytes().decode("latin-1"))
+
+    def test_bad_format_raises(self):
+        from correctmanage import export_content_to_file
+
+        with self.assertRaises(ValueError):
+            export_content_to_file(self._items(), "pdf", "x.pdf", title="书")
 
 
 if __name__ == "__main__":

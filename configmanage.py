@@ -212,6 +212,9 @@ DEFAULT_CONFIG = {
     # 矫正界面快捷键绑定（op -> 组合键字符串）。随机端口下 localStorage 每次运行失效，
     # 故持久化到 config.json（经 /api/shortcuts GET/POST 读写）。
     "shortcuts": {},
+    # 矫正界面鼠标手势绑定（op -> 手势字符串，如 "Middle+Up"）。与 shortcuts 同因
+    # 持久化到 config.json（经 /api/mouse_shortcuts GET/POST 读写）。
+    "mouse_shortcuts": {},
     # 矫正界面格式规则（弹窗管理）：新模型每条 {id, name, mode(first|all), conditions:[{type, pattern, scope, formats}]}；
     # 旧模型 {id, name, formats, condition, else_formats} 读取时由 correctmanage._validate_format_rules 迁移
     "format_rules": [],
@@ -665,6 +668,37 @@ def set_shortcuts(shortcuts: dict) -> dict:
             return cfg
         except Exception as e:
             print(f"[config] Error updating shortcuts, fallback to default: {e}")
+            cfg = DEFAULT_CONFIG.copy()
+            with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            return cfg
+
+
+def set_mouse_shortcuts(mouse_shortcuts: dict) -> dict:
+    """设置矫正界面鼠标手势绑定（顶层键 mouse_shortcuts）并持久化。
+
+    与 set_shortcuts 同构：锁内读配置、改值、校验、原子写回，返回新配置。
+    仅在确有变更时写盘（设置页每次录制都会 POST，避免无谓磁盘写）。
+    线程安全。
+    """
+    if not isinstance(mouse_shortcuts, dict):
+        raise ValueError("mouse_shortcuts 必须是对象（op -> 手势）")
+    clean = {str(k): ("" if v is None else str(v)) for k, v in mouse_shortcuts.items()}
+    with _CFG_LOCK:
+        try:
+            if os.path.exists(_CONFIG_PATH):
+                with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            else:
+                cfg = DEFAULT_CONFIG.copy()
+            before = cfg.get("mouse_shortcuts")
+            cfg["mouse_shortcuts"] = clean
+            cfg = validate_and_patch_config(cfg)
+            if before != clean:  # 无变更不写盘
+                _atomic_write_json(_CONFIG_PATH, cfg)
+            return cfg
+        except Exception as e:
+            print(f"[config] Error updating mouse_shortcuts, fallback to default: {e}")
             cfg = DEFAULT_CONFIG.copy()
             with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)

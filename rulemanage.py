@@ -60,11 +60,29 @@ VALID_FORMAT_OPS = {
     "sub",
 }
 
+# 8 种行内包装格式类（2026-09-19）：单一事实来源。
+# 前端（ui/app.js INLINE_CLASSES、ui/epubedit.js INLINE_CLASSES）、
+# correctmanage (sanitize/导出 DOCX/MD)、rulemanage remove op、htmlmanage CSS 均与此保持一致。
+INLINE_FORMAT_CLASSES = (
+    "ptoe-underline",
+    "ptoe-underdot",
+    "ptoe-strike",
+    "ptoe-charbox",
+    "ptoe-shade",
+    "ptoe-highlight",
+    "ptoe-sup",
+    "ptoe-sub",
+)
+
 # 空元素（void elements）——无闭合标签、无子节点
 VOID_TAGS = {"br", "img", "hr", "input", "meta", "link", "base", "area", "col", "embed", "param", "source", "track", "wbr"}
 
 # 序列化时允许的标签（与 sanitize_html 白名单兼容）
-ALLOWED_TAGS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "strong", "em", "br", "span", "img"}
+# 2026-09-15：补充 div —— 矫正界面未应用规则前的页面 HTML 就是 <div> 行块，
+# 若排除 div 则 MiniDOMParser 把 div 当 __skip_ 透明容器、其内文本全部丢弃，
+# 纯 div 页面（新打开的 OCR 页）规则匹配数为 0（静默失效）。div 语义与 p 相同
+# （BLOCK_TAGS 已含 div），序列化原样保留。
+ALLOWED_TAGS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "div", "strong", "em", "br", "span", "img"}
 
 # 块级标签
 BLOCK_TAGS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "div"}
@@ -257,6 +275,19 @@ def _compile_cached(raw: str) -> re.Pattern:
             _REGEX_CACHE.popitem(last=False)
         _REGEX_CACHE[raw] = pat
         return pat
+
+
+def compile_pattern(raw: str) -> re.Pattern:
+    """按引擎口径编译条件正则（对外入口）。
+
+    - 支持 `/pattern/flags` 写法（flags: i/m/s），与 find_matches / eval_condition 完全一致；
+    - 拦截灾难性回溯的危险模式；
+    - 写法非法时抛 re.error，由调用方捕获。
+
+    供服务端保存校验、匹配预览等复用：这些地方原先直接用裸 re.compile，
+    会把 USAGE.md 里文档化的 `/pattern/flags` 写法判为非法而静默丢弃整条条件。
+    """
+    return _compile_cached(raw)
 
 
 # =============================================================================
@@ -670,12 +701,18 @@ def eval_format_rule(rule: Rule, page_text: str, selection: tuple[int, int] | No
     求值单条规则，返回应用计划。
     - mode=first: 首个匹配条件生效即停（none-only 条件=该处不处理守卫）
     - mode=all: 全部匹配条件按序各自应用
-    - 条件分类：
+    - 条件分类（**三类格式可叠加，不再互斥**）：
       * target != match -> target_conds (before/after/between)
-      * regex + group_formats -> group_conds
-      * regex + match_formats -> match_conds
-      * contains/prefix/suffix/regex with formats -> pattern_conds
+      * regex + group_formats -> group_conds（逐捕获组）
+      * regex + match_formats -> match_conds（逐匹配）
+      * contains/prefix/suffix/regex with formats -> pattern_conds（作用到全部匹配）
       * 无条件或 selection scope -> fmt_entries
+
+    2026-09-13 修复：这三类此前用 `elif` 串联，导致只要条件带了 group_formats /
+    match_formats（哪怕数组里只有一行填了格式、甚至全是空行），条件级 `formats`
+    就被整条丢弃 —— 症状是「一条正则匹配到多个对象，却只有最后一个匹配对象被改了
+    格式」。现在三类叠加生效：条件级 formats 作用于**全部匹配**，分组/逐匹配格式
+    在其之上追加，互不吞并。
     """
     out = EvalResult()
     for cond in rule.conditions:
@@ -692,42 +729,41 @@ def eval_format_rule(rule: Rule, page_text: str, selection: tuple[int, int] | No
         # paragraph scope: 调用方需传入段落文本，这里简化为整页（前端 paragraph scope 也是基于光标所在块）
         # 实际 paragraph 语义在前端由选区决定，服务端无法精确复现，退回整页文本
 
-        if eval_condition(cond, eval_text):
-            if cond.target != "match":
-                out.target_conds.append(cond)
-                # target 条件在 first 模式下也不中断，全部求值
-            elif cond.type == "regex" and cond.group_formats:
-                out.group_conds.append(cond)
-                if rule.mode == "first":
-                    break
-            elif cond.type == "regex" and cond.match_formats:
-                out.match_conds.append(cond)
-                if rule.mode == "first":
-                    break
-            elif cond.type in ("regex", "contains", "prefix", "suffix") and cond.formats:
-                if cond.pattern:
-                    # 有模式的条件：放入 pattern_conds，后续按匹配位置应用
-                    out.pattern_conds.append(cond)
-                else:
-                    # 无条件规则（空 pattern）：整体范围应用（selection/page）
-                    # 选区工具（如「中标」）无选区时不应用——否则「应用全部规则」
-                    # 会退化为整页范围，把全页段落都改成该工具的格式。
-                    if cond.scope == "selection" and not selection:
-                        continue
-                    fmts = [op for op in cond.formats if op != "none"]
-                    page_scope = (cond.scope == "page")
-                    out.fmt_entries.append({"fmts": fmts, "page_scope": page_scope})
-                if rule.mode == "first":
-                    break
+        if not eval_condition(cond, eval_text):
+            continue
+        if cond.target != "match":
+            # target 条件（之前/之后/两条件之间）在 first 模式下也不中断，全部求值
+            out.target_conds.append(cond)
+            continue
+
+        has_group = cond.type == "regex" and bool(cond.group_formats)
+        has_match = cond.type == "regex" and bool(cond.match_formats)
+        if has_group:
+            out.group_conds.append(cond)
+        if has_match:
+            out.match_conds.append(cond)
+
+        if cond.formats:
+            if cond.pattern:
+                # 有模式的条件：放入 pattern_conds，后续按**每一个**匹配位置应用
+                out.pattern_conds.append(cond)
+            elif cond.scope == "selection" and not selection:
+                # 无条件规则（空 pattern）+ 选区 scope 且无选区：整体范围无意义
+                # （选区工具如「中标」无选区时不应用——否则「应用全部规则」会退化
+                # 为整页范围，把全页段落都改成该工具的格式）。不算命中，不中断 first。
+                continue
             else:
-                # 无条件或 selection scope：放入 fmt_entries（选区工具无选区不应用，同上）
-                if cond.scope == "selection" and not selection:
-                    continue
                 fmts = [op for op in cond.formats if op != "none"]
                 page_scope = (cond.scope == "page")
                 out.fmt_entries.append({"fmts": fmts, "page_scope": page_scope})
-                if rule.mode == "first":
-                    break
+        elif not has_group and not has_match:
+            # 既无条件级格式、也无分组/逐匹配格式：维持原语义（无条件/守卫条目）
+            if cond.scope == "selection" and not selection:
+                continue
+            out.fmt_entries.append({"fmts": [], "page_scope": cond.scope == "page"})
+
+        if rule.mode == "first":
+            break
     return out
 
 
@@ -803,7 +839,7 @@ def apply_inline_format(nodes_info: list[TextNodeInfo], start_off: int, end_off:
         # 移除 strong/em 以及所有新增行内格式 span，保留标记 span 与 img
         _unwrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "strong")
         _unwrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "em")
-        for cls in ("ptoe-note", "ptoe-citation", "ptoe-underline", "ptoe-strike", "ptoe-charbox", "ptoe-shade", "ptoe-highlight", "ptoe-sup", "ptoe-sub"):
+        for cls in ("ptoe-note", "ptoe-citation") + INLINE_FORMAT_CLASSES:
             _unwrap_inline_class(nodes_info, start_node, start_idx, end_node, end_idx, cls)
         return True
     return False

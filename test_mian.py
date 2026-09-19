@@ -551,6 +551,93 @@ class TestCorrectSubcommand(unittest.TestCase):
         self.assertIsNone(calls["kw"].get("history_id"))
 
 
+class TestEpubEdit(unittest.TestCase):
+    """mian.py epubedit 子命令：解析、调用 epub_edit、错误路径、菜单项。"""
+
+    def setUp(self):
+        self._tmp = Path(tempfile.mkdtemp(prefix="test_mian_epub_"))
+        self._epub = self._tmp / "book.epub"
+        # 最小合法 EPUB 文件（存在性校验只查 isfile）
+        self._epub.write_bytes(b"PK\x03\x04minimal-epub-stub")
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_epubedit_calls_epub_edit_no_browser(self):
+        """_cmd_epubedit 透传 idle_timeout + open_browser（lazy import 取到 patched 对象）。"""
+        import argparse
+
+        with mock.patch("epubeditmanage.epub_edit") as m:
+            rc = mian._cmd_epubedit(
+                argparse.Namespace(epub=str(self._epub), idle_timeout=60, no_browser=True)
+            )
+        self.assertEqual(rc, 0)
+        m.assert_called_once_with(str(self._epub), idle_timeout=60, open_browser=False)
+
+    def test_epubedit_main_dispatch(self):
+        """main(['epubedit', <epub>, --idle-timeout, --no-browser]) → rc 0 且参数透传。"""
+        import contextlib
+        import io
+
+        args, kw = {}, {}
+        original = None
+        import epubeditmanage
+
+        def _fake(path, **kwargs):
+            args["path"] = path
+            kw.update(kwargs)
+            return None
+
+        original = epubeditmanage.epub_edit
+        epubeditmanage.epub_edit = _fake
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = mian.main(["epubedit", str(self._epub), "--idle-timeout", "60", "--no-browser"])
+        finally:
+            epubeditmanage.epub_edit = original
+        self.assertEqual(rc, 0)
+        self.assertEqual(args.get("path"), str(self._epub))
+        self.assertEqual(kw.get("idle_timeout"), 60)
+        self.assertFalse(kw.get("open_browser"))
+
+    def test_epubedit_missing_file_error(self):
+        """文件不存在 → stderr 中文错误 + rc 1，不调用 epub_edit。"""
+        import argparse
+        import contextlib
+        import io
+
+        with mock.patch("epubeditmanage.epub_edit") as m:
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = mian._cmd_epubedit(
+                    argparse.Namespace(epub=str(self._tmp / "nope.epub"), idle_timeout=60, no_browser=True)
+                )
+        self.assertEqual(rc, 1)
+        self.assertIn("文件不存在", err.getvalue())
+        m.assert_not_called()
+
+    def test_epubedit_menu_shows_item_3(self):
+        """终端菜单包含「EPUB 编辑」（位于矫正界面之后）。"""
+        import contextlib
+        import io
+
+        class _TTY(io.StringIO):
+            def isatty(self):
+                return True
+
+        old_stdin = sys.stdin
+        sys.stdin = _TTY("0\n")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                rc = mian.main([])
+            out = buf.getvalue()
+            self.assertEqual(rc, 0)
+            self.assertIn("EPUB 编辑", out)
+            self.assertLess(out.index("矫正界面"), out.index("EPUB 编辑"),
+                            "菜单第 2 项为矫正界面，第 3 项为 EPUB 编辑")
+        finally:
+            sys.stdin = old_stdin
+
+
 class TestGuiPrompt(unittest.TestCase):
     """GUI 转换子进程的弹窗询问协议（PTOE_UI_PROMPT=1，2026-08-17）。
 
