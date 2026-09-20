@@ -8807,8 +8807,30 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
 .badge{position:absolute;top:8px;left:8px;background:rgba(0,0,0,.55);color:#fff;font-size:11px;padding:2px 8px;border-radius:10px;pointer-events:none;}
 .editable{height:0;min-height:100%;overflow-y:auto;padding:10px 14px;border:1px solid var(--border);border-radius:4px;line-height:1.7;font-size:var(--editor-font-size);outline:none;}
 .editable:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(47,111,237,.15);}
-.editable h1{font-size:1.45em;} .editable h2{font-size:1.28em;} .editable h3{font-size:1.12em;}
-.editable h4,.editable h5,.editable h6{font-size:1.02em;}
+.editable h1{font-size:1.5em;} .editable h2{font-size:1.38em;} .editable h3{font-size:1.26em;}
+.editable h4{font-size:1.16em;} .editable h5{font-size:1.07em;} .editable h6{font-size:1em;}
+/* 标题级别指示（2026-09）：h1-h6 块显示「H1..H6」徽章（::before 伪元素）+
+   级别色浅底条，一眼区分各级标题与正文。纯显示层——::before 不序列化，
+   innerHTML/历史/导出正文均不含徽章；正文段落与 ptoe-note/ptoe-marker 样式不变。 */
+.editable h1,.editable h2,.editable h3,.editable h4,.editable h5,.editable h6{border-radius:3px;}
+.editable h1{--h-lv:#2D5AE0;background:rgba(45,90,224,.09);}
+.editable h2{--h-lv:#3B6FFF;background:rgba(59,111,255,.07);}
+.editable h3{--h-lv:#4E7CE8;background:rgba(78,124,232,.07);}
+.editable h4{--h-lv:#6E96ED;background:rgba(110,150,237,.07);}
+.editable h5{--h-lv:#8FADF2;background:rgba(143,173,242,.06);}
+.editable h6{--h-lv:#A8C0F7;background:rgba(168,192,247,.05);}
+.editable h1::before,.editable h2::before,.editable h3::before,
+.editable h4::before,.editable h5::before,.editable h6::before{
+  display:inline-block;margin-right:6px;padding:2px 5px;border-radius:3px;
+  font-size:11px;font-weight:700;line-height:1;vertical-align:1px;
+  background:var(--h-lv);user-select:none;-webkit-user-select:none;pointer-events:none;
+}
+.editable h1::before{content:"H1";color:#fff;}
+.editable h2::before{content:"H2";color:#fff;}
+.editable h3::before{content:"H3";color:#fff;}
+.editable h4::before{content:"H4";color:#1C2733;}
+.editable h5::before{content:"H5";color:#1C2733;}
+.editable h6::before{content:"H6";color:#5A6B7C;}
 .ptoe-align-left{text-align:left;} .ptoe-align-center{text-align:center;} .ptoe-align-right{text-align:right;}
 .ptoe-marker{background:#fff3bf;border:1px solid #e8c24a;border-radius:3px;padding:0 4px;font-size:12px;color:#8a6d00;cursor:help;user-select:all;}
 .ptoe-search{background:#fff1a8;border-radius:2px;padding:0 2px;color:inherit;}

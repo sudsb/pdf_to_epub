@@ -126,6 +126,25 @@ body{margin:0;font-family:"Microsoft YaHei",system-ui,sans-serif;background:var(
 }
 .art-body:focus{box-shadow:var(--focus-ring);}
 .art-body p{margin:.4em 0;}
+/* 标题级别指示（2026-09）：与矫正界面一致——h2-h6 块「H2..H6」徽章（::before）+
+   级别色浅底条；纯显示层，不序列化进保存/导出的正文。EPUB 正文不含 h1。 */
+.art-body h2,.art-body h3,.art-body h4,.art-body h5,.art-body h6{border-radius:3px;}
+.art-body h2{font-size:1.38em;--h-lv:#3B6FFF;background:rgba(59,111,255,.07);}
+.art-body h3{font-size:1.26em;--h-lv:#4E7CE8;background:rgba(78,124,232,.07);}
+.art-body h4{font-size:1.16em;--h-lv:#6E96ED;background:rgba(110,150,237,.07);}
+.art-body h5{font-size:1.07em;--h-lv:#8FADF2;background:rgba(143,173,242,.06);}
+.art-body h6{font-size:1em;--h-lv:#A8C0F7;background:rgba(168,192,247,.05);}
+.art-body h2::before,.art-body h3::before,.art-body h4::before,
+.art-body h5::before,.art-body h6::before{
+  display:inline-block;margin-right:6px;padding:2px 5px;border-radius:3px;
+  font-size:11px;font-weight:700;line-height:1;vertical-align:1px;
+  background:var(--h-lv);user-select:none;-webkit-user-select:none;pointer-events:none;
+}
+.art-body h2::before{content:"H2";color:#fff;}
+.art-body h3::before{content:"H3";color:#fff;}
+.art-body h4::before{content:"H4";color:#1C2733;}
+.art-body h5::before{content:"H5";color:#1C2733;}
+.art-body h6::before{content:"H6";color:#5A6B7C;}
 /* 行内格式样式（与 EPUB 导出白名单一致的类名） */
 .ptoe-underline{text-decoration:underline;}
 .ptoe-underdot{border-bottom:1px dotted #333;}
