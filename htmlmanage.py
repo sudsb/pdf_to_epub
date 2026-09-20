@@ -21,8 +21,13 @@ import html
 import base64
 from typing import Dict, List, Any, Optional, Tuple
 
-# 手动矫正（correctmanage.sanitize_html）白名单标签：出现任一即走标记渲染路径
-_MARKUP_RE = re.compile(r"</?(?:p|h[1-6]|strong|em|br|span)([^>]*)>", flags=re.I)
+# 手动矫正（correctmanage.sanitize_html）白名单标签：出现任一即走标记渲染路径。
+# 表格标签于 2026-09-20 加入：只含 <table> 的片段（无 p/strong/em/br/span）也须
+# 走标记渲染路径，否则落入纯文本转义分支导致 EPUB 表格被打成字面量。
+_MARKUP_RE = re.compile(
+    r"</?(?:p|h[1-6]|strong|em|br|span|table|thead|tbody|tfoot|tr|th|td)([^>]*)>",
+    flags=re.I,
+)
 
 # 块级保留 class：注释（ptoe-note）+ 对齐类（ptoe-align-*）+ 换页（ptoe-page-break）
 _NOTE_CLASS = "ptoe-note"
@@ -506,6 +511,28 @@ class CSSManager:
         img.ptoe-img-vtop { vertical-align: top; }
         img.ptoe-img-vmid { vertical-align: middle; }
         img.ptoe-img-vbot { vertical-align: bottom; }
+        /* 表格（2026-09-20）：矫正界面插入的表格走通用边框样式。
+           注意：CSS 会被内联进 XHTML 的 style 元素——注释里出现字面
+           尖括号会被当成标签导致整个文件非法，此处注释不含尖括号。 */
+        table {
+          border-collapse: collapse;
+          margin: 0.6em auto;
+          width: 100%;
+          max-width: 100%;
+        }
+        th, td {
+          border: 1px solid #999999;
+          padding: 0.3em 0.6em;
+          vertical-align: top;
+        }
+        th {
+          font-weight: bold;
+          text-align: center;
+          background: #f0f0f0;
+        }
+        td {
+          text-align: left;
+        }
         .cover {
           text-align: center;
           margin-top: 2em;

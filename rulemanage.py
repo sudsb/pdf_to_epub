@@ -82,7 +82,14 @@ VOID_TAGS = {"br", "img", "hr", "input", "meta", "link", "base", "area", "col", 
 # 若排除 div 则 MiniDOMParser 把 div 当 __skip_ 透明容器、其内文本全部丢弃，
 # 纯 div 页面（新打开的 OCR 页）规则匹配数为 0（静默失效）。div 语义与 p 相同
 # （BLOCK_TAGS 已含 div），序列化原样保留。
-ALLOWED_TAGS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "div", "strong", "em", "br", "span", "img"}
+# 2026-09-20：补充表格结构标签（table/thead/tbody/tfoot/tr/th/td）——矫正界面
+# 插入表格后页面含表格 HTML，若不加入白名单，MiniDOMParser 同样把表格标签当
+# __skip_ 透明容器、表格文本全部丢弃（规则匹配 0，静默失效）。表格标签不加入
+# BLOCK_TAGS：规则文本匹配仍只针对段落级内容。
+ALLOWED_TAGS = {
+    "p", "h1", "h2", "h3", "h4", "h5", "h6", "div", "strong", "em", "br", "span", "img",
+    "table", "thead", "tbody", "tfoot", "tr", "th", "td",
+}
 
 # 块级标签
 BLOCK_TAGS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "div"}

@@ -23,6 +23,7 @@ const OPS = [
   ['proofread_correct','校正'], ['proofread_reocr','重识别'], ['proofread_apply','应用'],
   ['proofread_clear','清除标注'], ['proofread_revert','回退'],
   ['proofread_accept', '采纳纠错'], ['proofread_ignore', '忽略纠错'],
+  ['insert_table', '插入表格'],
 ];
 const OP_ICON = {
   bold:'<span class="ic-b">B</span>', italic:'<span class="ic-i">I</span>',
@@ -43,6 +44,7 @@ const OP_TIP = {
   marker_join:'段落标记（段首合上段，段尾合下段）',
   marker_page:'换页标记（从此处之后的内容显示在新的一页）',
   proofread_accept: '采纳纠错（替换为候选字）', proofread_ignore: '忽略纠错（消除标注）',
+  insert_table: '插入表格（行列可设，默认 3 行 × 4 列，可选手表头）',
   strip_ws: '去空（去除段落内全部空白，保留换行）',
   // 新增内联格式提示
   underline:'下划线', strike:'删除线', charbox:'字符边框',
@@ -65,6 +67,7 @@ const DEFAULTS = {
   proofread_correct:'Ctrl+K', proofread_reocr:'Ctrl+Shift+R', proofread_apply:'Ctrl+Shift+A',
   proofread_clear:'Ctrl+Shift+X', proofread_revert:'Ctrl+Shift+Z',
   proofread_accept: 'Enter', proofread_ignore: 'Escape',
+  insert_table: 'Ctrl+Alt+T',
 };
 // 鼠标中键手势（与键盘快捷键同一套操作体系）：手势是稀缺资源，默认只绑定对齐三件套。
 const MOUSE_GESTURES = [
@@ -365,7 +368,7 @@ function _multiSelUpdateStatus() {
 
 // 弹窗开着时不响应 Esc 清除（各弹窗自己的 Esc/关闭优先）
 function _multiSelAnyModalOpen() {
-  const ids = ['modalBg','searchModalBg','exportModalBg','indentModalBg','finishModalBg','finishConfirmBg','formatRulesModalBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg'];
+  const ids = ['modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','finishModalBg','finishConfirmBg','formatRulesModalBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg'];
   for (let k = 0; k < ids.length; k++) {
     const el = document.getElementById(ids[k]);
     if (el && el.style.display === 'flex') return true;
@@ -433,8 +436,16 @@ function inlineToMd(t) {
 function htmlToMd(html) {
   // 已清洗 HTML（p/h1-6/strong/em/br/span）→ markdown 源码；标记 span 原样保留
   // 修复 Markdown↔富文本切换丢失格式：带 class/data-* 的块级标签原样保留为 raw HTML，
-  // mdToHtml 会原样输出（/^<(p|h[1-6]|div)(\s|>)/i.test(line) 分支），实现格式无损往返。
+  // mdToHtml 会原样输出（/^<(p|h[1-6]|div|table)(\s|>)/i.test(line) 分支），实现格式无损往返。
+  // 表格（2026-09）：<table>…</table> 整块先剥离为占位符再处理 —— ①避免 <br>→\n
+  // 把单行表格拆成多行（mdToHtml 只对 <table 开头的行原样透传）；②单元格内容不受
+  // inlineToMd 的实体反转影响；raw HTML 在源码模式可见可编辑，切回富文本原样还原。
   let s = String(html || '');
+  const tblHold = [];
+  s = s.replace(/<table[\s\S]*?<\/table>/gi, function (m) {
+    tblHold.push(m);
+    return '\u0000TBL' + (tblHold.length - 1) + '\u0000';
+  });
   s = s.replace(/<br\s*\/?>/gi, '\n');
   s = s.replace(/<(h[1-6]|p|div)(\s[^>]*)>([\s\S]*?)<\/\1>/gi, function(m, tag, attrs, inner) {
     // 带 class 或 data-* 属性的块：原样保留 raw HTML 供 mdToHtml 原样输出
@@ -447,6 +458,8 @@ function htmlToMd(html) {
   });
   s = inlineToMd(s);
   s = s.replace(/\n{3,}/g, '\n\n');
+  // 还原被占位符保护的表格（raw HTML 保持字节不变）
+  s = s.replace(/\u0000TBL(\d+)\u0000/g, function (m, n) { return tblHold[Number(n)]; });
   return s.trim();
 }
 function inlineMd(t) {
@@ -485,7 +498,7 @@ function mdToHtml(md) {
       out.push('<p>' + buf.join('<br/>') + '</p>');
       continue;
     }
-    if (/^<(p|h[1-6]|div)(\s|>)/i.test(line)) { out.push(line); i++; continue; }
+    if (/^<(p|h[1-6]|div|table)(\s|>)/i.test(line)) { out.push(line); i++; continue; }
     let m = line.match(/^(#{1,6})\s+(.*)$/);
     if (m) { const lv = m[1].length; out.push('<h' + lv + '>' + inlineMd(m[2]) + '</h' + lv + '>'); i++; continue; }
     if (/^>\s?/.test(line)) {
@@ -502,7 +515,7 @@ function mdToHtml(md) {
       continue;
     }
     const buf = [];
-    while (i < lines.length && lines[i].trim() && !/^```/.test(lines[i]) && !/^#{1,6}\s/.test(lines[i]) && !/^>\s?/.test(lines[i]) && !/^(\s*)([-*+]|\d+\.)\s+/.test(lines[i]) && !/^<(p|h[1-6]|div)(\s|>)/i.test(lines[i])) {
+    while (i < lines.length && lines[i].trim() && !/^```/.test(lines[i]) && !/^#{1,6}\s/.test(lines[i]) && !/^>\s?/.test(lines[i]) && !/^(\s*)([-*+]|\d+\.)\s+/.test(lines[i]) && !/^<(p|h[1-6]|div|table)(\s|>)/i.test(lines[i])) {
       buf.push(inlineMd(lines[i]));
       i++;
     }
@@ -984,6 +997,321 @@ function insertImageDataUrl(dataUrl, size, i, modeOverride) {
     showToast('已插入图片（居中，' + (mode === 'full' ? '全画幅' : '局部') + '显示）', 'ok');
   }
 }
+
+// ---------- 插入表格（2026-09）----------
+// 生成契约 HTML：<table><thead><tr><th>…</th></tr></thead><tbody><tr><td>…</td></tr></tbody></table>
+// 紧凑单行输出（后端 sanitize 会归一化）；单元格初始为空文本；行列 1-20 clamp。
+// 前端只生成文本单元格（不套块级 p/h），表格自身不加 class。
+function buildTableHtml(rows, cols, header) {
+  let r = Math.floor(Number(rows));
+  let c = Math.floor(Number(cols));
+  if (!isFinite(r) || r < 1) r = 1;
+  if (r > 20) r = 20;
+  if (!isFinite(c) || c < 1) c = 1;
+  if (c > 20) c = 20;
+  let h = '<table>';
+  if (header) {
+    h += '<thead><tr>';
+    for (let k = 0; k < c; k++) h += '<th></th>';
+    h += '</tr></thead>';
+  }
+  h += '<tbody>';
+  for (let i = 0; i < r; i++) {
+    h += '<tr>';
+    for (let k = 0; k < c; k++) h += '<td></td>';
+    h += '</tr>';
+  }
+  h += '</tbody></table>';
+  return h;
+}
+
+// 恢复 .editable 内的区间（表格/图片插入共用）：起点已脱离 DOM、不在 .editable
+// 内或 addRange 抛错都视为不可恢复 → 调用方回退到下一候选。
+function _restoreEditableRange(range) {
+  if (!range) return false;
+  const sc = range.startContainer;
+  if (!sc || !sc.isConnected) return false;
+  const el = sc.nodeType === 1 ? sc : sc.parentNode;
+  if (!el || !el.closest || !el.closest('.editable')) return false;
+  try {
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+let _tblCaretRange = null; // 打开表格弹窗时的光标快照（弹窗 focus 输入框会夺焦，确认插入时恢复它）
+
+// 在光标处插入表格：目标页优先取当前视口页（与 insertImageDataUrl 一致），再回退
+// 到最近聚焦的编辑区。Markdown 源码模式下插入 raw HTML（源码可见可编辑），
+// mdToHtml 对 <table 开头的行原样透传 → 切回富文本表格完整保留。
+function insertTable(rows, cols, header) {
+  let ed = null;
+  let i = null;
+  const vp = viewportPage();
+  if (vp != null && vp >= 0) {
+    const row = host.querySelector('.page-row[data-i="' + vp + '"]');
+    ed = row ? row.querySelector('.editable') : null;
+    if (ed) i = vp;
+  }
+  if (!ed) ed = currentEditable();
+  if (!ed) { showToast('未找到可插入的编辑区', 'fail'); return; }
+  if (i == null) {
+    const row = ed.closest('.page-row');
+    i = row ? Number(row.dataset.i) : 0;
+  }
+  const html = buildTableHtml(rows, cols, !!header);
+  const before = histBegin('插入表格', [i]);
+  ed.focus();
+  inDiscreteOp = true;
+  try {
+    withScrollStable(() => {
+      // 恢复插入点：优先打开弹窗时的光标快照（含折叠光标），其次最近一次在
+      // .editable 内的选区/光标；都失效才落到编辑区末尾并提示。
+      let restored = _restoreEditableRange(_tblCaretRange);
+      if (!restored) restored = _restoreEditableRange(_lastEditableRange);
+      if (!restored) {
+        const r = document.createRange();
+        r.selectNodeContents(ed);
+        r.collapse(false);
+        const sel2 = window.getSelection();
+        sel2.removeAllRanges();
+        try { sel2.addRange(r); } catch (e2) { /* 极端情况忽略 */ }
+        showToast('未找到原光标位置，已插入到页末', 'warn');
+      }
+      if (mdMode) {
+        document.execCommand('insertText', false, html);
+      } else if (!document.execCommand('insertHTML', false, html)) {
+        ed.appendChild(document.createElement('div')).innerHTML = html;
+      }
+    });
+  } finally { inDiscreteOp = false; }
+  syncContent(ed); markDirty(i); scheduleRemeasure(i);
+  histEnd(before, '插入表格');
+  showToast('已插入表格（' + ((header ? 1 : 0) + rows) + ' 行 × ' + cols + ' 列）', 'ok');
+}
+// 弹窗输入 clamp：确认时把行列数钳到 [1,20] 并回写输入框
+function _tableClamp(id) {
+  const el = document.getElementById(id);
+  if (!el) return 1;
+  let v = Math.floor(Number(el.value));
+  if (!isFinite(v) || v < 1) v = 1;
+  if (v > 20) v = 20;
+  el.value = v;
+  return v;
+}
+function openTableDialog() {
+  const bg = document.getElementById('tableModalBg');
+  if (!bg) return;
+  // 打开弹窗前快照当前在 .editable 内的光标（含折叠光标）——弹窗 focus 输入框会
+  // 夺走文档选区，此刻不记，确认插入时 _lastEditableRange 可能已陈旧。
+  const sel = window.getSelection();
+  _tblCaretRange = null;
+  if (sel && sel.rangeCount > 0) {
+    const range = sel.getRangeAt(0);
+    if (_editableFromSelection(range, sel)) _tblCaretRange = range.cloneRange();
+  }
+  bg.style.display = 'flex';
+  const input = document.getElementById('tableRows');
+  if (input) input.focus();
+}
+function closeTableDialog() {
+  const bg = document.getElementById('tableModalBg');
+  if (bg) bg.style.display = 'none';
+}
+function confirmTableDialog() {
+  const r = _tableClamp('tableRows');
+  const c = _tableClamp('tableCols');
+  const headerEl = document.getElementById('tableHeader');
+  const header = headerEl ? headerEl.checked : false;
+  closeTableDialog();
+  insertTable(r, c, header);
+}
+
+// ---------- 表格操作条（2026-09） ----------
+// 光标/选区进入表格单元格时，在单元格上方弹出浮动操作条：加行/删行/加列/删列/
+// 居左/居中/居右/删除表格。单元格对齐以 ptoe-align-left|center|right class 表达
+// （后端 sanitize 保留、导出按 class 渲染）。所有操作单步撤销 + withScrollStable。
+let _tblKey = null; // { i, cell, table, ed }：当前操作目标（光标所在单元格）
+let _tblBarVisible = false;
+const tblBar = document.getElementById('tblBar'); // 浮动操作条（correctmanage _UI_HTML）
+
+// 由当前选区/光标推断所在的表格单元格；不在 .editable 内或不在单元格里返回 null
+function _tblCellFromSelection() {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) return null;
+  let n = sel.anchorNode;
+  if (!n) return null;
+  if (n.nodeType !== 1) n = n.parentNode;
+  if (!n || !n.closest) return null;
+  const cell = n.closest('td,th');
+  if (!cell) return null;
+  const table = cell.closest('table');
+  if (!table) return null;
+  const ed = cell.closest('.editable');
+  if (!ed) return null;
+  const row = ed.closest('.page-row');
+  if (!row) return null;
+  return { i: Number(row.dataset.i), cell: cell, table: table, ed: ed };
+}
+
+function _tblAlignOf(cell) {
+  if (cell.classList.contains('ptoe-align-left')) return 'left';
+  if (cell.classList.contains('ptoe-align-center')) return 'center';
+  if (cell.classList.contains('ptoe-align-right')) return 'right';
+  return '';
+}
+
+function showTblBar() {
+  if (mdMode) return; // Markdown 源码模式无真实表格节点
+  if (!tblBar || !_tblKey) return;
+  const rect = _tblKey.cell.getBoundingClientRect();
+  tblBar.style.display = 'flex';
+  const r = tblBar.getBoundingClientRect();
+  let left = rect.left + rect.width / 2 - r.width / 2;
+  left = Math.max(8, Math.min(left, window.innerWidth - r.width - 8));
+  let top = rect.top - r.height - 6;
+  if (top < 8) top = rect.bottom + 6;
+  if (top + r.height > window.innerHeight - 8) top = Math.max(8, window.innerHeight - r.height - 8);
+  tblBar.style.left = left + 'px';
+  tblBar.style.top = top + 'px';
+  _tblBarVisible = true;
+  _tblSyncAlignActive();
+}
+function hideTblBar() {
+  if (tblBar) tblBar.style.display = 'none';
+  _tblKey = null;
+  _tblBarVisible = false;
+}
+// 对齐按钮高亮当前生效方向（只认 ptoe-align-* 三类，与后端契约一致）
+function _tblSyncAlignActive() {
+  if (!tblBar || !_tblKey) return;
+  const cur = _tblAlignOf(_tblKey.cell);
+  tblBar.querySelectorAll('[data-tbl-align]').forEach(function (b) {
+    b.classList.toggle('active', b.dataset.tblAlign === cur);
+  });
+}
+// 光标状态变更（点击/键盘移动/选区变化）→ 进入单元格显示、离开隐藏
+function _tblSyncVisibility() {
+  if (mdMode) { hideTblBar(); return; }
+  const k = _tblCellFromSelection();
+  if (!k) { hideTblBar(); return; }
+  // 同单元格内打字/微移不重复定位；首次进入或换格时定位
+  if (!_tblBarVisible || !_tblKey || _tblKey.cell !== k.cell || _tblKey.i !== k.i) {
+    _tblKey = k;
+    showTblBar();
+  }
+}
+document.addEventListener('selectionchange', _tblSyncVisibility);
+document.addEventListener('mouseup', _tblSyncVisibility);
+document.addEventListener('keyup', (e) => { if (!e.isComposing) _tblSyncVisibility(); });
+
+// 表格操作包裹：单步撤销 + withScrollStable + 提交内容/脏标记/重排
+function _tblOperate(label, fn, i) {
+  const ed = _tblKey ? _tblKey.ed : null;
+  const before = histBegin(label, [i]);
+  inDiscreteOp = true;
+  try { withScrollStable(fn); } finally { inDiscreteOp = false; }
+  if (ed) { syncContent(ed); markDirty(i); scheduleRemeasure(i); }
+  histEnd(before, label);
+}
+
+function _tblAddRow() {
+  if (!_tblKey) return;
+  const tbody = _tblKey.table.querySelector('tbody');
+  if (!tbody) return;
+  if (_tblKey.table.querySelectorAll('tr').length >= 20) { showToast('表格最多 20 行', 'warn'); return; }
+  const curTr = _tblKey.cell.closest('tr');
+  const cols = curTr ? curTr.children.length : 1;
+  const tr = document.createElement('tr');
+  for (let k = 0; k < cols; k++) tr.appendChild(document.createElement('td'));
+  if (curTr && curTr.parentNode === tbody) tbody.insertBefore(tr, curTr.nextSibling);
+  else tbody.insertBefore(tr, tbody.firstChild); // 当前在 thead 行 → 插到 tbody 首行
+}
+function _tblDelRow() {
+  if (!_tblKey) return;
+  if (_tblKey.table.querySelectorAll('tr').length <= 1) { showToast('至少保留 1 行', 'warn'); return; }
+  const tr = _tblKey.cell.closest('tr');
+  if (!tr || !tr.parentNode) return;
+  // 删的是 thead 唯一行 → 顺带移除空 thead 元素
+  if (tr.parentNode.tagName === 'THEAD' && tr.parentNode.querySelectorAll('tr').length === 1) {
+    tr.parentNode.parentNode.removeChild(tr.parentNode);
+  } else {
+    tr.parentNode.removeChild(tr);
+  }
+}
+function _tblAddCol() {
+  if (!_tblKey) return;
+  const trs = _tblKey.table.querySelectorAll('tr');
+  const maxCols = trs.length ? Math.max.apply(null, Array.prototype.map.call(trs, (t) => t.children.length)) : 0;
+  if (maxCols >= 20) { showToast('表格最多 20 列', 'warn'); return; }
+  // 当前列索引 = 当前 cell 在其所在行的 index（含 colspan 累计偏移）
+  const curTr = _tblKey.cell.parentNode;
+  const cellIdx = curTr ? Array.prototype.indexOf.call(curTr.children, _tblKey.cell) : 0;
+  trs.forEach(function (tr) {
+    const inHead = tr.parentNode && tr.parentNode.tagName === 'THEAD';
+    const td = document.createElement(inHead ? 'th' : 'td');
+    // 不足该列的行补到末尾
+    if (cellIdx + 1 < tr.children.length) tr.insertBefore(td, tr.children[cellIdx + 1]);
+    else tr.appendChild(td);
+  });
+}
+function _tblDelCol() {
+  if (!_tblKey) return;
+  const trs = _tblKey.table.querySelectorAll('tr');
+  const maxCols = trs.length ? Math.max.apply(null, Array.prototype.map.call(trs, (t) => t.children.length)) : 0;
+  if (maxCols <= 1) { showToast('至少保留 1 列', 'warn'); return; }
+  const curTr = _tblKey.cell.parentNode;
+  const cellIdx = curTr ? Array.prototype.indexOf.call(curTr.children, _tblKey.cell) : 0;
+  trs.forEach(function (tr) {
+    if (cellIdx < tr.children.length) tr.removeChild(tr.children[cellIdx]);
+  });
+}
+function _tblAlign(align) {
+  if (!_tblKey) return;
+  const cell = _tblKey.cell;
+  const cur = _tblAlignOf(cell);
+  ['ptoe-align-left', 'ptoe-align-center', 'ptoe-align-right'].forEach((c) => cell.classList.remove(c));
+  if (cur !== align) cell.classList.add('ptoe-align-' + align); // 点当前已生效方向 = 取消
+  _tblSyncAlignActive();
+}
+function _tblDelTable() {
+  if (!_tblKey) return;
+  const table = _tblKey.table;
+  const ed = _tblKey.ed;
+  if (table.parentNode) table.parentNode.removeChild(table);
+  // 表格是块内唯一内容时留一个空段落容器，防行高塌陷
+  if (!/[^\s]/.test(ed.textContent)) {
+    const p = document.createElement('p');
+    p.appendChild(document.createElement('br'));
+    ed.appendChild(p);
+  }
+}
+
+if (tblBar) tblBar.addEventListener('click', function (e) {
+  const btn = e.target.closest('button');
+  if (!btn || !_tblKey) return;
+  const op = btn.dataset.tblOp;
+  const i = _tblKey.i;
+  if (op === 'addrow') _tblOperate('表格-加行', _tblAddRow, i);
+  else if (op === 'delrow') _tblOperate('表格-删行', _tblDelRow, i);
+  else if (op === 'addcol') _tblOperate('表格-加列', _tblAddCol, i);
+  else if (op === 'delcol') _tblOperate('表格-删列', _tblDelCol, i);
+  else if (op === 'alignleft' || op === 'aligncenter' || op === 'alignright') {
+    _tblOperate('表格-对齐', () => _tblAlign(op.slice(5)), i);
+  } else if (op === 'deltable') {
+    _tblOperate('删除表格', _tblDelTable, i);
+    hideTblBar();
+    return;
+  }
+  // 结构/对齐操作后重定位操作条（cell 可能已换/被删）
+  if (_tblKey && _tblKey.table && _tblKey.table.isConnected) {
+    if (!_tblKey.cell.isConnected) _tblKey.cell = _tblKey.table.querySelector('td,th');
+    if (_tblKey.cell) showTblBar(); else hideTblBar();
+  } else hideTblBar();
+});
 
 // 左侧原图裁剪后插入：叠加裁剪层，拖拽选区，确认后 canvas 裁剪为 dataUrl 插入
 function openCrop(row, i) {
@@ -2176,6 +2504,7 @@ async function convertAll(mode) {
 }
 function setMdMode(on) {
   if (!!on === mdMode) return;
+  hideTblBar(); // 表格操作条仅富文本模式可用
   if (on) {
     for (let i = 0; i < pages.length; i++) {
       mdSourceMap.set(i, htmlToMd(contentMap.has(i) ? contentMap.get(i) : pages[i].text));
@@ -3085,6 +3414,7 @@ async function loadHistoryVersion(id, name, ver) {
     contentMap = newContent;
     mdSourceMap = newMd;
     histClear(); // 整体替换内容，撤销/重做历史失效
+    hideTblBar(); // 历史版本载入后旧的表格操作条定位/引用已失效
     editedSet.clear();
     for (let i = 0; i < pages.length; i++) editedSet.add(i);
     heights.length = pages.length; heights.fill(0);
@@ -3379,8 +3709,9 @@ document.addEventListener('selectionchange', () => {
   const sel = window.getSelection();
   if (!sel || sel.rangeCount === 0 || sel.isCollapsed) hidePopup();
   hideErrPopup();
-  // 记录选区（仅在 .editable 内且非折叠时）
-  if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
+  // 记录在 .editable 内的选区/光标（折叠光标一并记录——插入表格/图片要落在
+  // 光标处；只记非折叠选区时，「把光标点进正文再点工具栏」会回退到旧选区甚至页末）
+  if (sel && sel.rangeCount > 0) {
     const range = sel.getRangeAt(0);
     if (_editableFromSelection(range, sel)) {
       _lastEditableRange = range.cloneRange();
@@ -5119,6 +5450,8 @@ document.addEventListener('mousedown', function (e) {
   }
   // 点击图片弹窗外 → 关闭图片弹窗
   if (_imgKey && !e.target.closest('#imgPopup')) hideImgPopup();
+  // 点击表格操作条外部（且不在表格单元格内——换格由 selectionchange 重建目标）→ 关闭操作条
+  if (_tblKey && !e.target.closest('#tblBar') && !e.target.closest('.editable td,.editable th')) hideTblBar();
 });
 // 点击编辑区内的图片 → 弹出图片设置弹窗（行内图片可能没有 <p> 包裹，pEl 允许为 null）
 document.addEventListener('click', function (e) {
@@ -5220,9 +5553,10 @@ document.getElementById('imgPopup').addEventListener('click', function (e) {
     hideImgPopup();
   }
 });
-// Esc 关闭图片弹窗
+// Esc 关闭图片弹窗 / 表格操作条
 document.addEventListener('keydown', function (e) {
   if (e.key === 'Escape' && _imgKey) { hideImgPopup(); }
+  if (e.key === 'Escape' && _tblKey) { hideTblBar(); }
 });
 
 // 字号下拉：仅调整编辑区显示字号（CSS 变量 --editor-font-size）；
@@ -6945,6 +7279,7 @@ const SHORTCUT_ACTIONS = {
   proofread_revert: proofreadRevertCurrent,
   proofread_accept: acceptErrShortcut,
   proofread_ignore: ignoreErrShortcut,
+  insert_table: openTableDialog,
   popup: function() {
     const sel = window.getSelection();
     if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return true;
@@ -7259,6 +7594,16 @@ document.getElementById('indCloseBtn').addEventListener('click', closeIndentDial
 _backdropClickClose('indentModalBg', closeIndentDialog);
 document.getElementById('indOkBtn').addEventListener('click', () => applyIndentSettings(false));
 document.getElementById('indClearBtn').addEventListener('click', () => applyIndentSettings(true));
+// 插入表格弹窗：打开/关闭/确定（行列 clamp 在确认时执行；遮罩点击关闭）
+const _tableBtn = document.getElementById('tableBtn');
+if (_tableBtn) _tableBtn.addEventListener('click', openTableDialog);
+const _tableOkBtn = document.getElementById('tableOkBtn');
+if (_tableOkBtn) _tableOkBtn.addEventListener('click', confirmTableDialog);
+const _tableCancelBtn = document.getElementById('tableCancelBtn');
+if (_tableCancelBtn) _tableCancelBtn.addEventListener('click', closeTableDialog);
+const _tableCloseBtn = document.getElementById('tableCloseBtn');
+if (_tableCloseBtn) _tableCloseBtn.addEventListener('click', closeTableDialog);
+if (document.getElementById('tableModalBg')) _backdropClickClose('tableModalBg', closeTableDialog);
 ['indLeft','indRight','indSpecial','indVal','indBefore','indAfter','indLh'].forEach(function(id) {
   document.getElementById(id).addEventListener('input', updateIndentPreview);
   document.getElementById(id).addEventListener('change', updateIndentPreview);
@@ -7586,7 +7931,7 @@ const scheduleViewport = () => {
 };
 window.addEventListener('wheel', markUserScroll, { passive: true });
 window.addEventListener('touchmove', markUserScroll, { passive: true });
-window.addEventListener('scroll', () => { markAnyScroll(); scheduleViewport(); hidePopup(); closeContextMenu(); }, { passive: true });
+window.addEventListener('scroll', () => { markAnyScroll(); scheduleViewport(); hidePopup(); hideTblBar(); closeContextMenu(); }, { passive: true });
 window.addEventListener('beforeunload', (e) => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
 // ---------- 浏览器存活监测 ----------
 setInterval(() => { fetch('/api/heartbeat', { method: 'POST' }).catch(() => {}); }, 30000);
@@ -7645,7 +7990,7 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
     // Defensive: hide known modal/backdrop elements at startup to avoid accidental blocking overlays
     (function(){
       const _modalIds = [
-        'modalBg','searchModalBg','exportModalBg','indentModalBg','finishModalBg','finishConfirmBg',
+        'modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','finishModalBg','finishConfirmBg',
         'historyModalBg','helpModalBg','formatRulesModalBg','frRuleModalBg','frFmtPopupBg',
         'imgPopup','errPopup','popup','proofreadMenu',
         'charWrapMenu','supSubMenu'
@@ -7686,7 +8031,7 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
   // 防御性：确保没有 modal 遮罩在初始化时意外显示（会导致工具栏/按钮无法响应）
   // 注意：contextMenu 不在此列——它靠 hidden 属性 + CSS [hidden] 显隐，inline display:none
   // 会永久压过 #contextMenu{display:flex}，导致右键菜单永不显示（2026-08 修复）。
-  ['modalBg','searchModalBg','exportModalBg','indentModalBg','formatRulesModalBg','finishModalBg','finishConfirmBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg','imgPopup','errPopup','popup','proofreadMenu','charWrapMenu','supSubMenu'].forEach(function(id) {
+  ['modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','formatRulesModalBg','finishModalBg','finishConfirmBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg','imgPopup','errPopup','popup','proofreadMenu','charWrapMenu','supSubMenu'].forEach(function(id) {
     const el = document.getElementById(id);
     if (el) el.style.display = 'none';
   });

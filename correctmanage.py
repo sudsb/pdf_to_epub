@@ -1215,6 +1215,78 @@ class _Sanitizer(HTMLParser):
         self.data_attrs: list[tuple[str, str]] = []  # 当前块保留的缩进/间距 data 属性
         self.skip: int = 0  # 非内容标签嵌套深度
         self._reopen: list[tuple[str, str]] = []  # 跨块未闭合的行内标签（顺延重开）
+        # 表格累积模式（2026-09-20 插入表格支持）：
+        # 进入 <table> 后暂存结构，整表结束时产出规范 <table>…</table> 块。
+        self._tbl_depth = 0  # 表格嵌套深度（>0 = 处于表格累积模式）
+        self._tbl_skip = 0  # 嵌套表格丢弃深度（内容整体跳过，防递归炸）
+        self._tbl_has_thead = False  # 输入是否出现过 <thead>
+        self._tbl_in_thead = False  # 当前行是否属于 thead 分组
+        self._tbl_head: list[list[str]] = []  # thead 行（每行 = cell inner html 列表）
+        self._tbl_body: list[list[str]] = []  # tbody 行
+        self._tbl_row: list[str] | None = None  # 当前行 cells
+        self._cell_open = False  # 当前是否处于 th/td 单元格
+        self._cell_th = False  # 当前单元格是否为 th
+        self._cell_attrs: list[str] = []  # 当前单元格保留的 colspan/rowspan 属性串
+        self._cell_buf: list[str] = []  # 单元格行内内容缓冲
+        self._cell_stack: list[tuple[str, str]] = []  # 单元格内未闭合行内标签
+
+    def _inline_target(self) -> tuple[list[str], list[tuple[str, str]]]:
+        """当前行内写入目标：表格单元格内 → (cell_buf, cell_stack)；否则 → (buf, stack)。"""
+        if self._tbl_depth and self._cell_open:
+            return self._cell_buf, self._cell_stack
+        return self.buf, self.stack
+
+    def _tbl_finish_cell(self) -> None:
+        """结束当前单元格：把 cell inner HTML 附加到当前行（空单元格也保留）。"""
+        if not self._cell_open:
+            return
+        if self._tbl_row is None:
+            self._tbl_row = []
+        closes = "".join(
+            f"</{t}>" for t, _ in reversed(self._cell_stack) if t != "__skip_mark__"
+        )
+        inner = "".join(self._cell_buf) + closes
+        tag = "th" if self._cell_th else "td"
+        attrs = (" " + " ".join(self._cell_attrs)) if self._cell_attrs else ""
+        self._tbl_row.append(f"<{tag}{attrs}>{inner}</{tag}>")
+        self._cell_open = False
+        self._cell_buf = []
+        self._cell_stack = []
+
+    def _tbl_finish_row(self) -> None:
+        """结束当前行：按所属分组（thead/tbody）收进行列表。"""
+        self._tbl_finish_cell()
+        if self._tbl_row is not None:
+            (self._tbl_head if self._tbl_in_thead else self._tbl_body).append(
+                self._tbl_row
+            )
+            self._tbl_row = None
+
+    def _tbl_finish_table(self) -> None:
+        """表格结束：产出规范 <table>…</table> 块（行内 tight 无多余空白；无 thead 则省略）。"""
+        if not self._tbl_depth:
+            return
+        self._tbl_finish_row()
+        parts: list[str] = ["<table>"]
+        if self._tbl_head:
+            parts.append("<thead>")
+            for row in self._tbl_head:
+                parts.append("<tr>" + "".join(row) + "</tr>")
+            parts.append("</thead>")
+        if self._tbl_body:
+            parts.append("<tbody>")
+            for row in self._tbl_body:
+                parts.append("<tr>" + "".join(row) + "</tr>")
+            parts.append("</tbody>")
+        parts.append("</table>")
+        self.blocks.append("".join(parts))
+        self._tbl_depth = 0
+        self._tbl_skip = 0
+        self._tbl_has_thead = False
+        self._tbl_in_thead = False
+        self._tbl_head = []
+        self._tbl_body = []
+        self._tbl_row = None
 
     def _flush(self) -> None:
         if self.block is None:
@@ -1274,32 +1346,103 @@ class _Sanitizer(HTMLParser):
             return
         if self.skip:
             return
+        if self._tbl_skip:
+            # 嵌套表格丢弃区：内容整体跳过（深度守卫防递归炸）
+            if tag == "table":
+                self._tbl_skip += 1
+            return
+        if tag == "table":
+            if self._tbl_depth:
+                self._tbl_skip += 1
+                return
+            self._flush()
+            self._tbl_depth = 1
+            self._tbl_has_thead = False
+            self._tbl_in_thead = False
+            self._tbl_head = []
+            self._tbl_body = []
+            self._tbl_row = None
+            self._cell_open = False
+            return
+        if self._tbl_depth:
+            # 表格结构标签：只作结构累积（thead/tbody/tfoot/tr/th/td）
+            if tag in ("thead", "tfoot"):
+                self._tbl_has_thead = self._tbl_has_thead or tag == "thead"
+                self._tbl_in_thead = tag == "thead"
+                self._tbl_finish_cell()
+                return
+            if tag == "tbody":
+                self._tbl_in_thead = False
+                self._tbl_finish_cell()
+                return
+            if tag == "tr":
+                self._tbl_finish_row()
+                self._tbl_row = []
+                return
+            if tag in ("th", "td"):
+                self._tbl_finish_cell()
+                d = dict(attrs)
+                # 单元格属性：对齐 class（ptoe-align-*）保留，其余 class 丢弃；
+                # colspan/rowspan 合法值保留（非法值不保留，与块级属性同策略）。
+                cell_attrs: list[str] = []
+                for c in (d.get("class") or "").split():
+                    if c in _ALIGN_CLASSES:
+                        cell_attrs.append(f'class="{c}"')
+                        break
+                for k in ("colspan", "rowspan"):
+                    v = (d.get(k) or "").strip()
+                    if re.fullmatch(r"\d{1,2}", v):
+                        cell_attrs.append(f'{k}="{v}"')
+                self._cell_open = True
+                self._cell_th = tag == "th"
+                self._cell_attrs = cell_attrs
+                self._cell_buf = []
+                self._cell_stack = []
+                return
+            if tag in ("p", "div") or _BLOCK_RE.fullmatch(tag):
+                # 单元格内块级标签：丢弃标签、内容并入文本（保持行内）
+                if self._cell_open:
+                    return
+                # 表格结构层的块级标签：视为表格非正常结束，落入正常块级逻辑
+                self._tbl_finish_table()
+            elif self._cell_open:
+                # 单元格内行内标签：走统一行内逻辑（路由到 cell buf）
+                pass
+            else:
+                # 不在单元格内的行内/其它标签：表格结构层内容丢弃
+                return
         if tag in ("b", "strong"):
-            self.buf.append("<strong>")
-            self.stack.append(("strong", "<strong>"))
+            buf, stack = self._inline_target()
+            buf.append("<strong>")
+            stack.append(("strong", "<strong>"))
         elif tag in ("i", "em"):
-            self.buf.append("<em>")
-            self.stack.append(("em", "<em>"))
+            buf, stack = self._inline_target()
+            buf.append("<em>")
+            stack.append(("em", "<em>"))
         elif tag in _ALIAS_INLINE_TAGS:
             # 原生/外部标签（<u>/<s>/<strike>/<del>/<sup>/<sub>/<mark>）→ 等价格式类，
             # 避免「界面有格式、导出后丢失」（2026-09-16）。
             # 例外：<mark class="ptoe-search"> 是搜索高亮（临时视图态），仍按原样剥掉标签。
             # 压入占位栈项，保证对应的 </mark> 只弹栈、不误关其它行内标签。
             if "ptoe-search" in (dict(attrs).get("class") or "").split():
-                self.stack.append(("__skip_mark__", ""))
+                _, stack = self._inline_target()
+                stack.append(("__skip_mark__", ""))
                 return
             open_html = f'<span class="{_ALIAS_INLINE_TAGS[tag]}">'
-            self.buf.append(open_html)
-            self.stack.append(("span", open_html))
+            buf, stack = self._inline_target()
+            buf.append(open_html)
+            stack.append(("span", open_html))
         elif tag == "font":
             # <font color="...">（浏览器 execCommand('foreColor') / 粘贴内容）→ 内联样式 span
             color = (dict(attrs).get("color") or "").strip()
             if _COLOR_VALUE_RE.match(color):
                 open_html = f'<span style="color:{_html.escape(color, quote=True)}">'
-                self.buf.append(open_html)
-                self.stack.append(("span", open_html))
+                buf, stack = self._inline_target()
+                buf.append(open_html)
+                stack.append(("span", open_html))
         elif tag == "br":
-            self.buf.append("<br/>")
+            buf, _ = self._inline_target()
+            buf.append("<br/>")
         elif tag in ("p", "div"):
             self._open_block(
                 "p", classes=_block_classes(attrs), data_attrs=_block_data_attrs(attrs)
@@ -1326,8 +1469,9 @@ class _Sanitizer(HTMLParser):
                 )
                 cls_html = f' class="{cls}"' if cls else ""
                 open_html = f'<span data-ptoe-marker="{v}"{cls_html}>'
-                self.buf.append(open_html)
-                self.stack.append(("span", open_html))
+                buf, stack = self._inline_target()
+                buf.append(open_html)
+                stack.append(("span", open_html))
             else:
                 # 保留行内格式 span：对齐内联样式 + 白名单格式类；
                 # 外部/粘贴样式按等价语义折成格式类（2026-09-16 修复：原先只保留第一个
@@ -1398,23 +1542,56 @@ class _Sanitizer(HTMLParser):
             return
         if self.skip:
             return
+        if self._tbl_skip:
+            if tag == "table":
+                self._tbl_skip -= 1
+            return
+        if self._tbl_depth:
+            if tag == "table":
+                self._tbl_finish_table()
+                return
+            if tag in ("thead", "tfoot"):
+                self._tbl_in_thead = False
+                self._tbl_finish_cell()
+                return
+            if tag == "tbody":
+                self._tbl_in_thead = False
+                self._tbl_finish_cell()
+                return
+            if tag == "tr":
+                self._tbl_finish_row()
+                return
+            if tag in ("th", "td"):
+                self._tbl_finish_cell()
+                return
+            if tag in ("p", "div") or _BLOCK_RE.fullmatch(tag):
+                # 单元格内块级闭合标签丢弃
+                if self._cell_open:
+                    return
+                # 表格结构层的块级闭合：视为表格非正常结束，落入正常闭合逻辑
+                self._tbl_finish_table()
+            elif not self._cell_open:
+                # 表格结构层行内闭标签丢弃
+                return
+            # 单元格内行内闭标签：落入统一行内闭合逻辑（路由到 cell stack）
+        buf, stack = self._inline_target()
         # 搜索高亮 <mark class="ptoe-search"> 只压了占位栈项：这里只弹栈
-        if tag == "mark" and self.stack and self.stack[-1][0] == "__skip_mark__":
-            self.stack.pop()
+        if tag == "mark" and stack and stack[-1][0] == "__skip_mark__":
+            stack.pop()
             return
         # 原生/外部行内标签已归一为 span（见 _ALIAS_INLINE_TAGS / font 分支）
         if tag in _ALIAS_INLINE_TAGS:
             tag = "span"
-        names = [n for n, _ in self.stack]
+        names = [n for n, _ in stack]
         if tag in ("strong", "b") and "strong" in names:
-            self.buf.append("</strong>")
-            self.stack.pop()
+            buf.append("</strong>")
+            stack.pop()
         elif tag in ("em", "i") and "em" in names:
-            self.buf.append("</em>")
-            self.stack.pop()
-        elif tag in ("span", "font") and self.stack and self.stack[-1][0] == "span":
-            self.buf.append("</span>")
-            self.stack.pop()
+            buf.append("</em>")
+            stack.pop()
+        elif tag in ("span", "font") and stack and stack[-1][0] == "span":
+            buf.append("</span>")
+            stack.pop()
         elif (
             tag in ("p", "div")
             and self.block is not None
@@ -1431,9 +1608,17 @@ class _Sanitizer(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self.skip:
             return
+        if self._tbl_skip:
+            return
+        if self._tbl_depth:
+            if self._cell_open:
+                self._cell_buf.append(_html.escape(data, quote=False))
+            # 表格结构层裸文本丢弃（单元格内文本已累计）
+            return
         self.buf.append(_html.escape(data, quote=False))
 
     def result(self) -> str:
+        self._tbl_finish_table()
         self._flush()
         if self.buf:
             content = "".join(self.buf)
@@ -4558,6 +4743,21 @@ def _rich_align(attrs_str: str) -> str:
     return ""
 
 
+def _cell_align(attrs: list[tuple[str, str | None]]) -> str:
+    """从 td/th 标签 attrs 提取对齐类 → ""|"left"|"center"|"right"。
+
+    契约：矫正界面只产出 ptoe-align-left/center/right 三种值，
+    其余 class（含非法 ptoe-align-*）一律忽略（与 _Sanitizer 同策略）。
+    """
+    for k, v in attrs:
+        if k == "class":
+            for c in (v or "").split():
+                if c in _ALIGN_CLASSES:
+                    return c[len("ptoe-align-"):]
+            break
+    return ""
+
+
 def _html_to_rich_blocks(html: str) -> list[dict]:
     """已清洗 HTML → 富文本块列表，供 TXT/DOCX/MD 导出（保留格式信息）。
 
@@ -4596,6 +4796,79 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             self._join_at_start = False
             self._join_last = False
             self._has_non_ws_text = False
+            # 表格块累积（2026-09-20）：<table> 整表产出一个 "table" 块
+            self.tbl_depth = 0  # 表格嵌套深度（>0 = 处于表格内）
+            self.tbl_skip = 0  # 嵌套表格丢弃深度
+            self.tbl_has_thead = False
+            self.tbl_in_thead = False
+            self.tbl_head: list[list[str]] = []  # thead 行（每行 = cell inner html 列表）
+            self.tbl_body: list[list[str]] = []  # tbody 行
+            self.tbl_row: list[str] | None = None
+            self.tbl_row_align: list[str] | None = None  # 当前行各 cell 对齐（algn 并行行）
+            self.tbl_cell_open = False
+            self.tbl_cell: list[str] = []
+            self.tbl_cell_align = ""  # 当前单元格对齐（""|"left"|"center"|"right"）
+            self.tbl_cell_stack: list[str] = []  # 单元格内未闭合标签（"__marker__" = 内容剥除）
+            self.tbl_raw: list[str] = []  # 表格原始 HTML（防御：含 colspan/rowspan 时 MD raw 透传）
+            self.tbl_has_span = False  # 是否出现过 colspan/rowspan
+            self.tbl_align_head: list[list[str]] = []  # thead 行对齐（并行 tbl_head）
+            self.tbl_align_body: list[list[str]] = []  # tbody 行对齐（并行 tbl_body）
+
+        def _tbl_cell_end(self) -> None:
+            """结束当前单元格：cell inner html 附加到当前行（空单元格保留）。"""
+            if not self.tbl_cell_open:
+                return
+            if self.tbl_row is None:
+                self.tbl_row = []
+            if self.tbl_row_align is None:
+                self.tbl_row_align = []
+            self.tbl_row.append("".join(self.tbl_cell))
+            self.tbl_row_align.append(self.tbl_cell_align)
+            self.tbl_cell_open = False
+            self.tbl_cell = []
+            self.tbl_cell_align = ""
+
+        def _tbl_row_end(self) -> None:
+            self._tbl_cell_end()
+            if self.tbl_row is not None:
+                (self.tbl_head if self.tbl_in_thead else self.tbl_body).append(
+                    self.tbl_row
+                )
+                (self.tbl_align_head if self.tbl_in_thead else self.tbl_align_body).append(
+                    self.tbl_row_align or []
+                )
+                self.tbl_row = None
+                self.tbl_row_align = None
+
+        def _tbl_table_end(self) -> None:
+            """表格结束：产出 {"kind":"table","header","rows","algn"} 块（可选 raw/has_span）。"""
+            if not self.tbl_depth:
+                return
+            self._tbl_row_end()
+            if self.tbl_head or self.tbl_body:
+                block: dict = {
+                    "kind": "table",
+                    "header": bool(self.tbl_head),
+                    "rows": self.tbl_head + self.tbl_body,
+                    "algn": self.tbl_align_head + self.tbl_align_body,
+                    # raw 恒附带：单元格对齐同列不一致时 MD 导出也要整块透传
+                    "raw": "".join(self.tbl_raw),
+                }
+                if self.tbl_has_span:
+                    block["has_span"] = True
+                self.blocks.append(block)
+            self.tbl_depth = 0
+            self.tbl_skip = 0
+            self.tbl_has_thead = False
+            self.tbl_in_thead = False
+            self.tbl_head = []
+            self.tbl_body = []
+            self.tbl_align_head = []
+            self.tbl_align_body = []
+            self.tbl_row = None
+            self.tbl_row_align = None
+            self.tbl_raw = []
+            self.tbl_has_span = False
 
         def _flags(self) -> dict:
             """返回当前栈状态对应的行内格式标志字典。"""
@@ -4729,6 +5002,79 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             if tag in _SKIP_TAGS:
                 self.skip += 1
                 return
+            if tag == "table":
+                if self.tbl_depth:
+                    self.tbl_skip += 1
+                    self.tbl_raw.append(self.get_starttag_text() or "<table>")
+                    return
+                self._flush()
+                self.tbl_depth = 1
+                self.tbl_has_thead = False
+                self.tbl_in_thead = False
+                self.tbl_head = []
+                self.tbl_body = []
+                self.tbl_align_head = []
+                self.tbl_align_body = []
+                self.tbl_row = None
+                self.tbl_row_align = None
+                self.tbl_cell_open = False
+                self.tbl_cell = []
+                self.tbl_cell_align = ""
+                self.tbl_cell_stack = []
+                self.tbl_raw = [self.get_starttag_text() or "<table>"]
+                self.tbl_has_span = False
+                return
+            if self.tbl_skip:
+                if tag == "table":
+                    self.tbl_skip += 1
+                self.tbl_raw.append(self.get_starttag_text() or f"<{tag}>")
+                return
+            if self.tbl_depth:
+                self.tbl_raw.append(self.get_starttag_text() or f"<{tag}>")
+                if tag in ("thead", "tfoot"):
+                    self.tbl_has_thead = self.tbl_has_thead or tag == "thead"
+                    self.tbl_in_thead = tag == "thead"
+                    self._tbl_cell_end()
+                    return
+                if tag == "tbody":
+                    self.tbl_in_thead = False
+                    self._tbl_cell_end()
+                    return
+                if tag == "tr":
+                    self._tbl_row_end()
+                    self.tbl_row = []
+                    self.tbl_row_align = []
+                    return
+                if tag in ("th", "td"):
+                    self._tbl_cell_end()
+                    d = dict(attrs)
+                    for k in ("colspan", "rowspan"):
+                        v = (d.get(k) or "").strip()
+                        if re.fullmatch(r"\d{1,2}", v):
+                            self.tbl_has_span = True
+                    self.tbl_cell_open = True
+                    self.tbl_cell = []
+                    self.tbl_cell_align = _cell_align(attrs)
+                    self.tbl_cell_stack = []
+                    return
+                if tag == "br":
+                    self.tbl_cell.append("<br>")
+                    return
+                if tag == "img":
+                    return  # 单元格内图片不导出（与 block 分支 img 语义一致即可，防御）
+                if tag in _RICH_INLINE_TAGS:
+                    attrs_d = dict(attrs)
+                    cls = (attrs_d.get("class") or "").split()
+                    if "ptoe-marker" in cls:
+                        self.tbl_cell_stack.append("__marker__")
+                        return
+                    self.tbl_cell.append(self.get_starttag_text() or f"<{tag}>")
+                    self.tbl_cell_stack.append(tag)
+                    return
+                # 其它标签（含 p/div/h 等防御性）：raw 透传进 cell
+                self.tbl_cell.append(self.get_starttag_text() or f"<{tag}>")
+                self.tbl_cell_stack.append(tag)
+                return
             if tag in ("p", "div") or (
                 len(tag) == 2 and tag[0] == "h" and tag[1] in "123456"
             ):
@@ -4787,6 +5133,15 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             self.inner.append(self.get_starttag_text() or f"<{tag}>")
 
         def handle_startendtag(self, tag, attrs) -> None:
+            if self.tbl_skip or self.tbl_depth:
+                # 表格内的自闭合标签
+                stxt = self.get_starttag_text() or f"<{tag}/>"
+                self.tbl_raw.append(stxt)
+                if tag == "br" and self.tbl_cell_open:
+                    self.tbl_cell.append("<br>")
+                elif tag not in ("td", "th") and self.tbl_cell_open:
+                    self.tbl_cell.append(stxt)
+                return
             if tag in _SKIP_TAGS:
                 return
             if tag == "br":
@@ -4798,6 +5153,32 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
         def handle_endtag(self, tag) -> None:
             if tag in _SKIP_TAGS:
                 self.skip = max(0, self.skip - 1)
+                return
+            if self.tbl_skip:
+                if tag == "table":
+                    self.tbl_skip -= 1
+                self.tbl_raw.append(f"</{tag}>")
+                return
+            if self.tbl_depth:
+                self.tbl_raw.append(f"</{tag}>")
+                if tag == "table":
+                    self._tbl_table_end()
+                    return
+                if tag in ("thead", "tfoot", "tbody"):
+                    self.tbl_in_thead = False
+                    self._tbl_cell_end()
+                    return
+                if tag == "tr":
+                    self._tbl_row_end()
+                    return
+                if tag in ("th", "td"):
+                    self._tbl_cell_end()
+                    return
+                # 单元格内行内/其它标签闭合（容忍不匹配/未闭合）
+                if self.tbl_cell_stack:
+                    t = self.tbl_cell_stack.pop()
+                    if t != "__marker__":
+                        self.tbl_cell.append(f"</{tag}>")
                 return
             if tag in ("p", "div") or (
                 len(tag) == 2 and tag[0] == "h" and tag[1] in "123456"
@@ -4817,6 +5198,22 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
         def handle_data(self, data) -> None:
             if self.skip:
                 return
+            if self.tbl_skip:
+                self.tbl_raw.append(data)
+                return
+            if self.tbl_depth:
+                self.tbl_raw.append(data)
+                if self.tbl_cell_open and (
+                    not self.tbl_cell_stack or self.tbl_cell_stack[-1] != "__marker__"
+                ):
+                    # inner 重转义（convert_charrefs 已解码实体；保持 HTML 形态供透传）
+                    self.tbl_cell.append(
+                        str(data)
+                        .replace("&", "&")
+                        .replace("<", "<")
+                        .replace(">", ">")
+                    )
+                return
             if any(mk for _, mk, _ in self.stack):
                 return  # 标记 span 内容整体剥除
             self._push_text(data)
@@ -4831,6 +5228,7 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
     parser = _Parser()
     parser.feed(str(html or ""))
     parser.close()
+    parser._tbl_table_end()
     parser._flush()
     return parser.blocks
 
@@ -4860,6 +5258,12 @@ def _apply_join_marks(blocks: list[dict]) -> list[dict]:
         cur = dict(blocks[i])
         cur_join_next = cur.pop("join_next", False)
         cur_join_prev = cur.pop("join_prev", False)
+
+        if cur.get("kind") == "table":
+            # 表格块打断合并链（表格与文本不合并，前后段落标记不跨表格生效）
+            out.append(cur)
+            i += 1
+            continue
 
         # 尝试与上一输出块合并：上一块带 join_next 或当前块带 join_prev
         if out:
@@ -4993,6 +5397,77 @@ def _docx_escape(text: str) -> str:
     )
 
 
+def _cell_plain_text(inner: str) -> str:
+    """表格单元格 inner HTML → 纯文本（<br> → 换行，其余标签剥除）。
+
+    供 TXT/DOCX 表格导出使用；实体已在 HTMLParser convert_charrefs 阶段解码，
+    此处只需还原解析器「no-op 重转义」产生的 &lt;/&gt;/&amp;。
+    """
+    s = str(inner or "")
+    s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
+    s = re.sub(r"<[^>]*>", "", s)
+    s = s.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    return s
+
+
+def _md_cell_text(inner: str) -> str:
+    """表格单元格 inner HTML → Markdown 单元格文本（加粗/斜体转 * 记号，其余剥标签）。"""
+    s = str(inner or "")
+    s = re.sub(r"<br\s*/?>", " ", s, flags=re.I)
+    s = re.sub(r"</?(?:strong|b)\s*>", "**", s, flags=re.I)
+    s = re.sub(r"</?(?:em|i)\s*>", "*", s, flags=re.I)
+    s = re.sub(r"<[^>]*>", "", s)
+    s = s.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    return s
+
+
+def _build_docx_table(
+    rows: list[list[str]],
+    header: bool,
+    algn: list[list[str]] | None = None,
+) -> str:
+    """富文本表格块 → OOXML <w:tbl>（单线边框 4 边 + 内横/竖线；表头行加粗）。
+
+    algn：与 rows 同维的二维数组（单元格对齐 ""|"left"|"center"|"right"）；
+    对齐为 center/right 时单元格段落输出 <w:jc>（left/空 不输出，与块段落一致）。
+    """
+    if not rows:
+        return "<w:p/>"
+    row_count = len(rows)
+    col_count = max((len(r) for r in rows), default=0)
+    xml: list[str] = [
+        "<w:tbl><w:tblPr>",
+        '<w:tblW w:w="0" w:type="auto"/>',
+        "<w:tblBorders>",
+        '<w:top w:val="single" w:sz="4" w:space="0" w:color="999999"/>',
+        '<w:left w:val="single" w:sz="4" w:space="0" w:color="999999"/>',
+        '<w:bottom w:val="single" w:sz="4" w:space="0" w:color="999999"/>',
+        '<w:right w:val="single" w:sz="4" w:space="0" w:color="999999"/>',
+        '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="999999"/>',
+        '<w:insideV w:val="single" w:sz="4" w:space="0" w:color="999999"/>',
+        "</w:tblBorders></w:tblPr>",
+    ]
+    for ri, row in enumerate(rows):
+        xml.append("<w:tr>")
+        bold = bool(header) and ri == 0
+        row_align = (algn[ri] if algn and ri < len(algn) else None) or []
+        for ci, cell in enumerate(row):
+            text = _cell_plain_text(cell)
+            t = _docx_escape(text).replace(
+                "\n", '</w:t><w:br/><w:t xml:space="preserve">'
+            )
+            rpr = "<w:rPr><w:b/></w:rPr>" if bold else "<w:rPr/>"
+            a = row_align[ci] if ci < len(row_align) else ""
+            jc = f'<w:pPr><w:jc w:val="{a}"/></w:pPr>' if a in ("center", "right") else ""
+            xml.append(
+                "<w:tc><w:tcPr><w:tcW w:w=\"0\" w:type=\"auto\"/></w:tcPr>"
+                f"<w:p>{jc}<w:r>{rpr}<w:t xml:space=\"preserve\">{t}</w:t></w:r></w:p></w:tc>"
+            )
+        xml.append("</w:tr>")
+    xml.append("</w:tbl>")
+    return "".join(xml)
+
+
 def _build_docx(blocks: list[Any], path: str) -> None:
     """块列表 → 最小合法 .docx（zipfile 打包，无第三方依赖）。
 
@@ -5061,6 +5536,18 @@ def _build_docx(blocks: list[Any], path: str) -> None:
                 f'<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
                 f'<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic>'
                 f"</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"
+            )
+            continue
+
+        if block["kind"] == "table":
+            # 表格 → OOXML <w:tbl>（单线边框；表头行加粗；跨列/跨行防御性拍平；
+            # 单元格对齐 algn → w:jc）
+            parts.append(
+                _build_docx_table(
+                    block.get("rows") or [],
+                    bool(block.get("header")),
+                    block.get("algn"),
+                )
             )
             continue
 
@@ -5214,6 +5701,67 @@ def _build_md(blocks: list[Any], path: str) -> None:
         if b["kind"] == "img":
             parts.append(f"![{b.get('alt') or ''}]({b.get('src') or ''})")
             continue
+        if b["kind"] == "table":
+            # 表格 → GFM 管线表（表头行 + | --- | --- | 分隔线）；无表头时补
+            # 空表头行 + 分隔线，保证首行显示为数据行。
+            # 对齐（2026-09-20）：每列取表头+首数据行的对齐（任一非空）为列对齐；
+            # 同列全部单元格（含表头）非空对齐须一致，否则整表回退 raw HTML 透传
+            # （与 colspan/rowspan 同一兜底路径）。
+            if b.get("has_span"):
+                # 防御：含 colspan/rowspan 的表格无法用管线表表达 → 整块 raw HTML 透传
+                parts.append(b.get("raw") or "")
+                continue
+            rows: list[list[str]] = b.get("rows") or []
+            algn: list[list[str]] = b.get("algn") or []
+            if not rows:
+                continue
+
+            def _md_row(cells: list[str]) -> str:
+                return "| " + " | ".join(_md_cell_text(c) for c in cells) + " |"
+
+            # 列对齐决定：优先表头行、其次首数据行进位填充（任一非空）。
+            # 同列内非空对齐值若不一致（如表头居中、数据行左对齐）→ 冲突 → raw 透传。
+            ncols = max((len(r) for r in rows), default=1)
+            col_aligns: list[str] = []
+            raw_fallback = False
+            for c in range(ncols):
+                vals: set[str] = set()
+                for ri, row in enumerate(rows):
+                    if c < len(row) and algn and ri < len(algn) and c < len(algn[ri]):
+                        v = algn[ri][c]
+                        if v:
+                            vals.add(v)
+                if len(vals) > 1:
+                    raw_fallback = True
+                    break
+                col_aligns.append(next(iter(vals), ""))
+            if raw_fallback:
+                # 同一列单元格对齐各异：管线表无法表达 → 整块 raw HTML 透传
+                parts.append(b.get("raw") or "")
+                continue
+
+            def _md_sep(cols: int) -> str:
+                # GFM 分隔符：左 :--- / 中 :---: / 右 ---:；无对齐 ---
+                marks = {"left": ":---", "center": ":---:", "right": "---:"}
+                return (
+                    "| "
+                    + " | ".join(marks.get(col_aligns[c], "---") for c in range(cols))
+                    + " |"
+                )
+
+            tbl_lines: list[str] = []
+            if b.get("header"):
+                tbl_lines.append(_md_row(rows[0]))
+                tbl_lines.append(_md_sep(len(rows[0])))
+                tbl_lines.extend(_md_row(r) for r in rows[1:])
+            else:
+                # 无表头：补空表头行；列对齐按首行数据行推
+                n = max((len(r) for r in rows), default=1)
+                tbl_lines.append("| " + " | ".join("" for _ in range(n)) + " |")
+                tbl_lines.append(_md_sep(n))
+                tbl_lines.extend(_md_row(r) for r in rows)
+            parts.append("\n".join(tbl_lines))
+            continue
         attrs = b.get("attrs") or ""
         inner = b.get("inner") or ""
         # 带属性块、或含新增行内格式类：原样透传（与前端 htmlToMd 规则一致）
@@ -5354,6 +5902,14 @@ def export_content_to_file(
             # 以全角空格前缀近似（纯文本唯一能承载的版式信息）
             if b["kind"] == "img":
                 return "[图片]"
+            if b["kind"] == "table":
+                # 表格 → Tab 分隔行（每行一个表格行）；跨列/跨行防御性拍平
+                rows: list[list[str]] = b.get("rows") or []
+                if not rows:
+                    return ""
+                return "\n".join(
+                    "\t".join(_cell_plain_text(c) for c in row) for row in rows
+                )
             line = "".join(r["text"] for r in b["runs"])
             ind = b.get("indent") or {}
             if ind.get("ind") == "first":
@@ -8934,6 +9490,24 @@ body.paint-mode{cursor:copy;}
 .editable img.ptoe-img-vtop{vertical-align:top;}
 .editable img.ptoe-img-vmid{vertical-align:middle;}
 .editable img.ptoe-img-vbot{vertical-align:bottom;}
+/* 插入表格（2026-09）：编辑区内表格渲染；边框/表头底色走 CSS 变量，暗色主题自适应。
+   2026-09 反馈修复：默认撑满行宽（width:100%）、单元格最小宽度 + 顶对齐 */
+.editable table{border-collapse:collapse;margin:.5em 0;width:100%;max-width:100%;}
+.editable th,.editable td{border:1px solid var(--border);padding:.3em .6em;text-align:left;vertical-align:top;min-width:3em;}
+.editable th{font-weight:bold;text-align:center;background:#f2f5fa;}
+.dark .editable th{background:var(--bg-hover);}
+/* 表格操作条（2026-09）：光标进入表格单元格时由 JS 定位并显示；
+   加行/删行/加列/删列/对齐/删除表格；对齐按钮按当前单元格 class 高亮 */
+#tblBar{position:fixed;z-index:64;display:none;flex-wrap:wrap;gap:2px;align-items:center;padding:4px 6px;background:rgba(255,255,255,.94);border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.18);}
+.tbl-bar-sep{width:1px;height:16px;background:#d5dbe3;margin:0 3px;}
+#tblBar button{background:transparent;border:1px solid transparent;border-radius:5px;padding:2px 7px;font-size:12px;color:#1c2733;cursor:pointer;white-space:nowrap;}
+#tblBar button:hover{background:#eef3fb;border-color:var(--accent);color:var(--accent);}
+#tblBar button.active{background:#e0eaff;border-color:var(--accent);color:var(--accent);font-weight:600;}
+#tblBar button.danger{color:#c0392b;}
+#tblBar button.danger:hover{background:#fdecea;border-color:#e74c3c;}
+.dark #tblBar{background:rgba(30,35,45,.94);border-color:#3a4150;}
+.dark #tblBar button{color:#ddd;}
+.dark .tbl-bar-sep{background:#3a4150;}
 /* 搜索 / 替换弹窗（工具栏「搜」按钮打开；结果列表点击跳转、↑↓上一个/下一个） */
 #searchModalBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
 .search-modal{max-width:640px;width:94%;display:flex;flex-direction:column;}
@@ -8946,6 +9520,11 @@ body.paint-mode{cursor:copy;}
 .indent-grid select{padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;background:#fff;}
 .indent-preview{border:1px dashed var(--border);border-radius:6px;padding:10px 12px;margin:8px 0 12px;min-height:56px;overflow:auto;background:#fafbfc;}
 .indent-preview p{margin:0;}
+/* 插入表格弹窗：行列数输入与「首行表头」勾选（外层复用 .search-modal/.export-actions） */
+#tableModalBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+.table-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 14px;margin:10px 0;font-size:13px;}
+.table-grid label{display:flex;align-items:center;gap:6px;white-space:nowrap;}
+.table-grid input[type="number"]{width:72px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;}
 .export-desc{font-size:13px;color:#5a6b7c;margin:0 0 14px;line-height:1.6;}
 .export-actions{display:flex;gap:10px;justify-content:flex-end;}
 .search-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;}
@@ -9121,6 +9700,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
           <button type="button" class="tb-btn" id="imgExternalBtn" role="menuitem" onmousedown="event.preventDefault()" title="从本地文件选择图片，插入到文字光标处" aria-label="插入外部图片">插入图片</button>
           <input type="file" id="imgExternalInput" accept="image/*" style="display:none"/>
           <button type="button" class="tb-btn" id="indentDlgBtn" role="menuitem" onmousedown="event.preventDefault()" title="段落设置：左/右缩进、首行/悬挂缩进、段前段后与行距（导出 EPUB 生效）" aria-label="段落设置">段落设置</button>
+          <button type="button" class="tb-btn" id="tableBtn" role="menuitem" onmousedown="event.preventDefault()" title="插入表格：在光标处插入空表格，行/列数与是否带表头可设（Ctrl+Alt+T）" aria-label="插入表格">插入表格</button>
         </div>
       </div>
     </div>
@@ -9396,6 +9976,22 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
     <button type="button" id="indOkBtn" class="primary" title="把设置应用到所选段落">确定</button>
   </div>
 </div></div>
+<div id="tableModalBg"><div class="modal search-modal">
+  <div class="search-head">
+    <h3>插入表格</h3>
+    <button type="button" class="x-btn" id="tableCloseBtn" title="关闭 (Esc)" aria-label="关闭">✕</button>
+  </div>
+  <p class="export-desc">在光标处插入空表格。行数与列数可设为 1-20；勾选「首行表头」则首行改为粗体表头行。</p>
+  <div class="table-grid">
+    <label>行数 <input type="number" id="tableRows" value="4" min="1" max="20" step="1"></label>
+    <label>列数 <input type="number" id="tableCols" value="5" min="1" max="20" step="1"></label>
+    <label><input type="checkbox" id="tableHeader" checked> 首行表头</label>
+  </div>
+  <div class="export-actions">
+    <button type="button" id="tableCancelBtn" title="取消插入">取消</button>
+    <button type="button" id="tableOkBtn" class="primary" title="在光标处插入表格">插入</button>
+  </div>
+</div></div>
 <div id="modalBg"><div class="modal">
   <h3>设置</h3>
   <div class="settings-tabs">
@@ -9604,6 +10200,20 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   <div style="display:flex;gap:4px;margin-top:2px;">
     <button type="button" class="img-pop-btn" data-img-op="delete" style="flex:1;color:#c0392b;">删除</button>
   </div>
+</div>
+<!-- 表格操作条：光标进入表格单元格时弹出（加行/删行/加列/删列/对齐/删除表格） -->
+<div id="tblBar" style="display:none;" aria-label="表格操作">
+  <button type="button" data-tbl-op="addrow" title="下方插入一行">加行</button>
+  <button type="button" data-tbl-op="delrow" title="删除当前行">删行</button>
+  <span class="tbl-bar-sep"></span>
+  <button type="button" data-tbl-op="addcol" title="右侧插入一列">加列</button>
+  <button type="button" data-tbl-op="delcol" title="删除当前列">删列</button>
+  <span class="tbl-bar-sep"></span>
+  <button type="button" data-tbl-op="alignleft" data-tbl-align="left" title="单元格左对齐">左</button>
+  <button type="button" data-tbl-op="aligncenter" data-tbl-align="center" title="单元格居中">中</button>
+  <button type="button" data-tbl-op="alignright" data-tbl-align="right" title="单元格右对齐">右</button>
+  <span class="tbl-bar-sep"></span>
+  <button type="button" data-tbl-op="deltable" class="danger" title="删除整个表格">删除表格</button>
 </div>
 <div id="toast" aria-hidden="true"></div>
 <script src="/ui/app.js"></script>

@@ -10744,5 +10744,490 @@ class TestExportContentToFile(unittest.TestCase):
             export_content_to_file(self._items(), "pdf", "x.pdf", title="书")
 
 
+class TestTable(unittest.TestCase):
+    """矫正界面插入表格（2026-09-20）：sanitize 保留 → 富文本块 → TXT/DOCX/MD 导出。"""
+
+    # ---- sanitize 保留 ----
+
+    def test_sanitize_full_table_canonical(self):
+        src = (
+            "<table>\n<thead><tr><th>表头1</th><th>表头2</th></tr></thead>\n"
+            "<tbody>\n<tr><td>a<strong>粗</strong></td><td>b</td></tr>\n"
+            "<tr><td></td><td><em>斜</em></td></tr>\n</tbody>\n</table>"
+        )
+        self.assertEqual(
+            sanitize_html(src),
+            "<table><thead><tr><th>表头1</th><th>表头2</th></tr></thead>"
+            "<tbody><tr><td>a<strong>粗</strong></td><td>b</td></tr>"
+            "<tr><td></td><td><em>斜</em></td></tr></tbody></table>",
+        )
+
+    def test_sanitize_table_no_thead_wraps_tbody(self):
+        out = sanitize_html("<table><tr><td>a</td><td>b</td></tr></table>")
+        self.assertEqual(
+            out, "<table><tbody><tr><td>a</td><td>b</td></tr></tbody></table>"
+        )
+
+    def test_sanitize_table_mixed_with_blocks(self):
+        out = sanitize_html(
+            "<p>前</p><table><tr><td>a</td></tr></table><p>后</p>"
+        )
+        self.assertEqual(
+            out,
+            "<p>前</p><table><tbody><tr><td>a</td></tr></tbody></table><p>后</p>",
+        )
+
+    def test_sanitize_table_colspan_rowspan_preserved(self):
+        out = sanitize_html(
+            '<table><tr><td colspan="2">跨列</td></tr>'
+            '<tr><td rowspan="3">纵</td><td></td></tr></table>'
+        )
+        self.assertEqual(
+            out,
+            '<table><tbody><tr><td colspan="2">跨列</td></tr>'
+            '<tr><td rowspan="3">纵</td><td></td></tr></tbody></table>',
+        )
+        # 非法跨列值（非纯数字）不保留
+        out2 = sanitize_html(
+            '<table><tr><td colspan="abc">x</td></tr></table>'
+        )
+        self.assertNotIn("colspan", out2)
+
+    def test_sanitize_table_block_tags_in_cell_dropped(self):
+        out = sanitize_html("<table><tr><td><p>段1</p><div>段2</div></td></tr></table>")
+        self.assertEqual(
+            out, "<table><tbody><tr><td>段1段2</td></tr></tbody></table>"
+        )
+
+    def test_sanitize_table_nested_dropped(self):
+        out = sanitize_html(
+            "<table><tr><td>外<table><tr><td>内</td></tr></table>尾</td></tr></table>"
+        )
+        self.assertEqual(
+            out, "<table><tbody><tr><td>外尾</td></tr></tbody></table>"
+        )
+
+    def test_sanitize_table_selfclosing_cell(self):
+        out = sanitize_html("<table><tr><td/>x<td>y</td></tr></table>")
+        self.assertIn("<td></td>", out)
+        self.assertIn("<td>y</td>", out)
+
+    def test_sanitize_table_unclosed_at_eof(self):
+        out = sanitize_html("<table><tr><td>x</td></tr>")
+        self.assertEqual(out, "<table><tbody><tr><td>x</td></tr></tbody></table>")
+
+    def test_sanitize_non_table_unchanged(self):
+        # 回归：既有白名单行为不受表格分支影响
+        self.assertEqual(sanitize_html("<p>你好</p>"), "<p>你好</p>")
+
+    # ---- 富文本块 ----
+
+    def test_rich_blocks_table_shape(self):
+        blocks = _html_to_rich_blocks(
+            "<table><thead><tr><th>h1</th><th>h2</th></tr></thead>"
+            "<tbody><tr><td>a</td><td>b</td></tr></tbody></table>"
+        )
+        self.assertEqual(len(blocks), 1)
+        t = blocks[0]
+        self.assertEqual(t["kind"], "table")
+        self.assertTrue(t["header"])
+        self.assertEqual(t["rows"], [["h1", "h2"], ["a", "b"]])
+
+    def test_rich_blocks_table_no_header(self):
+        t = _html_to_rich_blocks("<table><tr><td>a</td></tr></table>")[0]
+        self.assertEqual(t["kind"], "table")
+        self.assertFalse(t["header"])
+        self.assertEqual(t["rows"], [["a"]])
+
+    def test_rich_blocks_table_has_span_raw(self):
+        t = _html_to_rich_blocks(
+            '<table><tr><td colspan="2">跨</td></tr></table>'
+        )[0]
+        self.assertTrue(t.get("has_span"))
+        self.assertIn("<table>", t.get("raw", ""))
+        self.assertIn('colspan="2"', t.get("raw", ""))
+
+    def test_rich_blocks_table_cell_inline_kept(self):
+        t = _html_to_rich_blocks(
+            "<table><tr><td>a<strong>b</strong><br/>c</td>"
+            '<td><span class="ptoe-underline">下</span></td></tr></table>'
+        )[0]
+        self.assertIn("<strong>b</strong>", t["rows"][0][0])
+        self.assertIn("<br>", t["rows"][0][0])
+        self.assertIn('class="ptoe-underline"', t["rows"][0][1])
+
+    def test_apply_join_marks_keeps_table(self):
+        blocks = _html_to_rich_blocks(
+            '<p>a<span class="ptoe-marker" data-ptoe-marker="join">§</span></p>'
+            "<table><tr><td>x</td></tr></table><p>b</p>"
+        )
+        out = _apply_join_marks(blocks)
+        self.assertEqual([b["kind"] for b in out], ["p", "table", "p"])
+        self.assertEqual(out[0]["text"], "a")
+        self.assertEqual(out[2]["text"], "b")
+
+    # ---- 导出 ----
+
+    def test_export_txt_table(self):
+        import tempfile as _tf
+
+        from correctmanage import export_content_to_file
+
+        out = Path(_tf.mkdtemp(prefix="t_tbl_")) / "a.txt"
+        items = [
+            {
+                "page": 1,
+                "html": (
+                    "<p>表前</p>"
+                    "<table><thead><tr><th>甲</th><th>乙</th></tr></thead>"
+                    "<tbody><tr><td>1</td><td><strong>粗</strong></td></tr>"
+                    "<tr><td></td><td>3<br/>4</td></tr></tbody></table>"
+                    "<p>表后</p>"
+                ),
+            }
+        ]
+        export_content_to_file(items, "txt", str(out), title="书")
+        text = out.read_bytes().decode("utf-8-sig").replace("\r\n", "\n")
+        self.assertIn("表前", text)
+        self.assertIn("表后", text)
+        self.assertIn("甲\t乙", text)
+        self.assertIn("1\t粗", text)
+        # 空单元格保留（行以制表符开头）；<br> → 换行
+        self.assertIn("\t3\n4", text)
+
+    def test_export_md_table(self):
+        import tempfile as _tf
+
+        from correctmanage import export_content_to_file
+
+        out = Path(_tf.mkdtemp(prefix="t_tbl_")) / "a.md"
+        items = [
+            {
+                "page": 1,
+                "html": (
+                    "<table><thead><tr><th>甲</th><th>乙</th></tr></thead>"
+                    "<tbody><tr><td>1</td><td><strong>粗</strong></td></tr>"
+                    "<tr><td></td><td>3<br/>4</td></tr></tbody></table>"
+                ),
+            }
+        ]
+        export_content_to_file(items, "md", str(out), title="书")
+        text = out.read_text(encoding="utf-8")
+        self.assertIn("| 甲 | 乙 |", text)
+        self.assertIn("| --- | --- |", text)
+        self.assertIn("| 1 | **粗** |", text)
+        self.assertIn("|  | 3 4 |", text)
+
+    def test_export_md_table_no_header_dummy_row(self):
+        import tempfile as _tf
+
+        from correctmanage import export_content_to_file
+
+        out = Path(_tf.mkdtemp(prefix="t_tbl_")) / "a.md"
+        items = [
+            {"page": 1, "html": "<table><tr><td>r1c1</td><td>r1c2</td></tr></table>"}
+        ]
+        export_content_to_file(items, "md", str(out), title="书")
+        text = out.read_text(encoding="utf-8")
+        parts = [ln for ln in text.splitlines() if ln.strip()]
+        self.assertEqual(parts[0], "|  |  |")
+        self.assertEqual(parts[1], "| --- | --- |")
+        self.assertEqual(parts[2], "| r1c1 | r1c2 |")
+
+    def test_export_md_table_span_raw_passthrough(self):
+        import tempfile as _tf
+
+        from correctmanage import export_content_to_file
+
+        out = Path(_tf.mkdtemp(prefix="t_tbl_")) / "a.md"
+        items = [
+            {"page": 1, "html": '<table><tr><td colspan="2">跨</td></tr></table>'}
+        ]
+        export_content_to_file(items, "md", str(out), title="书")
+        text = out.read_text(encoding="utf-8")
+        self.assertIn("<table>", text)
+        self.assertIn('colspan="2"', text)
+
+    def test_export_docx_table(self):
+        import tempfile as _tf
+        import zipfile
+
+        from correctmanage import export_content_to_file
+
+        out = Path(_tf.mkdtemp(prefix="t_tbl_")) / "a.docx"
+        items = [
+            {
+                "page": 1,
+                "html": (
+                    "<table><thead><tr><th>甲</th><th>乙</th></tr></thead>"
+                    "<tbody><tr><td>1</td><td><strong>粗</strong></td></tr>"
+                    "<tr><td></td><td>3<br/>4</td></tr></tbody></table>"
+                ),
+            }
+        ]
+        export_content_to_file(items, "docx", str(out), title="书")
+        with zipfile.ZipFile(out) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8")
+        self.assertIn("<w:tbl>", xml)
+        self.assertIn("<w:tblBorders>", xml)
+        self.assertIn("<w:tblW w:w=\"0\" w:type=\"auto\"/>", xml)
+        # 3 行（表头 + 2 数据行）
+        self.assertEqual(xml.count("<w:tr>"), 3)
+        # 表头行加粗（2 个表头单元格各含一个 b），数据行不加粗
+        self.assertEqual(xml.count("<w:rPr><w:b/></w:rPr>"), 2)
+        self.assertIn("甲", xml)
+        self.assertIn("3", xml)
+        self.assertIn("4", xml)
+
+    def test_export_epub_table_preserved(self):
+        import tempfile as _tf
+        import zipfile
+
+        from correctmanage import export_content_to_file
+
+        out = Path(_tf.mkdtemp(prefix="t_tbl_")) / "a.epub"
+        items = [
+            {
+                "page": 1,
+                "html": (
+                    "<p>前</p>"
+                    "<table><thead><tr><th>甲</th><th>乙</th></tr></thead>"
+                    "<tbody><tr><td>1</td><td>2</td></tr></tbody></table>"
+                ),
+            }
+        ]
+        export_content_to_file(items, "epub", str(out), title="书")
+        with zipfile.ZipFile(out) as zf:
+            names = zf.namelist()
+            content = [
+                n
+                for n in names
+                if n.startswith("OEBPS/Text/") and n.endswith(".xhtml")
+            ]
+            self.assertTrue(content, "epub 缺少正文内容文件")
+            body = zf.read(content[0]).decode("utf-8")
+        self.assertIn("<table>", body)
+        self.assertIn("<th>甲</th>", body)
+        self.assertIn("<td>2</td>", body)
+
+    # ---- 单元格对齐 class（2026-09-20）----
+
+    def test_sanitize_table_cell_align_class_preserved(self):
+        src = (
+            "<table><thead><tr>"
+            '<th class="ptoe-align-center">标题</th>'
+            '<th class="ptoe-align-left">左</th>'
+            "</tr></thead><tbody><tr>"
+            '<td class="ptoe-align-right">值</td>'
+            '<td class="ptoe-align-center">中</td>'
+            "</tr></tbody></table>"
+        )
+        out = sanitize_html(src)
+        self.assertIn('<th class="ptoe-align-center">标题</th>', out)
+        self.assertIn('<th class="ptoe-align-left">左</th>', out)
+        self.assertIn('<td class="ptoe-align-right">值</td>', out)
+        self.assertIn('<td class="ptoe-align-center">中</td>', out)
+
+    def test_sanitize_table_cell_invalid_align_class_dropped(self):
+        out = sanitize_html(
+            '<table><tr><td class="ptoe-align-justify evil ptoe-align-center">x</td>'
+            '<td class="ptoe-align-foo">y</td></tr></table>'
+        )
+        # justify/foo 不在契约内 → 剥除；center 保留；evil 剥除
+        self.assertIn('<td class="ptoe-align-center">x</td>', out)
+        self.assertIn("<td>y</td>", out)
+        self.assertNotIn("justify", out)
+        self.assertNotIn("evil", out)
+
+    def test_sanitize_table_cell_align_with_colspan(self):
+        out = sanitize_html(
+            '<table><tr><td class="ptoe-align-center" colspan="2">跨</td></tr></table>'
+        )
+        self.assertIn('<td class="ptoe-align-center" colspan="2">跨</td>', out)
+
+    def test_rich_blocks_table_algn_shape(self):
+        t = _html_to_rich_blocks(
+            "<table><thead><tr>"
+            '<th class="ptoe-align-center">h1</th><th>h2</th>'
+            "</tr></thead><tbody><tr>"
+            '<td class="ptoe-align-center">a</td><td class="ptoe-align-right">b</td>'
+            "</tr></tbody></table>"
+        )[0]
+        self.assertEqual(t["algn"], [["center", ""], ["center", "right"]])
+        # rows 与 algn 同维
+        self.assertEqual(len(t["rows"]), len(t["algn"]))
+
+    def test_rich_blocks_table_algn_no_header(self):
+        t = _html_to_rich_blocks(
+            '<table><tr><td class="ptoe-align-left">a</td><td>b</td></tr></table>'
+        )[0]
+        self.assertEqual(t["algn"], [["left", ""]])
+        self.assertFalse(t["header"])
+
+    def test_export_md_table_align_three_states(self):
+        import tempfile as _tf
+
+        from correctmanage import export_content_to_file
+
+        out = Path(_tf.mkdtemp(prefix="t_tbl_")) / "a.md"
+        items = [
+            {
+                "page": 1,
+                "html": (
+                    "<table><thead><tr>"
+                    '<th class="ptoe-align-left">左</th>'
+                    '<th class="ptoe-align-center">中</th>'
+                    '<th class="ptoe-align-right">右</th>'
+                    "<th>无</th>"
+                    "</tr></thead><tbody><tr>"
+                    '<td class="ptoe-align-left">a</td>'
+                    '<td class="ptoe-align-center">b</td>'
+                    '<td class="ptoe-align-right">c</td>'
+                    "<td>d</td>"
+                    "</tr></tbody></table>"
+                ),
+            }
+        ]
+        export_content_to_file(items, "md", str(out), title="书")
+        text = out.read_text(encoding="utf-8")
+        self.assertIn("| 左 | 中 | 右 | 无 |", text)
+        self.assertIn("| :--- | :---: | ---: | --- |", text)
+        self.assertIn("| a | b | c | d |", text)
+
+    def test_export_md_table_align_conflict_raw_fallback(self):
+        import tempfile as _tf
+
+        from correctmanage import export_content_to_file
+
+        # 首列：表头 center、数据行 left → 同列对齐不一致 → 整表 raw HTML 透传
+        out = Path(_tf.mkdtemp(prefix="t_tbl_")) / "a.md"
+        items = [
+            {
+                "page": 1,
+                "html": (
+                    "<table><thead><tr>"
+                    '<th class="ptoe-align-center">表头</th>'
+                    "</tr></thead><tbody><tr>"
+                    '<td class="ptoe-align-left">数据</td>'
+                    "</tr></tbody></table>"
+                ),
+            }
+        ]
+        export_content_to_file(items, "md", str(out), title="书")
+        text = out.read_text(encoding="utf-8")
+        # raw 透传：原样 HTML 而非管线表
+        self.assertIn("<table>", text)
+        self.assertIn('class="ptoe-align-center"', text)
+        self.assertNotIn("| ---", text)
+
+    def test_export_md_table_align_no_header_from_first_data_row(self):
+        import tempfile as _tf
+
+        from correctmanage import export_content_to_file
+
+        # 无表头：假表头行的分隔线按首行数据行对齐推（右对齐 → ---:）
+        out = Path(_tf.mkdtemp(prefix="t_tbl_")) / "a.md"
+        items = [
+            {
+                "page": 1,
+                "html": (
+                    "<table><tr>"
+                    '<td class="ptoe-align-right">a</td><td>b</td>'
+                    "</tr></table>"
+                ),
+            }
+        ]
+        export_content_to_file(items, "md", str(out), title="书")
+        text = out.read_text(encoding="utf-8")
+        parts = [ln for ln in text.splitlines() if ln.strip()]
+        self.assertEqual(parts[0], "|  |  |")
+        # 首行数据行给出右对齐 → 分隔线第一列 ---:
+        self.assertEqual(parts[1], "| ---: | --- |")
+        self.assertEqual(parts[2], "| a | b |")
+
+    def test_export_docx_table_align(self):
+        import tempfile as _tf
+        import zipfile
+
+        from correctmanage import export_content_to_file
+
+        out = Path(_tf.mkdtemp(prefix="t_tbl_")) / "a.docx"
+        items = [
+            {
+                "page": 1,
+                "html": (
+                    "<table><tbody><tr>"
+                    '<td class="ptoe-align-center">中</td>'
+                    '<td class="ptoe-align-right">右</td>'
+                    '<td class="ptoe-align-left">左</td>'
+                    "<td>无</td>"
+                    "</tr></tbody></table>"
+                ),
+            }
+        ]
+        export_content_to_file(items, "docx", str(out), title="书")
+        with zipfile.ZipFile(out) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8")
+        # center/right → w:jc；left/空 → 不输出
+        self.assertIn('<w:pPr><w:jc w:val="center"/></w:pPr>', xml)
+        self.assertIn('<w:pPr><w:jc w:val="right"/></w:pPr>', xml)
+        self.assertNotIn('w:val="left"', xml)
+
+    def test_export_epub_table_align_wellformed(self):
+        import tempfile as _tf
+        import xml.etree.ElementTree as ET
+        import zipfile
+
+        from correctmanage import export_content_to_file
+
+        out = Path(_tf.mkdtemp(prefix="t_tbl_")) / "a.epub"
+        items = [
+            {
+                "page": 1,
+                "html": (
+                    "<p>前</p>"
+                    "<table><thead><tr>"
+                    '<th class="ptoe-align-center">标题</th>'
+                    "</tr></thead><tbody><tr>"
+                    '<td class="ptoe-align-right">值</td>'
+                    "</tr></tbody></table>"
+                    "<p>后</p>"
+                ),
+            }
+        ]
+        export_content_to_file(items, "epub", str(out), title="书")
+        with zipfile.ZipFile(out) as zf:
+            names = zf.namelist()
+            content = [
+                n
+                for n in names
+                if n.startswith("OEBPS/Text/") and n.endswith(".xhtml")
+            ]
+            self.assertTrue(content, "epub 缺少正文内容文件")
+            body = zf.read(content[0]).decode("utf-8")
+        # XML 良构
+        ET.fromstring(body)
+        self.assertIn('<th class="ptoe-align-center">', body)
+        self.assertIn('<td class="ptoe-align-right">', body)
+
+    def test_sanitize_chain_align_no_regression(self):
+        # sanitize → rich 全链路：对齐 class 保留并进入 algn
+        src = (
+            "<table><thead><tr><th class=\"ptoe-align-center\">标题</th></tr></thead>"
+            "<tbody><tr><td class=\"ptoe-align-right\">值</td></tr></tbody></table>"
+        )
+        clean = sanitize_html(src)
+        blocks = _html_to_rich_blocks(clean)
+        self.assertEqual(blocks[0]["algn"], [["center"], ["right"]])
+
+    # ---- rulemanage 白名单 ----
+
+    def test_rulemanage_allowed_table_tags(self):
+        self.assertLessEqual(
+            {"table", "thead", "tbody", "tfoot", "tr", "th", "td"},
+            rulemanage.ALLOWED_TAGS,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
