@@ -58,6 +58,36 @@ __all__ = [
 # 纯函数（无 HTTP，可单测）
 # --------------------------------------------------------------------------
 
+_TABLE_SPAN_RE = re.compile(r"<table\b[^>]*>.*?</table\s*>", flags=re.I | re.S)
+_TABLE_OPEN_RE = re.compile(r"<table\b[^>]*>", flags=re.I)
+_H1_AHEAD_RE = re.compile(r"<h1(?:\s|>)", flags=re.I)
+
+
+def _table_spans(text):
+    """text 中所有表格的 (起, 止) 区间；未闭合的表格一直算到文末。"""
+    spans = [m.span() for m in _TABLE_SPAN_RE.finditer(text)]
+    for m in _TABLE_OPEN_RE.finditer(text):
+        if not any(s <= m.start() < e for s, e in spans):
+            spans.append((m.start(), len(text)))
+    return spans
+
+
+def _split_outside_tables(text, pattern):
+    """按 pattern 前瞻切分，跳过表格区域内的匹配点（与 htmlmanage 同语义）。"""
+    spans = _table_spans(text)
+    cuts = [
+        m.start()
+        for m in pattern.finditer(text)
+        if not any(s <= m.start() < e for s, e in spans)
+    ]
+    parts, prev = [], 0
+    for c in cuts:
+        parts.append(text[prev:c])
+        prev = c
+    parts.append(text[prev:])
+    return [p for p in parts if p.strip()]
+
+
 def split_articles(text: str, fallback_title: str):
     r"""把整本书的正文 HTML 按一级标题切分为文章列表。
 
@@ -69,12 +99,14 @@ def split_articles(text: str, fallback_title: str):
         空回退 fallback_title），文本为 </h1> 之后的剩余部分（保留原样，
         空串允许存在但不为 None）；
       * 首个 h1 之前的序言块 → 标题 = fallback_title。
+    切分点只认表格**外**的 <h1>（2026-09-27）：单元格里的 h1 是表格排版而非
+    章节标题，按它切会造出伪文章 + 伪标题。
     返回 [{'title': str, 'text': str}, ...]，只包含非空块。
     """
     if '<h1' not in text:
         return [{"title": fallback_title or "", "text": text.strip()}]
     out = []
-    for chunk in (c for c in re.split(r'(?=<h1(?:\s|>))', text) if c.strip()):
+    for chunk in _split_outside_tables(text, _H1_AHEAD_RE):
         if chunk[0:3].lower() == '<h1':
             m = re.search(r'<h1[^>]*>(.*?)</h1>', chunk, flags=re.S)
             if m:

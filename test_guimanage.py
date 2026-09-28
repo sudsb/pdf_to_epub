@@ -710,6 +710,42 @@ class TestGuiConfigPost(unittest.TestCase):
         self.assertEqual(on_disk["gui_display"], "browser")
 
 
+class TestGuiPaddleMergeLines(GuiServerTestBase):
+    """paddle_merge_lines（PaddleOCR 多行合并成段落）开关的 GET/POST 校验（2026-09-28）。"""
+
+    def _on_disk(self):
+        with open(self._cfg_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_get_defaults_true_then_post_false_persists(self):
+        """键缺失时 GET 下发默认 True；POST false → 200 且真正写盘为布尔 False。"""
+        status, _, body = self._get("/api/config")
+        self.assertEqual(status, 200)
+        self.assertIs(json.loads(body)["config"]["paddle_merge_lines"], True)
+
+        status, raw = self._post("/api/config", {"paddle_merge_lines": False})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(raw)["ok"])
+        # 磁盘持久化验证：存的是布尔 False，不是字符串
+        self.assertIs(self._on_disk()["paddle_merge_lines"], False)
+
+        status, _, body = self._get("/api/config")
+        self.assertEqual(status, 200)
+        self.assertIs(json.loads(body)["config"]["paddle_merge_lines"], False)
+
+    def test_post_invalid_value_rejected_and_not_written(self):
+        """POST 非法值 → 400 中文错误，且该键不会被写成非法值。"""
+        status, raw = self._post("/api/config", {"paddle_merge_lines": "maybe"})
+        self.assertEqual(status, 400)
+        data = json.loads(raw)
+        self.assertFalse(data["ok"])
+        self.assertIn("paddle_merge_lines 仅接受 true/false", data["error"])
+        # 端点开头的 get_config() 会把 DEFAULT_CONFIG 的缺省键回填并重写文件，
+        # 故此处不能比对整份文件字节，只断言该键不是被写进去的非法值。
+        stored = self._on_disk().get("paddle_merge_lines", True)
+        self.assertIs(stored, True, "非法值不得写盘（键缺省或保持默认 True）")
+
+
 class TestTabEndpoints(GuiServerTestBase):
     """标签页会话与 /api/tabs 端点测试。"""
 

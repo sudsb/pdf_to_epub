@@ -104,7 +104,7 @@ class TestRunserver(_EngineResetMixin, unittest.TestCase):
              mock.patch.object(vm._SESSION, "get",
                                side_effect=[_resp(503), _resp(200, ready)]):
             ok = vm.runserver("HY")
-
+        
         self.assertTrue(ok)
         self.assertIs(vm._server_process, proc)
         self.assertEqual(popen.call_count, 1)

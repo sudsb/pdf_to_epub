@@ -19,7 +19,7 @@ import re
 import zipfile
 import uuid
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 from datetime import datetime, timezone
 from urllib.parse import quote as urlquote
 
@@ -267,26 +267,47 @@ class EPUBPacker:
                 return href
         return None
 
-    def generate_toc_ncx(self, metadata: EPUBMetadata, toc_items: List[Dict[str, str]]) -> str:
-        # minimal NCX
+    def generate_toc_ncx(self, metadata: EPUBMetadata, toc_items: List[Dict[str, Any]]) -> str:
+        # minimal NCX（目录 navPoint 按标题层级嵌套：h2+ 挂在最近上级标题下，
+        # 与 htmlmanage.render_toc_page 的树状目录同构，2026-09-24）
         ncx = ET.Element('ncx')
         ncx.set('xmlns', 'http://www.daisy.org/z3986/2005/ncx/')
         ncx.set('version', '2005-1')
         head = ET.SubElement(ncx, 'head')
         ET.SubElement(head, 'meta', name='dtb:uid', content=metadata.identifier)
-        ET.SubElement(head, 'meta', name='dtb:depth', content='1')
+        depth_meta = ET.SubElement(head, 'meta', name='dtb:depth', content='1')
         ET.SubElement(head, 'meta', name='dtb:totalPageCount', content='0')
         ET.SubElement(head, 'meta', name='dtb:maxPageNumber', content='0')
         docTitle = ET.SubElement(ncx, 'docTitle')
         ET.SubElement(docTitle, 'text').text = metadata.title
         docAuthor = ET.SubElement(ncx, 'docAuthor')
         ET.SubElement(docAuthor, 'text').text = metadata.author
+
+        def _level(it: Dict[str, Any]) -> int:
+            try:
+                return max(1, int(it.get('level') or 1))
+            except (TypeError, ValueError):
+                return 1
+
         navMap = ET.SubElement(ncx, 'navMap')
-        for i, it in enumerate(toc_items):
-            navPoint = ET.SubElement(navMap, 'navPoint', id=f'navPoint-{i+1}', playOrder=str(i+1))
+        stack: List[Tuple[int, ET.Element]] = []  # (层级, 该层级 navPoint 元素)
+        counter = 0
+        max_depth = 1
+        for it in toc_items:
+            level = _level(it)
+            # 收尾：弹出层级 ≥ 新条目的 navPoint（≥ 而非 >：同级新条目
+            # 也是上一级容器的子节点，须先弹出同级项以回到正确的父级）
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            parent = stack[-1][1] if stack else navMap
+            counter += 1
+            navPoint = ET.SubElement(parent, 'navPoint', id=f'navPoint-{counter}', playOrder=str(counter))
             navLabel = ET.SubElement(navPoint, 'navLabel')
             ET.SubElement(navLabel, 'text').text = it.get('title')
-            ET.SubElement(navPoint, 'content', src=it.get('href'))
+            ET.SubElement(navPoint, 'content', src=it.get('href') or '')
+            stack.append((level, navPoint))
+            max_depth = max(max_depth, len(stack))
+        depth_meta.set('content', str(max_depth))
         return ET.tostring(ncx, encoding='unicode')
 
     def pack(self, metadata: EPUBMetadata, spine_order: List[str], toc_items: List[Dict[str, str]]) -> str:
@@ -340,7 +361,7 @@ class EPUBPacker:
                 (e.replace('\\', '/') for _s, e in manifest_sources if os.path.basename(e) == base),
                 file_part,
             )
-            mapped_toc.append({'title': it.get('title'), 'href': mapped + (f'#{frag}' if frag else '')})
+            mapped_toc.append({'title': it.get('title'), 'href': mapped + (f'#{frag}' if frag else ''), 'level': it.get('level')})
         ncx_content = self.generate_toc_ncx(metadata, mapped_toc)
 
         # write into epub zip: mimetype (stored), then rest

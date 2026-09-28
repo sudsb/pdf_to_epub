@@ -6,7 +6,7 @@ const PRELOAD = 15;
 let _scrollDir = 1, _viewportY = 0, _lastLo = 0; // 最近一次滚动方向（1 向下 / -1 向上）、视口位置与上次窗口下界，供 updateViewport 动态预挂载/空白兜底
 const OPS = [
   ['bold','粗体'], ['italic','斜体'], ['heading','标题'], ['p','正文'],
-  ['remove','清除格式'], ['note','注释'],
+  ['remove','清除格式'], ['note','注释'], ['citation','引用'],
   ['align_left','居左'], ['align_center','居中'], ['align_right','居右'],
   ['centerbold','居中加粗'], ['merge','合并段落'], ['popup','弹出菜单'],
   ['marker_full','全文标记'], ['marker_note','注释标记'], ['marker_join','段落标记'],
@@ -28,7 +28,7 @@ const OPS = [
 const OP_ICON = {
   bold:'<span class="ic-b">B</span>', italic:'<span class="ic-i">I</span>',
   heading:'<span class="ic-h">标</span>', p:'<span class="ic-p">正</span>',
-  remove:'<span class="ic-t">清</span>', note:'注',
+  remove:'<span class="ic-t">清</span>', note:'注', citation:'引',
   align_left:'左', align_center:'中', align_right:'右',
   centerbold:'中粗', merge:'合',
   marker_full:'篇', marker_note:'释', marker_join:'段', marker_page:'页',
@@ -36,7 +36,7 @@ const OP_ICON = {
 };
 const OP_TIP = {
   bold:'粗体', italic:'斜体', heading:'标题（循环 H1→H6→正文）', p:'正文',
-  remove:'清除格式', note:'注释格式（整段小字）',
+  remove:'清除格式', note:'注释格式（整段小字）', citation:'引用格式（整段斜体，独立字体默认宋体）',
   align_left:'居左', align_center:'居中', align_right:'居右',
   centerbold:'居中加粗（转为正文段落并居中加粗）', merge:'合并选中段落', popup:'弹出选中菜单',
   marker_full:'全文标记（文章到此结束，开新页）',
@@ -52,7 +52,7 @@ const OP_TIP = {
 };
 const DEFAULTS = {
   bold:'Ctrl+B', italic:'Ctrl+I', heading:'Ctrl+1', p:'Ctrl+0',
-  note:'Ctrl+Shift+N',
+  note:'Ctrl+Shift+N', citation:'',
   align_left:'Ctrl+Shift+Left', align_center:'Ctrl+Shift+Up', align_right:'Ctrl+Shift+Right',
    centerbold:'Alt+B', merge:'Alt+G', popup:'Alt+P',
   marker_full:'Ctrl+Shift+F', marker_note:'Ctrl+Shift+M', marker_join:'Ctrl+Shift+J',
@@ -110,9 +110,9 @@ function errHoverDelay() { return uiv('err_hover_delay', 1500); }
 // correct_pages 每运行随机端口 → localStorage 按 origin 隔离每次失效，
 // 故以内存 uiSettings 为准、服务端为准，localStorage 仅作加载前的同步兜底。
 // 弹出菜单可选操作池（与后端 correctmanage.POPUP_ELIGIBLE_OPS 保持一致；paint = 格式刷，不在 OPS 数组中）
-const POPUP_ELIGIBLE_OPS = ['bold','italic','underline','strike','highlight','charbox','shade','sup','sub','heading','p','remove','note','align_left','align_center','align_right','centerbold','flush','indent','merge','marker_full','marker_note','marker_join','marker_page','paint'];
+const POPUP_ELIGIBLE_OPS = ['bold','italic','underline','strike','highlight','charbox','shade','sup','sub','heading','p','remove','note','citation','align_left','align_center','align_right','centerbold','flush','indent','merge','marker_full','marker_note','marker_join','marker_page','paint'];
 const UI_SETTINGS_DEFAULTS = { tip_delay: 600, err_hover_delay: 1500, editor_font_size: 14, img_mode: '', rule_all_pages_confirm: true,
-  popup_row1: ['bold','italic','heading','p','note','paint','remove'],
+  popup_row1: ['bold','italic','heading','p','note','citation','paint','remove'],
   popup_row2: ['align_left','align_center','align_right','centerbold','merge','sup','sub'],
   popup_rule_count: 5 };
 let uiSettings = null; // 服务端加载前为 null → 读 localStorage 兜底；加载后为完整对象
@@ -368,7 +368,7 @@ function _multiSelUpdateStatus() {
 
 // 弹窗开着时不响应 Esc 清除（各弹窗自己的 Esc/关闭优先）
 function _multiSelAnyModalOpen() {
-  const ids = ['modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','finishModalBg','finishConfirmBg','formatRulesModalBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg'];
+  const ids = ['modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','charFormatModalBg','finishModalBg','finishConfirmBg','formatRulesModalBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg','replaceRulesModalBg','rrEditModalBg'];
   for (let k = 0; k < ids.length; k++) {
     const el = document.getElementById(ids[k]);
     if (el && el.style.display === 'flex') return true;
@@ -542,6 +542,21 @@ function _ensureBlockNewlines(html) {
   const h = String(html == null ? '' : html);
   return h.replace(/<(p|div|h[1-6])((?:"[^"]*"|'[^']*'|[^>"'])*)>(?![ \t]*\r?\n)/gi, function (m) { return m + '\n'; });
 }
+// 编辑器内段落设置预览（2026-09-24）：对渲染串中带 data-* 的块开标签注入
+// inline style（公式与 htmlmanage._indent_style_attrs 逐字节一致，见 _indStyleFromData）。
+// 仅在渲染字符串里注入——存储 html 不变（syncContent 用 stripIndentStyles 剥除），
+// sanitize 落盘时块级 style 亦被剥（后端契约：语义由 data-* 承载）。
+function _injectIndentStyles(html) {
+  let s = String(html == null ? '' : html);
+  if (s.indexOf('data-') < 0) return s; // 快速返回：绝大多数行不带段落设置
+  return s.replace(/<(p|div|h[1-6])(\s[^>]*?)(\/?)>/gi, function (m, tag, attrs, slf) {
+    if (!/data-(?:pl|pr|ind|indv|spb|spa|lh)="/.test(attrs)) return m;
+    if (/\sstyle=/.test(attrs)) return m; // 已带 style（用户手动/历史），不覆盖
+    const st = _indStyleFromData(attrs);
+    if (!st) return m;
+    return '<' + tag + attrs + ' style="' + st + '"' + (slf || '') + '>';
+  });
+}
 function displayHtml(i) {
   let base;
   if (!mdMode) base = contentMap.has(i) ? contentMap.get(i) : pages[i].text;
@@ -553,6 +568,8 @@ function displayHtml(i) {
   // 返回的 html（含 \n）用于 pageRow 渲染/格式规则应用，引擎与浏览器 textContent
   // 两侧同时获得换行，选区偏移契约保持一致。
   base = _ensureBlockNewlines(base);
+  // 2026-09-24：段落设置预览（data-* → inline style，仅在渲染串内；存储不变）
+  base = _injectIndentStyles(base);
   // If there's an active search highlight query, inject highlights into the
   // rendered HTML. Do NOT mutate underlying stored source (collect/pageSource
   // uses raw content). Regex validity already handled upstream; guard anyway.
@@ -791,7 +808,19 @@ function syncContent(ed) {
   if (!row) return;
   const i = Number(row.dataset.i);
   if (mdMode) mdSourceMap.set(i, editableSource(ed));
-  else contentMap.set(i, _stripSearchMarks(_stripMultiSelClass(ed.innerHTML)));
+  else contentMap.set(i, _stripSearchMarks(stripIndentStyles(_stripMultiSelClass(ed.innerHTML))));
+}
+// 2026-09-24：剥除下划线注入的段落设置 inline style（p/div/h1-6 开标签），
+// 保证存储 html 只含 data-* 语义（与后端 sanitize 剥块级 style 一致）。
+// 幂等：无 style 原样返回；`/>` 自闭合标签也处理；style 属性在任意位置均可剥。
+function stripIndentStyles(html) {
+  const s = String(html == null ? '' : html);
+  if (s.indexOf(' style=') < 0) return s;
+  return s.replace(/<(p|div|h[1-6])([^>]*)>/gi, function (m, tag, attrs) {
+    if (!/\sstyle="/.test(attrs)) return m;
+    const next = attrs.replace(/\sstyle="[^"]*"/g, '');
+    return '<' + tag + next + '>';
+  });
 }
 let _lastFocusedEd = null; // 最近聚焦过的编辑区（2026-08-23：点击工具栏按钮夺焦后仍能定位目标页）
 function currentEditable() {
@@ -1787,6 +1816,9 @@ function updateViewport() {
 }
 // ---------- 多行/多块选择辅助与格式应用 ----------
 function _blocksBetween(ed, startBlock, endBlock) {
+  // 边界解析失败（选区锚点在 ed 之外，_boundaryBlockInRange 返回 null）→ 不做任何应用，
+  // 防止「选中段落却整页生效」（2026-09-24）。
+  if (startBlock === null || endBlock === null) return [];
   const blocks = [];
   let walker = document.createTreeWalker(ed, NodeFilter.SHOW_ELEMENT, {
     acceptNode: function(n) {
@@ -1813,7 +1845,11 @@ function _blocksBetween(ed, startBlock, endBlock) {
 // closest('p,div,h1-h6') 会命中 .editable 本身（div），导致 _blocksBetween 从首块
 // 收集或收集到末块、格式溢出到无关段落（正则捕获组格式应用曾因此整页变 h1/注释）。
 // 此处按方向吸附到最近的真实块：起点向后找、终点向前找；无法解析时回退 ed。
+// 注意：选区边界在 ed 之外（如焦点在输入框/弹窗时遗留的残选区）必须返回 null 让
+// _blocksBetween 短路返回空——若回退 ed 会把「整页所有块」收进范围，段落设置/合并
+// 等操作瞬间铺满整页（2026-09-24 修复：选中段落设置成整页的问题根因）。
 function _boundaryBlockInRange(ed, node, isEnd) {
+  if (!node || !ed.contains(node)) return null; // 选区锚点不在编辑区内 → 不可解析
   const el = node.nodeType === 3 ? node.parentElement : node;
   const b = (el && el.closest) ? el.closest('p,div,h1,h2,h3,h4,h5,h6') : null;
   if (b && b !== ed && ed.contains(b)) return b;
@@ -1971,6 +2007,8 @@ function _convertBlockTag(block, newTag) {
 }
 // 正文（2026-09-13 修复）：转 <p> 的同时清掉「段落文本样式」——块级 ptoe-note/ptoe-citation
 // 与行内 <span class="ptoe-note">（规则引擎「匹配对象/分组」路径把注释落成行内 span）。
+// 2026-09-22：行内 <span class="ptoe-citation"> 一并解包（引用现在支持行内包裹）。
+// 2026-09-24：行内 <span class="ptoe-align-*>"> 一并解包（对齐现在支持行内包裹），保持正文归一。
 // 保留对齐/缩进/图片段落类：centerbold 与「段落设置」依赖 _convertBlockTag 保类。
 function _toBodyParagraph(block) {
   const p = _convertBlockTag(block, 'p') || block;
@@ -1978,6 +2016,10 @@ function _toBodyParagraph(block) {
   const whole = document.createRange();
   whole.selectNodeContents(p);
   unwrapSpans(p, 'ptoe-note', whole);
+  unwrapSpans(p, 'ptoe-citation', whole);
+  unwrapSpans(p, 'ptoe-align-left', whole);
+  unwrapSpans(p, 'ptoe-align-center', whole);
+  unwrapSpans(p, 'ptoe-align-right', whole);
   return p;
 }
 
@@ -1986,19 +2028,33 @@ function toggleNote(ed) {
   // <span class="ptoe-note">…</span>（见 rulemanage._INLINE_LEAF_OPS_M），必须一并处理。
   // 2026-09-13 修复：老实现只 toggle 块的 class，导致规则套上的注释点「注释」关不掉
   // ——第二次点击反而又给整块加了一层注释样式。
+  // 2026-09-24：部分选区（单块内、未覆盖整块）→ 行内包裹 <span class="ptoe-note">；
+  // 已有行内注释则解包关闭（并顺带清块级注释类）；整块/折叠/跨块 → 块级 toggle
+  // （与 toggleCitation 的部分选区行内化同构，跨块不放行行内包裹）。
   const row = ed.closest('.page-row');
   const i = row ? Number(row.dataset.i) : -1;
+  const multi = _selectionMultiBlock(ed);
   histRun('注释格式', [i], function () {
     applyToSelectedBlocks(ed, function (block, range) {
+      if (multi) { block.classList.toggle('ptoe-note'); return; }
       const r = (range && !range.collapsed) ? range : (function () {
         const rr = document.createRange();
         rr.selectNodeContents(block);
         return rr;
       })();
+      if (r.collapsed) { block.classList.toggle('ptoe-note'); return; }
+      const whole = document.createRange();
+      whole.selectNodeContents(block);
+      if (r.compareBoundaryPoints(Range.START_TO_START, whole) === 0 &&
+          r.compareBoundaryPoints(Range.END_TO_END, whole) === 0) {
+        block.classList.toggle('ptoe-note');
+        return;
+      }
+      // 部分选区：已有行内注释 → 解包关闭（块级注释类一并清掉）；否则包裹选中文字
       if (unwrapSpans(block, 'ptoe-note', r) > 0) {
         block.classList.remove('ptoe-note'); // 行内注释已关 → 块级注释一并关掉
       } else {
-        block.classList.toggle('ptoe-note');
+        wrapRange(block, r, 'ptoe-note');
       }
     });
     syncContent(ed);
@@ -2012,7 +2068,12 @@ const INLINE_CLASSES = ['ptoe-underline','ptoe-underdot','ptoe-strike','ptoe-cha
 // 「清除格式」需要解包的行内类：8 项字符格式 + 规则引擎落在行内的注释 span
 // （2026-09-13 修复：规则「匹配对象」路径的 note 是 <span class="ptoe-note">，
 //  原先只解包 8 类 → 规则套上的注释文本点「清除格式」清不掉）
-const INLINE_TEXT_CLASSES = ['ptoe-note'].concat(INLINE_CLASSES);
+// + 行内引用 span（2026-09-22：toggleCitation 部分选区改为包裹
+//  <span class="ptoe-citation">，清除格式/正文归一必须一并解包）
+// 唯一消费方=applyOp('remove') 的解包循环（:2392），扩展安全。
+// 2026-09：行内对齐 span（ptoe-align-left|center|right）一并纳入「清除格式」解包范围——
+// 部分选区对齐/注释落在行内 <span class="ptoe-align-*>">（见 applyAlign/toggleNote 行内分支）。
+const INLINE_TEXT_CLASSES = ['ptoe-note', 'ptoe-citation', 'ptoe-align-left', 'ptoe-align-center', 'ptoe-align-right'].concat(INLINE_CLASSES);
 const INLINE_CLASS_LABEL = {
   underline:'下划线', underdot:'下加点', strike:'删除线', charbox:'字符边框',
   shade:'底纹', highlight:'突显', sup:'上标', sub:'下标'
@@ -2022,6 +2083,150 @@ const INLINE_MUTEX = {
   'ptoe-sup': ['ptoe-sup','ptoe-sub'],
   'ptoe-sub': ['ptoe-sup','ptoe-sub']
 };
+// 对齐类（块级与行内共用）：行内对齐互斥 = 同向解包关闭 + 换向先解包其余两类
+const ALIGN_CLASSES = ['ptoe-align-left', 'ptoe-align-center', 'ptoe-align-right'];
+// 格式刷捕获/应用的行内类：8 种字符类 + 行内注释/引用 + 行内对齐
+// （与后端 correctmanage._INLINE_FORMAT_CLASSES = {note,citation} ∪ 8 类 ∪ 对齐 对齐）
+const BRUSH_INLINE_CLASSES = ['ptoe-note', 'ptoe-citation'].concat(ALIGN_CLASSES, INLINE_CLASSES);
+
+// ============================================================================
+// 逐字符格式（span 上的 style）—— 与后端 rulemanage.normalize_char_style 逐字节同构
+// ============================================================================
+// 单一事实源在 rulemanage.py:138-238（前端只镜像，不另立规则）：任何 style 串
+// 都必须经 normalizeCharStyle 归一后再写回，否则保存内容每来回一次就 churn。
+// 契约：
+//   - 序列化顺序恒为 text-align ; font-size ; font-family ; color；分隔 ';'、无尾分号；
+//   - 白名单外的属性（position/top/letter-spacing/…）一律丢弃；
+//   - font-size  整数 px，四舍五入后钳制 8..72（'20.4px' → 20px）；
+//   - font-family 必须命中原样（去引号 + 折叠空白后）10 项字体栈之一；
+//   - color      '#' + 3..8 位十六进制（统一小写）或 3..20 位颜色名（原样透传）；
+//   - text-align 仅 left|center|right；
+//   - 同名重复声明后者覆盖前者；无存活声明返回 ''（调用方据此省略 style 属性）。
+// 幂等：normalizeCharStyle(normalizeCharStyle(x)) === normalizeCharStyle(x)。
+const CHAR_STYLE_PROPS = ['text-align', 'font-size', 'font-family', 'color'];
+const CHAR_FONT_STACKS = [
+  '宋体, SimSun, serif',
+  '黑体, SimHei, sans-serif',
+  '楷体, KaiTi, serif',
+  '仿宋, FangSong, serif',
+  '微软雅黑, Microsoft YaHei, sans-serif',
+  '等线, DengXian, sans-serif',
+  'serif', 'sans-serif', 'monospace', 'cursive',
+];
+const CHAR_SIZE_MIN = 8, CHAR_SIZE_MAX = 72;
+const CHAR_ALIGN_VALUES = ['left', 'center', 'right'];
+// 与后端 rulemanage._CHAR_COLOR_RE 同形：# + 3-8 位十六进制，或 3-20 位颜色名
+const _CHAR_COLOR_RE = /^(#[0-9a-fA-F]{3,8}|[a-zA-Z]{3,20})$/;
+// 与后端 rulemanage._FONT_SIZE_RE 同形：整数或小数 + px（大小写不敏感）
+const _CHAR_FONT_SIZE_RE = /^(\d{1,4}(?:\.\d+)?)\s*px$/i;
+const _CHAR_FONT_QUOTE_RE = /["']/g;
+const _CHAR_FONT_WS_RE = /\s+/g;
+
+// 单条声明校验 + 归一（非法返回 ''）—— 对应 rulemanage._canon_char_decl
+// 半数取偶：与 Python round()（银行家舍入）逐位一致，见下方 font-size 分支注释
+function _roundHalfEven(x) {
+  const f = Math.floor(x);
+  const diff = x - f;
+  if (diff > 0.5) return f + 1;
+  if (diff < 0.5) return f;
+  return (f % 2 === 0) ? f : f + 1;   // 恰好 .5 → 取偶（f 偶则 f，奇则 f+1）
+}
+function _canonCharDecl(prop, val) {
+  if (prop === 'text-align') {
+    const v = String(val == null ? '' : val).trim().toLowerCase();
+    return CHAR_ALIGN_VALUES.indexOf(v) >= 0 ? v : '';
+  }
+  if (prop === 'font-size') {
+    const m = _CHAR_FONT_SIZE_RE.exec(String(val == null ? '' : val).trim());
+    if (!m) return '';
+    // 四舍五入后钳制。注意：后端是 Python int(round(float(x)))，round() 用「银行家舍入」
+    // （.5 取偶），JS Math.round 是「四舍五入」（.5 进位）。20.5px 后端得 20px、
+    // Math.round 会得 21px —— 同一份内容来回一次就 churn，故此处显式实现半数取偶。
+    const px = _roundHalfEven(parseFloat(m[1]));
+    if (!isFinite(px)) return '';
+    return Math.max(CHAR_SIZE_MIN, Math.min(CHAR_SIZE_MAX, px)) + 'px';
+  }
+  if (prop === 'font-family') {
+    const v = String(val == null ? '' : val).replace(_CHAR_FONT_QUOTE_RE, '').replace(_CHAR_FONT_WS_RE, ' ').trim();
+    return CHAR_FONT_STACKS.indexOf(v) >= 0 ? v : '';
+  }
+  if (prop === 'color') {
+    const v = String(val == null ? '' : val).trim();
+    if (!_CHAR_COLOR_RE.test(v)) return '';
+    return v.charAt(0) === '#' ? v.toLowerCase() : v;
+  }
+  return '';
+}
+// 原始 style 串 → 规范化后的字符样式串（无存活声明返回 ''）—— 对应 rulemanage.normalize_char_style
+function normalizeCharStyle(raw) {
+  const vals = {};
+  const parts = String(raw == null ? '' : raw).split(';');
+  for (let i = 0; i < parts.length; i++) {
+    const decl = parts[i];
+    if (!decl || !decl.trim()) continue;
+    const ci = decl.indexOf(':');
+    if (ci < 0) continue;                       // 无冒号 → 丢弃（不抛错）
+    const key = decl.slice(0, ci).trim().toLowerCase();
+    if (CHAR_STYLE_PROPS.indexOf(key) < 0) continue;   // 白名单外（含 position/top/…）
+    const canon = _canonCharDecl(key, decl.slice(ci + 1));
+    if (canon) vals[key] = canon;               // 同名后者覆盖前者
+  }
+  const out = [];
+  for (let i = 0; i < CHAR_STYLE_PROPS.length; i++) {
+    const k = CHAR_STYLE_PROPS[i];
+    if (Object.prototype.hasOwnProperty.call(vals, k)) out.push(k + ':' + vals[k]);
+  }
+  return out.join(';');
+}
+// 取规范化字符样式中的单个声明值（不存在或非法返回 ''）—— 对应 rulemanage.char_style_get
+function charStyleGet(raw, prop) {
+  const key = String(prop == null ? '' : prop).trim().toLowerCase();
+  if (CHAR_STYLE_PROPS.indexOf(key) < 0) return '';
+  const norm = normalizeCharStyle(raw);
+  if (!norm) return '';
+  const prefix = key + ':';
+  const parts = norm.split(';');
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i].indexOf(prefix) === 0) return parts[i].slice(prefix.length);
+  }
+  return '';
+}
+// {prop: 值} 声明映射 → 规范化 style 串（顺序/过滤一律交给 normalizeCharStyle）
+function charStyleString(decls) {
+  const d = decls || {};
+  const parts = [];
+  for (let i = 0; i < CHAR_STYLE_PROPS.length; i++) {
+    const k = CHAR_STYLE_PROPS[i];
+    const v = d[k];
+    if (v === undefined || v === null || v === '') continue;
+    parts.push(k + ':' + v);
+  }
+  return normalizeCharStyle(parts.join(';'));
+}
+// 规范化 style 串 → {prop: value} 映射（清除/合并的唯一入口）
+function charStyleDeclMap(style) {
+  const out = {};
+  const norm = normalizeCharStyle(style);
+  if (!norm) return out;
+  const parts = norm.split(';');
+  for (let i = 0; i < parts.length; i++) {
+    const ci = parts[i].indexOf(':');
+    if (ci > 0) out[parts[i].slice(0, ci)] = parts[i].slice(ci + 1);
+  }
+  return out;
+}
+
+// 当前选区是否跨多个块（>1）。行内部分选区包裹（note/align）只允许在「单块内、
+// 未覆盖整块」的选区发生；跨块选区一律维持块级 toggle（避免把多个段落拆成
+// 零散行内片段）。折叠选区视为非跨块（由调用方按整块处理）。
+function _selectionMultiBlock(ed) {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return false;
+  const range = sel.getRangeAt(0);
+  const startBlock = _boundaryBlockInRange(ed, range.startContainer, false);
+  const endBlock = _boundaryBlockInRange(ed, range.endContainer, true);
+  return _blocksBetween(ed, startBlock, endBlock).length > 1;
+}
 
 // 解包与给定 range 相交的指定 class 的 span：把子节点移回父节点，保持顺序
 // 返回实际解包的个数（调用方据此判断"本次是关闭还是应用"，如 toggleNote）
@@ -2042,6 +2247,270 @@ function unwrapSpans(block, cls, range) {
     }
   }
   return unwrapped;
+}
+// 解包与 range 相交的「逐字符格式载体」span[style]（removeFormat 只清字符属性、不拆 span，
+// 须显式解包；2026-09-27）。只认 style 声明，无 style 的语义 span（标记/注释等）不受影响。
+function unwrapStyledSpans(block, range) {
+  const spans = block.querySelectorAll('span[style]');
+  let unwrapped = 0;
+  for (const span of spans) {
+    const spanRange = document.createRange();
+    spanRange.selectNodeContents(span);
+    if (range.compareBoundaryPoints(Range.START_TO_END, spanRange) >= 0 &&
+        range.compareBoundaryPoints(Range.END_TO_START, spanRange) <= 0) {
+      const frag = document.createDocumentFragment();
+      while (span.firstChild) frag.appendChild(span.firstChild);
+      span.parentNode.replaceChild(frag, span);
+      unwrapped += 1;
+    }
+  }
+  return unwrapped;
+}
+
+// 选区偏移快照（文本级）：把 block 内 range 的起止映射为整块纯文本的 [start, end) 偏移。
+// unwrapSpans 移动文本节点后，部分引擎（jsdom 等）会把 range 边界折叠损坏成 collapsed，
+// 而 wrapRange 的 collapsed 回退会错误地把「整块」包进 span（曾致对齐换向把整段包住，
+// 2026-09-24 harness F9 实证）。解包类操作不改变块内文本内容与顺序 → 偏移稳定 →
+// 操作后重建 range 与操作前等价。真实 Chrome 按 DOM 规范保留边界，此快照双引擎都安全。
+function _snapOffsets(block, range) {
+  try {
+    const whole = document.createRange();
+    whole.selectNodeContents(block);
+    const start = document.createRange();
+    start.setStart(whole.startContainer, whole.startOffset);
+    start.setEnd(range.startContainer, range.startOffset);
+    const end = document.createRange();
+    end.setStart(whole.startContainer, whole.startOffset);
+    end.setEnd(range.endContainer, range.endOffset);
+    return { start: start.toString().length, end: end.toString().length };
+  } catch (e) {
+    return null;
+  }
+}
+// 按偏移重建 block 内的文本范围（偏移落在文本节点上；找不到/越界回退 null，调用方兜底原 range）
+function _rangeFromOffsets(block, snap) {
+  if (!snap) return null;
+  const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, null, false);
+  let acc = 0;
+  let s = null;
+  let e = null;
+  let node;
+  while ((node = walker.nextNode()) && !(s && e)) {
+    const len = node.data.length;
+    if (s === null && acc + len > snap.start) {
+      s = { node: node, off: Math.max(0, snap.start - acc) };
+    }
+    if (e === null && acc + len >= snap.end) {
+      e = { node: node, off: Math.max(0, snap.end - acc) };
+    }
+    acc += len;
+  }
+  if (!s || !e) return null;
+  const r = document.createRange();
+  r.setStart(s.node, s.off);
+  r.setEnd(e.node, e.off);
+  return r;
+}
+
+// ============================================================================
+// 分隔线（直线 / 线段 / 点线 / 双线）—— 与后端 correctmanage.DIVIDER_* 单一同构
+// ============================================================================
+// 契约：非空段落 + 两个类（基类 ptoe-divider + 样式后缀），正文恒为 8 个字形。
+// 后端 _divider_glyph 不信任块内文本、总是按 DIVIDER_GLYPHS 重生成 → 前端插入
+// 时直接写规范字形串；未知样式回退 solid。
+const DIVIDER_CLASS = 'ptoe-divider';
+const DIVIDER_STYLES = {
+  solid: 'ptoe-divider-solid',
+  dashed: 'ptoe-divider-dashed',
+  dotted: 'ptoe-divider-dotted',
+  double: 'ptoe-divider-double',
+};
+const DIVIDER_GLYPHS = { solid: '─', dashed: '╌', dotted: '┈', double: '═' };
+const DIVIDER_DEFAULT_STYLE = 'solid';
+const DIVIDER_STYLE_LABEL = { solid: '直线', dashed: '线段', dotted: '点线', double: '双线' };
+// 字形串：恒 8 个字符（视觉宽度一致）
+function dividerGlyph(style) {
+  const ch = DIVIDER_GLYPHS[style] || DIVIDER_GLYPHS[DIVIDER_DEFAULT_STYLE];
+  return new Array(9).join(ch);
+}
+// 规范段落 HTML：<p class="ptoe-divider ptoe-divider-solid">────────</p>
+function buildDividerHtml(style) {
+  const key = DIVIDER_STYLES[style] ? style : DIVIDER_DEFAULT_STYLE;
+  return '<p class="' + DIVIDER_CLASS + ' ' + DIVIDER_STYLES[key] + '">' + dividerGlyph(key) + '</p>';
+}
+// 块是否为分隔线（清除格式/字符格式都必须跳过，否则分隔线会退化成一行方框字符）
+function isDividerBlock(el) {
+  if (!el || !el.classList) return false;
+  for (const c of el.classList) if (c === DIVIDER_CLASS || c.indexOf(DIVIDER_CLASS) === 0) return true;
+  return false;
+}
+// 一行 raw HTML 串是否是分隔线（Markdown 源码模式下以 <div> 逐行渲染，故按串判定）
+function isDividerHtmlLine(html) {
+  return /<\/?(p|div)[^>]*class="[^"]*\bptoe-divider\b/i.test(String(html == null ? '' : html));
+}
+
+// ============================================================================
+// 逐字符格式应用引擎（style 落在 span 上，合并而非嵌套）
+// ============================================================================
+// 目标区间：折叠光标 → 整块内容；恰好覆盖整块 → 整块内容；否则用原选区。
+// 整块判定走文本偏移（0..总长）而非 compareBoundaryPoints：真实浏览器选区与
+// selectNodeContents 的边界点容器路径不同（(text,0) vs (parent,i)），
+// compareBoundaryPoints 对「等价位置」在 jsdom/Chrome 上结果不一致。
+function _charTargetRange(block, range) {
+  const whole = document.createRange();
+  whole.selectNodeContents(block);
+  if (!range || range.collapsed) return whole;
+  const snap = _snapOffsets(block, range);
+  const total = (block.textContent || '').length;
+  if (snap && total > 0 && snap.start === 0 && snap.end >= total) return whole;
+  return range;
+}
+// 边界 (container, offset) 是否严格位于 span 内部
+function _pointStrictlyInside(sp, container, offset) {
+  if (!container || !sp || !sp.contains(container)) return false;
+  if (container === sp) return offset > 0 && offset < sp.childNodes.length;
+  if (container.nodeType === 3) return (container.data || '').length > 0;
+  return true;
+}
+// 在块内绝对文本偏移处，把「跨越该偏移的最外层 span[style]」切成前后两半（各带同样的
+// 规范化声明）。刻意只处理**块的直接子节点**这一层：嵌套 style span 属异常内容，宁可不切
+// 也不能破坏结构（切了也只会让内层先被解包）。切点落在 span 端点/空隙/文本节点外 → 不切。
+// 全程按文本偏移定位、不动 live range —— extractContents 之后 range 归属在两个引擎里
+// 行为不同（Chrome 会跟着节点切分，jsdom 不跟），依赖它会出难复现的偏移错位。
+function _splitTopSpanAt(block, offset) {
+  const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, null, false);
+  let acc = 0, node, target = null, off = 0;
+  while ((node = walker.nextNode())) {
+    const len = node.data.length;
+    if (offset > acc && offset < acc + len) { target = node; off = offset - acc; break; }
+    acc += len;
+  }
+  if (!target) return false;                      // 切点不在任何文本节点内部
+  let el = target.parentElement;
+  while (el && el !== block && !(el.tagName === 'SPAN' && el.hasAttribute('style'))) {
+    el = el.parentElement;
+  }
+  if (!el || el === block) return false;          // 该字符没有被 style span 覆盖
+  if (el.parentNode !== block) return false;      // 嵌套 style span → 不动
+  const r = document.createRange();
+  r.setStart(target, off);
+  r.setEnd(el, el.childNodes.length);
+  const tail = el.cloneNode(false);
+  tail.appendChild(r.extractContents());
+  if (!tail.textContent) return false;            // 后半为空，无需切
+  el.parentNode.insertBefore(tail, el.nextSibling);
+  return true;
+}
+// 把与区间相交但未被包含的字符样式 span 在两端切开，使区间内段成为顶层兄弟节点 ——
+// 随后即可「解包合并再统一包裹」，既不嵌套也不丢已有声明。
+function _splitStyledSpans(block, snap) {
+  for (let guard = 0; guard < 40; guard++) {
+    let did = false;
+    if (_splitTopSpanAt(block, snap.start)) did = true;
+    if (_splitTopSpanAt(block, snap.end)) did = true;
+    if (!did) return;
+  }
+}
+// 用规范化 style 串包裹区间（不嵌套：调用方已解包/切分过）
+function wrapRangeWithStyle(block, range, styleStr) {
+  if (!styleStr || !range || range.collapsed) return false;
+  try {
+    const clone = range.cloneRange();
+    const frag = clone.extractContents();
+    const sp = document.createElement('span');
+    sp.setAttribute('style', styleStr);
+    sp.appendChild(frag);
+    clone.insertNode(sp);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+// el 内部文本在 block 全文中的 [start, end) 偏移。文档序保证 el 的文本节点连续，
+// 一旦见过 el 的首个文本节点又见到非 el 节点即可收尾。
+function _textExtentIn(block, el) {
+  if (!el || !block) return null;
+  const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, null, false);
+  let node, acc = 0, start = -1, end = -1, seen = false;
+  while ((node = walker.nextNode())) {
+    const len = node.data.length;
+    if (el.contains(node)) {
+      if (start < 0) start = acc;
+      end = acc + len;
+      seen = true;
+    } else if (seen) {
+      break;
+    }
+    acc += len;
+  }
+  return start < 0 ? null : { start: start, end: end };
+}
+// 对块内区间应用/清除逐字符格式。decls = {prop: 值}，值 ''/null 表示删除该项。
+// 返回「本块是否真的发生变化」（供 undo 裁剪与诚实计数）。
+function applyCharStyleToBlock(block, range, decls) {
+  if (!block || isDividerBlock(block)) return false;   // 分隔线不参与
+  if (!(block.textContent || '').length) return false; // 无文字（如纯图片段）不改
+  const before = block.innerHTML;
+  const d = decls || {};
+  if (!Object.keys(d).length) return false;
+  const r = _charTargetRange(block, range);
+  const snap = _snapOffsets(block, r);
+  if (!snap || snap.end <= snap.start) return false;    // 折叠/空区间无事可做
+  // 1) 在两端按文本偏移切开跨越边界的 style span
+  _splitStyledSpans(block, snap);
+  // 2) 收集完全落在目标区间内的 style span（合并已有声明，不嵌套）。
+  //    一律用**文本偏移**判包含，不能用 compareBoundaryPoints：同一段文字可以被
+  //    (text,0)→(text,2) 与 (span,0)→(span,1) 两种容器路径表示，jsdom 与 Chrome
+  //    对这种「等价但表示不同」的边界点比较结果不同（jsdom 给 1/-1，Chrome 给 0），
+  //    任何一种硬编码符号都只在其中一个引擎成立（2026-09-27 实测）。
+  const inner = [];
+  const spans = block.querySelectorAll('span[style]');
+  for (let i = 0; i < spans.length; i++) {
+    const ex = _textExtentIn(block, spans[i]);
+    if (ex && ex.start >= snap.start && ex.end <= snap.end) inner.push(spans[i]);
+  }
+  const merged = {};
+  for (let i = 0; i < inner.length; i++) {
+    const ex = charStyleDeclMap(inner[i].getAttribute('style') || '');
+    for (const k in ex) merged[k] = ex[k];
+  }
+  // 3) 新声明覆盖（'' = 删除该属性）
+  for (const k in d) {
+    if (d[k] === '' || d[k] === null || d[k] === undefined) delete merged[k];
+    else merged[k] = d[k];
+  }
+  for (let i = 0; i < inner.length; i++) {
+    const frag = document.createDocumentFragment();
+    while (inner[i].firstChild) frag.appendChild(inner[i].firstChild);
+    inner[i].parentNode.replaceChild(frag, inner[i]);
+  }
+  try { block.normalize(); } catch (e) {}
+  // 4) 重建目标区间并统一包裹（清除后无存活声明 → 不包裹，span 被解包即清除）
+  const styleStr = charStyleString(merged);
+  if (styleStr) {
+    const rr = _rangeFromOffsets(block, snap);
+    if (rr && !rr.collapsed) wrapRangeWithStyle(block, rr, styleStr);
+  }
+  return block.innerHTML !== before;
+}
+// 块集合（p/div/h1-h6，与 _blocksBetween 同一口径；含表格内块）
+function _editableCharBlocks(root) {
+  const out = [];
+  if (!root) return out;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+    acceptNode: function (n) {
+      return /^(P|DIV|H[1-6])$/.test(n.tagName) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+    }
+  });
+  let cur = walker.nextNode();
+  while (cur) { out.push(cur); cur = walker.nextNode(); }
+  return out;
+}
+// 整块内容区间
+function _wholeBlockRange(block) {
+  const r = document.createRange();
+  r.selectNodeContents(block);
+  return r;
 }
 
 // 应用/切换内联 class（用于 toolbar/menu/brush/rules）
@@ -2080,9 +2549,12 @@ function applyInlineClass(ed, cls, opts) {
       }
 
       // 互斥处理：上/下标不能共存（同步清除本 class 自身，实现解包）
+      // 先快照偏移：解包会移动文本节点，部分引擎（jsdom）随后把 range 折叠损坏 →
+      // 后续解包/包裹全部用重建 range（偏移在解包间稳定，见 _snapOffsets/_rangeFromOffsets）
+      const snap = INLINE_MUTEX[cls] ? _snapOffsets(block, range) : null;
       if (INLINE_MUTEX[cls]) {
         for (const mCls of INLINE_MUTEX[cls]) {
-          unwrapSpans(block, mCls, range);
+          unwrapSpans(block, mCls, snap ? _rangeFromOffsets(block, snap) : range);
         }
       }
 
@@ -2092,25 +2564,29 @@ function applyInlineClass(ed, cls, opts) {
         // 上/下标（INLINE_MUTEX 里只有 ptoe-sup/ptoe-sub）→ 下划线/下加点/删除线/字符边框/
         // 底纹/突显 第二次点击时既不包裹也不解包，表现为"再点一次格式关不掉"。
         if (hasCls) {
-          unwrapSpans(block, cls, range);
+          unwrapSpans(block, cls, snap ? _rangeFromOffsets(block, snap) : range);
         } else {
-          wrapRange(block, range, cls);
+          const rr = snap ? _rangeFromOffsets(block, snap) : range;
+          if (rr) wrapRange(block, rr, cls);
         }
       } else {
         // 规则应用模式：仅在选区内无该 class 时包裹（不解包）
+        const rr = snap ? _rangeFromOffsets(block, snap) : range;
         const existing = block.querySelectorAll('span.' + cls);
         let hasIntersect = false;
-        for (const span of existing) {
-          const spanRange = document.createRange();
-          spanRange.selectNodeContents(span);
-          if (range.compareBoundaryPoints(Range.START_TO_END, spanRange) >= 0 &&
-              range.compareBoundaryPoints(Range.END_TO_START, spanRange) <= 0) {
-            hasIntersect = true;
-            break;
+        if (rr) {
+          for (const span of existing) {
+            const spanRange = document.createRange();
+            spanRange.selectNodeContents(span);
+            if (rr.compareBoundaryPoints(Range.START_TO_END, spanRange) >= 0 &&
+                rr.compareBoundaryPoints(Range.END_TO_START, spanRange) <= 0) {
+              hasIntersect = true;
+              break;
+            }
           }
         }
-        if (!hasIntersect) {
-          wrapRange(block, range, cls);
+        if (!hasIntersect && rr) {
+          wrapRange(block, rr, cls);
         }
       }
     });
@@ -2181,12 +2657,32 @@ function wrapRange(block, range, cls) {
 }
 
 function toggleCitation(ed) {
-  // Toggle ptoe-citation on all blocks in selection (斜体 + 独立字体)
+  // 引用（斜体 + 独立字体）：2026-09-22 修复「选中几个字整段被改」。
+  // 老实现只 toggle 整块的 class → 部分选区把整段变宋体+斜体。
+  // 现在：部分选区 → 仅包裹选中内容为行内 <span class="ptoe-citation">
+  // （选区内已有行内引用 span 则解包 = 关闭开关，与 applyInlineClass toggle 语义一致）；
+  // 整块 / 折叠光标 / 多块（Ctrl+点击）选区 → 保持块级 class 切换（与 toggleNote 一致）。
   const row = ed.closest('.page-row');
   const i = row ? Number(row.dataset.i) : -1;
   histRun('引用格式', [i], function () {
-    applyToSelectedBlocks(ed, function(block) {
-      block.classList.toggle('ptoe-citation');
+    applyToSelectedBlocks(ed, function (block, range) {
+      const r = (range && !range.collapsed) ? range : (function () {
+        const rr = document.createRange();
+        rr.selectNodeContents(block);
+        return rr;
+      })();
+      if (r.collapsed) { block.classList.toggle('ptoe-citation'); return; }
+      const whole = document.createRange();
+      whole.selectNodeContents(block);
+      if (r.compareBoundaryPoints(Range.START_TO_START, whole) === 0 &&
+          r.compareBoundaryPoints(Range.END_TO_END, whole) === 0) {
+        block.classList.toggle('ptoe-citation');
+        return;
+      }
+      // 部分选区：已有行内引用 → 解包（关闭）；否则包裹选中文字
+      if (unwrapSpans(block, 'ptoe-citation', r) === 0) {
+        wrapRange(block, r, 'ptoe-citation');
+      }
     });
     syncContent(ed);
     if (row) { markDirty(i); scheduleRemeasure(i); }
@@ -2213,10 +2709,37 @@ function cycleHeading(ed) {
 function applyAlign(ed, pos) {
   const row = ed.closest('.page-row');
   const i = row ? Number(row.dataset.i) : -1;
+  const cls = 'ptoe-align-' + pos;
+  // 2026-09-24：部分选区（单块内、未覆盖整块）→ 行内包裹 <span class="ptoe-align-*">；
+  // 同向已有 → 解包关闭（幂等）；换向 → 先解包其余对齐类（互斥）；整块/折叠/跨块 →
+  // 现有块级行为不变。
+  const multi = _selectionMultiBlock(ed);
   histRun('对齐', [i], function () {
-    applyToSelectedBlocks(ed, function(block) {
-      block.classList.remove('ptoe-align-left', 'ptoe-align-center', 'ptoe-align-right');
-      block.classList.add('ptoe-align-' + pos);
+    applyToSelectedBlocks(ed, function(block, range) {
+      const whole = document.createRange();
+      whole.selectNodeContents(block);
+      const r = (range && !range.collapsed) ? range : whole;
+      const blockLevel = multi || r.collapsed || (
+        r.compareBoundaryPoints(Range.START_TO_START, whole) === 0 &&
+        r.compareBoundaryPoints(Range.END_TO_END, whole) === 0
+      );
+      if (blockLevel) {
+        block.classList.remove('ptoe-align-left', 'ptoe-align-center', 'ptoe-align-right');
+        block.classList.add(cls);
+        return;
+      }
+      // 部分选区：行内对齐（互斥：先解包目标类=幂等关闭；再解包其余对齐类=换向）
+      // 解包会移动文本节点，部分引擎随后折叠损坏 range → 先快照偏移，后续解包/包裹用重建 range
+      // （否则 wrapRange 的 collapsed 回退会把整块包进 span，2026-09-24 harness F9 实证）
+      const snap = _snapOffsets(block, r);
+      const closed = unwrapSpans(block, cls, r);
+      for (const c of ALIGN_CLASSES) {
+        if (c !== cls) unwrapSpans(block, c, snap ? _rangeFromOffsets(block, snap) : r);
+      }
+      if (closed === 0) {
+        const rr = snap ? _rangeFromOffsets(block, snap) : r;
+        if (rr) wrapRange(block, rr, cls);
+      }
     });
     syncContent(ed);
     if (row) { markDirty(i); scheduleRemeasure(i); }
@@ -2236,11 +2759,21 @@ function applyFormatBrushToSelection(format) {
     if (format.bold) withScrollStable(() => document.execCommand('bold'));
     if (format.italic) withScrollStable(() => document.execCommand('italic'));
     if (format.color) withScrollStable(() => document.execCommand('foreColor', false, format.color));
-    // inline: 7 种新格式类（2026-09）
+    // inline: 行内类（2026-09：8 种字符格式 + 行内注释/引用 + 行内对齐，与后端同源）
     if (format.inlineClasses && format.inlineClasses.length) {
       // 用 applyToSelectedBlocks 传入的块内 range（多块选区时全局 range 会误伤其他块）
       const range = r || window.getSelection().getRangeAt(0);
-      for (const cls of INLINE_CLASSES) {
+      // 行内对齐互斥：应用某个对齐类时先解包其余两个对齐类（换向语义）
+      let alignTarget = null;
+      for (const c of ALIGN_CLASSES) {
+        if (format.inlineClasses.includes(c)) { alignTarget = c; break; }
+      }
+      if (alignTarget) {
+        for (const c of ALIGN_CLASSES) {
+          if (c !== alignTarget) unwrapSpans(block, c, range);
+        }
+      }
+      for (const cls of BRUSH_INLINE_CLASSES) {
         if (format.inlineClasses.includes(cls)) {
           // 确保存在：若选区内无该 class 则包裹
           const existing = block.querySelectorAll('span.' + cls);
@@ -2298,8 +2831,8 @@ function captureFormatFromSelection() {
   try { fmt.bold = document.queryCommandState('bold'); } catch (e) {}
   try { fmt.italic = document.queryCommandState('italic'); } catch (e) {}
   try { fmt.color = window.getComputedStyle(block).color; } catch (e) {}
-  // 捕获选区内的内联格式类（7 种新格式）
-  // 1) 遍历 range 内所有文本节点，收集其祖先 span 中的 INLINE_CLASSES
+  // 捕获选区内的行内格式类（8 种字符类 + 行内注释/引用 + 行内对齐，格式刷传播用）
+  // 1) 遍历 range 内所有文本节点，收集其祖先 span 中的 BRUSH_INLINE_CLASSES
   const walker = document.createTreeWalker(range.commonAncestorContainer, NodeFilter.SHOW_TEXT, {
     acceptNode: function(n) {
       const r = document.createRange();
@@ -2313,7 +2846,7 @@ function captureFormatFromSelection() {
   while ((tn = walker.nextNode())) {
     const span = tn.parentElement && tn.parentElement.closest ? tn.parentElement.closest('span') : null;
     if (span && span.classList) {
-      for (const cls of INLINE_CLASSES) {
+      for (const cls of BRUSH_INLINE_CLASSES) {
         if (span.classList.contains(cls)) inlineSet.add(cls);
       }
     }
@@ -2324,7 +2857,7 @@ function captureFormatFromSelection() {
     const spans = frag.querySelectorAll('span');
     for (const s of spans) {
       if (s.classList) {
-        for (const cls of INLINE_CLASSES) {
+        for (const cls of BRUSH_INLINE_CLASSES) {
           if (s.classList.contains(cls)) inlineSet.add(cls);
         }
       }
@@ -2341,6 +2874,7 @@ function applyOp(op) { const ed = currentEditable(); if (!ed) return;
    }
    if (op.indexOf('marker_') === 0) { insertMarker(op); return; }
    if (op === 'note') { toggleNote(ed); return; }
+   if (op === 'citation') { toggleCitation(ed); return; }
    if (op === 'heading') { cycleHeading(ed); return; }
    if (op.indexOf('align_') === 0) { applyAlign(ed, op.slice(6)); return; }
    if (op === 'flush' || op === 'indent') { applyIndentMode(ed, op); return; }
@@ -2374,6 +2908,9 @@ function applyOp(op) { const ed = currentEditable(); if (!ed) return;
   // 块级格式（标题/注释/引用/对齐/顶格缩进）一并清除。
   // 保护：ptoe-marker 标记 span（不在 INLINE_CLASSES，天然不触碰）；
   // 图片段落 ptoe-img-* 类与非文本 <img> 元素原样保留（图片布局不是文本格式）。
+  // 2026-09-27：分隔线块整体跳过（清掉类/属性会把整行分隔线退化成一行方框字符）；
+  // 逐字符格式载体 span[style] 一并解包（removeFormat 只清字符属性、不拆 span）。
+  if (isDividerBlock(block)) return;
   const sel = window.getSelection();
   // 折叠/无选中文字：按“光标所在整块”清除——把 range 扩为整块（行为可预期）
   const range = (r && !r.collapsed) ? r : (function () {
@@ -2387,8 +2924,14 @@ function applyOp(op) { const ed = currentEditable(); if (!ed) return;
     sel.addRange(range);
     document.execCommand('removeFormat');
     // 行内格式 span：逐个解包与 range 相交者（文本留在原位）
+    // 每类解包后 range 可能被引擎折叠损坏 → 解包前快照偏移、每类重建（见 _snapOffsets）
     // INLINE_TEXT_CLASSES = 8 类字符格式 + 规则引擎的行内注释 span（2026-09-13 修复）
-    for (const cls of INLINE_TEXT_CLASSES) unwrapSpans(block, cls, range);
+    const snap = _snapOffsets(block, range);
+    for (const cls of INLINE_TEXT_CLASSES) {
+      unwrapSpans(block, cls, snap ? _rangeFromOffsets(block, snap) : range);
+    }
+    // 逐字符格式载体：span 上的 style 全部剥除（与「清除字符格式」同效）
+    unwrapStyledSpans(block, range);
     // 块级标签：H1-H6 / DIV → 归一 <p>（_convertBlockTag 保留 class/data-*，
     // 图片段落若在 DIV 内其 ptoe-img-* 类随之保留）
     if (/^H[1-6]$/.test(block.tagName) || block.tagName === 'DIV') {
@@ -2603,6 +3146,159 @@ function searchRegexFor(query) {
   return new RegExp(q, regexMode ? 'gimu' : 'giu');
 }
 
+// ---------- 搜索范围 + 保留组（2026-09） ----------
+// 搜索可限定「当前页/全部页」；正则带捕获组时支持「部分替换」——勾选保留组后，
+// 只替换非保留组片段，保留组原文不动（典型：匹配「第([一二三四五六七八九十百千]+)章」，
+// 保留组 1 原样、其余部分按「替换为」处理）。
+let searchScope = 'all';              // 'all' | 'page'（当前页）
+let keepGroups = new Set();           // 保留的捕获组编号（1 起；0=整段匹配全部保留）
+let _lastKeepGroupCount = 0;          // 上次渲染的组数：组数增长时把新组默认加入保留
+let sessionDisplayName = '';          // 当前会话历史名：自动备份时随载荷发送（服务端重命名历史）
+
+// 部分替换的判定：正则模式 + 至少一个捕获组
+function _partialModeActive() {
+  const box = document.getElementById('searchRegex');
+  if (!box || !box.checked) return false;
+  return _countCaptureGroups((document.getElementById('searchInput').value || '').trim()) >= 1;
+}
+
+// 替换文本中的反向引用展开：$0=整段匹配；$N 引用「被保留的组」→ 空串
+// （保留组的原文已经原样留在原地，替换处引用它等于不删不替）。
+function _expandKeepRegex(replacement, m, kg) {
+  return String(replacement).replace(/\$(\d+)/g, function (all, n) {
+    const k = parseInt(n, 10);
+    if (k === 0) return m[0];
+    if (kg.has(k)) return '';
+    const v = m[k];
+    return (v == null) ? '' : v;
+  });
+}
+
+// 把一次匹配 [s,e) 切成平铺区域列表（捕获组 1..N 与组间缝隙），供部分替换按组拼接。
+// 依赖 m.indices（正则须带 d 标志重建）；个别实现不支持 indices 时退化为把整段
+// 匹配当作一个待替换缝隙（= 全替换，保留组失效但不会出错）。
+function _matchFlatRegions(m, groupCount) {
+  const regions = [];
+  if (m.indices) {
+    let cursor = m.index;
+    for (let k = 1; k <= groupCount; k++) {
+      const span = m.indices[k];
+      const gs = span ? span[0] : -1;
+      const ge = span ? span[1] : -1;
+      if (gs < 0) continue;                                  // 未参与的组（如可选组）无区域
+      if (gs > cursor) regions.push({ s: cursor, e: gs, keep: null }); // 前缝
+      regions.push({ s: gs, e: ge, keep: k });
+      cursor = ge;
+    }
+    const end = m.index + m[0].length;
+    if (cursor < end) regions.push({ s: cursor, e: end, keep: null }); // 尾缝
+  } else {
+    regions.push({ s: m.index, e: m.index + m[0].length, keep: null });
+  }
+  return regions;
+}
+
+// 在单个文本片段上执行部分替换：target=-1 全部替换；target=N 只替换第 N 处（0 起，
+// N 为全局序号——跨 token 累计，与旧 replaceCurrent 的页内序号语义一致）。
+// 返回 { out, replaced, ordEnd }：out=结果文本、replaced=实际文本变化次数、ordEnd=本
+// 片段结束时的全局序号（从 startOrd 起累计）。
+function _partialApply(text, re, kg, replacement, target, startOrd) {
+  const flags = (re.flags.indexOf('d') >= 0) ? re.flags : (re.flags + 'd');
+  const re2 = new RegExp(re.source, flags);
+  const groupCount = _countCaptureGroups(re.source);
+  let out = '', last = 0, ord = startOrd, replaced = 0, seen = 0;
+  re2.lastIndex = 0;
+  let m;
+  while ((m = re2.exec(text)) !== null) {
+    seen++; // 每个 exec 命中的匹配都计数（含零宽/整段保留），用于区分「没匹配」与「匹配但未替换」
+    if (m.index === re2.lastIndex) {
+      // 零宽匹配守卫：只推进锚点不产生片段，避免死循环（last 同步推进，防止前缀重复拼接）
+      out += text.slice(last, m.index);
+      last = m.index;
+      re2.lastIndex++;
+      continue;
+    } // 零宽守卫
+    const thisOrd = ord++;
+    out += text.slice(last, m.index);
+    if (target < 0 || thisOrd === target) {
+      if (kg.has(0)) {
+        out += m[0];                                          // 整段保留：只数不改
+      } else {
+        const regions = _matchFlatRegions(m, groupCount);
+        for (const r of regions) {
+          if (r.keep !== null && kg.has(r.keep)) out += text.slice(r.s, r.e);
+          else out += _expandKeepRegex(replacement, m, kg);
+        }
+        replaced++;
+      }
+    } else {
+      out += m[0];
+    }
+    last = m.index + m[0].length;
+  }
+  out += text.slice(last);
+  return { out: out, replaced: replaced, ordEnd: ord, seen: seen };
+}
+
+// 按 token 切分执行部分替换（与 pageText/replaceAll 相同的标签间文本语义）：
+// toks=已按 (<[^>]+>) 切分的数组（mdMode 传 [整页文本]）；target=-1 全替换，
+// target=N 只替换全局第 N 处。返回 { text, replaced, count, seen }：
+// count=处理到的匹配总数；seen=正则实际命中的匹配总数（含零宽，永不小于 count 的已处理部分）。
+function _partialReplaceTokens(toks, re, kg, replacement, target) {
+  let out = '', replaced = 0, ord = 0, seen = 0;
+  for (const tok of toks) {
+    if (tok.charAt(0) === '<') { out += tok; continue; }
+    const r = _partialApply(tok, re, kg, replacement, target, ord);
+    out += r.out;
+    replaced += r.replaced;
+    ord = r.ordEnd;
+    seen += r.seen;
+  }
+  return { text: out, replaced: replaced, count: ord, seen: seen };
+}
+
+// 按当前范围（全部页/当前页）返回要处理的页索引数组
+function _searchScopeIndexes() {
+  if (searchScope === 'page') return [viewportPage()];
+  return pages.map(function (p, i) { return i; });
+}
+
+// 保留组 chips：正则带捕获组时显示，点击切换该组的保留/替换
+function updateKeepChips() {
+  const row = document.getElementById('keepGroupsRow');
+  if (!row) return;
+  const active = _partialModeActive();
+  row.style.display = active ? 'flex' : 'none';
+  if (!active) return;
+  const q = (document.getElementById('searchInput').value || '').trim();
+  const n = q ? _countCaptureGroups(q) : 0;
+  // 组数增长时把新组默认加入保留；回落后移除越界组（组 0 之外的无效项）
+  if (n > _lastKeepGroupCount) {
+    for (let k = _lastKeepGroupCount + 1; k <= n; k++) keepGroups.add(k);
+  }
+  for (const k of [...keepGroups]) {
+    if (k < 1 || k > n) keepGroups.delete(k);
+  }
+  _lastKeepGroupCount = n;
+  const chipBox = document.getElementById('keepGroupsChips');
+  if (!chipBox) return;
+  chipBox.innerHTML = '';
+  const mk = function (label, k) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'kg-chip' + (keepGroups.has(k) ? ' on' : '');
+    b.textContent = label;
+    b.title = k === 0 ? '整段匹配全部保留，不替换' : '保留第 ' + k + ' 个捕获组的原文，仅替换其余部分';
+    b.addEventListener('click', function () {
+      if (keepGroups.has(k)) keepGroups.delete(k); else keepGroups.add(k);
+      updateKeepChips();
+    });
+    return b;
+  };
+  chipBox.appendChild(mk('组0·整段', 0));
+  for (let k = 1; k <= n; k++) chipBox.appendChild(mk('组' + k, k));
+}
+
 function updateSearchNav() {
   const pos = document.getElementById('searchPos');
   if (pos) pos.textContent = searchResults.length ? (searchCurrent + 1) + ' / ' + searchResults.length : '';
@@ -2624,7 +3320,7 @@ function renderSearchResults(results, total, MAX) {
   results.forEach(function (r, k) {
     const item = document.createElement('div');
     item.className = 'sr-item';
-    item.innerHTML = '<div class="sr-page">第 ' + r.page + ' 页</div><div class="sr-ctx">' + r.ctx + '</div>';
+    item.innerHTML = '<div class="sr-page">' + (r.scopePage ? '本页' : '第 ' + r.page + ' 页') + '</div><div class="sr-ctx">' + r.ctx + '</div>';
     item.addEventListener('click', function () {
       searchCurrent = k;
       updateSearchNav();
@@ -2645,7 +3341,9 @@ function searchPages() {
   const CONTEXT = 40, MAX = 200;
   const results = [];
   let total = 0, pageStart = 0;
-  for (let i = 0; i < pages.length; i++) {
+  const scopeIdx = _searchScopeIndexes(); // 搜索范围：全部页 / 当前页（2026-09）
+  const scopePage = searchScope === 'page';
+  for (const i of scopeIdx) {
     const text = pageText(i);
     re.lastIndex = 0;
     let m;
@@ -2657,7 +3355,7 @@ function searchPages() {
       const s = Math.max(0, m.index - CONTEXT);
       const e2 = Math.min(text.length, m.index + m[0].length + CONTEXT);
       results.push({
-        i: i, page: pages[i].page, pageOrd: pageOrd, withinPage: withinPage,
+        i: i, page: pages[i].page, pageOrd: pageOrd, withinPage: withinPage, scopePage: scopePage,
         ctx: esc(decodeEntities(text.slice(s, m.index))) + '<mark>' + esc(decodeEntities(m[0])) + '</mark>' + esc(decodeEntities(text.slice(m.index + m[0].length, e2)))
       });
     }
@@ -2738,6 +3436,7 @@ function clearSearchHighlights() {
 
 // 标记只在点击「搜索」后应用（2026-08）；输入框清空时立即消除全部文字标记
 document.getElementById('searchInput').addEventListener('input', function () {
+  updateKeepChips(); // 正则/捕获组变化 → 刷新保留组 chips
   if (!(this.value || '').trim()) clearSearchHighlights();
 });
 
@@ -2750,6 +3449,189 @@ function clearSearchState() {
   updateSearchNav();                // 清空「x / y」位置显示
 }
 document.getElementById('searchClearBtn').addEventListener('click', clearSearchState);
+
+// ---------- 替换规则（2026-09）：把带保留组的替换固化为可复用规则，一键应用 ----------
+let replaceRules = [];       // [{id,name,pattern,flags,replacement,keep_groups,builtin}]
+let rrEditingId = null;      // 正在编辑的规则 id（null=新建）
+let rrKeepGroups = new Set();// 编辑弹窗内的保留组
+let rrLastGroupCount = 0;
+
+function openReplaceRulesModal() { loadReplaceRules(); document.getElementById('replaceRulesModalBg').style.display = 'flex'; }
+function closeReplaceRulesModal() { document.getElementById('replaceRulesModalBg').style.display = 'none'; }
+
+function loadReplaceRules() {
+  fetchJSON('/api/replace_rules').then(function (res) {
+    replaceRules = (res && Array.isArray(res.rules)) ? res.rules : [];
+    renderReplaceRules();
+  }).catch(function () { replaceRules = []; renderReplaceRules(); });
+}
+
+function renderReplaceRules() {
+  const list = document.getElementById('rrList');
+  if (!list) return;
+  list.innerHTML = '';
+  if (!replaceRules.length) {
+    list.innerHTML = '<div class="sr-empty">暂无替换规则。点击「新建规则」把带保留组的替换保存下来复用。</div>';
+    return;
+  }
+  replaceRules.forEach(function (rule, idx) {
+    const row = document.createElement('div');
+    row.className = 'rr-item';
+    const kg = (rule.keep_groups && rule.keep_groups.length) ? '　保留组 ' + rule.keep_groups.join('/') : '';
+    row.innerHTML =
+      '<div class="rr-item-head"><span class="rr-name">' + esc(rule.name || '（未命名规则）') + '</span>' +
+      (rule.builtin ? '<span class="rr-builtin">内置</span>' : '') +
+      '<code class="rr-pat">/' + esc(String(rule.pattern)) + '/' + esc(String(rule.flags || '')) + '</code>' +
+      '<span class="rr-repl">→ ' + esc(String(rule.replacement || '')) + kg + '</span></div>' +
+      '<div class="rr-item-acts">' +
+      '<button type="button" data-rr="apply" title="用该规则替换当前页">应用当前页</button>' +
+      '<button type="button" data-rr="applyall" title="用该规则替换全部页面">应用全部页</button>' +
+      (!rule.builtin ? '<button type="button" data-rr="edit">编辑</button><button type="button" data-rr="del" class="danger">删除</button>' : '') +
+      '</div>';
+    row.dataset.rrIdx = String(idx);
+    row.dataset.rrId = rule.id || '';
+    list.appendChild(row);
+  });
+}
+
+function persistReplaceRules() {
+  fetchJSON('/api/replace_rules', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ rules: replaceRules })
+  }).then(function (res) {
+    if (!res || res.ok === false) throw new Error((res && res.error) || '保存替换规则失败');
+    if (Array.isArray(res.rules)) replaceRules = res.rules;
+    renderReplaceRules();
+  }).catch(function (e) {
+    showToast('保存替换规则失败：' + e.message, 'fail');
+  });
+}
+
+// 编辑弹窗内的保留组 chips（与搜索框内 updateKeepChips 同构；组 0=整段保留）
+function updateRrKeepChips() {
+  const row = document.getElementById('rrKeepGroupsRow');
+  if (!row) return;
+  const raw = (document.getElementById('rrPattern').value || '').trim();
+  const pattern = raw.replace(/^\/(.+)\/[a-z]*$/, '$1'); // 兼容 /pattern/flags 写法
+  const n = pattern ? _countCaptureGroups(pattern) : 0;
+  row.style.display = n >= 1 ? 'flex' : 'none';
+  if (n >= 1 && n > rrLastGroupCount) {
+    for (let k = rrLastGroupCount + 1; k <= n; k++) rrKeepGroups.add(k);
+  }
+  for (const k of [...rrKeepGroups]) if (k < 1 || k > n) rrKeepGroups.delete(k);
+  rrLastGroupCount = n;
+  const chips = document.getElementById('rrKeepChips');
+  if (!chips) return;
+  chips.innerHTML = '';
+  if (n < 1) return;
+  const mk = function (k) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'kg-chip' + (rrKeepGroups.has(k) ? ' on' : '');
+    b.textContent = k === 0 ? '组0·整段' : '组' + k;
+    b.title = k === 0 ? '整段匹配全部保留' : '保留第 ' + k + ' 个捕获组的原文';
+    b.addEventListener('click', function () {
+      if (rrKeepGroups.has(k)) rrKeepGroups.delete(k); else rrKeepGroups.add(k);
+      updateRrKeepChips();
+    });
+    return b;
+  };
+  chips.appendChild(mk(0));
+  for (let k = 1; k <= n; k++) chips.appendChild(mk(k));
+}
+
+function openRrEdit(rule) {
+  rrEditingId = rule ? rule.id : null;
+  rrKeepGroups = new Set(rule && Array.isArray(rule.keep_groups) ? rule.keep_groups.filter(function (f) { return f >= 0; }) : []);
+  rrLastGroupCount = 0;
+  document.getElementById('rrEditTitle').textContent = rule ? '编辑替换规则' : '新建替换规则';
+  document.getElementById('rrName').value = (rule && rule.name) || '';
+  document.getElementById('rrPattern').value = (rule && rule.pattern) || '';
+  document.getElementById('rrFlags').value = (rule && rule.flags) || '';
+  document.getElementById('rrReplacement').value = (rule && rule.replacement) || '';
+  updateRrKeepChips();
+  document.getElementById('rrEditModalBg').style.display = 'flex';
+  document.getElementById('rrPattern').focus();
+}
+function closeRrEdit() { document.getElementById('rrEditModalBg').style.display = 'none'; }
+
+function saveRrEdit() {
+  const name = document.getElementById('rrName').value.trim();
+  const pattern = document.getElementById('rrPattern').value.trim();
+  const flags = document.getElementById('rrFlags').value.trim().replace(/[^imsu]/g, '');
+  const replacement = document.getElementById('rrReplacement').value;
+  if (!pattern) { showToast('请输入正则表达式', 'warn'); return; }
+  try { new RegExp(pattern, flags); } catch (e) { showToast('正则表达式无效：' + e.message, 'fail'); return; }
+  const kgArr = [...rrKeepGroups].sort(function (a, b) { return a - b; });
+  if (rrEditingId) {
+    const rule = replaceRules.find(function (r) { return r.id === rrEditingId; });
+    if (!rule) { showToast('规则不存在，可能已被删除', 'warn'); closeRrEdit(); return; }
+    rule.name = name; rule.pattern = pattern; rule.flags = flags; rule.replacement = replacement;
+    rule.keep_groups = kgArr;
+  } else {
+    replaceRules.push({
+      id: 'rr_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+      name: name, pattern: pattern, flags: flags, replacement: replacement,
+      keep_groups: kgArr, builtin: false
+    });
+  }
+  closeRrEdit();
+  persistReplaceRules();
+  showToast('已保存替换规则「' + (name || '未命名') + '」', 'ok');
+}
+
+// 规则应用正则：g + 用户标志去重，缺 u 补 u（indices 所需），apply 时再加 d
+function rrApplyRegex(rule) {
+  const base = ('g' + String(rule.flags || '').replace(/[^imsu]/g, '')).split('').filter(function (f, i, a) { return a.indexOf(f) === i; }).join('');
+  return new RegExp(rule.pattern, base.indexOf('u') >= 0 ? base : (base + 'u'));
+}
+
+// 用保存的规则执行替换：allPages=false 只作用当前页。保留组语义与搜索框内相同。
+function applyReplaceRule(rule, allPages) {
+  const kg = new Set((rule.keep_groups || []).filter(function (k) { return k >= 0; }));
+  let re;
+  try { re = rrApplyRegex(rule); }
+  catch (e) { showToast('规则正则无效：' + e.message, 'fail'); return; }
+  const scopeIdx = allPages ? pages.map(function (p, i) { return i; }) : [viewportPage()];
+  const changed = [];
+  let count = 0;
+  let replacedTotal = 0, noopTotal = 0, seenTotal = 0; // 2026-09：规则的诚实统计（同 replaceAll）
+  const before = histBegin('替换规则「' + (rule.name || '未命名') + '」', allPages ? null : scopeIdx);
+  for (const i of scopeIdx) {
+    const src = pageSource(i);
+    const toks = mdMode ? [src] : src.split(/(<[^>]+>)/);
+    const rr = _partialReplaceTokens(toks, re, kg, rule.replacement, -1);
+    seenTotal += rr.seen;
+    if (rr.replaced > 0) {
+      if (rr.text !== src) { changed.push({ i: i, out: rr.text }); replacedTotal += rr.replaced; }
+      else noopTotal += rr.replaced; // 改写结果与原文一致（如全部组保留）→ 无净变化
+    }
+  }
+  if (replacedTotal === 0) {
+    // 无实际变化：诚实区分三种情况后关闭历史事务（histEnd 对无改动页不会推入撤销栈）
+    histEnd(before, '替换规则');
+    if (noopTotal > 0) showToast('匹配内容均为保留组，未实际替换', 'warn');
+    else if (seenTotal > 0) showToast('匹配均为保留组或零宽匹配，未替换', 'warn');
+    else showToast('未找到匹配内容，未替换', 'warn');
+    return;
+  }
+  count = replacedTotal;
+  for (const ch of changed) {
+    if (mdMode) mdSourceMap.set(ch.i, ch.out);
+    else contentMap.set(ch.i, ch.out);
+  }
+  for (const row of [...host.children]) {
+    const idx = Number(row.dataset.i);
+    const ed = row.querySelector('.editable');
+    if (ed) { ed.innerHTML = displayHtml(idx); _reapplyProofread(idx); scheduleRemeasure(idx); }
+  }
+  for (const ch of changed) editedSet.add(ch.i);
+  dirty = true;
+  updateStatus();
+  histEnd(before, '替换规则');
+  showToast('已应用规则「' + (rule.name || '未命名') + '」：替换 ' + count + ' 处' + (allPages ? '' : '（当前页）'), 'ok');
+  searchPages();
+}
 
 async function exportFile(fmt) {
   try {
@@ -2792,7 +3674,24 @@ function replaceCurrent() {
   const before = histBegin('替换当前', [i]);
   const src = pageSource(i);
   let out, c = 0;
-  if (mdMode) {
+  if (_partialModeActive()) {
+    // 部分替换：只替换该次匹配中非保留的组片段（目标=页内第 target 处匹配）
+    const rr = _partialReplaceTokens(mdMode ? [src] : src.split(/(<[^>]+>)/), re, keepGroups, repl, target);
+    if (rr.replaced > 0 && rr.text === src) {
+      // 匹配被改写但结果与原文一致（如全部捕获组保留且间隙为空）→ 无净变化，不入历史
+      histEnd(before, '替换当前'); // 关闭空事务：无实际变化不会推入撤销栈
+      showToast('匹配内容均被保留，未实际替换', 'warn');
+      return;
+    }
+    if (rr.replaced === 0) {
+      histEnd(before, '替换当前'); // 同上：未改动内容
+      if (rr.seen > 0) showToast('匹配均为保留组或零宽匹配，未替换', 'warn');
+      else showToast('该处匹配已变化，请重新搜索', 'warn');
+      return;
+    }
+    out = rr.text;
+    c = rr.count;
+  } else if (mdMode) {
     out = src.replace(re, function (m) { const n = c++; return (n === target) ? repl : m; });
   } else {
     out = src.split(/(<[^>]+>)/).map(function (tok) {
@@ -2800,7 +3699,7 @@ function replaceCurrent() {
       return tok.replace(re, function (m) { const n = c++; return (n === target) ? repl : m; });
     }).join('');
   }
-  if (c <= target) { showToast('该处匹配已变化，请重新搜索', 'warn'); return; }
+  if (!_partialModeActive() && c <= target) { showToast('该处匹配已变化，请重新搜索', 'warn'); return; }
   if (mdMode) mdSourceMap.set(i, out);
   else contentMap.set(i, out);
   const row = host.querySelector('.page-row[data-i="' + i + '"]');
@@ -2844,24 +3743,51 @@ function replaceAll() {
   catch (e) { showToast('正则表达式无效：' + e.message, 'fail'); return; }
   const changed = [];
   let count = 0;
+  let replacedTotal = 0, noopTotal = 0, seenTotal = 0; // 2026-09：部分替换的诚实统计
   const before = histBegin('全部替换', null); // 全页快照；histEnd 只保留实际变化页
-  for (let i = 0; i < pages.length; i++) {
-    const src = pageSource(i);
-    let out, c = 0;
-    if (mdMode) {
-      // Markdown 源码：直接整体替换
-      out = src.replace(re, function () { c++; return repl; });
-    } else {
-      // 富文本：只替换标签之间的文本 token，不触碰标签/属性，避免破坏 HTML 结构
-      out = src.split(/(<[^>]+>)/).map(function (tok) {
-        if (tok.charAt(0) === '<') return tok;
-        return tok.replace(re, function () { c++; return repl; });
-      }).join('');
+  const scopeIdx = _searchScopeIndexes();     // 替换范围：全部页 / 当前页（2026-09）
+  if (_partialModeActive()) {
+    // 部分替换：正则带捕获组 + 保留组设置——只替换未被保留的组片段
+    for (const i of scopeIdx) {
+      const src = pageSource(i);
+      const toks = mdMode ? [src] : src.split(/(<[^>]+>)/);
+      const rr = _partialReplaceTokens(toks, re, keepGroups, repl, -1);
+      seenTotal += rr.seen;
+      if (rr.replaced > 0) {
+        if (rr.text !== src) { changed.push({ i: i, out: rr.text }); replacedTotal += rr.replaced; }
+        else noopTotal += rr.replaced; // 改写结果与原文一致（如全部组保留）→ 无净变化
+      }
     }
-    if (c > 0) changed.push({ i: i, out: out });
-    count += c;
+    if (replacedTotal > 0) count = replacedTotal; // 成功统计；失败分支用 replacedTotal 分别提示
+  } else {
+    for (const i of scopeIdx) {
+      const src = pageSource(i);
+      let out, c = 0;
+      if (mdMode) {
+        // Markdown 源码：直接整体替换
+        out = src.replace(re, function () { c++; return repl; });
+      } else {
+        // 富文本：只替换标签之间的文本 token，不触碰标签/属性，避免破坏 HTML 结构
+        out = src.split(/(<[^>]+>)/).map(function (tok) {
+          if (tok.charAt(0) === '<') return tok;
+          return tok.replace(re, function () { c++; return repl; });
+        }).join('');
+      }
+      if (c > 0) changed.push({ i: i, out: out });
+      count += c;
+    }
   }
-  if (count === 0) { showToast('未找到匹配内容，未替换', 'warn'); return; }
+  if (count === 0) {
+    histEnd(before, '全部替换'); // 关闭空事务：无实际变化不会推入撤销栈
+    if (_partialModeActive()) {
+      if (noopTotal > 0) showToast('匹配内容均为保留组，未实际替换', 'warn');
+      else if (seenTotal > 0) showToast('匹配均为保留组或零宽匹配，未替换', 'warn');
+      else showToast('未找到匹配内容，未替换', 'warn');
+    } else {
+      showToast('未找到匹配内容，未替换', 'warn');
+    }
+    return;
+  }
   for (const ch of changed) {
     if (mdMode) mdSourceMap.set(ch.i, ch.out);
     else contentMap.set(ch.i, ch.out);
@@ -2875,7 +3801,7 @@ function replaceAll() {
   dirty = true;
   updateStatus();
   histEnd(before, '全部替换');
-  showToast('已替换 ' + count + ' 处', 'ok');
+  showToast('已替换 ' + count + ' 处' + (searchScope === 'page' ? '（当前页）' : ''), 'ok');
   searchPages(); // 替换后刷新结果列表（匹配数可能变化）
 }
 
@@ -2934,6 +3860,110 @@ async function stage() {
   }
   finally { btn.disabled = false; }
 }
+
+// ---------- 自动备份（2026-09） ----------
+// 内容有改动时按设定间隔调用 /api/autosave 写入本地历史；不打断编辑：
+// 弹窗打开、保存/暂存进行中、无改动或未启用时跳过本轮。备份不改变 dirty 状态
+// （手动保存/暂存仍是唯一「已保存」标记），也不会进撤销栈。
+let autoSaveSettings = { enabled: false, interval_minutes: 5, new_backup: true };
+let _autoSaveTimer = null;
+let _autoSaveInFlight = false;
+
+function _autoSaveModalOpen() {
+  const ids = ['modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','charFormatModalBg','finishModalBg','finishConfirmBg','formatRulesModalBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg','replaceRulesModalBg','rrEditModalBg'];
+  for (let k = 0; k < ids.length; k++) {
+    const el = document.getElementById(ids[k]);
+    if (el && el.style.display === 'flex') return true;
+  }
+  return false;
+}
+
+function loadAutoSaveFromServer() {
+  fetchJSON('/api/auto_save').then(function (res) {
+    if (res && res.auto_save && typeof res.auto_save === 'object') {
+      autoSaveSettings = Object.assign({ enabled: false, interval_minutes: 5, new_backup: true }, res.auto_save);
+      syncAutoSaveUi();
+    }
+  }).catch(function () {});
+}
+
+function syncAutoSaveUi() {
+  const en = document.getElementById('autoSaveEnabled');
+  const iv = document.getElementById('autoSaveInterval');
+  const nb = document.getElementById('autoSaveNewBackup');
+  if (en) en.checked = !!autoSaveSettings.enabled;
+  if (iv) { iv.value = autoSaveSettings.interval_minutes || 5; iv.disabled = !autoSaveSettings.enabled; }
+  if (nb) { nb.checked = !!autoSaveSettings.new_backup; nb.disabled = !autoSaveSettings.enabled; }
+}
+
+function bindAutoSaveSettingsEvents() {
+  const en = document.getElementById('autoSaveEnabled');
+  if (!en || en.dataset.bound === '1') return;
+  en.dataset.bound = '1';
+  const iv = document.getElementById('autoSaveInterval');
+  const nb = document.getElementById('autoSaveNewBackup');
+  en.addEventListener('change', function () {
+    autoSaveSettings.enabled = en.checked;
+    syncAutoSaveUi();
+    saveAutoSaveSettings();
+    _autoSaveSchedule();
+  });
+  if (iv) iv.addEventListener('change', function () {
+    const v = parseInt(iv.value, 10);
+    autoSaveSettings.interval_minutes = isFinite(v) ? Math.min(60, Math.max(1, v)) : 5;
+    iv.value = autoSaveSettings.interval_minutes;
+    saveAutoSaveSettings();
+    _autoSaveSchedule();
+  });
+  if (nb) nb.addEventListener('change', function () {
+    autoSaveSettings.new_backup = nb.checked;
+    saveAutoSaveSettings();
+  });
+}
+
+function saveAutoSaveSettings() {
+  fetchJSON('/api/auto_save', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ auto_save: autoSaveSettings })
+  }).catch(function () {});
+}
+
+function _autoSaveSchedule() {
+  if (_autoSaveTimer) clearTimeout(_autoSaveTimer);
+  _autoSaveTimer = setTimeout(_autoSaveTick, Math.max(1, autoSaveSettings.interval_minutes || 5) * 60 * 1000);
+}
+
+async function _autoSaveTick() {
+  _autoSaveSchedule(); // 先排下一轮，await 失败也不中断
+  if (!autoSaveSettings.enabled) return;
+  if (!dirty) return;
+  if (_autoSaveInFlight) return;
+  const saveBtn = document.getElementById('saveBtn');
+  const stageBtn = document.getElementById('stageBtn');
+  if (saveBtn && saveBtn.disabled) return;
+  if (stageBtn && stageBtn.disabled) return;
+  if (_autoSaveModalOpen()) return;
+  _autoSaveInFlight = true;
+  try {
+    const res = await fetchJSON('/api/autosave', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        pages: collect(),
+        proofread: collectProofread(),
+        last_proofread_page: lastProofreadPage,
+        display_name: sessionDisplayName || ''
+      })
+    });
+    if (!res || res.ok === false) throw new Error((res && res.error) || '自动备份失败');
+    setStatus('已自动' + (autoSaveSettings.new_backup ? '备份' : '更新') + '，' + new Date().toLocaleTimeString());
+    if (document.getElementById('historyModalBg') && document.getElementById('historyModalBg').style.display === 'flex') loadHistory();
+  } catch (e) {
+    showToast('自动备份失败：' + e.message, 'fail');
+  } finally {
+    _autoSaveInFlight = false;
+  }
+}
+
 async function confirmFinish() {
   let totalErrors = 0;
   for (let i = 0; i < pages.length; i++) {
@@ -3296,7 +4326,13 @@ function closeHistory() { document.getElementById('historyModalBg').style.displa
 // 搜索/导出模态框开关：与 historyModalBg 同一模式（CSS 默认 display:none）。
 // 曾因重构丢失这四个函数导致加载期 ReferenceError，后续所有绑定（含工具栏）
 // 全部失效——编辑后务必 node --check 并核对每个顶层绑定目标函数已定义。
-function openSearchModal() { document.getElementById('searchModalBg').style.display = 'flex'; document.getElementById('searchInput').focus(); }
+function openSearchModal() {
+  document.getElementById('searchModalBg').style.display = 'flex';
+  // 2026-09：范围分段按钮与保留组 chips 随打开同步（可能已在设置里切过范围）
+  document.querySelectorAll('.scope-btn').forEach(function (b) { b.classList.toggle('active', b.dataset.scope === searchScope); });
+  updateKeepChips();
+  document.getElementById('searchInput').focus();
+}
 function closeSearchModal() { document.getElementById('searchModalBg').style.display = 'none'; }
 function openExportModal() { document.getElementById('exportModalBg').style.display = 'flex'; }
 function closeExportModal() { document.getElementById('exportModalBg').style.display = 'none'; }
@@ -3306,6 +4342,20 @@ function closeExportModal() { document.getElementById('exportModalBg').style.dis
 // data-spb/spa=段前段后、data-lh=行距），sanitize 白名单放行；导出 EPUB 时由
 // htmlmanage 转为内联样式。编辑器内用 attribute selector 即时预览。
 const _IND_ATTRS = ['data-pl','data-pr','data-ind','data-indv','data-spb','data-spa','data-lh'];
+let _indSelRange = null; // 段落设置弹窗打开时的选区快照：弹窗内交互销毁 document 选区后，点确定时恢复
+function _captureIndentSelection() {
+  const ed = currentEditable();
+  const sel = window.getSelection();
+  if (ed && sel && sel.rangeCount > 0 && !sel.isCollapsed) {
+    let node = sel.getRangeAt(0).commonAncestorContainer;
+    if (node.nodeType === 3) node = node.parentElement;
+    if (node && ed.contains(node)) {
+      _indSelRange = { ed: ed, range: sel.getRangeAt(0).cloneRange() };
+      return;
+    }
+  }
+  _indSelRange = null;
+}
 function _indTargetBlock() {
   const ed = currentEditable();
   if (!ed) return null;
@@ -3316,6 +4366,7 @@ function _indTargetBlock() {
     || (ed.firstElementChild && ed.firstElementChild.closest('p,h1,h2,h3,h4,h5,h6')) || null;
 }
 function openIndentDialog() {
+  _captureIndentSelection(); // 打开时快照当前选区：弹窗内交互（焦点/选区移动）会销毁 document 选区
   const b = _indTargetBlock();
   const g = function(id) { return document.getElementById(id); };
   const get = function(a) { return (b && b.getAttribute(a)) || ''; };
@@ -3329,22 +4380,124 @@ function openIndentDialog() {
   updateIndentPreview();
   document.getElementById('indentModalBg').style.display = 'flex';
 }
-function closeIndentDialog() { document.getElementById('indentModalBg').style.display = 'none'; }
+function closeIndentDialog() {
+  _indSelRange = null; // 关闭弹窗后清空选区快照，防陈旧快照被下次会话错用
+  document.getElementById('indentModalBg').style.display = 'none';
+}
+// 2026-09-24：段落设置三模式（选中段落 / 当前页全部正文段落 / 全部正文）。
+// 作用范围由 #indMode* 单选组决定（indentMode()），预览与确认文案相应切换。
+function indentMode() {
+  const all = document.getElementById('indModeAll');
+  const pg = document.getElementById('indModePage');
+  if (all && all.checked) return 'all';
+  if (pg && pg.checked) return 'page';
+  return 'selection';
+}
+// 与 htmlmanage._indent_style_attrs 逐字节同构：仅接受数字值（^-?\d+(\.\d+)?$）
+// 与 data-ind ∈ {first,hang}；hang → margin-left:(pl+indv)em + text-indent:-indv em
+// （合并取值，不与 data-pl 重复声明）；否则 pl→margin-left、first→text-indent、
+// pr→margin-right、spb/spa→×1.5em、lh→line-height（无 em 单位，>0 才输出）。
+// Python :g 格式化（去尾零）↔ JS round(x*1e6)/1e6。空串/非法值一律视为缺席。
+function _indStyleFromData(attrsStr) {
+  const str = String(attrsStr == null ? '' : attrsStr);
+  const get = function (name) {
+    const m = str.match(new RegExp('\\s' + name + '="([^"]*)"'));
+    return m ? m[1].trim() : '';
+  };
+  const numRe = /^-?\d+(?:\.\d+)?$/;
+  const vals = {};
+  for (const a of ['data-pl', 'data-pr', 'data-indv', 'data-spb', 'data-spa', 'data-lh']) {
+    const v = get(a);
+    if (v !== '' && numRe.test(v)) vals[a] = v;
+  }
+  const ind = get('data-ind');
+  if (ind === 'first' || ind === 'hang') vals['data-ind'] = ind;
+  const num = function (key, d) {
+    const v = vals[key];
+    return v !== undefined ? parseFloat(v) : d;
+  };
+  const fmt = function (n) { return String(Math.round(n * 1e6) / 1e6); };
+  const parts = [];
+  const hasPl = 'data-pl' in vals;
+  const pl = hasPl ? num('data-pl', 0) : null;
+  const pr = 'data-pr' in vals ? num('data-pr', 0) : null;
+  const indv = num('data-indv', 2.0);
+  const mode = vals['data-ind'];
+  if (mode === 'hang') {
+    const base = (pl || 0.0) + indv;
+    parts.push('margin-left:' + fmt(base) + 'em');
+    parts.push('text-indent:-' + fmt(indv) + 'em');
+  } else {
+    if (pl !== null) parts.push('margin-left:' + fmt(pl) + 'em');
+    if (mode === 'first') parts.push('text-indent:' + fmt(indv) + 'em');
+  }
+  if (pr !== null) parts.push('margin-right:' + fmt(pr) + 'em');
+  if ('data-spb' in vals) parts.push('margin-top:' + fmt(num('data-spb', 0) * 1.5) + 'em');
+  if ('data-spa' in vals) parts.push('margin-bottom:' + fmt(num('data-spa', 0) * 1.5) + 'em');
+  if ('data-lh' in vals && num('data-lh', 0) > 0) parts.push('line-height:' + fmt(num('data-lh', 0)));
+  return parts.join(';');
+}
 function _indStyleFor(v) {
-  // 由一组 data 属性值生成编辑器即时预览用的内联样式（与导出规则一致）
-  const s = [];
-  const num = function(x, d) { const n = parseFloat(x); return isNaN(n) ? d : n; };
-  const pl = v.pl !== '' ? num(v.pl, 0) : null;
-  const pr = v.pr !== '' ? num(v.pr, 0) : null;
-  const indv = num(v.indv, 2);
-  if (pl != null) s.push('margin-left:' + pl + 'em');
-  if (pr != null) s.push('margin-right:' + pr + 'em');
-  if (v.ind === 'first') s.push('text-indent:' + indv + 'em');
-  else if (v.ind === 'hang') { s.push('padding-left:' + indv + 'em'); s.push('text-indent:-' + indv + 'em'); }
-  if (v.spb !== '') s.push('margin-top:' + num(v.spb, 0) * 1.5 + 'em');
-  if (v.spa !== '') s.push('margin-bottom:' + num(v.spa, 0) * 1.5 + 'em');
-  if (v.lh !== '') s.push('line-height:' + num(v.lh, 1.6));
-  return s.join(';');
+  // 预览用：把对象值编译成属性串，复用同一套「值与格式化」逻辑（保证预览=导出同公式）
+  const attrsStr = ' data-pl="' + (v.pl || '') + '" data-pr="' + (v.pr || '') +
+    '" data-ind="' + (v.ind || '') + '" data-indv="' + (v.indv || '2') + '"' +
+    ' data-spb="' + (v.spb || '') + '" data-spa="' + (v.spa || '') + '" data-lh="' + (v.lh || '') + '"';
+  return _indStyleFromData(attrsStr);
+}
+// 块元素 → 属性串（供选中段落模式按 live DOM 生成样式）
+function _blockAttrsString(block) {
+  let s = '';
+  for (const a of _IND_ATTRS) {
+    const v = block.getAttribute(a);
+    if (v !== null && v !== '') s += ' ' + a + '="' + String(v).replace(/"/g, '&quot;') + '"';
+  }
+  return s;
+}
+// 设置/清除单个块开标签上的 data-* 属性（老属性整体移除后重插；支持自闭合 />）
+function _setIndentData(openTag, attrsStr) {
+  let t = String(openTag);
+  t = t.replace(/\s+data-(?:pl|pr|ind|indv|spb|spa|lh)="[^"]*"/g, '');
+  const a = String(attrsStr == null ? '' : attrsStr).trim();
+  if (a) {
+    if (t.endsWith('/>')) t = t.slice(0, -2) + ' ' + a + ' />';
+    else if (t.endsWith('>')) t = t.slice(0, -1) + ' ' + a + '>';
+  }
+  return t;
+}
+function _valsToAttrs(vals) {
+  // vals: {data-pl:'', data-ind:'first', …} → ' data-pl="2" data-ind="first" '（空值跳过）
+  // data-indv 仅在特殊格式非空时写出（与旧 selection 分支语义一致）。
+  let s = '';
+  for (const a of _IND_ATTRS) {
+    const v = vals[a];
+    if (v === undefined || v === '') continue;
+    if (a === 'data-indv' && (vals['data-ind'] === undefined || vals['data-ind'] === '')) continue;
+    s += ' ' + a + '="' + String(v).replace(/"/g, '&quot;') + '"';
+  }
+  return s;
+}
+// 对整页 HTML 串应用/清除段落设置：p/div/h1-6 开标签全局替换；表格整块保护
+// （占位符 \u0000TBL{n}\u0000 或原生 <table>…</table> 内容不触碰——单元格内
+// <p> 视为表格版式而非正文段落）。返回 {html, count}。
+function _applyIndentToHtml(html, vals, clearOnly) {
+  let s = String(html == null ? '' : html);
+  let count = 0;
+  const tblHold = [];
+  s = s.replace(/<table[\s\S]*?<\/table>/gi, function (m) { tblHold.push(m); return '\u0000TBL' + (tblHold.length - 1) + '\u0000'; });
+  s = s.replace(/<(p|div|h[1-6])(\s[^>]*?)?>/gi, function (m, tag, attrs) {
+    const a = attrs || '';
+    let open;
+    if (clearOnly) {
+      if (!/data-(?:pl|pr|ind|indv|spb|spa|lh)="/.test(a)) return m;
+      open = '<' + tag + a.replace(/\s+data-(?:pl|pr|ind|indv|spb|spa|lh)="[^"]*"/g, '') + '>';
+    } else {
+      open = _setIndentData('<' + tag + a + '>', _valsToAttrs(vals));
+    }
+    count++;
+    return open;
+  });
+  s = s.replace(/\u0000TBL(\d+)\u0000/g, function (m, n) { return tblHold[Number(n)] != null ? tblHold[Number(n)] : m; });
+  return { html: s, count: count };
 }
 function updateIndentPreview() {
   const g = function(id) { return document.getElementById(id); };
@@ -3352,32 +4505,463 @@ function updateIndentPreview() {
   const pv = document.getElementById('indPreview');
   pv.querySelector('p').setAttribute('style', st);
 }
-function applyIndentSettings(clearOnly) {
-  const ed = currentEditable();
-  if (!ed) { showToast('未找到可设置的编辑区', 'fail'); return; }
-  const row = ed.closest('.page-row');
-  const i = row ? Number(row.dataset.i) : -1;
+// 应用到页面源串（contentMap/mdSourceMap），返回是否发生变更（供 histEnd 裁剪）
+function _applyIndentToPage(i, vals, clearOnly) {
+  const before = pageSource(i);
+  const res = _applyIndentToHtml(before, vals, clearOnly);
+  if (res.count === 0) return false;
+  if (mdMode) mdSourceMap.set(i, res.html);
+  else contentMap.set(i, res.html);
+  markDirty(i);
+  const row = host.querySelector('.page-row[data-i="' + i + '"]');
+  if (row) {
+    const ed = row.querySelector('.editable');
+    if (ed) { ed.innerHTML = displayHtml(i); scheduleRemeasure(i); }
+  }
+  return true;
+}
+function applyIndentSettings(mode, clearOnly) {
   const g = function(id) { return document.getElementById(id); };
+  const ed = currentEditable();
+  const row = ed ? ed.closest('.page-row') : null;
+  const i = row ? Number(row.dataset.i) : viewportPage();
   const vals = clearOnly ? {} : {
     'data-pl': g('indLeft').value.trim(), 'data-pr': g('indRight').value.trim(),
     'data-ind': g('indSpecial').value, 'data-indv': g('indVal').value.trim(),
     'data-spb': g('indBefore').value.trim(), 'data-spa': g('indAfter').value.trim(),
     'data-lh': g('indLh').value,
   };
+  const _close = function () { closeIndentDialog(); };
+
+  if (mode === 'page') {
+    // 当前页：整页正文段落统一设置（md 源码模式仅处理 raw <p|div|h1-6> 行）
+    if (i < 0 || i >= pages.length) { showToast('未找到当前页', 'fail'); return; }
+    histRun(clearOnly ? '清除段落设置(页)' : '段落设置(页)', [i], function () {
+      const ok = _applyIndentToPage(i, vals, clearOnly);
+      setStatus(ok
+        ? (clearOnly ? '已清除当前页正文段落的段落设置' : '已应用段落设置至当前页正文段落')
+        : '当前页未找到可设置的正文段落');
+    });
+    _close();
+    return;
+  }
+  if (mode === 'all') {
+    // 全部正文（整书快照：histBegin(null) 捕获所有页，histEnd 按变化页裁剪为一步撤销）
+    if (!confirm(clearOnly
+      ? '确定清除全部正文段落的段落设置？此操作不可撤销，但可执行一次撤销恢复。'
+      : '确定应用段落设置至全部正文段落？此操作不可撤销，但可执行一次撤销恢复。')) return;
+    histCommitInput();
+    const before = histBegin('段落设置(全部)', null);
+    let changed = 0;
+    inDiscreteOp = true;
+    try {
+      for (let p = 0; p < pages.length; p++) {
+        if (_applyIndentToPage(p, vals, clearOnly)) changed++;
+      }
+    } finally { inDiscreteOp = false; }
+    histEnd(before, clearOnly ? '清除段落设置(全部)' : '段落设置(全部)');
+    setStatus(clearOnly ? '已清除全部正文段落的段落设置' : '段落设置已应用至全部正文段落');
+    _close();
+    return;
+  }
+  // selection：选中/光标所在段落（沿用块级 DOM 修改路径，多块选区统一生效；
+  // 样式仅写入 style 用于即时预览，syncContent 会经 stripIndentStyles 剥除，
+  // 渲染时由 data-* → displayHtml 注入，与整页路径同公式）
+  if (!ed) { showToast('未找到可设置的编辑区', 'fail'); return; }
+  // 弹窗内的交互（输入框聚焦/选区移动）会销毁 document 选区：点确定时先恢复打开弹窗时的
+  // 选区快照（须同页且节点仍连接在 DOM 上，防止跨页/重渲染后错用陈旧 range）。
+  const selNow = window.getSelection();
+  if (selNow && (selNow.rangeCount === 0 || selNow.isCollapsed || !ed.contains(selNow.anchorNode))
+      && _indSelRange && _indSelRange.ed === ed
+      && _indSelRange.range.startContainer.isConnected) {
+    selNow.removeAllRanges();
+    selNow.addRange(_indSelRange.range);
+  }
   histRun(clearOnly ? '清除段落设置' : '段落设置', [i], function () {
-    applyToSelectedBlocks(ed, function(block) {
+    const blocks = applyToSelectedBlocks(ed, function(block) {
       for (const a of _IND_ATTRS) block.removeAttribute(a);
       for (const a in vals) {
         if (vals[a] !== '' && !(a === 'data-indv' && vals['data-ind'] === '') && !(a === 'data-ind' && vals[a] === '')) block.setAttribute(a, vals[a]);
       }
-      block.style.marginLeft = ''; block.style.marginRight = '';
-      block.style.textIndent = ''; block.style.paddingLeft = '';
-      block.style.marginTop = ''; block.style.marginBottom = ''; block.style.lineHeight = '';
+      block.style.cssText = _indStyleFromData(_blockAttrsString(block));
     });
+    if (!blocks.length) { showToast('未选中可设置的段落（光标/选区需在正文内）', 'warn'); return; }
     syncContent(ed);
     if (row) { markDirty(i); scheduleRemeasure(i); }
   });
-  closeIndentDialog();
+  _close();
+}
+
+// ============================================================================
+// 字符格式弹窗（2026-09-27）—— 逐字符 字号/字体/颜色
+// ============================================================================
+// 选区存活：打开弹窗时快照 document 选区。弹窗内的输入框/单选钮一被聚焦就会销毁
+// document 选区，直接用「点确定时的实时选区」会让「选中内容」退化成整页 —— 段落
+// 设置弹窗 2026-09-24 踩过同一个坑（弹窗交互销毁选区），这里沿用同一套方案：
+// 非折叠选区存 _cfSelRange（恢复用），任意选区/折叠光标存 _cfCaretRange。
+let _cfSelRange = null;
+let _cfCaretRange = null;
+let _cfColor = '';
+function _paintColorSwatch() {
+  const sw = document.getElementById('cfColorSwatch');
+  if (sw) sw.style.background = _cfColor || '';
+}
+function _captureCharFormatSelection() {
+  const ed = currentEditable();
+  const sel = window.getSelection();
+  _cfSelRange = null;
+  _cfCaretRange = null;
+  if (!ed || !sel || sel.rangeCount === 0) return;
+  const range = sel.getRangeAt(0);
+  if (!_editableFromSelection(range, sel)) return;
+  // 光标快照与选区快照同形 {ed, range}：恢复端用的是同一个 usable() 判据，
+  // 存裸 Range 会让折叠光标永远恢复不了（形状不匹配恒 false）。
+  _cfCaretRange = { ed: ed, range: range.cloneRange() };
+  if (sel.isCollapsed) return;
+  let node = range.commonAncestorContainer;
+  if (node.nodeType === 3) node = node.parentElement;
+  if (node && ed.contains(node)) _cfSelRange = { ed: ed, range: range.cloneRange() };
+}
+// 快照是否还「活着」：编辑区在文档里 + 选区起点节点仍在文档里。
+// 撤销/重做会重建行 DOM，快照里的 range 会指向已被替换掉的旧节点——
+// 此时必须视作失效，否则会把格式打到用户没选的地方（2026-09-27 修正）。
+function _cfSnapshotAlive(snap) {
+  return !!(snap && snap.ed && snap.ed.isConnected && snap.range &&
+            snap.range.startContainer && snap.range.startContainer.isConnected);
+}
+// 弹窗打开时的目标编辑区：**仅当弹窗真的开着**且快照有效时用快照，否则回落到
+// 当前选区。弹窗已关（closeCharFormatDialog 会清空快照）就不能用旧快照，
+// 否则「当前页 / 全部页」的作用范围会被上一次开弹窗时的位置劫持。
+function _cfTargetEd() {
+  const bg = document.getElementById('charFormatModalBg');
+  if (bg && bg.style.display === 'flex') {
+    if (_cfSnapshotAlive(_cfSelRange)) return _cfSelRange.ed;
+    if (_cfSnapshotAlive(_cfCaretRange)) return _cfCaretRange.ed;
+  }
+  return currentEditable();
+}
+function _cfSnapshotUsable(snap, ed) {
+  return _cfSnapshotAlive(snap) && snap.ed === ed;
+}
+// 恢复打开弹窗时的选区。快照存在即以快照为准：弹窗交互期间选区「仍在同一编辑区内」
+// 也可能是被输入框焦点挪到了同页另一段，此时若提前 return 就会作用错地方。
+function _restoreCharFormatSelection(ed) {
+  const sel = window.getSelection();
+  if (!sel) return;
+  if (_cfSnapshotUsable(_cfSelRange, ed)) { sel.removeAllRanges(); sel.addRange(_cfSelRange.range); return; }
+  if (_cfSnapshotUsable(_cfCaretRange, ed)) { sel.removeAllRanges(); sel.addRange(_cfCaretRange.range); }
+}
+// 打开时读出「光标处已有的字符格式」作为弹窗初值（无则全部为不修改）
+function _charStyleAtCaret(ed) {
+  const sel = window.getSelection();
+  let node = null;
+  if (ed && sel && sel.rangeCount > 0) node = sel.getRangeAt(0).startContainer;
+  let el = node && node.nodeType === 3 ? node.parentElement : node;
+  const sp = el && el.closest ? el.closest('span[style]') : null;
+  return sp ? charStyleDeclMap(sp.getAttribute('style') || '') : {};
+}
+function openCharFormatDialog() {
+  const bg = document.getElementById('charFormatModalBg');
+  if (!bg) return;
+  _captureCharFormatSelection();
+  const cur = charStyleString(_charStyleAtCaret(currentEditable()));
+  const sizeSel = document.getElementById('cfSizeSel');
+  const sizeNum = document.getElementById('cfSizeNum');
+  const fontSel = document.getElementById('cfFontSel');
+  const sz = charStyleGet(cur, 'font-size');
+  const fam = charStyleGet(cur, 'font-family');
+  const preset = sizeSel ? sizeSel.querySelector('option[value="' + sz.replace('px', '') + '"]') : null;
+  if (sizeSel) sizeSel.value = preset ? sz.replace('px', '') : '';
+  if (sizeNum) sizeNum.value = (sz && !preset) ? sz.replace('px', '') : '';
+  if (fontSel) fontSel.value = fam || '';
+  _cfColor = charStyleGet(cur, 'color') || '';
+  _paintColorSwatch();
+  updateCharFormatPreview();
+  bg.style.display = 'flex';
+}
+function closeCharFormatDialog() {
+  _cfSelRange = null;
+  _cfCaretRange = null;
+  const bg = document.getElementById('charFormatModalBg');
+  if (bg) bg.style.display = 'none';
+}
+function charFormatMode() {
+  if (document.getElementById('cfModeAll') && document.getElementById('cfModeAll').checked) return 'all';
+  if (document.getElementById('cfModePage') && document.getElementById('cfModePage').checked) return 'page';
+  return 'selection';
+}
+// 弹窗取值 → 声明映射（空串键 = 清除该属性；三个键全空 = 无事可做）
+function _charFormatDecls() {
+  const d = {};
+  const sel = document.getElementById('cfSizeSel');
+  const num = document.getElementById('cfSizeNum');
+  const font = document.getElementById('cfFontSel');
+  let px = '';
+  if (num && String(num.value).trim() !== '') px = String(num.value).trim();
+  else if (sel) px = sel.value;
+  d['font-size'] = px === '' ? '' : _canonCharDecl('font-size', px.indexOf('px') >= 0 ? px : px + 'px');
+  const fam = font ? font.value : '';
+  d['font-family'] = fam ? _canonCharDecl('font-family', fam) : '';
+  d['color'] = _cfColor ? _canonCharDecl('color', _cfColor) : '';
+  return d;
+}
+// 预览：把弹窗当前取值编成规范化 style 串贴到示例段落上
+function updateCharFormatPreview() {
+  const pv = document.getElementById('cfPreview');
+  if (!pv) return;
+  const p = pv.querySelector('p');
+  if (!p) return;
+  if (p.hasAttribute('style')) p.removeAttribute('style');
+  const st = charStyleString(_charFormatDecls());
+  if (st) p.setAttribute('style', st);
+}
+// Markdown 源码模式的逐行字符格式（源串即真源；inlineMd 原样透传 raw HTML span）
+// 契约：一行 = 一个 <div>，整行包裹；行首已是 <span style="…"> 则合并声明（不重复嵌套）
+function _applyCharStyleToMd(src, decls) {
+  const styleStr = charStyleString(decls);
+  const lines = String(src == null ? '' : src).split('\n');
+  let changed = false;
+  const out = lines.map(function (line) {
+    if (!line.trim()) return line;
+    const m = line.match(/^<span style="([^"]*)">([\s\S]*)<\/span>$/);
+    if (m) {
+      const merged = charStyleDeclMap(m[1]);
+      let any = false;
+      for (const k in decls) {
+        if (decls[k] === '') { if (merged[k] !== undefined) { delete merged[k]; any = true; } }
+        else { merged[k] = decls[k]; any = true; }
+      }
+      if (!any) return line;
+      changed = true;
+      const st = charStyleString(merged);
+      return st ? '<span style="' + st + '">' + m[2] + '</span>' : m[2];
+    }
+    if (isDividerHtmlLine(line)) return line;          // 分隔线不参与
+    if (!styleStr) return line;                        // 无存活声明且无可清项
+    changed = true;
+    return '<span style="' + styleStr + '">' + line + '</span>';
+  });
+  return { text: out.join('\n'), changed: changed };
+}
+// 单页范围：对页内全部文字块应用/清除（挂载页走 live DOM，离屏页走脱离文档的 DOM）
+function _applyCharStyleToPage(i, decls) {
+  const before = pageSource(i);
+  if (mdMode) {
+    const res = _applyCharStyleToMd(before, decls);
+    if (!res.changed) return false;
+    mdSourceMap.set(i, res.text);
+  } else {
+    const row = host.querySelector('.page-row[data-i="' + i + '"]');
+    const ed = row ? row.querySelector('.editable') : null;
+    let changed = 0;
+    if (ed) {
+      const blocks = _editableCharBlocks(ed);
+      for (const b of blocks) { if (applyCharStyleToBlock(b, _wholeBlockRange(b), decls)) changed++; }
+      if (!changed) return false;
+      syncContent(ed);
+    } else {
+      const d = document.createElement('div');
+      d.innerHTML = before;
+      for (const b of _editableCharBlocks(d)) applyCharStyleToBlock(b, _wholeBlockRange(b), decls);
+      if (d.innerHTML === before) return false;
+      contentMap.set(i, d.innerHTML);
+    }
+  }
+  if (pageSource(i) === before) return false;
+  markDirty(i);
+  const rw = host.querySelector('.page-row[data-i="' + i + '"]');
+  if (rw) { const e2 = rw.querySelector('.editable'); if (e2) { e2.innerHTML = displayHtml(i); scheduleRemeasure(i); } }
+  return true;
+}
+// 弹窗「确定」/「清除字符格式」主入口
+function applyCharFormat(clearOnly) {
+  const mode = charFormatMode();
+  const decls = clearOnly ? { 'font-size': '', 'font-family': '', 'color': '' } : _charFormatDecls();
+  const styleStr = charStyleString(decls);
+  if (!clearOnly && !styleStr) {
+    closeCharFormatDialog();
+    showToast('请至少选择一项要设置的字符格式（字号 / 字体 / 颜色），或点「清除字符格式」', 'warn');
+    return;
+  }
+  const ed0 = _cfTargetEd();
+  const row0 = ed0 ? ed0.closest('.page-row') : null;
+  const i0 = row0 ? Number(row0.dataset.i) : viewportPage();
+  const label = clearOnly ? '清除字符格式' : '字符格式';
+
+  if (mode === 'page') {
+    if (i0 < 0 || i0 >= pages.length) { closeCharFormatDialog(); showToast('未找到当前页', 'fail'); return; }
+    let ok = false;
+    histRun(label + '(页)', [i0], function () { ok = _applyCharStyleToPage(i0, decls); });
+    setStatus(ok ? (clearOnly ? '已清除当前页的字符格式' : '字符格式已应用到当前页') : '当前页没有可处理的文字');
+    closeCharFormatDialog();
+    return;
+  }
+  if (mode === 'all') {
+    if (!confirm(clearOnly
+      ? '确定清除全部页面的字符格式（字号/字体/颜色）？此操作可执行一次撤销恢复。'
+      : '确定把字符格式应用到全部页面？此操作可执行一次撤销恢复。')) return;
+    const before = histBegin(label + '(全部)', null);   // histBegin 内部已 histCommitInput
+    let changed = 0;
+    inDiscreteOp = true;
+    try {
+      for (let p = 0; p < pages.length; p++) { if (_applyCharStyleToPage(p, decls)) changed++; }
+    } finally { inDiscreteOp = false; }
+    histEnd(before, label + '(全部)');
+    setStatus(changed
+      ? (clearOnly ? '已清除 ' + changed + ' 页的字符格式' : '字符格式已应用到 ' + changed + ' 页')
+      : '全书没有可处理的文字');
+    closeCharFormatDialog();
+    return;
+  }
+  // selection：选中文字 / 折叠光标所在整块 / 多块集合
+  const ed = ed0;
+  if (!ed) { closeCharFormatDialog(); showToast('未找到可设置的编辑区', 'fail'); return; }
+  const i = row0 ? Number(row0.dataset.i) : viewportPage();
+  _restoreCharFormatSelection(ed);
+  if (mdMode) {
+    _applyCharFormatMdSelection(ed, decls, clearOnly);
+    closeCharFormatDialog();
+    return;
+  }
+  let applied = 0, skipped = 0, any = false;
+  histRun(label, [i], function () {
+    applyToSelectedBlocks(ed, function (block, r) {
+      any = true;
+      if (isDividerBlock(block)) { skipped++; return; }
+      if (applyCharStyleToBlock(block, r, decls)) applied++; else skipped++;
+    });
+    if (!any) {
+      showToast('未选中可设置字符格式的文字：请先在正文里选中文字（选中内容模式）', 'warn');
+      return;
+    }
+    syncContent(ed);
+    if (row0) { markDirty(i); scheduleRemeasure(i); }
+  });
+  closeCharFormatDialog();
+  if (applied) setStatus((clearOnly ? '已清除字符格式：' : '已应用字符格式：') + applied + ' 处' + (skipped ? '，跳过 ' + skipped + ' 处' : ''));
+  else if (skipped) showToast('所选范围内没有可处理的文字（分隔线不参与字符格式）', 'warn');
+}
+// Markdown 源码模式的「选中内容」：走 insertText 写 raw HTML span（不碰 innerHTML）
+function _applyCharFormatMdSelection(ed, decls, clearOnly) {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+    showToast('未选中可设置字符格式的文字：Markdown 模式下需先选中文字（选中内容模式）', 'warn');
+    return;
+  }
+  const r = sel.getRangeAt(0);
+  if (!_editableFromSelection(r, sel)) {
+    showToast('选区不在编辑区内，无法设置字符格式', 'warn');
+    return;
+  }
+  const text = r.toString();
+  if (!text.length) { showToast('未选中可设置字符格式的文字', 'warn'); return; }
+  // 合并：选区已被同一字符样式 span 覆盖时只改该 span 的声明（不重复嵌套）
+  const startEl = r.startContainer.nodeType === 3 ? r.startContainer.parentElement : r.startContainer;
+  const sp = startEl && startEl.closest ? startEl.closest('span[style]') : null;
+  const merged = sp ? charStyleDeclMap(sp.getAttribute('style') || '') : {};
+  let any = false;
+  for (const k in decls) {
+    if (clearOnly || decls[k] === '') { if (merged[k] !== undefined) { delete merged[k]; any = true; } }
+    else { merged[k] = decls[k]; any = true; }
+  }
+  if (!any) { showToast('所选文字没有可修改的字符格式', 'warn'); return; }
+  const st = charStyleString(merged);
+  const row = ed.closest('.page-row');
+  const i = row ? Number(row.dataset.i) : -1;
+  histRun(clearOnly ? '清除字符格式' : '字符格式', [i], function () {
+    withScrollStable(() => document.execCommand('insertText', false, st ? '<span style="' + st + '">' + text + '</span>' : text));
+    syncContent(ed);
+    if (row) { markDirty(i); scheduleRemeasure(i); }
+  });
+}
+// 工具栏「清除字符格式」按钮：按当前选区（折叠光标 → 光标所在整块）清除
+function clearCharFormatQuick() {
+  const selRadio = document.getElementById('cfModeSel');
+  if (selRadio) selRadio.checked = true;   // 按钮只做「选中内容」语义
+  applyCharFormat(true);
+}
+
+// ============================================================================
+// 插入分隔线
+// ============================================================================
+// 在 caret 所在块前插入一个分隔线段落（块首则插在块前，否则紧随当前块之后）
+// 返回新分隔线块；无可用编辑区返回 null
+function insertDividerAtCaret(style) {
+  const key = DIVIDER_STYLES[style] ? style : DIVIDER_DEFAULT_STYLE;
+  const ed = currentEditable();
+  if (!ed) { showToast('未找到可插入分隔线的编辑区（请先把光标放到正文里）', 'warn'); return null; }
+  const row = ed.closest('.page-row');
+  const i = row ? Number(row.dataset.i) : viewportPage();
+  if (mdMode) { _insertDividerMd(ed, key, i); return null; }
+  const sel = window.getSelection();
+  let block = null;
+  if (sel && sel.rangeCount > 0) {
+    let n = sel.getRangeAt(0).startContainer;
+    if (n.nodeType === 3) n = n.parentElement;
+    const b = n && n.closest ? n.closest('p,div,h1,h2,h3,h4,h5,h6') : null;
+    if (b && b !== ed && ed.contains(b)) block = b;
+  }
+  if (!block) block = ed.firstElementChild;
+  if (!block) { showToast('当前页没有可插入分隔线的位置', 'warn'); return null; }
+  // 光标在块首 → 插在该块之前；否则紧随该块之后（分隔线读作「在正文之间」）
+  let atBlockStart = false;
+  if (sel && sel.rangeCount > 0) {
+    if (!sel.isCollapsed) atBlockStart = false;
+    else {
+      const r = sel.getRangeAt(0);
+      const probe = document.createRange();
+      probe.selectNodeContents(block);
+      probe.setEnd(r.startContainer, r.startOffset);
+      atBlockStart = (probe.toString() || '').trim() === '';
+    }
+  }
+  let made = null;
+  histRun('插入分隔线', [i], function () {
+    const p = document.createElement('p');
+    p.className = DIVIDER_CLASS + ' ' + DIVIDER_STYLES[key];
+    p.appendChild(document.createTextNode(dividerGlyph(key)));
+    if (atBlockStart && block.parentNode === ed) ed.insertBefore(p, block);
+    else ed.insertBefore(p, block.nextSibling);
+    syncContent(ed);
+    if (row) { markDirty(i); scheduleRemeasure(i); }
+    made = p;
+  });
+  setStatus('已插入' + DIVIDER_STYLE_LABEL[key] + '分隔线');
+  return made;
+}
+// Markdown 源码模式：在光标所在行前/后插入一行 raw HTML 分隔线
+function _insertDividerMd(ed, styleKey, i) {
+  const htmlLine = buildDividerHtml(styleKey);
+  let lineIdx = -1;
+  let atStart = true;
+  const sel = window.getSelection();
+  if (sel && sel.rangeCount > 0) {
+    const r = sel.getRangeAt(0);
+    let n = r.startContainer;
+    let block = n.nodeType === 3 ? n.parentElement : n;
+    if (block && block.closest && block.closest('.editable') === ed) {
+      const divs = ed.querySelectorAll(':scope > div');
+      for (let k = 0; k < divs.length; k++) {
+        if (divs[k] === block || divs[k].contains(block)) { lineIdx = k; break; }
+      }
+      if (lineIdx < 0) {
+        const probe = document.createRange();
+        probe.selectNodeContents(block);
+        probe.setEnd(r.startContainer, r.startOffset);
+        atStart = (probe.toString() || '').trim() === '';
+      }
+    }
+  }
+  const lines = String(pageSource(i) == null ? '' : pageSource(i)).split('\n');
+  const pos = lineIdx < 0 ? lines.length : (atStart ? lineIdx : lineIdx + 1);
+  histRun('插入分隔线', [i], function () {
+    const next = lines.slice();
+    next.splice(pos, 0, htmlLine);
+    mdSourceMap.set(i, next.join('\n'));
+    ed.innerHTML = displayHtml(i);
+    if (i >= 0) { markDirty(i); scheduleRemeasure(i); }
+  });
+  setStatus('已插入' + DIVIDER_STYLE_LABEL[styleKey] + '分隔线');
 }
 async function loadHistoryVersion(id, name, ver) {
   const displayName = name + (ver ? ' v' + ver : '');
@@ -3388,6 +4972,8 @@ async function loadHistoryVersion(id, name, ver) {
       body: JSON.stringify({ id: id })
     });
     const loaded = res.pages || [];
+    // 2026-09：记录当前会话历史名，自动备份时随载荷发送（重命名后保持原名）
+    sessionDisplayName = (res && typeof res.display_name === 'string' && res.display_name) ? res.display_name : (name || '');
     const map = {};
     for (const it of loaded) map[it.page] = it.html;
     // 旧内容按页码收集（未编辑页取初始 text）
@@ -4192,8 +5778,31 @@ ctxMenu.addEventListener('click', (e) => {
   if (!item) return;
   const kind = item.dataset.ctx;
   if (kind === 'reocr') ctxRun(runReocr);
-  else if (kind === 'insertimg') ctxRun(ctxInsertImage);
+  else if (kind === 'insertimg') ctxRun(function () {
+    // 2026-09：右键「插入图片」改为直接唤起外部图片选择（同工具栏「图」按钮）
+    const exIn = document.getElementById('imgExternalInput');
+    if (exIn) exIn.click(); else showToast('图片插入不可用', 'warn');
+  });
   else if (kind === 'clear') ctxRun(proofreadClearCurrent);
+  else if (kind === 'applypr') ctxRun(proofreadApplyCurrent); // 2026-09：右键直接应用当前页全部校正
+  else if (kind === 'clearfmt') ctxRun(function () {
+    // 2026-09：清除格式——右键目标页整体清除文本格式（行内样式解包、标题/div 归一 <p>）
+    const ed2 = ctxTargetEditable();
+    if (!ed2) { showToast('请先点击某一页的文字', 'warn'); return; }
+    if (_ctxEditable && ed2 !== currentEditable()) {
+      ed2.focus();
+      const sel = window.getSelection();
+      const range = (_ctxRange && ed2.contains(_ctxRange.startContainer)) ? _ctxRange : (function () {
+        const r = document.createRange();
+        r.selectNodeContents(ed2);
+        r.collapse(true);
+        return r;
+      })();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+    applyOp('remove'); // applyOp 内部自带 histRun 与整块/选区语义
+  });
   else if (kind === 'clearpage') ctxRun(function () {
     // 清空当前页内容（2026-08-23：替代原 Markdown 占位项）
     var ed2 = ctxTargetEditable();
@@ -4674,12 +6283,12 @@ function renderProofread(i) {
       sEl.className = 'ptoe-err';
       sEl.setAttribute('data-err-i', k);
       sEl.setAttribute('data-err-empty', '1');
-      sEl.textContent = err.candidates[0];
+      sEl.textContent = _candText(err.candidates[0]); // 2026-09-21：候选为 dict {text,score} 时取 text
       frag.appendChild(sEl);
       const fixEl = document.createElement('span');
       fixEl.className = 'ptoe-fix';
       fixEl.setAttribute('data-err-i', k);
-      fixEl.textContent = err.candidates[0];
+      fixEl.textContent = _candText(err.candidates[0]);
       frag.appendChild(fixEl);
       ed.insertBefore(frag, ed.firstChild);
       continue;
@@ -4723,7 +6332,7 @@ function renderProofread(i) {
         const fixEl = document.createElement('span');
         fixEl.className = 'ptoe-fix';
         fixEl.setAttribute('data-err-i', k);
-        fixEl.textContent = err.candidates.join('/');
+        fixEl.textContent = err.candidates.map(_candText).join('/'); // 2026-09-21：多候选展示同样归一 dict
         frag.appendChild(fixEl);
       }
       firstSeg = false;
@@ -5130,6 +6739,12 @@ function proofreadClearCurrent() {
   setStatus('已清除当前页纠错标注');
 }
 
+// 候选文本归一：LLM 深度校对候选为 {text, score} 对象（服务端原样下发），字符串候选原样返回；
+// 应用于 DOM 文本/反馈/delta 计算前统一取 text，避免 [object Object] 与 NaN delta（2026-09-21）
+function _candText(c) {
+  return (c && typeof c === 'object' && 'text' in c) ? c.text : c;
+}
+
 // 子项2 应用：把当前页所有有候选的提示替换为 candidates[0]；无候选（增字）=删除 wrong（支持跨多文本节点）
 function proofreadApplyCurrent() {
   closeProofreadMenu();
@@ -5143,7 +6758,7 @@ function proofreadApplyCurrent() {
   // D6: 改文本主体包进 histRun（入撤销栈）
   histRun('应用纠错', [i], function () {
     let applied = 0;
-    let skippedOverlap = 0, skippedMismatch = 0; // 2026-08-23：统计未应用原因，toast 如实反馈
+    let skippedOverlap = 0, skippedMissing = 0; // 2026-09-21：统计未应用原因（重叠/标注缺失），toast 如实反馈
     const acceptItems = []; // 收集批量 accept 反馈
     const appliedShifts = []; // 收集 {start, delta, origStart} 用于 rebase 剩余标注
     const appliedRanges = []; // 已应用原始区间：跳过与其重叠的条目
@@ -5155,23 +6770,20 @@ function proofreadApplyCurrent() {
       // 否则重叠删除/替换会产生交错重复的文字错乱——2026-08 修复）
       if (appliedRanges.some(function (r) { return err.start < r.end && r.start < err.end; })) { skippedOverlap++; continue; }
       const sEls = ed.querySelectorAll('.ptoe-err[data-err-i="' + idx + '"]');
-      if (!sEls.length) continue;
-      // 严格校验：标注段文本必须与 wrong 完全一致，否则该条偏移已失效，
-      // 放弃而不替换（把候选写进错误位置正是「文字错位+内容缺失」的根源）
+      if (!sEls.length) { skippedMissing++; continue; } // 标注 span 缺失（如已被编辑移除）如实计数
+      // 标注段文本拼接（供 delta 计算）；2026-09-21 改为与应用锚定标注 span 本身
+      // （与手动 ✓ 一致）——DOM 文本与 err.wrong 不一致（reocr/繁简转换/$ 清理后
+      // 漂移）不再整条跳过
       let segText = '';
       sEls.forEach(function (s) { segText += s.textContent; });
-      // 2026-08-23：放宽校验——替换锚定在标注 span 本身（不依赖偏移），空白差异
-      // 不再导致整条被跳过；归一化后仍不一致才视为标注失效跳过
-      var _normPr = function (s) { return (s || '').replace(/\s+/g, ''); };
-      if (err.wrong && _normPr(segText) !== _normPr(err.wrong)) { skippedMismatch++; continue; }
       const fixEl = ed.querySelector('.ptoe-fix[data-err-i="' + idx + '"]');
       if (fixEl) fixEl.parentNode.removeChild(fixEl);
-      const delta = (err.candidates && err.candidates.length ? err.candidates[0].length : 0) - (err.wrong ? err.wrong.length : 0);
+      const delta = (err.candidates && err.candidates.length ? String(_candText(err.candidates[0])).length : 0) - (segText ? segText.length : (err.wrong ? err.wrong.length : 0));
       if (err.candidates && err.candidates.length) {
         // 有候选：首段替换为 candidates[0]，其余段删除
-        sEls[0].parentNode.replaceChild(document.createTextNode(err.candidates[0]), sEls[0]);
+        sEls[0].parentNode.replaceChild(document.createTextNode(_candText(err.candidates[0])), sEls[0]);
         for (let p = 1; p < sEls.length; p++) sEls[p].parentNode.removeChild(sEls[p]);
-        acceptItems.push({ wrong: err.wrong, fixed: err.candidates[0] }); // 收集反馈
+        acceptItems.push({ wrong: segText || err.wrong, fixed: _candText(err.candidates[0]) }); // 收集反馈
       } else {
         // 无候选（增字）：全部段删除
         for (const s of sEls) s.parentNode.removeChild(s);
@@ -5198,13 +6810,13 @@ function proofreadApplyCurrent() {
     renderProofread(i);
     // 批量反馈：应用全部
     proofreadFeedbackAcceptBatch(acceptItems);
-    const skippedTotal = skippedOverlap + skippedMismatch;
+    const skippedTotal = skippedOverlap + skippedMissing;
     if (applied > 0) {
-      const msg = '已应用 ' + applied + ' 处纠错提示' + (skippedTotal ? '，跳过 ' + skippedTotal + ' 处（重叠或文本已变化）' : '');
+      const msg = '已应用 ' + applied + ' 处纠错提示' + (skippedTotal ? '，跳过 ' + skippedTotal + ' 处（重叠或标注缺失）' : '');
       showToast(msg, 'ok');
       setStatus(msg);
     } else if (skippedTotal > 0) {
-      showToast('有 ' + skippedTotal + ' 处提示无法应用（重叠或文本已变化）', 'warn');
+      showToast('有 ' + skippedTotal + ' 处提示无法应用（重叠或标注缺失）', 'warn');
       setStatus('有 ' + skippedTotal + ' 处提示无法应用');
     } else {
       showToast('当前页没有可应用的纠错提示', 'warn');
@@ -5369,13 +6981,13 @@ document.getElementById('errOk').addEventListener('click', function () {
     const fixEl2 = ed.querySelector('.ptoe-fix[data-err-i="' + k + '"]');
     if (fixEl2) fixEl2.parentNode.removeChild(fixEl2);
     // 计算 delta：整条 wrong 被替换为 candidates[0]（或删除）
-    const delta = (err.candidates && err.candidates.length ? err.candidates[0].length : 0) - (err.wrong ? err.wrong.length : 0);
+    const delta = (err.candidates && err.candidates.length ? String(_candText(err.candidates[0])).length : 0) - (err.wrong ? err.wrong.length : 0);
     if (err.candidates && err.candidates.length) {
       // 有候选：首段替换为 candidates[0]，其余段删除
-      sEls[0].parentNode.replaceChild(document.createTextNode(err.candidates[0]), sEls[0]);
+      sEls[0].parentNode.replaceChild(document.createTextNode(_candText(err.candidates[0])), sEls[0]);
       for (let p = 1; p < sEls.length; p++) sEls[p].parentNode.removeChild(sEls[p]);
       // 反馈：采纳候选
-      proofreadFeedbackAccept(err.wrong, err.candidates[0]);
+      proofreadFeedbackAccept(err.wrong, _candText(err.candidates[0]));
     } else {
       // 无候选（增字）：全部段删除
       for (const s of sEls) s.parentNode.removeChild(s);
@@ -5447,6 +7059,12 @@ document.addEventListener('mousedown', function (e) {
   const ssBtn = document.getElementById('supSubBtn');
   if (ssMenu && ssMenu.style.display === 'block' && !e.target.closest('#supSubMenu') && !e.target.closest('#supSubBtn')) {
     closeDropMenu('supSubBtn', 'supSubMenu');
+  }
+  // 分隔线下拉（2026-09-27）
+  const dvMenu = document.getElementById('dividerMenu');
+  const dvBtn = document.getElementById('dividerBtn');
+  if (dvMenu && dvMenu.style.display === 'block' && !e.target.closest('#dividerMenu') && !e.target.closest('#dividerBtn')) {
+    closeDropMenu('dividerBtn', 'dividerMenu');
   }
   // 点击图片弹窗外 → 关闭图片弹窗
   if (_imgKey && !e.target.closest('#imgPopup')) hideImgPopup();
@@ -6927,6 +8545,7 @@ function openSettings() {
   document.querySelectorAll('.settings-panel').forEach(p => p.style.display = 'none');
   document.getElementById('panel-shortcuts').style.display = 'block';
   initPopupSettings();
+  syncAutoSaveUi(); // 2026-09：打开设置时同步自动备份开关状态
 }
 function closeSettings() { capturingOp = null; mouseCapturingOp = null; document.getElementById('modalBg').style.display = 'none'; }
 
@@ -6997,16 +8616,31 @@ async function loadFontSettings() {
   try {
     const res = await fetchJSON('/api/config');
     if (res && res.fonts) {
-      document.getElementById('fontBody').value = res.fonts.body || '';
-      document.getElementById('fontHeading').value = res.fonts.heading || '';
-      document.getElementById('fontNote').value = res.fonts.note || '';
-      document.getElementById('fontCitation').value = res.fonts.citation || '';
+      setFontSelect('fontBody', res.fonts.body);
+      setFontSelect('fontHeading', res.fonts.heading);
+      setFontSelect('fontNote', res.fonts.note);
+      setFontSelect('fontCitation', res.fonts.citation);
       applyFontCSSVariables(res.fonts);
     }
     if (res && typeof res.citationItalicEnabled === 'boolean') {
       document.getElementById('citationItalicEnabled').checked = res.citationItalicEnabled;
+      applyCitationItalic(res.citationItalicEnabled); // 键缺失时不设置 → CSS 兜底斜体
     }
   } catch (e) { console.warn('loadFontSettings failed', e); }
+}
+
+// 下拉字体选择：选中与选项匹配的值；存量自定义值（不在预置选项中）动态补一个选项展示
+function setFontSelect(id, val) {
+  const sel = document.getElementById(id);
+  const v = (val || '').trim();
+  sel.value = v;
+  if (v && sel.value !== v) {
+    const opt = document.createElement('option');
+    opt.value = v;
+    opt.textContent = v + '（自定义）';
+    sel.appendChild(opt);
+    sel.value = v;
+  }
 }
 
 async function saveFontSettings() {
@@ -7020,16 +8654,30 @@ async function saveFontSettings() {
   try {
     await fetchJSON('/api/config', { method: 'POST', body: JSON.stringify({ fonts, citationItalicEnabled }) });
     applyFontCSSVariables(fonts);
+    applyCitationItalic(citationItalicEnabled);
     setStatus('字体设置已保存');
   } catch (e) { setStatus('字体设置保存失败: ' + e); }
 }
 
 function applyFontCSSVariables(fonts) {
   const root = document.documentElement;
-  if (fonts.body) root.style.setProperty('--font-body', fonts.body);
-  if (fonts.heading) root.style.setProperty('--font-heading', fonts.heading);
-  if (fonts.note) root.style.setProperty('--font-note', fonts.note);
-  if (fonts.citation) root.style.setProperty('--font-citation', fonts.citation);
+  const apply = (key, val) => {
+    if (val) root.style.setProperty(key, val);
+    else root.style.removeProperty(key);
+  };
+  apply('--font-body', fonts.body);
+  apply('--font-heading', fonts.heading);
+  apply('--font-note', fonts.note);
+  apply('--font-citation', fonts.citation);
+}
+
+// 「启用引用斜体」开关：页面级 CSS 变量 --citation-italic 控制
+// .editable .ptoe-citation 的 font-style（correctmanage _UI_HTML 用
+// var(--citation-italic, italic) 兜底）。不设置该变量时保持默认斜体。
+function applyCitationItalic(enabled) {
+  const root = document.documentElement;
+  if (enabled) root.style.setProperty('--citation-italic', 'italic');
+  else root.style.setProperty('--citation-italic', 'normal');
 }
 
 async function openHelp() {
@@ -7577,6 +9225,57 @@ function _backdropClickClose(bgId, closeFn) {
   bg.addEventListener('click', function (e) { if (e.target === bg && downOnBg) closeFn(); });
 }
 _backdropClickClose('searchModalBg', closeSearchModal);
+// 搜索范围分段按钮：切范围后若已有关键词直接重搜，否则清空结果与高亮（2026-09）
+document.querySelectorAll('.scope-btn').forEach(function (b) {
+  b.addEventListener('click', function () {
+    searchScope = b.dataset.scope;
+    document.querySelectorAll('.scope-btn').forEach(function (x) { x.classList.toggle('active', x === b); });
+    updateKeepChips();
+    const q = (document.getElementById('searchInput').value || '').trim();
+    if (q) searchPages(); else clearSearchState();
+  });
+});
+// 正则开关：捕获组变化 → 刷新保留组 chips；已有关键词则重搜（普通/正则结果不同）
+document.getElementById('searchRegex').addEventListener('change', function () {
+  updateKeepChips();
+  const q = (document.getElementById('searchInput').value || '').trim();
+  if (q) searchPages(); else clearSearchState();
+});
+// 替换规则弹窗绑定（2026-09）
+const _rrOpenBtn = document.getElementById('replaceRulesOpenBtn');
+if (_rrOpenBtn) _rrOpenBtn.addEventListener('click', openReplaceRulesModal);
+const _rrCloseBtn = document.getElementById('replaceRulesCloseBtn');
+if (_rrCloseBtn) _rrCloseBtn.addEventListener('click', closeReplaceRulesModal);
+if (document.getElementById('replaceRulesModalBg')) _backdropClickClose('replaceRulesModalBg', closeReplaceRulesModal);
+const _rrNewBtn = document.getElementById('rrNewBtn');
+if (_rrNewBtn) _rrNewBtn.addEventListener('click', function () { openRrEdit(null); });
+const _rrList = document.getElementById('rrList');
+if (_rrList) _rrList.addEventListener('click', function (e) {
+  const btn = e.target.closest('button[data-rr]');
+  if (!btn) return;
+  const row = btn.closest('.rr-item');
+  if (!row) return;
+  const rule = replaceRules[parseInt(row.dataset.rrIdx, 10)];
+  if (!rule) return;
+  const act = btn.dataset.rr;
+  if (act === 'apply') applyReplaceRule(rule, false);
+  else if (act === 'applyall') applyReplaceRule(rule, true);
+  else if (act === 'edit') openRrEdit(rule);
+  else if (act === 'del') {
+    replaceRules = replaceRules.filter(function (r) { return r !== rule; });
+    persistReplaceRules();
+    showToast('已删除替换规则「' + (rule.name || '') + '」', 'ok');
+  }
+});
+const _rrEditCloseBtn = document.getElementById('rrEditCloseBtn');
+if (_rrEditCloseBtn) _rrEditCloseBtn.addEventListener('click', closeRrEdit);
+const _rrEditCancelBtn = document.getElementById('rrEditCancelBtn');
+if (_rrEditCancelBtn) _rrEditCancelBtn.addEventListener('click', closeRrEdit);
+if (document.getElementById('rrEditModalBg')) _backdropClickClose('rrEditModalBg', closeRrEdit);
+const _rrEditSaveBtn = document.getElementById('rrEditSaveBtn');
+if (_rrEditSaveBtn) _rrEditSaveBtn.addEventListener('click', saveRrEdit);
+const _rrPatternInput = document.getElementById('rrPattern');
+if (_rrPatternInput) _rrPatternInput.addEventListener('input', updateRrKeepChips);
 const _exportBtn = document.getElementById('exportBtn');
 if (_exportBtn) _exportBtn.addEventListener('click', openExportModal);
 const _exportTxtBtn = document.getElementById('exportTxtBtn');
@@ -7592,8 +9291,8 @@ _backdropClickClose('exportModalBg', closeExportModal);
 document.getElementById('indentDlgBtn').addEventListener('click', openIndentDialog);
 document.getElementById('indCloseBtn').addEventListener('click', closeIndentDialog);
 _backdropClickClose('indentModalBg', closeIndentDialog);
-document.getElementById('indOkBtn').addEventListener('click', () => applyIndentSettings(false));
-document.getElementById('indClearBtn').addEventListener('click', () => applyIndentSettings(true));
+document.getElementById('indOkBtn').addEventListener('click', () => applyIndentSettings(indentMode(), false));
+document.getElementById('indClearBtn').addEventListener('click', () => applyIndentSettings(indentMode(), true));
 // 插入表格弹窗：打开/关闭/确定（行列 clamp 在确认时执行；遮罩点击关闭）
 const _tableBtn = document.getElementById('tableBtn');
 if (_tableBtn) _tableBtn.addEventListener('click', openTableDialog);
@@ -7604,6 +9303,71 @@ if (_tableCancelBtn) _tableCancelBtn.addEventListener('click', closeTableDialog)
 const _tableCloseBtn = document.getElementById('tableCloseBtn');
 if (_tableCloseBtn) _tableCloseBtn.addEventListener('click', closeTableDialog);
 if (document.getElementById('tableModalBg')) _backdropClickClose('tableModalBg', closeTableDialog);
+// 字符格式弹窗（2026-09-27）：打开/关闭/取值预览/确定/清除。
+// 选区由 openCharFormatDialog 快照（弹窗内聚焦输入框会销毁 document 选区，
+// 段落设置弹窗 2026-09-24 同款问题，见 _captureCharFormatSelection 注释）。
+(function bindCharFormatDialog() {
+  const openBtn = document.getElementById('charFormatBtn');
+  if (openBtn) openBtn.addEventListener('click', openCharFormatDialog);
+  const quickClear = document.getElementById('charFmtClearBtn');
+  if (quickClear) quickClear.addEventListener('click', clearCharFormatQuick);
+  const okBtn = document.getElementById('cfOkBtn');
+  if (okBtn) okBtn.addEventListener('click', () => applyCharFormat(false));
+  const clearBtn = document.getElementById('cfClearBtn');
+  if (clearBtn) clearBtn.addEventListener('click', () => applyCharFormat(true));
+  const cancelBtn = document.getElementById('cfCancelBtn');
+  if (cancelBtn) cancelBtn.addEventListener('click', closeCharFormatDialog);
+  const closeBtn = document.getElementById('cfCloseBtn');
+  if (closeBtn) closeBtn.addEventListener('click', closeCharFormatDialog);
+  if (document.getElementById('charFormatModalBg')) _backdropClickClose('charFormatModalBg', closeCharFormatDialog);
+  // 字号：下拉预设 ↔ 自定义数字框双向同步
+  const sizeSel = document.getElementById('cfSizeSel');
+  const sizeNum = document.getElementById('cfSizeNum');
+  if (sizeSel) sizeSel.addEventListener('change', () => {
+    if (sizeNum) sizeNum.value = '';
+    updateCharFormatPreview();
+  });
+  if (sizeNum) sizeNum.addEventListener('input', () => {
+    // 输入非 8-72 整数时保留自定义值（预览按钳制显示），不强行回写下拉
+    updateCharFormatPreview();
+  });
+  const fontSel = document.getElementById('cfFontSel');
+  if (fontSel) fontSel.addEventListener('change', updateCharFormatPreview);
+  // 颜色：隐藏 input[type=color] + 色块预览（与工具栏 colorBtn 同一模式，独立一个以免串扰）
+  const colorBtn = document.getElementById('cfColorBtn');
+  const colorClear = document.getElementById('cfColorClearBtn');
+  if (colorBtn) {
+    const inp = document.createElement('input');
+    inp.type = 'color'; inp.id = 'cfColorInput'; inp.style.display = 'none';
+    document.body.appendChild(inp);
+    colorBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      inp.value = _cfColor || '#000000';   // 空值时给个可用的默认起点
+      inp.click();
+    });
+    inp.addEventListener('input', () => { _cfColor = inp.value; _paintColorSwatch(); updateCharFormatPreview(); });
+  }
+  if (colorClear) colorClear.addEventListener('click', () => { _cfColor = ''; _paintColorSwatch(); updateCharFormatPreview(); });
+  // 弹窗内 Esc 关闭（与遮罩点击/关闭按钮一致）
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    const bg = document.getElementById('charFormatModalBg');
+    if (bg && bg.style.display === 'flex' && !e.defaultPrevented) { closeCharFormatDialog(); e.preventDefault(); }
+  });
+})();
+// 分隔线下拉菜单（2026-09-27）：dividerBtn -> dividerMenu（data-div: solid/dashed/dotted/double）
+(function bindDividerMenu() {
+  const dvBtn = document.getElementById('dividerBtn');
+  const dvMenu = document.getElementById('dividerMenu');
+  if (!dvBtn || !dvMenu) return;
+  dvBtn.addEventListener('click', (e) => { e.preventDefault(); toggleDropMenu('dividerBtn', 'dividerMenu'); });
+  dvMenu.addEventListener('click', (e) => {
+    const item = e.target.closest('[data-div]');
+    if (!item) return;
+    closeDropMenu('dividerBtn', 'dividerMenu');
+    insertDividerAtCaret(item.dataset.div);
+  });
+})();
 ['indLeft','indRight','indSpecial','indVal','indBefore','indAfter','indLh'].forEach(function(id) {
   document.getElementById(id).addEventListener('input', updateIndentPreview);
   document.getElementById(id).addEventListener('change', updateIndentPreview);
@@ -7661,14 +9425,15 @@ if (_resetMouseBtn) _resetMouseBtn.addEventListener('click', () => {
   renderShortcutTable();
   showToast('鼠标动作已恢复默认设置', 'ok');
 });
-// 设置-字体：恢复默认（与 configmanage.DEFAULT_CONFIG fonts 一致）
+// 设置-字体：恢复默认（默认 = 不修改字体，使用阅读器默认；引用格式内置宋体由 CSS fallback 兜底）
 document.getElementById('resetFontsBtn').addEventListener('click', async () => {
-  document.getElementById('fontBody').value = 'serif';
-  document.getElementById('fontHeading').value = 'sans-serif';
-  document.getElementById('fontNote').value = 'serif';
-  document.getElementById('fontCitation').value = 'cursive';
+  setFontSelect('fontBody', '');
+  setFontSelect('fontHeading', '');
+  setFontSelect('fontNote', '');
+  setFontSelect('fontCitation', '');
   document.getElementById('citationItalicEnabled').checked = true;
-  applyFontCSSVariables({ body: 'serif', heading: 'sans-serif', note: 'serif', citation: 'cursive' });
+  applyCitationItalic(true); // 恢复默认 = 引用斜体开启
+  applyFontCSSVariables({ body: '', heading: '', note: '', citation: '' });
   await saveFontSettings();
   showToast('字体设置已恢复默认', 'ok');
 });
@@ -7990,8 +9755,9 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
     // Defensive: hide known modal/backdrop elements at startup to avoid accidental blocking overlays
     (function(){
       const _modalIds = [
-        'modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','finishModalBg','finishConfirmBg',
+        'modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','charFormatModalBg','finishModalBg','finishConfirmBg',
         'historyModalBg','helpModalBg','formatRulesModalBg','frRuleModalBg','frFmtPopupBg',
+        'replaceRulesModalBg','rrEditModalBg',
         'imgPopup','errPopup','popup','proofreadMenu',
         'charWrapMenu','supSubMenu'
       ];
@@ -8031,10 +9797,13 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
   // 防御性：确保没有 modal 遮罩在初始化时意外显示（会导致工具栏/按钮无法响应）
   // 注意：contextMenu 不在此列——它靠 hidden 属性 + CSS [hidden] 显隐，inline display:none
   // 会永久压过 #contextMenu{display:flex}，导致右键菜单永不显示（2026-08 修复）。
-  ['modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','formatRulesModalBg','finishModalBg','finishConfirmBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg','imgPopup','errPopup','popup','proofreadMenu','charWrapMenu','supSubMenu'].forEach(function(id) {
+  ['modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','charFormatModalBg','formatRulesModalBg','finishModalBg','finishConfirmBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg','replaceRulesModalBg','rrEditModalBg','imgPopup','errPopup','popup','proofreadMenu','charWrapMenu','supSubMenu','dividerMenu'].forEach(function(id) {
     const el = document.getElementById(id);
     if (el) el.style.display = 'none';
   });
   setStatus('已加载 ' + pages.length + ' 页');
   updatePagePos();
+  bindAutoSaveSettingsEvents(); // 自动备份设置事件（一次性，防重复绑定）
+  loadAutoSaveFromServer();      // 服务端自动备份设置（异步覆盖默认值）
+  _autoSaveSchedule();           // 启动定时检查
 })();

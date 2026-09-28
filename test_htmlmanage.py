@@ -179,6 +179,68 @@ class TestCSSManagerStylesheet(unittest.TestCase):
         self.assertIn('顶格/缩进为手动段落格式', css)
 
 
+class TestCitationItalicConfig(unittest.TestCase):
+    """2026-09-22 修复：EPUB 导出 CSS 遵循 citationItalicEnabled 设置。
+
+    generate_stylesheet 默认路径懒读 configmanage.get_config(show_dialogs=False)；
+    测试以 monkeypatch 替换 configmanage.get_config（与 test_correctmanage
+    _patch_cfg 同法），addCleanup 恢复，避免影响其他套件。
+    """
+
+    def _patch_cfg(self, cfg):
+        """替换 configmanage.get_config 返回 cfg；记录调用 kwargs 供断言。"""
+        import configmanage
+
+        calls = []
+
+        def fake_get_config(*a, **k):
+            calls.append(k)
+            return cfg
+
+        orig = configmanage.get_config
+        configmanage.get_config = fake_get_config
+        self.addCleanup(lambda: setattr(configmanage, "get_config", orig))
+        return calls
+
+    @staticmethod
+    def _citation_rule(css):
+        """截取 .ptoe-citation { ... } 规则体（含选择器），用于块内断言。"""
+        start = css.index('.ptoe-citation {')
+        end = css.index('}', start)
+        return css[start:end + 1]
+
+    def test_disabled_emits_normal(self):
+        """citationItalicEnabled=False → .ptoe-citation 规则体为 font-style: normal，
+        且规则体内绝不出现 font-style: italic。"""
+        calls = self._patch_cfg({"citationItalicEnabled": False})
+        css = htmlmanage.CSSManager().generate_stylesheet()
+        rule = self._citation_rule(css)
+        self.assertIn('font-style: normal', rule)
+        self.assertNotIn('font-style: italic', rule)
+        # font-family（宋体）不受影响
+        self.assertIn('font-family: "宋体", SimSun, serif;', rule)
+        # 必须以 show_dialogs=False 调用，杜绝 tkinter 对话框
+        self.assertTrue(calls, "get_config 未被调用")
+        self.assertTrue(all(k.get("show_dialogs") is False for k in calls),
+                        f"get_config 须 show_dialogs=False，实得 {calls}")
+
+    def test_enabled_emits_italic(self):
+        """citationItalicEnabled=True → 规则体含 font-style: italic（与历史输出一致）。"""
+        self._patch_cfg({"citationItalicEnabled": True})
+        css = htmlmanage.CSSManager().generate_stylesheet()
+        rule = self._citation_rule(css)
+        self.assertIn('font-style: italic', rule)
+        self.assertNotIn('font-style: normal', rule)
+
+    def test_missing_key_defaults_to_italic(self):
+        """配置缺键（不含 citationItalicEnabled）→ 回退默认 True → italic。"""
+        self._patch_cfg({})
+        css = htmlmanage.CSSManager().generate_stylesheet()
+        rule = self._citation_rule(css)
+        self.assertIn('font-style: italic', rule)
+        self.assertNotIn('font-style: normal', rule)
+
+
 class TestHTMLConverterIntegration(unittest.TestCase):
     """HTMLConverter.convert_document 集成测试"""
 
@@ -397,6 +459,189 @@ class TestNewInlineFormatCSS(unittest.TestCase):
             html2 = f'<p>正文<span class="{cls}">测试</span>继续</p>'
             out2 = converter._render_fragment(html2)
             self.assertIn(f'<span class="{cls}">测试</span>', out2)
+
+    def test_render_fragment_inline_align_spans_passthrough(self):
+        """_render_fragment 对行内对齐 span 透传 class（ptoe-align-*）与
+        规则引擎产出的 style="text-align:..."，两者都不进样式转换路径被剥。"""
+        converter = htmlmanage.HTMLConverter(output_dir="/tmp")
+        out = converter._render_fragment(
+            '<p>前<span class="ptoe-align-center">居中</span>后</p>'
+        )
+        self.assertIn('<span class="ptoe-align-center">居中</span>', out)
+        out2 = converter._render_fragment(
+            '<p><span style="text-align:right">规则产出</span></p>'
+        )
+        self.assertIn('<span style="text-align:right">规则产出</span>', out2)
+        # 行内注释/引用 span 同样原样透传
+        out3 = converter._render_fragment(
+            '<p>正文<span class="ptoe-note">注</span><span class="ptoe-citation">引</span></p>'
+        )
+        self.assertIn('<span class="ptoe-note">注</span>', out3)
+        self.assertIn('<span class="ptoe-citation">引</span>', out3)
+
+    def test_align_css_block_display_with_table_cell_guard(self):
+        """对齐类 CSS：display:block（行内 span 渲染对齐）+ td/th 覆盖回 table-cell。"""
+        cssm = htmlmanage.CSSManager()
+        css = cssm.generate_stylesheet()
+        for cls in (".ptoe-align-left", ".ptoe-align-center", ".ptoe-align-right"):
+            self.assertIn(cls + " {", css)
+            self.assertIn("display: block", css)
+            self.assertIn("text-align: ", css)
+        # 表格单元格保护（display:block 会破坏表格布局）
+        self.assertIn("td.ptoe-align-left, td.ptoe-align-center, td.ptoe-align-right", css)
+        self.assertIn("display: table-cell", css)
+
+
+class TestDividerCSS(unittest.TestCase):
+    """分隔线 CSS 四种线型（2026-09-27）。"""
+
+    def test_base_and_four_variants_present(self):
+        """基类 + solid/dashed/dotted/double 五条规则齐全。"""
+        css = htmlmanage.CSSManager().generate_stylesheet()
+        for cls in (
+            ".ptoe-divider",
+            ".ptoe-divider-solid",
+            ".ptoe-divider-dashed",
+            ".ptoe-divider-dotted",
+            ".ptoe-divider-double",
+        ):
+            self.assertIn(cls + " {", css, cls)
+
+    def test_base_rule_is_weak_and_centered(self):
+        """基类：居中 + 弱化色 + 不换行（避免字形被折行截断）。"""
+        css = htmlmanage.CSSManager().generate_stylesheet()
+        body = css.split(".ptoe-divider {", 1)[1].split("}", 1)[0]
+        self.assertIn("text-align: center", body)
+        self.assertIn("text-indent: 0", body)
+        self.assertIn("color: #999999", body)
+        self.assertIn("white-space: nowrap", body)
+
+    def test_variants_differ_from_each_other(self):
+        """四种线型各有独立声明（字距/字重区分），不是四条空规则。"""
+        css = htmlmanage.CSSManager().generate_stylesheet()
+        bodies = {}
+        for name in ("solid", "dashed", "dotted", "double"):
+            bodies[name] = css.split(f".ptoe-divider-{name} {{", 1)[1].split("}", 1)[0]
+        for name, body in bodies.items():
+            self.assertTrue(body.strip(), f"{name} 规则为空")
+        # double 用粗体字重，线型系列靠字距
+        self.assertIn("font-weight: bold", bodies["double"])
+        self.assertIn("letter-spacing:", bodies["dashed"])
+        self.assertIn("letter-spacing:", bodies["dotted"])
+
+    def test_divider_css_comment_has_no_literal_angle_brackets(self):
+        """新增的分隔线 CSS 注释不含字面尖括号（保持注释卫生与历史约定一致）。"""
+        css = htmlmanage.CSSManager().generate_stylesheet()
+        comments = [chunk.split("*/", 1)[0] for chunk in css.split("/*")[1:]]
+        divider_comments = [c for c in comments if "ptoe-divider" in c or "分隔线" in c]
+        self.assertTrue(divider_comments, "未找到分隔线相关 CSS 注释")
+        for comment in divider_comments:
+            self.assertNotIn("<", comment, comment)
+            self.assertNotIn(">", comment, comment)
+
+    def test_inject_styles_wraps_css_in_cdata(self):
+        """内联 CSS 由 CDATA 包裹 —— 注释里的字面尖括号因此对 XML 解析器无害。"""
+        out = htmlmanage.CSSManager().inject_styles(
+            "<html><head></head><body>x</body></html>"
+        )
+        self.assertIn("/* <![CDATA[ */", out)
+        self.assertIn("/* ]]> */", out)
+
+
+class TestDividerAndCharStyleOutput(unittest.TestCase):
+    """分隔线与字符样式在 XHTML/EPUB 中的落地（2026-09-27）。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.converter = htmlmanage.HTMLConverter(output_dir=self.tmpdir)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _convert(self, page_text):
+        structured = {
+            'meta': {'title': '测试书', 'author': '作者', 'language': 'zh-CN'},
+            'pages': [{'page': 1, 'text': page_text}],
+        }
+        result = self.converter.convert_document(structured, merge_pages=True)
+        path = os.path.join(self.tmpdir, result['content_files'][0])
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+
+    def test_divider_keeps_base_and_suffix_class(self):
+        """基类 + 后缀两个 class 都保留（按精确成员过滤会丢掉后缀）。"""
+        for style in ('solid', 'dashed', 'dotted', 'double'):
+            content = self._convert(
+                f'<p class="ptoe-divider ptoe-divider-{style}">────────</p>'
+            )
+            self.assertIn(f'class="ptoe-divider ptoe-divider-{style}"', content, style)
+
+    def test_unknown_suffix_preserved_but_still_has_base(self):
+        """未知后缀类同样透传（前缀判定），CSS 缺失时按基类渲染。"""
+        content = self._convert(
+            '<p class="ptoe-divider ptoe-divider-wavy">X</p>'
+        )
+        self.assertIn('class="ptoe-divider ptoe-divider-wavy"', content)
+
+    def test_unrelated_classes_still_stripped(self):
+        """分隔线放行不放宽整个白名单：无关 class 仍被剥除。"""
+        content = self._convert(
+            '<p class="ptoe-divider ptoe-divider-solid evil-class">X</p>'
+        )
+        self.assertIn('class="ptoe-divider ptoe-divider-solid"', content)
+        self.assertNotIn("evil-class", content)
+
+    def test_char_style_span_passthrough(self):
+        """span style 原样进入 XHTML（HTML 侧无需再翻译）。"""
+        content = self._convert(
+            '<p>混排<span style="font-size:24px;color:#c00000">红</span>尾</p>'
+        )
+        self.assertIn('style="font-size:24px;color:#c00000"', content)
+        self.assertIn(">红<", content)
+
+    def test_output_is_well_formed_xml(self):
+        """含分隔线与字符样式的 XHTML 必须 XML 良构（CSS 注释尖括号陷阱回归）。"""
+        from xml.dom import minidom
+        content = self._convert(
+            '<h1>章</h1>'
+            '<p class="ptoe-divider ptoe-divider-solid">────────</p>'
+            '<p>混排<span style="font-size:24px">红</span>尾</p>'
+        )
+        minidom.parseString(content)
+
+    def test_divider_not_treated_as_heading_or_toc_entry(self):
+        """分隔线不进目录、不被当作标题（它是版式元素不是文章标题）。"""
+        structured = {
+            'meta': {'title': '测试书', 'author': '作者', 'language': 'zh-CN'},
+            'pages': [{'page': 1, 'text': (
+                '<h1>真标题</h1>'
+                '<p class="ptoe-divider ptoe-divider-solid">────────</p>'
+            )}],
+        }
+        result = self.converter.convert_document(structured, merge_pages=True)
+        content_path = os.path.join(self.tmpdir, result['content_files'][0])
+        with open(content_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        # 真标题仍是 h1，分隔线仍是带 class 的 p（未被升级为标题）
+        self.assertIn('<h1', content)
+        self.assertIn('class="ptoe-divider ptoe-divider-solid"', content)
+        # 目录文件里不含分隔线字形
+        nav_path = os.path.join(self.tmpdir, result['toc_file'])
+        with open(nav_path, 'r', encoding='utf-8') as f:
+            nav = f.read()
+        self.assertIn("真标题", nav)
+        self.assertNotIn("─", nav)
+
+    def test_block_class_html_prefix_acceptance(self):
+        """_block_class_html 按前缀放行分隔线类（单元级）。"""
+        for style in ('solid', 'dashed', 'dotted', 'double'):
+            out = htmlmanage._block_class_html(
+                f' class="ptoe-divider ptoe-divider-{style}"'
+            )
+            self.assertEqual(
+                out, f' class="ptoe-divider ptoe-divider-{style}"', style
+            )
 
 
 if __name__ == '__main__':

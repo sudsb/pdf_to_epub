@@ -38,6 +38,7 @@ from correctmanage import (
     diff_reocr_texts,
     _normalize_textcircled,
     _normalize_brackets,
+    _clean_bracket_junk_html,
     _strip_trailing_page_number,
     _page_text,
     _headings_to_body,
@@ -45,6 +46,13 @@ from correctmanage import (
     _prerender_embedded_images,
     _html_to_rich_blocks,
     _apply_join_marks,
+    _build_docx,
+    _build_md,
+    _divider_glyph,
+    DIVIDER_CLASS,
+    DIVIDER_STYLES,
+    DIVIDER_GLYPHS,
+    export_content_to_file,
 )
 
 
@@ -295,6 +303,82 @@ class TestSanitize(unittest.TestCase):
         self.assertIn('class="ptoe-note"', out4)
         self.assertIn('居中注释', out4)
 
+    def test_inline_align_class_spans_preserved(self):
+        # 2026-09-24：前端对部分选区用 <span class="ptoe-align-*"> 行内包裹
+        # （句中/词上独立对齐）→ sanitize 后 class 必须保留
+        out = sanitize_html(
+            '<p>前<span class="ptoe-align-center">居中</span>'
+            '<span class="ptoe-align-left">靠左</span>'
+            '<span class="ptoe-align-right">靠右</span>后</p>'
+        )
+        self.assertEqual(
+            out,
+            '<p>前<span class="ptoe-align-center">居中</span>'
+            '<span class="ptoe-align-left">靠左</span>'
+            '<span class="ptoe-align-right">靠右</span>后</p>',
+        )
+        # 与对齐 style 并存时两者都保留（规则引擎行内 style 路径不受影响）
+        out2 = sanitize_html(
+            '<p><span class="ptoe-align-center" style="text-align:center">双写</span></p>'
+        )
+        self.assertIn('class="ptoe-align-center"', out2)
+        self.assertIn('style="text-align:center"', out2)
+
+    def test_block_inline_style_stripped_keeps_class_data(self):
+        # 2026-09-24：前端做编辑器视觉预览会在块上落 inline style →
+        # sanitize 必须剥掉（否则历史 html 累积 style 且与 data-* 重复），
+        # class/data-* 属性照旧保留（段落设置仍由 data-* 驱动）
+        out = sanitize_html(
+            '<p style="text-indent:2em;margin-left:3em" class="ptoe-indent" '
+            'data-pl="2" data-ind="first" data-indv="2">正文</p>'
+        )
+        self.assertEqual(
+            out,
+            '<p class="ptoe-indent" data-pl="2" data-ind="first" data-indv="2">正文</p>',
+        )
+        self.assertNotIn("style=", out)
+        # 标题块 / div 同样剥 style
+        out2 = sanitize_html('<h2 style="text-align:center" class="ptoe-note">标题</h2>')
+        self.assertEqual(out2, '<h2 class="ptoe-note">标题</h2>')
+        out3 = sanitize_html('<div style="text-align:right" class="ptoe-align-right">块</div>')
+        self.assertEqual(out3, '<p class="ptoe-align-right">块</p>')
+        # 行内 span 的 style 规则路径不受影响（规则引擎产出 text-align 行内样式）
+        out4 = sanitize_html('<p><span style="text-align:center">行内</span></p>')
+        self.assertEqual(out4, '<p><span style="text-align:center">行内</span></p>')
+
+    def test_block_citation_class_preserved(self):
+        # 2026-09-24：citation 块+行内两用，块级 class 白名单须含 ptoe-citation
+        out = sanitize_html('<p class="ptoe-citation">块级引用</p>')
+        self.assertEqual(out, '<p class="ptoe-citation">块级引用</p>')
+        out2 = sanitize_html('<h3 class="ptoe-citation">标题引用</h3>')
+        self.assertEqual(out2, '<h3 class="ptoe-citation">标题引用</h3>')
+        # 行内引用仍保留
+        out3 = sanitize_html('<p><span class="ptoe-citation">行内引用</span></p>')
+        self.assertEqual(out3, '<p><span class="ptoe-citation">行内引用</span></p>')
+
+    def test_inline_class_whitelist_full(self):
+        # 全部行内包裹 class 逐项保留（note/citation/8 字符类/对齐类/标记）
+        for cls in (
+            "ptoe-note",
+            "ptoe-citation",
+            "ptoe-underline",
+            "ptoe-underdot",
+            "ptoe-strike",
+            "ptoe-charbox",
+            "ptoe-shade",
+            "ptoe-highlight",
+            "ptoe-sup",
+            "ptoe-sub",
+            "ptoe-align-left",
+            "ptoe-align-center",
+            "ptoe-align-right",
+        ):
+            out = sanitize_html(f'<p>x<span class="{cls}">y</span>z</p>')
+            self.assertIn(f'class="{cls}"', out, f"class {cls} 未保留: {out}")
+        # 非法类照旧剥除
+        out = sanitize_html('<p>x<span class="evil">y</span>z</p>')
+        self.assertEqual(out, "<p>xyz</p>")
+
 
 class TestEnsureMarkerClasses(unittest.TestCase):
     """_ensure_marker_classes：serve 时只为「真正带 data-ptoe-marker 的标记 span」
@@ -422,6 +506,25 @@ class TestCleanPageHtml(unittest.TestCase):
         once = clean_page_html(src)
         self.assertEqual(clean_page_html(once), once)
 
+    def test_dollar_bracket_hug_stripped(self):
+        # OvisOCR/o 系模型自造 $ 包裹引注括号：$〔n〕$ → 〔n〕
+        self.assertEqual(clean_page_html('<p>见$〔1〕$注</p>'), '<p>见〔1〕注</p>')
+        self.assertEqual(clean_page_html('<p>f$〔2〕$后</p>'), '<p>f〔2〕后</p>')
+        # 带空白紧贴也剥（_strip_dollar_bracket_hug 容忍 $ 与括号间的空白）
+        self.assertEqual(clean_page_html('<p>见$ 〔3〕 $注</p>'), '<p>见〔3〕注</p>')
+
+    def test_non_hugging_dollar_preserved(self):
+        # 不紧贴括号的 $（价格 / $x$ / 句中噪声）原样保留
+        self.assertEqual(clean_page_html('<p>价格 $5 元</p>'), '<p>价格 $5 元</p>')
+        self.assertEqual(clean_page_html('<p>$x$</p>'), '<p>$x$</p>')
+        self.assertEqual(clean_page_html('<p>共$20$元</p>'), '<p>共$20$元</p>')
+
+    def test_dollar_bracket_hug_idempotent(self):
+        src = '<p>见$〔1〕$注，价格 $5 元</p>'
+        once = clean_page_html(src)
+        self.assertEqual(once, '<p>见〔1〕注，价格 $5 元</p>')
+        self.assertEqual(clean_page_html(once), once)
+
     def test_md_bold_symbols_removed(self):
         # OCR/文本残留的 Markdown 加粗符号 ** 全部清除（含句中）
         self.assertEqual(clean_page_html('<p>这是**重点**内容</p>'), '<p>这是重点内容</p>')
@@ -463,6 +566,33 @@ class TestCleanPageHtml(unittest.TestCase):
             clean_page_html('<p>正文</p><p><span data-ptoe-marker="note">注</span></p>'),
             '<p>正文</p>\n<p><span data-ptoe-marker="note">注</span></p>',
         )
+
+
+class TestCleanBracketJunkHtml(unittest.TestCase):
+    """_clean_bracket_junk_html：历史/已存 HTML 的杂符括号清理（token 级）。"""
+
+    def test_dollar_hug_brackets_stripped_without_other_junk(self):
+        # 2026-09-21 修复：守卫字符集此前不含 $，纯 $〔1〕$（无 \ ^ ~ | · { }）
+        # 会早退原样返回；现在 $ 触发清理 → $〔1〕$ → 〔1〕
+        self.assertEqual(
+            _clean_bracket_junk_html('<p>见$〔1〕$注</p>'), '<p>见〔1〕注</p>'
+        )
+        self.assertEqual(_clean_bracket_junk_html('f$〔2〕$g'), 'f〔2〕g')
+
+    def test_price_dollar_unchanged(self):
+        # 仅含价格 $5 的字符串（不含其他杂符）不再早退但内容不变
+        self.assertEqual(
+            _clean_bracket_junk_html('<p>价格 $5 元</p>'), '<p>价格 $5 元</p>'
+        )
+
+    def test_other_junk_still_cleaned(self):
+        # 原有杂符行为不回归：\\〔^{x〕}\\ 仍被清理
+        self.assertEqual(_clean_bracket_junk_html('\\〔^{1〕}\\'), '〔1〕')
+
+    def test_idempotent(self):
+        once = _clean_bracket_junk_html('<p>见$〔1〕$注</p>')
+        self.assertEqual(once, '<p>见〔1〕注</p>')
+        self.assertEqual(_clean_bracket_junk_html(once), once)
 
 
 class TestInitialHtml(unittest.TestCase):
@@ -691,6 +821,47 @@ class TestPagesEndpoint(unittest.TestCase):
             )
         finally:
             self._stop(server)
+
+    def test_dollar_hug_brackets_cleaned_on_serve(self):
+        # 2026-09-21 修复：历史/已存 HTML 里 $〔n〕$（无其他杂符）经 /api/pages
+        # serve（→ _page_text → _clean_bracket_junk_html）也会被清理；
+        # 紧贴括号的 $ 剥除，不紧贴的（价格）原样保留。
+        import threading
+        from http.server import ThreadingHTTPServer
+
+        from correctmanage import _CorrectionHandler
+
+        state = {
+            "pages": {
+                1: "<p>见$〔1〕$注</p>",
+                2: "<p>价格 $5 元</p>",
+            },
+            "finished": threading.Event(),
+            "preview_cache": {},
+            "pdf_path": None,
+            "img_dir": None,
+            "preview_dpi": 110,
+            "preview_quality": 82,
+            "last_heartbeat": 0.0,
+            "gone_at": None,
+            "idle_timeout": 600.0,
+            "auto_finished": False,
+        }
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _CorrectionHandler)
+        server.daemon_threads = True
+        server.state = state
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            import requests
+
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+            res = requests.get(base + "/api/pages").json()
+            pages = {p["page"]: p["text"] for p in res["pages"]}
+            self.assertEqual(pages[1], "<p>\n见〔1〕注</p>")
+            self.assertEqual(pages[2], "<p>\n价格 $5 元</p>")
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 _VOID_TAGS = {"br", "img", "hr", "meta", "link", "input"}
@@ -1480,6 +1651,56 @@ class TestRenderFragment(unittest.TestCase):
         self.assertIn('epub:type="landmarks"', toc_html)
         self.assertNotIn('href="nav.xhtml"', toc_html)
         self.assertIn('href="content_1.xhtml"', toc_html)
+
+    def test_toc_tree_nested_levels(self):
+        # 2026-09-24：多级标题目录渲染为树状（下级标题嵌套在上级标题之下），
+        # 每级列表独立计数（新开一级从 1 重计）
+        toc_html = self.conv.render_toc_page(
+            [
+                {"title": "第一章", "href": "content_1.xhtml#h1", "level": 1},
+                {"title": "1.1", "href": "content_1.xhtml#h2", "level": 2},
+                {"title": "1.2", "href": "content_1.xhtml#h3", "level": 2},
+                {"title": "第二章", "href": "content_2.xhtml#h1", "level": 1},
+                {"title": "2.1", "href": "content_2.xhtml#h2", "level": 2},
+            ]
+        )
+        # 顶层含 第一章/第二章 两个 li，嵌套 1.1/1.2 与 2.1 两个子 ol
+        toc_nav = toc_html.split('<nav class="toc"', 1)[1].split('</nav>', 1)[0]
+        self.assertEqual(toc_nav.count("<ol>"), 3)
+        self.assertEqual(toc_nav.count("</ol>"), 3)
+        # 精确嵌套结构：第一章 li → 子 ol(1.1, 1.2) → 第二章 li → 子 ol(2.1)
+        self.assertIn(
+            '<ol>'
+            '<li><a href="content_1.xhtml#h1"><span class="toc-num">1.</span>第一章</a></li>'
+            '<ol>'
+            '<li><a href="content_1.xhtml#h2"><span class="toc-num">1.</span>1.1</a></li>'
+            '<li><a href="content_1.xhtml#h3"><span class="toc-num">2.</span>1.2</a></li>'
+            '</ol>'
+            '<li><a href="content_2.xhtml#h1"><span class="toc-num">2.</span>第二章</a></li>'
+            '<ol>'
+            '<li><a href="content_2.xhtml#h2"><span class="toc-num">1.</span>2.1</a></li>'
+            '</ol>'
+            '</ol>',
+            toc_html,
+        )
+        # 章节级编号与旧版一致（第一章=1、第二章=2），小节级从 1 重计
+        for num in ('1.</span>第一章', '2.</span>第二章', '1.</span>1.1', '2.</span>1.2', '1.</span>2.1'):
+            self.assertIn(f'<span class="toc-num">{num}', toc_html)
+
+    def test_toc_tree_level_fallback(self):
+        # 层级缺失/非法/首条非 h1 一律按 1 处理（不抛异常，平铺顶层）
+        toc_html = self.conv.render_toc_page(
+            [
+                {"title": "无层级", "href": "content_1.xhtml#h1"},
+                {"title": "非法", "href": "content_1.xhtml#h1", "level": "abc"},
+                {"title": "零", "href": "content_1.xhtml#h1", "level": 0},
+                {"title": "负", "href": "content_1.xhtml#h1", "level": -3},
+            ]
+        )
+        toc_nav = toc_html.split('<nav class="toc"', 1)[1].split('</nav>', 1)[0]
+        self.assertEqual(toc_nav.count("<ol>"), 1)
+        self.assertEqual(toc_nav.count("</ol>"), 1)
+        self.assertEqual(toc_nav.count('<span class="toc-num">'), 4)
 
     def test_convert_document_with_articles(self):
         # 全文标记拆出的文章结构 → 每篇一个内容页（开新页）
@@ -2638,6 +2859,1552 @@ class TestExport(unittest.TestCase):
         self.assertIn(f"![插图]({png})", text)
 
 
+class TestApplyMarkersTableBlock(unittest.TestCase):
+    """apply_markers：<table> 自成顶层块，原样透传（2026-09-27 内容丢失修复）。
+
+    修复前 table 不在 _BLOCK_TAG_RE 的块标签集合里，其 token 累积进 cur 后被
+    后续 <p> 认领（`if kind:` 为假 → 不 flush），或被 EOF 的 `kind or "p"` 包进
+    <p>；后者不仅是非法嵌套 <p><table>，还会把表格后面的真段落一起吞进包裹元素
+    （正文丢失）。本类逐条锁定修复后的契约。
+    """
+
+    TBL = "<table><tbody><tr><td>单元格</td></tr></tbody></table>"
+    TBL_HEAD = (
+        "<table><thead><tr><th>表头</th></tr></thead>"
+        "<tbody><tr><td>单元格</td></tr></tbody></table>"
+    )
+
+    def _run(self, *page_texts):
+        """apply_markers 便捷入口：单篇文章文本列表 → 该文章 HTML。"""
+        arts = apply_markers(
+            [{"page": i + 1, "text": t} for i, t in enumerate(page_texts)]
+        )
+        self.assertEqual(len(arts), 1, f"期望 1 篇文章，实得 {len(arts)}")
+        return arts[0]["text"]
+
+    def _run_all(self, *page_texts):
+        return apply_markers(
+            [{"page": i + 1, "text": t} for i, t in enumerate(page_texts)]
+        )
+
+    # ---------- 原始两个复现 ----------
+
+    def test_repro_table_at_end_is_not_wrapped_in_p(self):
+        """复现一：表格在块流末尾，不得被包成 <p><table>…</table></p>。"""
+        out = self._run("<h1>T</h1><p>a</p>" + self.TBL)
+        self.assertIn("<table>", out)
+        self.assertNotIn("<p><table", out)
+        self.assertNotIn("</table></p>", out)
+        self.assertIn("<h1>T</h1><p>a</p>" + self.TBL, out)
+
+    def test_repro_paragraph_after_table_is_not_swallowed(self):
+        """复现二：表格后的真段落被吞进包裹元素 = 正文丢失（核心回归）。"""
+        out = self._run("<p>x</p>" + self.TBL + "<p>after</p>")
+        self.assertIn("<p>x</p>" + self.TBL + "<p>after</p>", out)
+        self.assertNotIn("<p><table", out)
+        # after 必须仍是独立段落，不能被并入表格所在的 p
+        self.assertIn("</table><p>after</p>", out)
+
+    def test_paragraph_text_never_absorbed_into_table(self):
+        """表格前后段落文字逐字保留、顺序不变。"""
+        out = self._run("<p>前段</p>" + self.TBL_HEAD + "<p>后段</p>")
+        self.assertLess(out.index("前段"), out.index("<table>"))
+        self.assertLess(out.index("</table>"), out.index("后段"))
+        self.assertNotIn("前段</p><p", out)  # 没有多余包裹
+
+    # ---------- 1) _split_segments 空内容门 ----------
+
+    def test_text_bearing_table_survives(self):
+        """含文字的表格不因空内容门被丢。"""
+        out = self._run(self.TBL)
+        self.assertEqual(out, self.TBL)
+
+    def test_image_only_table_is_not_lost(self):
+        """纯图片表：剥标签后无文字，靠原子块路径存活（旧实现靠 <img> 侥幸存活）。"""
+        img = '<img src="data:image/png;base64,AA">'
+        src = f"<table><tbody><tr><td>{img}</td></tr></tbody></table>"
+        out = self._run(src)
+        self.assertIn("<img", out)
+        self.assertIn("<td>", out)
+
+    def test_marker_only_table_survives(self):
+        """只含标记 span 的表格：表体保留（标记被消费，见 item4）。"""
+        src = (
+            "<table><tbody><tr><td>"
+            '<span data-ptoe-marker="join">段落</span>'
+            "</td></tr></tbody></table>"
+        )
+        out = self._run(src)
+        self.assertIn("<table>", out)
+        self.assertIn("</table>", out)
+        self.assertNotIn("data-ptoe-marker", out)
+
+    def test_completely_empty_table_dropped_like_empty_p(self):
+        """整表无任何内容时丢弃——与 sanitize_html("<p></p>") == "" 的既有约定一致。
+
+        主循环的 `if html:` 门对所有 kind 一视同仁（空段落也被丢），故不单独为
+        表格开特例：空表在 EPUB 里只是空盒子，保留无信息。
+        """
+        self.assertEqual(self._run_all("<table></table>"), [])
+
+    # ---------- 2) 结构标签透明 / 单元格内无块标签 ----------
+
+    def test_structural_tags_do_not_shred_the_table(self):
+        """thead/tbody/tr/td/th 保持透明：不各自成 kind，表格结构完整。"""
+        out = self._run(self.TBL_HEAD)
+        self.assertEqual(out.count("<table>"), 1)
+        self.assertEqual(out.count("</table>"), 1)
+        self.assertEqual(out.count("<thead>"), 1)
+        self.assertEqual(out.count("<tbody>"), 1)
+        self.assertEqual(out.count("<tr>"), 2)
+        self.assertEqual(out, self.TBL_HEAD)  # 逐字节原样透传
+
+    def test_structure_tags_not_independently_wrapped(self):
+        """结构标签绝不被单独裹一层（否则表格被拆碎）。"""
+        out = self._run(self.TBL_HEAD)
+        for tag in ("thead", "tbody", "tr", "td", "th"):
+            for open_t in (f"<p><{tag}>", f"<h1><{tag}>", f"<{tag}><p>"):
+                self.assertNotIn(open_t, out, f"{tag} 被独立包裹/包裹他者")
+
+    def test_sanitizer_never_puts_block_tag_in_cell(self):
+        """前置事实：清洗器会把单元格内的 p/h1/div 降级为行内内容，故不会切断表格。"""
+        for cell in ("<p>cell</p>", "<h1>cell</h1>", "<div>cell</div>"):
+            with self.subTest(cell=cell):
+                out = sanitize_html(
+                    f"<table><tbody><tr><td>{cell}</td></tr></tbody></table>"
+                )
+                self.assertEqual(
+                    out,
+                    "<table><tbody><tr><td>cell</td></tr></tbody></table>",
+                )
+
+    def test_unsanitized_block_tag_in_cell_still_safe(self):
+        """未清洗的外部数据里 <td><p>…</p></td> 也不会切断表格（原子块兜底）。"""
+        out = self._run(
+            "<table><tbody><tr><td><p>cell</p></td></tr></tbody></table>"
+        )
+        self.assertEqual(out.count("<table>"), 1)
+        self.assertIn("<p>cell</p>", out)  # 原样保留，不被切成两块
+
+    # ---------- 3) attrs 往返 ----------
+
+    def test_sanitizer_strips_all_table_element_classes(self):
+        """前置事实：<table> 元素上的 class 一律被清洗掉（只有 td/th 保留对齐类）。"""
+        out = sanitize_html(
+            '<table class="ptoe-align-center" onclick="x()">'
+            "<tbody><tr><td>x</td></tr></tbody></table>"
+        )
+        self.assertEqual(
+            out, "<table><tbody><tr><td>x</td></tr></tbody></table>"
+        )
+
+    def test_cell_attrs_survive_apply_markers(self):
+        """单元格属性（对齐类 + colspan）在原子块路径下逐字保留，无需特判。"""
+        out = self._run(
+            '<table><tbody><tr><td class="ptoe-align-right" colspan="2">x</td>'
+            "</tr></tbody></table>"
+        )
+        self.assertIn('class="ptoe-align-right"', out)
+        self.assertIn('colspan="2"', out)
+
+    def test_no_table_level_attrs_needed_for_ui_tables(self):
+        """UI 插入的表格（buildTableHtml）无 class，apply_markers 无需为其保留属性。"""
+        ui = (
+            "<table><thead><tr><th></th></tr></thead>"
+            "<tbody><tr><td></td></tr></tbody></table>"
+        )
+        self.assertEqual(sanitize_html(ui), ui)
+        # 无任何 class → attrs 为空，输出即原文
+        self.assertEqual(self._run(ui), ui)
+
+    # ---------- 4) 段落标记不得吃掉表格 ----------
+
+    def test_join_before_table_does_not_merge_table_into_paragraph(self):
+        """<p>a</p> + join + 表格：join 被消费，但不把表格并进段落、也不丢。"""
+        out = self._run(
+            '<p>a</p><p><span data-ptoe-marker="join">段落</span></p>' + self.TBL
+        )
+        self.assertIn("<p>a</p>", out)
+        self.assertIn(self.TBL, out)
+        self.assertNotIn("<p><table", out)
+        self.assertNotIn("a</p><p>段落", out)  # 标记本身不进正文
+
+    def test_join_after_table_does_not_merge(self):
+        """表格 + join + <p>b</p>：表格不被合并，b 仍是独立段落。"""
+        out = self._run(
+            self.TBL + '<p><span data-ptoe-marker="join">段落</span></p><p>b</p>'
+        )
+        self.assertIn("</table><p>b</p>", out)
+        self.assertNotIn("<p><table", out)
+
+    def test_table_never_becomes_merge_target(self):
+        """_RENDERED_BLOCK_RE 只认 p/div，表格块不可被 _merge_paragraph 选中。"""
+        out = self._run(
+            self.TBL
+            + '<p><span data-ptoe-marker="note">注</span>x</p>'
+            + '<p class="ptoe-note">注释正文</p>'
+        )
+        # 注释 span 挂到正文段落上，表格内容未被注水
+        self.assertIn(self.TBL, out)
+        self.assertNotIn("单元格<span", out)
+        self.assertIn("<p><span class=\"ptoe-note\">（注释正文）</span>x</p>", out)
+
+    def test_chapter_marker_around_table(self):
+        """章节标记 + 表格：h2 正常落在表格前，表格仍为块级。"""
+        out = self._run(
+            '<p><span data-ptoe-marker="chapter:一">一</span></p>' + self.TBL
+            + "<p>tail</p>"
+        )
+        self.assertTrue(out.startswith("<h2>一</h2>"), out)
+        self.assertIn(self.TBL, out)
+        self.assertIn("</table><p>tail</p>", out)
+
+    def test_full_marker_around_table(self):
+        """全文标记 + 表格：仅切文章边界，表格原样落在新文章里。"""
+        arts = self._run_all(
+            "<p>前文</p>",
+            '<p><span data-ptoe-marker="full">全文</span></p>' + self.TBL,
+        )
+        self.assertEqual(len(arts), 2)
+        self.assertIn("前文", arts[0]["text"])
+        self.assertIn(self.TBL, arts[1]["text"])
+        self.assertNotIn("<p><table", arts[1]["text"])
+
+    def test_page_marker_around_table(self):
+        """换页标记 + 表格：占位段落插在表格前，表格结构不受影响。"""
+        out = self._run(
+            '<p><span data-ptoe-marker="page">换页</span></p>' + self.TBL
+            + "<p>tail</p>"
+        )
+        self.assertIn('<p class="ptoe-page-break"> </p>' + self.TBL, out)
+        self.assertNotIn("<p><table", out)
+
+    def test_note_marker_inside_table_does_not_break_note_count(self):
+        """表内 note 标记被丢弃，不参与数量校验（2 注释/2 标记仍通过）。"""
+        out = self._run(
+            '<p><span data-ptoe-marker="note">注</span>x</p>'
+            + '<p><span data-ptoe-marker="note">注</span>y</p>'
+            + '<p class="ptoe-note">n1</p>'
+            + '<table><tbody><tr><td><span data-ptoe-marker="note">注</span>'
+            + "</td></tr></tbody></table>"
+            + '<p class="ptoe-note">n2</p>'
+        )
+        self.assertEqual(out.count('class="ptoe-note"'), 2)
+        self.assertIn("（n1）", out)
+        self.assertIn("（n2）", out)
+        self.assertIn("<table>", out)
+
+    # ---------- 5) 空表 / 相邻表 / 首尾表 ----------
+
+    def test_two_tables_back_to_back(self):
+        """相邻两张表各自独立，不合并、不互相吞并。"""
+        out = self._run(self.TBL + self.TBL)
+        self.assertEqual(out.count("<table>"), 2)
+        self.assertEqual(out, self.TBL + self.TBL)
+
+    def test_table_as_first_block(self):
+        """表格是首个块：无前导空段落。"""
+        out = self._run(self.TBL + "<p>z</p>")
+        self.assertTrue(out.startswith("<table>"), out)
+        self.assertNotIn("<p></p>", out)
+
+    def test_table_as_last_block(self):
+        """表格是末块：EOF 不再补包裹。"""
+        out = self._run("<p>z</p>" + self.TBL)
+        self.assertTrue(out.endswith("</table>"), out)
+        self.assertNotIn("</table></p>", out)
+
+    def test_no_stray_empty_paragraphs_anywhere(self):
+        """以上各种位置组合都不产生空 <p></p> / <p> </p>。"""
+        cases = [
+            self.TBL,
+            self.TBL + "<p>z</p>",
+            "<p>z</p>" + self.TBL,
+            self.TBL + self.TBL,
+            "<p>a</p>" + self.TBL + "<p>b</p>" + self.TBL + "<p>c</p>",
+        ]
+        for src in cases:
+            with self.subTest(src=src[:40]):
+                out = self._run(src)
+                self.assertNotIn("<p></p>", out)
+                self.assertNotIn("<p> </p>", out)
+
+    def test_table_between_paragraphs_keeps_all_three_blocks(self):
+        """段-表-段：三个块都在，顺序不变。"""
+        out = self._run("<p>一</p>" + self.TBL + "<p>二</p>")
+        self.assertEqual(
+            out, "<p>一</p>" + self.TBL + "<p>二</p>"
+        )
+
+    # ---------- 6) 跨页 ----------
+
+    def test_table_page_then_paragraph_page(self):
+        """表格在第 1 页、段落在第 2 页：块状态不泄漏。"""
+        out = self._run(self.TBL, "<p>第二页</p>")
+        self.assertEqual(out, self.TBL + "<p>第二页</p>")
+
+    def test_paragraph_page_then_table_page(self):
+        """段落页在前、表格页在后：同样不泄漏。"""
+        out = self._run("<p>第一页</p>", self.TBL)
+        self.assertEqual(out, "<p>第一页</p>" + self.TBL)
+
+    def test_sanitizer_balances_table_per_page(self):
+        """前置事实：清洗逐页进行且 result() 收尾补齐，故表格不会跨页拆分。"""
+        # 截断的开标签在页内被自动闭合
+        self.assertEqual(
+            sanitize_html("<table><tbody><tr><td>a"),
+            "<table><tbody><tr><td>a</td></tr></tbody></table>",
+        )
+        # 孤立的闭合标签被丢弃
+        self.assertEqual(sanitize_html("</td></tr></tbody></table>"), "")
+
+    def test_join_across_page_onto_table_is_not_lost(self):
+        """跨页 join 落在表格上：标记被消费、表格独立，不与上一页段落合并。"""
+        out = self._run(
+            "<p>甲</p><p><span data-ptoe-marker=\"join\">段落</span></p>",
+            self.TBL,
+        )
+        self.assertIn("<p>甲</p>", out)
+        self.assertIn(self.TBL, out)
+        self.assertNotIn("<p><table", out)
+
+    # ---------- 7) 无标记路径 ----------
+
+    def test_no_marker_page_returns_single_article(self):
+        """无标记：一篇文章，表格内容逐字节保留。"""
+        src = "<p>a</p>" + self.TBL_HEAD + "<h2>H</h2><p>b</p>"
+        arts = self._run_all(src)
+        self.assertEqual(len(arts), 1)
+        self.assertEqual(arts[0]["text"], src)
+
+    def test_table_only_page_no_markers(self):
+        """整页只有表格且无标记：内容不丢。"""
+        arts = self._run_all(self.TBL_HEAD)
+        self.assertEqual(len(arts), 1)
+        self.assertEqual(arts[0]["text"], self.TBL_HEAD)
+
+    def test_no_marker_path_unchanged_for_non_table_pages(self):
+        """对照：不含表格的页面输出与既有行为一致（不因本修复而变化）。"""
+        self.assertEqual(
+            self._run("<h1>T</h1><p>a</p><p>b</p>"),
+            "<h1>T</h1><p>a</p><p>b</p>",
+        )
+
+
+class TestApplyMarkersTableEpubEndToEnd(unittest.TestCase):
+    """端到端：apply_markers → convert_document → 打包 .epub → 解析 content_xhtml。
+
+    这是**本该抓住该 bug 的检查**：修复前表格后面的真段落会被吞进包裹元素。
+    """
+
+    XHTML = "{http://www.w3.org/1999/xhtml}"
+    BEFORE = "表格前面的段落"
+    AFTER = "表格后面的段落"
+    PAGE = (
+        "<h1>章一</h1>"
+        "<p>表格前面的段落</p>"
+        "<table><thead><tr><th>表头</th></tr></thead>"
+        "<tbody><tr><td>单元格</td></tr></tbody></table>"
+        "<p>表格后面的段落</p>"
+    )
+
+    def _epub_root(self):
+        import xml.etree.ElementTree as ET
+        import zipfile
+
+        items = [{"page": 1, "html": sanitize_html(self.PAGE)}]
+        out = Path(tempfile.mkdtemp(prefix="t_tbl_epub_")) / "b.epub"
+        correctmanage.export_content_to_file(
+            items, "epub", str(out), title="表测试"
+        )
+        self.assertTrue(out.is_file())
+        with zipfile.ZipFile(out) as zf:
+            names = [
+                n
+                for n in zf.namelist()
+                if "content" in n and n.endswith(".xhtml")
+            ]
+            self.assertTrue(names, "EPUB 内没有 content_*.xhtml")
+            xml = zf.read(names[0]).decode("utf-8")
+        # 良构性：解析失败会直接抛异常
+        return ET.fromstring(xml), out.name
+
+    def test_epub_xhtml_is_well_formed_and_table_intact(self):
+        """打包出的 XHTML 必须良构，且表格与其单元格内容完好。"""
+        root, _name = self._epub_root()
+        self.assertEqual(root.tag, self.XHTML + "html")
+        tables = list(root.iter(self.XHTML + "table"))
+        self.assertEqual(len(tables), 1)
+        cells = [
+            "".join(e.itertext()).strip()
+            for e in tables[0].iter()
+            if e.tag in (self.XHTML + "th", self.XHTML + "td")
+        ]
+        self.assertEqual(cells, ["表头", "单元格"])
+
+    def test_epub_paragraphs_before_and_after_table_preserved(self):
+        """核心回归：表格前后的段落文字都在，且 AFTER 排在表格之后（修复前被吞）。"""
+        root, _name = self._epub_root()
+        blocks = [
+            ("".join(e.itertext()).strip())
+            for e in root.iter()
+            if e.tag in (self.XHTML + "p", self.XHTML + "h1")
+        ]
+        self.assertIn(self.BEFORE, blocks)
+        # AFTER 文字必须存在于文档中（不丢字）
+        flat = "".join(root.itertext())
+        self.assertIn(self.AFTER, flat)
+        # 文档顺序：表格在前、AFTER 在后
+        pos_tbl = flat.index("单元格")
+        self.assertLess(pos_tbl, flat.index(self.AFTER))
+
+    def test_paragraph_after_table_is_sibling_not_swallowed(self):
+        """**用户可见症状的回归测试**（原 expectedFailure 探针，已转正）。
+
+        修复前 htmlmanage 的块标签正则不认 <table>，表格 token 被后面的 <p>
+        认领，产出 <p><table>…</table>AFTER</p>：表格是非法嵌套，且 AFTER
+        段落不再是独立块（正文丢失）。现在 AFTER 必须是表格的**兄弟节点**，
+        且表格自身不得有任何 <p> 祖先。
+        """
+        root, _name = self._epub_root()
+        parent = {c: p for p in root.iter() for c in p}
+        tables = list(root.iter(self.XHTML + "table"))
+        self.assertEqual(len(tables), 1)
+        table = tables[0]
+
+        # 1) 表格在块级：祖先链里不得出现 <p>
+        chain, cur = [], table
+        while cur is not None:
+            chain.append(cur.tag)
+            cur = parent.get(cur)
+        self.assertNotIn(self.XHTML + "p", chain, f"表格被裹进 <p>：{chain}")
+
+        # 2) 表格的直接父节点是 <body>
+        table_parent = parent.get(table)
+        if table_parent is None:
+            self.fail("表格没有父节点")
+        self.assertEqual(table_parent.tag, self.XHTML + "body")
+
+        # 3) AFTER 段落是独立 <p>，且其父节点与表格相同（真正的兄弟节点）
+        after_ps = [
+            e
+            for e in root.iter(self.XHTML + "p")
+            if "".join(e.itertext()).strip() == self.AFTER
+        ]
+        self.assertEqual(
+            len(after_ps), 1, "表格后的段落未作为独立 <p> 保留（被吞）"
+        )
+        after_parent = parent.get(after_ps[0])
+        if after_parent is None:
+            self.fail("表格后的段落没有父节点")
+        self.assertIs(after_parent, table_parent)
+
+    def test_no_paragraph_wraps_a_table(self):
+        """全文档断言：任何 <p> 都不能直接包含 <table>。"""
+        root, _name = self._epub_root()
+        for p in root.iter(self.XHTML + "p"):
+            self.assertEqual(
+                len(list(p.iter(self.XHTML + "table"))),
+                0,
+                f"存在 <p><table> 非法嵌套：{''.join(p.itertext())[:60]}",
+            )
+
+
+class TestCleanBlocksTableBlock(unittest.TestCase):
+    """第三处：工具栏「清理」→ clean_page_html → _clean_blocks（2026-09-27）。
+
+    这是同一缺陷**最严重**的一处：表格不是被包裹，而是被**整体销毁**。
+    机制（已实测确认，与 apply_markers/_render_fragment 同源但更彻底）：
+
+    1) clean_page_html 先做 _STRIP_TAG_RE —— 它是**负向前瞻白名单**（保留
+       p/h1-6/strong/em/b/i/br/span/img，剥掉其余）。修复前 table/thead/
+       tbody/tr/td 全部被剥，单元格文本摊平成裸文本 `c1c2`；
+    2) 裸文本落进 _clean_blocks 的 cur，被随后的 <p> 认领 → <p>c1c2AFTER</p>。
+       表格消失、AFTER 段被吸收、段落边界丢失。
+
+    修复（两处缺一不可）：
+    - _STRIP_TAG_RE 豁免 table|thead|tfoot|tbody|tr|th|td（_Sanitizer 表格模式
+      消费的整套标签），让表格撑到 sanitize；
+    - _clean_blocks 把 <table>…</table> 当原子块：逐字节透传，不切块、不做
+      段内文本处理、不参与段落合并。
+
+    子决策：**整表原样透传，清理规则完全不进单元格**（不是「只做标点」）。
+    依据见 _clean_blocks docstring；本类的 test_cell_punctuation_is_not_rewritten
+    与 test_paragraph_punctuation_is_still_normalized 成对锁定该契约。
+    """
+
+    # 下面所有期望值都按 sanitize_html 的**规范形**写：sanitize 会把
+    # <table><tr>… 规范化成 <table><tbody><tr>…，_clean_blocks 拿到的是
+    # 规范形并须逐字节保持 —— 即「与 sanitize 输出完全一致」。
+    TBL = "<table><tbody><tr><td>c1</td><td>c2</td></tr></tbody></table>"
+    TBL_HEAD = (
+        "<table><thead><tr><th>表头</th></tr></thead>"
+        "<tbody><tr><td>c1</td></tr></tbody></table>"
+    )
+
+    # 直调 _clean_blocks 时的固定参数（只有 clean_page_html 一个生产调用方，
+    # 纵深防御分支须直调才能命中）
+    _CB_KW = {
+        "merge_paragraphs": False,
+        "strip_leading_symbols": True,
+        "normalize_punctuation": True,
+    }
+
+    # ---------- 1) 核心 repro + 字节一致 ----------
+
+    def test_table_survives_clean_and_after_stays_sibling(self):
+        """用户可见症状的回归测试：一次「清理」不得毁表。
+
+        修复前：<p>before</p><p>c1c2AFTER</p>（表格整体消失）
+        """
+        src = (
+            "<p>before</p>"
+            "<table><tbody><tr><td>c1</td><td>c2</td></tr></tbody></table>"
+            "<p>AFTER</p>"
+        )
+        out = clean_page_html(src)
+        self.assertEqual(out, f"<p>before</p>\n{self.TBL}\n<p>AFTER</p>")
+        # 表格与 AFTER 是三个独立行（= 三个独立块），AFTER 没被吸收
+        self.assertEqual(out.count("\n"), 2)
+        self.assertIn("</table>\n<p>AFTER</p>", out)
+        self.assertNotIn("c1c2", out)
+
+    def test_table_markup_is_byte_identical_to_sanitize_output(self):
+        """表格字节级等于 sanitize 规范输出（不是「包含」级别断言）。"""
+        src = self.TBL_HEAD + "<p>尾</p>"
+        self.assertEqual(clean_page_html(src), f"{self.TBL_HEAD}\n<p>尾</p>")
+
+    def test_table_is_not_wrapped_in_p(self):
+        """不得出现 <p><table> 包裹（strip_tags=False 路径原先必现）。"""
+        out = clean_page_html(
+            "<p>before</p>" + self.TBL + "<p>AFTER</p>",
+            strip_tags=False,
+        )
+        self.assertNotIn("<p><table", out)
+        self.assertNotIn("</table></p>", out)
+        self.assertEqual(out, f"<p>before</p>\n{self.TBL}\n<p>AFTER</p>")
+
+    # ---------- 2) merge_paragraphs 两种取值 ----------
+
+    def test_merge_paragraphs_true_table_is_barrier(self):
+        """merge=True：表格两侧的普通段落**不得跨过表格**粘在一起。"""
+        src = "<p>甲</p>" + self.TBL + "<p>乙</p>"
+        out = clean_page_html(src, merge_paragraphs=True)
+        self.assertEqual(out, f"<p>甲</p>\n{self.TBL}\n<p>乙</p>")
+        # 去掉表格后甲乙仍是两段（对照：没有表格时它们会合并）
+        self.assertEqual(clean_page_html("<p>甲</p><p>乙</p>", merge_paragraphs=True),
+                         "<p>甲乙</p>")
+
+    def test_merge_paragraphs_false_table_untouched(self):
+        """merge=False：表格透传，邻段不合并。"""
+        src = "<p>甲</p>" + self.TBL + "<p>乙</p>"
+        self.assertEqual(clean_page_html(src, merge_paragraphs=False),
+                         f"<p>甲</p>\n{self.TBL}\n<p>乙</p>")
+
+    def test_table_never_merge_source_nor_target(self):
+        """表格既不是合并源也不是合并目标（任何一侧都不融合）。"""
+        cases = {
+            "table_then_p": self.TBL + "<p>乙</p>",
+            "p_then_table": "<p>甲</p>" + self.TBL,
+            "table_between": "<p>甲</p>" + self.TBL + "<p>乙</p>",
+            "table_head_then_p": self.TBL_HEAD + "<p>乙</p>",
+        }
+        for name, src in cases.items():
+            with self.subTest(case=name):
+                out = clean_page_html(src, merge_paragraphs=True)
+                self.assertIn(self.TBL if self.TBL in src else self.TBL_HEAD, out)
+                self.assertNotIn("<p><table", out)
+                self.assertNotIn("</table></p>", out)
+                self.assertNotIn("</table>\n<p>甲乙", out)
+
+    def test_empty_paragraph_beside_table_not_absorbed(self):
+        """空段并入规则（`not merged[-1][1] or not toks`）也不得跨表生效。"""
+        out = clean_page_html(
+            "<p></p>" + self.TBL + "<p>乙</p>", merge_paragraphs=True
+        )
+        self.assertEqual(out, f"{self.TBL}\n<p>乙</p>")
+
+    # ---------- 3) strip_leading_symbols 两种取值 ----------
+
+    def test_strip_leading_symbols_true_leaves_cell_head_alone(self):
+        """段首符号清理开启时，单元格里的 #/* 等**不**被剥。"""
+        src = (
+            "<table><tbody><tr>"
+            "<td># 井号</td><td>* 星号</td><td>· 中点</td>"
+            "</tr></tbody></table>"
+        )
+        self.assertEqual(
+            clean_page_html(src, strip_leading_symbols=True),
+            "<table><tbody><tr>"
+            "<td># 井号</td><td>* 星号</td><td>· 中点</td>"
+            "</tr></tbody></table>",
+        )
+
+    def test_strip_leading_symbols_false_same_result_for_table(self):
+        """关闭段首符号清理：表格结果与开启时**完全一致**（证明表格被豁免）。"""
+        src = (
+            "<table><tbody><tr>"
+            "<td># 井号</td><td>* 星号</td><td>· 中点</td>"
+            "</tr></tbody></table>"
+        )
+        self.assertEqual(
+            clean_page_html(src, strip_leading_symbols=False),
+            clean_page_html(src, strip_leading_symbols=True),
+        )
+
+    def test_strip_leading_symbols_still_applies_to_neighbour_paragraphs(self):
+        """表格外的段落照常剥段首符号（表格豁免不是整体关掉该功能）。"""
+        out = clean_page_html(
+            "<p># 标题</p>" + self.TBL + "<p>* 条目</p>",
+            strip_leading_symbols=True,
+        )
+        self.assertEqual(out, f"<p>标题</p>\n{self.TBL}\n<p>条目</p>")
+
+    def test_strip_leading_symbols_false_keeps_neighbour_symbols(self):
+        """关闭时邻段符号保留（对照组，证明上条不是恒真断言）。"""
+        out = clean_page_html(
+            "<p># 标题</p>" + self.TBL, strip_leading_symbols=False
+        )
+        self.assertEqual(out, f"<p># 标题</p>\n{self.TBL}")
+
+    # ---------- 4) 子决策：单元格内标点/符号不被改写 ----------
+
+    def test_cell_punctuation_is_not_rewritten(self):
+        """子决策(1)=(a) 的核心断言：单元格内标点/记号逐字节保留。
+
+        单元格是数据表列：18,5 / 1.5 / 3-4 / [1] 若被半角→全角规则改写，
+        就是静默的数据损坏（数值列与参考文献序号列最受害）。
+        """
+        src = (
+            "<table><tbody><tr>"
+            "<td>18,5</td><td>1.5</td><td>3-4</td><td>[1]</td>"
+            "<td>a,b</td><td>**粗**</td>"
+            "</tr></tbody></table>"
+        )
+        self.assertEqual(
+            clean_page_html(src, normalize_punctuation=True),
+            "<table><tbody><tr>"
+            "<td>18,5</td><td>1.5</td><td>3-4</td><td>[1]</td>"
+            "<td>a,b</td><td>**粗**</td>"
+            "</tr></tbody></table>",
+        )
+
+    def test_cell_bracket_digits_not_converted(self):
+        """[1]/【2】→〔n〕 的规则不得作用在单元格上（参考文献序号列）。"""
+        src = "<table><tbody><tr><td>[1]</td><td>【2】</td></tr></tbody></table>"
+        self.assertEqual(
+            clean_page_html(src), src
+        )
+
+    def test_paragraph_punctuation_is_still_normalized(self):
+        """对照：表格外段落的中英标点仍被归一化（子决策未被过度实现）。"""
+        out = clean_page_html(
+            "<p>你好,世界</p>" + "<table><tbody><tr><td>a,b</td></tr></tbody></table>"
+        )
+        self.assertEqual(out, "<p>你好，世界</p>\n<table><tbody><tr><td>a,b</td></tr></tbody></table>")
+
+    # ---------- 5) 位置 / 形状组合 ----------
+
+    def test_table_first_last_only(self):
+        """表格在首 / 在末 / 独占：均不产生空段落、不丢表。"""
+        # 注意必须解包 (src, want)：直接 `for src, want in d.items()` 会把
+        # src 绑成子用例名（"first"），断言就变成 clean_page_html("first")。
+        for name, (src, want) in {
+            "first": (self.TBL + "<p>z</p>", f"{self.TBL}\n<p>z</p>"),
+            "last": ("<p>z</p>" + self.TBL, f"<p>z</p>\n{self.TBL}"),
+            "only": (self.TBL, self.TBL),
+        }.items():
+            with self.subTest(case=name):
+                self.assertEqual(clean_page_html(src), want)
+
+    def test_two_adjacent_tables(self):
+        """相邻两张表：都保留，互不吞并。"""
+        t2 = "<table><tbody><tr><td>t2</td></tr></tbody></table>"
+        self.assertEqual(clean_page_html(self.TBL + t2), f"{self.TBL}\n{t2}")
+
+    def test_table_before_and_after_heading(self):
+        """表格紧邻标题：标题照常是块，表格独立。"""
+        out = clean_page_html(self.TBL + "<h1>标题</h1>")
+        self.assertEqual(out, f"{self.TBL}\n<h1>标题</h1>")
+        out2 = clean_page_html("<h1>标题</h1>" + self.TBL)
+        self.assertEqual(out2, f"<h1>标题</h1>\n{self.TBL}")
+
+    def test_empty_table(self):
+        """空 <table></table>：保留原样（不因「无文字」被丢弃）。"""
+        self.assertEqual(
+            clean_page_html("<p>x</p><table></table><p>y</p>"),
+            "<p>x</p>\n<table></table>\n<p>y</p>",
+        )
+
+    def test_empty_cells(self):
+        """空 <td></td>：保留（不被当空块丢弃）。"""
+        src = "<table><tbody><tr><td></td><td></td></tr></tbody></table>"
+        self.assertEqual(clean_page_html(src), src)
+
+    def test_cell_with_leading_trailing_spaces_and_nbsp(self):
+        """单元格内首尾空格 / 不换行空格 / 连续空格逐字节保留。
+
+        期望值按 sanitize 规范形写（见类注释）：`&nbsp;` 经
+        HTMLParser(convert_charrefs=True) 变成 U+00A0，故此处直接用
+        \\u00a0 作为源与期望，才真正断言「逐字节保留」。
+        """
+        src = (
+            "<table><tbody><tr>"
+            "<td>  前导尾随  </td><td>中\u00a0不换行</td><td>a  b</td>"
+            "</tr></tbody></table>"
+        )
+        self.assertEqual(clean_page_html(src), src)
+        self.assertIn("\xa0", clean_page_html(src))
+
+    def test_h1_like_text_in_cell(self):
+        """单元格里的标题样文字：sanitize 压成行内文本，表格结构完好。"""
+        out = clean_page_html(
+            "<table><tbody><tr><td><h1>假章标题</h1></td></tr></tbody></table>",
+            strip_tags=False,
+        )
+        self.assertEqual(out, "<table><tbody><tr><td>假章标题</td></tr></tbody></table>")
+        self.assertNotIn("<h1>", out)  # 单元格内不留块级标签
+        self.assertIn("<table>", out)
+
+    def test_unclosed_table_is_kept_whole(self):
+        """未闭合表格：不被裹 <p>（sanitize 规范形 + 直调 _clean_blocks 两路）。"""
+        src = "<table><tbody><tr><td>a</td></tr></tbody>"
+        # 生产路径：clean_page_html 必先过 sanitize_html，_Sanitizer 表格累积
+        # 模式总会补上 </table>，故这里拿到的是**已闭合**的规范形。
+        closed = src + "</table>"
+        self.assertEqual(clean_page_html(src, strip_tags=False), closed)
+
+        # 纵深防御路径：直调 _clean_blocks 才会真的走到「累积器没见到
+        # </table> → EOF 冲刷」那条分支（tbl_buf 仍非 None）。
+        self.assertEqual(correctmanage._clean_blocks(src, **self._CB_KW), src)
+
+    def test_unclosed_table_at_eof_does_not_wrap_tail_in_p(self):
+        """未闭合表格的 EOF 冲刷决策：整段原样收尾，**不套 <p> 包裹**。
+
+        决策（2026-09-27 显式钉住）：未闭合 <table> 之后的 token 一律留在
+        表格块内 —— 逐字节保全 > 猜测边界。猜「</table> 缺失后下面的 <p> 是
+        兄弟节点」需要 cell 深度启发式，猜错反而丢数据；而 HTML 解析器本身
+        也把未闭合 <table> 之后的内容当作表内内容。另：生产路径不可达
+        （sanitize_html 必先闭合，_clean_blocks 全仓仅 clean_page_html 一个
+        调用方），此处为纵深防御契约。
+        """
+        src = "<p>before</p><table><tbody><tr><td>a</td></tr></tbody><p>AFTER</p>"
+        out = correctmanage._clean_blocks(src, **self._CB_KW)
+        self.assertEqual(
+            out,
+            "<p>before</p>\n<table><tbody><tr><td>a</td></tr></tbody><p>AFTER</p>",
+        )
+        # 表前段落完好、未被并进表格；尾部内容一字不丢
+        self.assertTrue(out.startswith("<p>before</p>\n<table>"))
+        self.assertIn("AFTER", out)
+        self.assertNotIn("<p><table", out)
+
+    def test_orphan_closing_table_tag_dropped(self):
+        """孤立 </table>：丢弃，不产出空块/空段落。"""
+        out = clean_page_html("<p>x</p></table><p>y</p>", strip_tags=False)
+        self.assertEqual(out, "<p>x</p>\n<p>y</p>")
+        self.assertNotIn("</table>", out)
+        self.assertNotIn("<p></p>", out)
+
+    def test_orphan_close_direct_does_not_get_wrapped_in_p(self):
+        """孤立 </table> 直调 _clean_blocks：就地丢弃，**不得**包成 <p></table></p>。
+
+        sanitize_html 自己就会删掉孤立 </table>（_Sanitizer 只在 _tbl_finish_table
+        里闭合表格），所以 clean_page_html 那条路碰不到；直调才命中这条分支。
+        对照：<div> 不在本层的块标签正则（p|h1-6）内，会被兜底包进 <p> —— 那是
+        本层既有的 div→p 兜底行为，与表格分支无关，故此用例只放 <p>。
+        """
+        out = correctmanage._clean_blocks(
+            "</table><p>y</p><h2>z</h2>", **self._CB_KW
+        )
+        self.assertEqual(out, "<p>y</p>\n<h2>z</h2>")
+        self.assertNotIn("</table>", out)
+        self.assertNotIn("<p></table>", out)
+
+    # ---------- 5b) 嵌套表 / 单元格内块级标签 / 无 tbody ----------
+
+    def test_nested_table_outer_close_ends_the_block(self):
+        """<td> 内嵌套表：**外层** </table> 才收尾整块（tbl_depth 计数）。
+
+        修复前（见下）内层 </table> 就收尾，外层剩余的 </td></tr></table> 落进
+        cur 并被兜底包成 <p>…</p> —— 非法嵌套，XHTML 解析直接报错。
+        """
+        nested = (
+            "<table><tbody><tr><td>outer"
+            "<table><tbody><tr><td>inner</td></tr></tbody></table>"
+            "</td></tr></tbody></table>"
+        )
+        out = correctmanage._clean_blocks(
+            "<p>before</p>" + nested + "<p>AFTER</p>", **self._CB_KW
+        )
+        self.assertEqual(out, f"<p>before</p>\n{nested}\n<p>AFTER</p>")
+        self.assertNotIn("<p></td>", out)
+        self.assertNotIn("</table></p>", out)
+        # 良构性：整段包一层即可被 XML 解析（<p><table> 或落单的 </td> 都会抛错）
+        import xml.etree.ElementTree as ET
+        ET.fromstring(f"<r>{out}</r>")
+
+    def test_production_path_flattens_nested_table_upstream(self):
+        """决策：嵌套表在 clean_page_html 路径上由 **sanitize** 归一，不在本层。
+
+        80k 次 tag-soup 模糊测试（2026-09-27）确认：sanitize_html 永不输出
+        嵌套表、也永不在 <td> 内留块级标签 —— _Sanitizer 的表格累积模式
+        （_tbl_skip）直接把内层表连内容一起丢弃。故 _clean_blocks 收到的输入
+        天然是单层表；本测试把该上游归一行为钉住，避免日后有人放松 _tbl_skip
+        时无声地把嵌套表推给本层。
+        """
+        nested = (
+            "<table><tbody><tr><td>outer"
+            "<table><tbody><tr><td>inner</td></tr></tbody></table>"
+            "</td></tr></tbody></table>"
+        )
+        out = clean_page_html(nested, strip_tags=False)
+        self.assertEqual(
+            out, "<table><tbody><tr><td>outer</td></tr></tbody></table>"
+        )
+        self.assertEqual(out.lower().count("<table"), 1)
+
+    def test_block_tags_inside_cell_are_not_kept_as_blocks(self):
+        """<td> 内的 <p>/<div>：由 sanitize 压成行内文本，单元格内不留块标签。
+
+        _clean_blocks 本身是逐字节透传，不参与这层决策；钉住它以防
+        <td><p>…</p></td> 这种非法嵌套流到 EPUB。
+        """
+        for cell in ("<p>in para</p>", "<div>in div</div>", "<h2>in h2</h2>"):
+            with self.subTest(cell=cell):
+                out = clean_page_html(
+                    f"<table><tbody><tr><td>{cell}tail</td></tr></tbody></table>",
+                    strip_tags=False,
+                )
+                self.assertNotIn("<p>", out.split("</table>")[0])
+                self.assertNotIn("<div>", out)
+                self.assertNotIn("<h2>", out)
+                self.assertIn("<td>", out)
+
+    def test_table_without_tbody_is_normalized_by_sanitize(self):
+        """无 <tbody> 的表：sanitize 补齐 tbody，_clean_blocks 逐字节透传。"""
+        out = clean_page_html(
+            "<table><tr><td>a</td><td>b</td></tr></table>", strip_tags=False
+        )
+        self.assertEqual(
+            out, "<table><tbody><tr><td>a</td><td>b</td></tr></tbody></table>"
+        )
+        # 直调本层：原样透传，不自己补 tbody
+        raw = "<table><tr><td>a</td></tr></table>"
+        self.assertEqual(correctmanage._clean_blocks(raw, **self._CB_KW), raw)
+
+    # ---------- 5c) 透传总账：<table> 自身属性 / 数值列逐字节 ----------
+
+    def test_table_open_tag_attributes_untouched_by_clean_blocks(self):
+        """<table> 元素**自身**的属性不被 _clean_blocks 改动（逐字节）。
+
+        注意归属：属性是被 sanitize_html 的白名单剥掉的（无属性安全契约），
+        不是被本层改的 —— 故此处直调 _clean_blocks 才能断言本层的契约。
+        """
+        raw = '<table class="ptoe-tbl" border="1" data-x="y"><tbody><tr><td>a</td></tr></tbody></table>'
+        self.assertEqual(correctmanage._clean_blocks(raw, **self._CB_KW), raw)
+        # 上游 sanitize 确实会剥属性（说明两者职责分离，不是本层偷改）
+        self.assertEqual(
+            clean_page_html(raw, strip_tags=False),
+            "<table><tbody><tr><td>a</td></tr></tbody></table>",
+        )
+
+    def test_numeric_and_citation_columns_are_byte_identical(self):
+        """总账：数值列/引注列/空白列的字节完全不变（清洗前后逐字比对）。"""
+        cells = ["18,5", "1.5", "3-4", "[1]", "【2】", "a,b", "  前后空格  ",
+                 "中\u00a0间", "a  b", "**粗**", "*斜*", "#井", "·中点", "50%"]
+        raw = ("<table><tbody><tr>"
+               + "".join(f"<td>{c}</td>" for c in cells)
+               + "</tr></tbody></table>")
+        # 直调本层：整表逐字节原样返回
+        self.assertEqual(correctmanage._clean_blocks(raw, **self._CB_KW), raw)
+        # 走完整清洗链（默认 normalize_punctuation=True）：单元格仍逐字不变
+        out = clean_page_html(raw)
+        for c in cells:
+            with self.subTest(cell=c):
+                self.assertIn(f"<td>{c}</td>", out)
+
+    def test_inline_markup_inside_cell_is_not_rewritten(self):
+        """单元格内 <strong>/<span>/<em> 原样保留（不做 ** → strong 转换）。"""
+        raw = (
+            "<table><tbody><tr>"
+            '<td><strong>粗</strong><em>斜</em><span class="x">s</span>**md**</td>'
+            "</tr></tbody></table>"
+        )
+        self.assertEqual(correctmanage._clean_blocks(raw, **self._CB_KW), raw)
+        out = clean_page_html(raw, strip_tags=False)
+        self.assertIn("<strong>粗</strong>", out)
+        self.assertIn("<em>斜</em>", out)
+        self.assertIn("**md**", out)  # md 粗体符号不被转成 <strong>
+
+    def test_marker_span_in_table_survives(self):
+        """表内标记 span 不被清理流程吞掉（与 apply_markers 契约一致）。"""
+        src = (
+            '<table><tbody><tr><td><span data-ptoe-marker="note">注</span>x</td>'
+            "</tr></tbody></table>"
+        )
+        self.assertEqual(clean_page_html(src, strip_tags=False), src)
+
+    def test_clean_is_idempotent_with_table(self):
+        """幂等：含表格的页面连续清理两次结果不变（docstring 契约）。"""
+        src = "<p>before</p>" + self.TBL + "<p>你好,世界</p>"
+        once = clean_page_html(src)
+        self.assertEqual(clean_page_html(once), once)
+
+    def test_table_attrs_span_and_align_preserved(self):
+        """单元格 colspan/rowspan/class 与 align 原样保留。
+
+        期望值按 sanitize 规范形写（见类注释）：`&nbsp;` → U+00A0、
+        `&#8451;` → ℃（convert_charrefs=True）。
+        """
+        src = (
+            '<table><tbody><tr><th colspan="2">观测</th></tr>'
+            '<tr><td rowspan="2">湿度</td>'
+            '<td class="ptoe-align-right">18\u00a0℃</td></tr>'
+            '<tr><td>45%</td></tr></tbody></table>'
+        )
+        self.assertEqual(clean_page_html(src), src)
+
+    # ---------- 6) 全链路：sanitize → clean → epub ----------
+
+    def test_full_pipeline_sanitize_clean_epub(self):
+        """sanitize_html → clean_page_html → export_content_to_file(epub)。
+
+        清理不得成为新的数据丢失通道：apply_markers / _render_fragment 修好后，
+        _clean_blocks 是链路上最后一个会把表格打碎的地方。
+        """
+        import xml.etree.ElementTree as ET
+        import zipfile
+
+        table = (
+            "<table><tbody>"
+            '<tr><th colspan="2">观测项目</th></tr>'
+            "<tr><td>  温度  </td>"
+            '<td class="ptoe-align-right"><strong>18</strong>\u00a0℃</td></tr>'
+            "<tr><td>18,5</td><td>1.5</td></tr>"
+            "</tbody></table>"
+        )
+        before = "<p>表前段落</p>"
+        after = "<p>表后段落,含逗号</p>"
+        raw = before + table + after
+
+        sanitized = sanitize_html(raw)
+        cleaned = clean_page_html(sanitized)
+        # 表格在清理后仍与 sanitize 规范形逐字节一致
+        self.assertIn(table, cleaned)
+        # 邻段：表前照旧，表后段落标点被清理（证明清理确实在工作）
+        self.assertIn("<p>表前段落</p>", cleaned)
+        self.assertIn("<p>表后段落，含逗号</p>", cleaned)
+
+        outdir = tempfile.mkdtemp(prefix="t_cleanpipe_")
+        self.addCleanup(shutil.rmtree, outdir, ignore_errors=True)
+        epub = Path(outdir) / "cleaned.epub"
+        export_content_to_file([{"page": 1, "html": cleaned}], "epub", str(epub), "书名")
+        self.assertTrue(epub.is_file(), "EPUB 未生成")
+
+        XH = "{http://www.w3.org/1999/xhtml}"
+        with zipfile.ZipFile(epub) as zf:
+            self.assertEqual(zf.read("mimetype"), b"application/epub+zip")
+            contents = {}
+            for n in zf.namelist():
+                if n.endswith((".xhtml", ".html", ".opf", ".ncx")):
+                    src = zf.read(n).decode("utf-8")
+                    contents[n] = src
+                    ET.fromstring(src)  # 良构：非法 <p><table> 会直接抛错
+        body_name = next(
+            n for n in contents if n.endswith(".xhtml") and "nav" not in n
+        )
+        root = ET.fromstring(contents[body_name])
+        parent = {c: p for p in root.iter() for c in p}
+
+        tables = list(root.iter(XH + "table"))
+        self.assertEqual(len(tables), 1, "表格数量不对")
+        tbl = tables[0]
+        tbl_parent = parent.get(tbl)
+        if tbl_parent is None:
+            self.fail("表格没有父节点")
+        self.assertEqual(tbl_parent.tag, XH + "body", "表格不是块级")
+        for p in root.iter(XH + "p"):
+            self.assertEqual(len(list(p.iter(XH + "table"))), 0, "<p><table> 非法嵌套")
+
+        # 单元格文本逐字一致（含空格 / nbsp / 未被改写的半角逗号）
+        cell_texts = [
+            "".join(e.itertext()) for e in root.iter()
+            if e.tag in (XH + "td", XH + "th")
+        ]
+        self.assertEqual(
+            cell_texts,
+            ["观测项目", "  温度  ", "18\u00a0℃", "18,5", "1.5"],
+        )
+        self.assertEqual(
+            [th.get("colspan") for th in tbl.iter(XH + "th")], ["2"]
+        )
+        self.assertEqual(len(list(tbl.iter(XH + "p"))), 0, "单元格内被塞了 <p>")
+
+        # 邻段原文与顺序（表后段落在 EPUB 里已归一化标点）
+        flow = [
+            "".join(e.itertext())
+            for e in root.iter()
+            if e.tag in (XH + "p", XH + "table")
+        ]
+        self.assertEqual(flow, ["表前段落", "观测项目  温度  18\u00a0℃18,51.5",
+                                "表后段落，含逗号"])
+
+
+class TestRenderFragmentTableBlock(unittest.TestCase):
+    """htmlmanage 侧：_render_fragment 把 <table> 当原子块（2026-09-27）。
+
+    与 correctmanage.apply_markers 同源缺陷的第二处：块标签正则不认 <table>，
+    表格 token 累积进 cur 后被后续 <p> 认领（`if kind:` 为假 → 不 flush）或被
+    EOF 的 `kind or 'p'` 包裹 → 非法 <p><table> 嵌套 + 表格后段落被吞。
+    表格必须原样透传，且不参与：空白符清理、包裹合成、标题计数、目录收集、
+    段落 class/缩进属性。
+    """
+
+    TBL = "<table><tbody><tr><td>单元格</td></tr></tbody></table>"
+    TBL_HEAD = (
+        "<table><thead><tr><th>表头</th></tr></thead>"
+        "<tbody><tr><td>单元格</td></tr></tbody></table>"
+    )
+    # 单元格空白是内容的一部分：首尾空格、&nbsp;、内部连续空格都必须保留
+    TBL_WS = (
+        "<table><tbody><tr>"
+        "<td>  前导空格</td><td>尾随空格  </td>"
+        "<td>中间&nbsp;不换行</td><td>a  b</td>"
+        "</tr></tbody></table>"
+    )
+
+    def setUp(self):
+        self.conv = htmlmanage.HTMLConverter(tempfile.mkdtemp(prefix="t_rf_"))
+        self.addCleanup(shutil.rmtree, self.conv.output_dir, ignore_errors=True)
+
+    def _render(self, text, toc=None):
+        return self.conv._render_fragment(text, toc_out=toc)
+
+    # ---------- 1) 空白符清理不得触碰单元格文本 ----------
+
+    def test_cell_whitespace_is_byte_identical(self):
+        """单元格内首尾空格 / &nbsp; / 连续空格逐字节保留（不过 _strip_ws_text）。"""
+        self.assertEqual(self._render(self.TBL_WS), self.TBL_WS)
+
+    def test_paragraph_whitespace_is_still_normalized(self):
+        """对照：段落空白清理照旧生效（表格豁免不是整体关掉清理）。"""
+        out = self._render("<p>  正文  </p>")
+        self.assertEqual(out, "<p>正文</p>")
+
+    def test_table_does_not_disable_strip_ws_for_neighbours(self):
+        """表格前后的段落各自照常清理空白，表格自身不变。"""
+        out = self._render("<p>  前  </p>" + self.TBL + "<p>  后  </p>")
+        self.assertIn("<p>前</p>", out)
+        self.assertIn("<p>后</p>", out)
+        self.assertIn(self.TBL, out)
+
+    def test_alignment_right_exemption_still_applies_to_paragraphs(self):
+        """居右段落豁免逻辑未因表格分支失效。"""
+        out = self._render('<p class="ptoe-align-right">  右  </p>')
+        self.assertIn("  右  ", out)
+
+    # ---------- 2) 不进目录、不动标题锚点计数 ----------
+
+    def test_table_produces_no_toc_entry(self):
+        """表格永不产生目录项。"""
+        toc = []
+        self._render(self.TBL, toc)
+        self.assertEqual(toc, [])
+
+    def test_table_does_not_shift_heading_anchor_ids(self):
+        """表格排在首个 h1 之前时，标题 id 仍从 h1 起算，不被表格扰动。"""
+        toc = []
+        body = self._render(self.TBL + "<h1>甲</h1><h2>乙</h2>", toc)
+        self.assertEqual([t["id"] for t in toc], ["h1", "h2"])
+        self.assertIn('<h1 id="h1"', body)
+        self.assertIn('<h2 id="h2"', body)
+        self.assertNotIn("id=\"h0\"", body)
+
+    def test_nav_href_matches_content_anchor_ids(self):
+        """端到端：nav.xhtml 的 href 片段都能在对应 content 页找到 id。"""
+        import re as _re
+        import xml.etree.ElementTree as ET
+
+        outdir = tempfile.mkdtemp(prefix="t_nav_")
+        self.addCleanup(shutil.rmtree, outdir, ignore_errors=True)
+        doc = {
+            "pages": [
+                {
+                    "page": 1,
+                    "text": self.TBL + "<h1>甲</h1><p>正文</p><h2>乙</h2>",
+                }
+            ],
+            "body": "",
+            "paragraphs": [],
+            "meta": {"title": "书名", "package_epub": False},
+        }
+        res = htmlmanage.HTMLConverter(outdir).convert_document(doc, merge_pages=True)
+        nav = Path(outdir) / res["toc_file"]
+        self.assertTrue(nav.is_file(), "缺少 nav.xhtml")
+        nav_src = nav.read_text(encoding="utf-8")
+        self.assertIn('epub:type="toc"', nav_src)  # EPUB3 导航声明
+        hrefs = _re.findall(r'href="([^"]+)"', nav_src)
+        self.assertTrue(hrefs, "nav.xhtml 里没有 href")
+        # nav 的 href 是相对 OEBPS/ 的文件名，故按 basename 建索引
+        contents = {}
+        for f in res["content_files"]:
+            src = (Path(outdir) / f).read_text(encoding="utf-8")
+            contents[Path(f).name] = src
+        for href in hrefs:
+            fname, _, frag = href.partition("#")
+            with self.subTest(href=href):
+                self.assertIn(fname, contents, f"nav 指向不存在的页：{href}")
+                ET.fromstring(contents[fname])  # 良构
+                if frag:
+                    self.assertIn(
+                        f'id="{frag}"',
+                        contents[fname],
+                        f"目录锚点 {frag} 在 {fname} 中不存在",
+                    )
+
+    # ---------- 3) 属性 ----------
+
+    def test_cell_attrs_survive_verbatim(self):
+        """单元格属性（对齐类 + colspan/rowspan）原样透传，不被段落逻辑改写。"""
+        src = (
+            '<table><tbody><tr>'
+            '<td class="ptoe-align-right" colspan="2">x</td>'
+            '<td rowspan="2">y</td>'
+            "</tr></tbody></table>"
+        )
+        self.assertEqual(self._render(src), src)
+
+    def test_paragraph_attrs_are_not_attached_to_table(self):
+        """紧邻段落的 class/缩进 style 不得被挂到表格上（表格无段落属性）。"""
+        out = self._render(
+            '<p class="ptoe-align-center" style="margin-left:2em">前</p>' + self.TBL
+        )
+        tbl = out[out.index("<table>"):]
+        self.assertNotIn("ptoe-align-center", tbl)
+        self.assertNotIn("text-align:center", tbl)
+        self.assertNotIn("style=", tbl)
+        # 段落自己的属性仍在
+        self.assertIn("ptoe-align-center", out.split("<table>")[0])
+
+    def test_table_element_class_is_dropped_by_sanitizer_upstream(self):
+        """前置事实：sanitize_html 剥掉 <table> 元素上的全部 class，故渲染端
+        无需为表格保留属性（class 只落在 td/th 上）。"""
+        out = sanitize_html(
+            '<table class="ptoe-align-center"><tbody><tr><td>x</td></tr></tbody></table>'
+        )
+        self.assertEqual(out, "<table><tbody><tr><td>x</td></tr></tbody></table>")
+        self.assertEqual(self._render(out), out)
+
+    # ---------- 4) 标题切分不得被单元格内的 h1 触发 ----------
+
+    def test_h1_inside_cell_does_not_split_chapters(self):
+        """单元格里的 h1 是表格排版，不是章节标题：不得造出伪章节/伪目录项。"""
+        outdir = tempfile.mkdtemp(prefix="t_h1cell_")
+        self.addCleanup(shutil.rmtree, outdir, ignore_errors=True)
+        text = (
+            "<p>甲</p>"
+            "<table><tbody><tr><td><h1>伪章标题</h1></td></tr></tbody></table>"
+            "<p>乙</p>"
+        )
+        doc = {
+            "pages": [{"page": 1, "text": text}],
+            "body": "",
+            "paragraphs": [],
+            "meta": {"title": "书名", "package_epub": False},
+        }
+        res = htmlmanage.HTMLConverter(outdir).convert_document(doc, merge_pages=True)
+        self.assertEqual(len(res["content_files"]), 1, "被单元格里的 h1 切成了多章")
+        src = (Path(outdir) / res["content_files"][0]).read_text(encoding="utf-8")
+        self.assertIn("伪章标题", src)  # 表格内容仍在
+        self.assertNotIn('id="h1"', src)  # 伪标题未登记为锚点
+
+    def test_real_h1_still_splits_chapters(self):
+        """对照：表格**外**的 h1 仍正常切分（表格感知未把切分整体关掉）。"""
+        outdir = tempfile.mkdtemp(prefix="t_h1real_")
+        self.addCleanup(shutil.rmtree, outdir, ignore_errors=True)
+        text = (
+            "<table><tbody><tr><td>t</td></tr></tbody></table>"
+            "<h1>真章一</h1><p>a</p>"
+            "<h1>真章二</h1><p>b</p>"
+        )
+        doc = {
+            "pages": [{"page": 1, "text": text}],
+            "body": "",
+            "paragraphs": [],
+            "meta": {"title": "书名", "package_epub": False},
+        }
+        res = htmlmanage.HTMLConverter(outdir).convert_document(doc, merge_pages=True)
+        self.assertEqual(len(res["content_files"]), 3)
+
+    def test_anchor_ids_land_on_real_headings_only(self):
+        """锚点 id 只出现在真实标题上。"""
+        import xml.etree.ElementTree as ET
+
+        outdir = tempfile.mkdtemp(prefix="t_anchor_")
+        self.addCleanup(shutil.rmtree, outdir, ignore_errors=True)
+        doc = {
+            "pages": [
+                {
+                    "page": 1,
+                    "text": self.TBL
+                    + "<h1>甲</h1><p>中</p><h2>乙</h2>",
+                }
+            ],
+            "body": "",
+            "paragraphs": [],
+            "meta": {"title": "书名", "package_epub": False},
+        }
+        res = htmlmanage.HTMLConverter(outdir).convert_document(doc, merge_pages=True)
+        root = ET.fromstring(
+            (Path(outdir) / res["content_files"][0]).read_text(encoding="utf-8")
+        )
+        ns = "{http://www.w3.org/1999/xhtml}"
+        for el in root.iter():
+            if el.get("id"):
+                self.assertIn(
+                    el.tag, (ns + "h1", ns + "h2", ns + "h3", ns + "h4", ns + "h5", ns + "h6")
+                )
+
+    # ---------- 5) 标记相邻（章节/全文/换页/注释） ----------
+
+    def test_table_next_to_chapter_marker_h2(self):
+        """章节标记产出的 h2 与表格相邻：表格仍为独立块。"""
+        out = self._render("<h2>一</h2>" + self.TBL + "<p>尾</p>")
+        self.assertIn(self.TBL, out)
+        self.assertIn("</table>\n<p>尾</p>", out)
+        self.assertNotIn("<p><table", out)
+
+    def test_table_next_to_page_break_paragraph(self):
+        """换页标记产出的 p.ptoe-page-break 与表格相邻：两者互不吞并。"""
+        out = self._render('<p class="ptoe-page-break"> </p>' + self.TBL + "<p>尾</p>")
+        self.assertIn(self.TBL, out)
+        self.assertIn("<p>尾</p>", out)
+        self.assertNotIn("<p><table", out)
+
+    def test_table_next_to_full_marker_article_boundary(self):
+        """全文标记切出的文章边界处有表格：两篇文章各自完整。"""
+        arts = correctmanage.apply_markers(
+            [
+                {"page": 1, "text": "<p>前文</p>"},
+                {
+                    "page": 2,
+                    "text": '<p><span data-ptoe-marker="full">全文</span></p>'
+                    + self.TBL
+                    + "<p>后文</p>",
+                },
+            ]
+        )
+        self.assertEqual(len(arts), 2)
+        self.assertEqual(arts[1]["text"], self.TBL + "<p>后文</p>")
+
+    def test_table_next_to_note_marker(self):
+        """注释标记段落与表格相邻：注释仍落在段落上，不注水到表格。"""
+        out = correctmanage.apply_markers(
+            [
+                {
+                    "page": 1,
+                    "text": '<p><span data-ptoe-marker="note">注</span>甲</p>'
+                    + self.TBL
+                    + '<p class="ptoe-note">注释正文</p>',
+                }
+            ]
+        )[0]["text"]
+        rendered = self._render(out)
+        self.assertIn(self.TBL, rendered)
+        self.assertIn('class="ptoe-note"', rendered)
+        self.assertNotIn("单元格<span", rendered)
+
+    def test_marker_span_inside_table_is_not_dropped(self):
+        """表内残留的 data-ptoe-marker token 不被兜底剔除（否则表格结构断裂）。"""
+        src = (
+            '<table><tbody><tr><td><span data-ptoe-marker="join">段落</span>x</td>'
+            "</tr></tbody></table>"
+        )
+        self.assertEqual(self._render(src), src)
+
+    # ---------- 6) 邻居组合 ----------
+
+    def test_all_neighbour_shapes(self):
+        """表格在首/末/独占/相邻/标题旁/空表/空单元格：均不产生空段落、不丢表。"""
+        cases = {
+            "first": self.TBL + "<p>z</p>",
+            "last": "<p>z</p>" + self.TBL,
+            "only": self.TBL,
+            "two_adjacent": self.TBL + self.TBL,
+            "then_heading": self.TBL + "<h1>H</h1>",
+            "after_heading": "<h1>H</h1>" + self.TBL,
+            "empty_table": "<table></table><p>z</p>",
+            "empty_cells": (
+                "<table><tbody><tr><td></td><td></td></tr></tbody></table><p>z</p>"
+            ),
+            "uppercase": "<TABLE><TBODY><TR><TD>x</TD></TR></TBODY></TABLE><p>z</p>",
+        }
+        for name, src in cases.items():
+            with self.subTest(case=name):
+                out = self._render(src)
+                self.assertNotIn("<p><table", out)
+                self.assertNotIn("</table></p>", out)
+                self.assertNotIn("<p></p>", out)
+                self.assertNotIn("<p> </p>", out)
+                # 表格没丢、开闭成对（大小写不敏感：_TABLE_TAG_RE 带 re.I）
+                self.assertIn("<table", out.lower())
+                self.assertIn("</table>", out.lower())
+                self.assertEqual(out.lower().count("<table"), out.lower().count("</table>"))
+
+    def test_unclosed_table_is_kept_whole_without_wrapper(self):
+        """未闭合的表格（外部脏数据）：整段原样收尾，不被裹进 <p>，也不丢。"""
+        src = "<table><tbody><tr><td>a</td></tr></tbody>"
+        out = self._render(src)
+        self.assertEqual(out, src)
+        self.assertNotIn("<p>", out)
+
+    def test_page_boundary_table_then_paragraph(self):
+        """跨页：表格页在前、段落页在后（走 apply_markers → convert_document）。"""
+        outdir = tempfile.mkdtemp(prefix="t_pageb_")
+        self.addCleanup(shutil.rmtree, outdir, ignore_errors=True)
+        pages = [
+            {"page": 1, "text": sanitize_html(self.TBL)},
+            {"page": 2, "text": sanitize_html("<p>第二页</p>")},
+        ]
+        items = apply_markers(pages)
+        doc = {"articles": items, "meta": {"title": "书名", "package_epub": False}}
+        res = htmlmanage.HTMLConverter(outdir).convert_document(doc, merge_pages=True)
+        src = "\n".join(
+            (Path(outdir) / f).read_text(encoding="utf-8")
+            for f in res["content_files"]
+        )
+        self.assertIn("<table>", src)
+        self.assertIn("</table>", src)
+        self.assertIn("第二页", src)
+        self.assertNotIn("<p><table", src)
+
+    # ---------- 7) 第三方点清扫 ----------
+
+    def test_split_at_block_boundary_never_cuts_inside_table(self):
+        """超长表格：软上限让位于表格完整，绝不拦腰截断（否则非法 XHTML）。"""
+        rows = "<tr><td>x</td></tr>" * 400
+        big = "<p>前</p><table><tbody>" + rows + "</tbody></table><p>后</p>"
+        chunks = htmlmanage._split_at_block_boundary(big, 2000)
+        self.assertGreater(len(chunks), 1)
+        for i, ch in enumerate(chunks):
+            with self.subTest(chunk=i):
+                self.assertEqual(ch.count("<table>"), ch.count("</table>"))
+        # 表格整体完整落在同一块
+        holders = [i for i, ch in enumerate(chunks) if "<table>" in ch]
+        self.assertEqual(len(holders), 1)
+        self.assertIn("</table>", chunks[holders[0]])
+
+    def test_split_at_block_boundary_normal_text_unchanged(self):
+        """对照：不含表格时切分行为与既有约定一致（表格让位逻辑不得外溢）。"""
+        txt = "<p>a</p><p>b</p><p>c</p>"
+        # limit=20 时窗口可容两个段落 → 切在第二个 </p> 之后
+        self.assertEqual(
+            htmlmanage._split_at_block_boundary(txt, 20),
+            ["<p>a</p><p>b</p>", "<p>c</p>"],
+        )
+        # limit 大于全文 → 单块原样返回
+        self.assertEqual(htmlmanage._split_at_block_boundary(txt, 9999), [txt])
+
+    def test_note_label_in_cell_does_not_hijack_preceding_paragraph(self):
+        """单元格里的注释标签不得把 ptoe-note-label 挂到表格前的无关段落上。"""
+        src = (
+            "<p>表前段落</p>"
+            "<table><tbody><tr><td><strong>注释：</strong>单元</td></tr></tbody></table>"
+        )
+        out = htmlmanage.transform_note_labels(src)
+        self.assertNotIn(
+            'class="ptoe-note-label"', out.split("<table>")[0]
+        )
+        self.assertNotIn("ptoe-note-label", out)  # 表格也不该被挂
+        self.assertIn("<p>表前段落</p>", out)
+
+    def test_note_label_in_paragraph_still_gets_class(self):
+        """对照：段落里的注释标签仍照常注入（修复未误伤正常路径）。"""
+        out = htmlmanage.transform_note_labels(
+            "<p><strong>注释：</strong>正文</p>"
+        )
+        self.assertIn('<p class="ptoe-note-label">', out)
+        self.assertIn("<strong>注释：</strong>", out)
+        self.assertIn("正文", out)
+
+    def test_epubedit_split_articles_skips_h1_in_cell(self):
+        """epubeditmanage.split_articles 同样不得被单元格里的 h1 切出伪文章。"""
+        import epubeditmanage
+
+        text = (
+            "<p>甲</p>"
+            "<table><tbody><tr><td><h1>伪章</h1></td></tr></tbody></table>"
+            "<p>乙</p>"
+        )
+        arts = epubeditmanage.split_articles(text, "书名")
+        self.assertEqual(len(arts), 1, f"切出伪文章：{arts}")
+        self.assertIn("伪章", arts[0]["text"])
+
+    def test_epubedit_split_articles_normal_h1_unchanged(self):
+        """对照：正常 h1 切分语义不变。"""
+        import epubeditmanage
+
+        arts = epubeditmanage.split_articles(
+            "<h1>章一</h1><p>a</p><h1>章二</h1><p>b</p>", "书名"
+        )
+        self.assertEqual([a["title"] for a in arts], ["章一", "章二"])
+        self.assertEqual([a["text"] for a in arts], ["<p>a</p>", "<p>b</p>"])
+
+    def test_rendered_block_re_is_still_merge_safe(self):
+        """_RENDERED_BLOCK_RE 只认 p/div → 表格块不可被 _merge_paragraph 选中。
+
+        这是「保持原样即安全」的站点：故意不加 table，否则 apply_markers 会把
+        表格当成可与相邻段落合并的普通块（原子表格不该参与段落合并）。
+        """
+        self.assertIsNone(
+            correctmanage._RENDERED_BLOCK_RE.match(
+                "<table><tbody><tr><td>x</td></tr></tbody></table>"
+            )
+        )
+        self.assertIsNotNone(
+            correctmanage._RENDERED_BLOCK_RE.match("<p>x</p>")
+        )
+
+    # ---------- 真实生产 fixture：走 /api/export 的 epub 链路 ----------
+
+    def test_realistic_fixture_full_epub_export(self):
+        """真实版面 fixture 走 export_content_to_file(epub) 全链路。
+
+        fixture 覆盖 UI 实际会产出的组合：h1 章节标题 + 居中加粗段 + 右上角
+        半角空格表格（单元格内含 strong/em/span、colspan、rowspan）+ 表后段落。
+        断言：XHTML 良构、表格块级、单元格文本逐字一致、段落顺序不乱、
+        目录可跳转。
+        """
+        import re as _re
+        import zipfile
+        import xml.etree.ElementTree as ET
+
+        # 标题不含内部空格：标题的空白折叠是既有行为，与表格无关，不在此耦合
+        heading = "<h1>第一章试验记录</h1>"
+        para_before = (
+            '<p class="ptoe-align-center"><strong>一九八四年秋</strong></p>'
+        )
+        # 单元格文本刻意含首尾空格与连续空格，验证不被清理
+        table = (
+            "<table><tbody>"
+            '<tr><th colspan="2">观测项目</th></tr>'
+            '<tr><td>  温度  </td>'
+            '<td class="ptoe-align-right"><strong>18</strong>&nbsp;℃</td></tr>'
+            '<tr><td rowspan="2">湿度</td><td> 40<em>%</em> </td></tr>'
+            '<tr><td>  45%  </td></tr>'
+            "</tbody></table>"
+        )
+        para_after = "<p>此表为原始记录，<strong>未经修正</strong>。</p>"
+
+        items = [
+            {
+                "page": 1,
+                "html": sanitize_html(heading + para_before + table + para_after),
+            }
+        ]
+        self.assertIn("<table>", items[0]["html"], "前置事实：sanitize 保留表格")
+
+        outdir = tempfile.mkdtemp(prefix="t_real_")
+        self.addCleanup(shutil.rmtree, outdir, ignore_errors=True)
+        epub = Path(outdir) / "book.epub"
+        correctmanage.export_content_to_file(items, "epub", str(epub), "书名")
+        self.assertTrue(epub.is_file(), "EPUB 未生成")
+
+        XH = "{http://www.w3.org/1999/xhtml}"
+        with zipfile.ZipFile(epub) as zf:
+            names = zf.namelist()
+            self.assertEqual(zf.read("mimetype"), b"application/epub+zip")
+            nav_name = next(n for n in names if n.endswith("nav.xhtml"))
+            content_names = sorted(
+                n for n in names if n.endswith(".xhtml") and n != nav_name
+            )
+            nav_src = zf.read(nav_name).decode("utf-8")
+            # 所有 XHTML 良构（非法 <p><table> 嵌套会让 ET 直接抛错）
+            contents = {}
+            for n in names:
+                if n.endswith((".xhtml", ".html", ".opf", ".ncx")):
+                    contents[n] = zf.read(n).decode("utf-8")
+                    ET.fromstring(contents[n])
+
+        body_src = contents[content_names[0]]
+        root = ET.fromstring(body_src)
+        parent = {c: p for p in root.iter() for c in p}
+
+        # 1) 表格块级
+        tables = list(root.iter(XH + "table"))
+        self.assertEqual(len(tables), 1, "表格数量不对")
+        tbl = tables[0]
+        tbl_parent = parent.get(tbl)
+        if tbl_parent is None:
+            self.fail("表格没有父节点")
+        self.assertEqual(tbl_parent.tag, XH + "body")
+        for p in root.iter(XH + "p"):
+            self.assertEqual(
+                len(list(p.iter(XH + "table"))), 0, "存在 <p><table> 非法嵌套"
+            )
+
+        # 2) 单元格文本逐字一致（含空格 / nbsp / rowspan 后的空单元）
+        cell_texts = [
+            "".join(e.itertext())
+            for e in root.iter()
+            if e.tag in (XH + "td", XH + "th")
+        ]
+        self.assertEqual(
+            cell_texts,
+            ["观测项目", "  温度  ", "18\u00a0℃", "湿度", " 40% ", "  45%  "],
+        )
+        # 单元格内无段落
+        self.assertEqual(len(list(tbl.iter(XH + "p"))), 0, "单元格内被塞了 <p>")
+        # colspan / rowspan 保留（5 个 td：温度/18℃/湿度/40%/45%）
+        self.assertEqual(
+            [th.get("colspan") for th in tbl.iter(XH + "th")], ["2"]
+        )
+        self.assertEqual(
+            [td.get("rowspan") for td in tbl.iter(XH + "td")],
+            [None, None, "2", None, None],
+        )
+
+        # 3) 段落顺序不乱
+        texts = [
+            "".join(e.itertext())
+            for e in root.iter()
+            if e.tag in (XH + "p", XH + "h1", XH + "h2", XH + "h3", XH + "table")
+        ]
+        i_tbl = texts.index(
+            next(t for t in texts if t.startswith("观测项目"))
+        )
+        self.assertEqual(texts[i_tbl - 2], "第一章试验记录")
+        self.assertEqual(texts[i_tbl - 1], "一九八四年秋")
+        self.assertEqual(texts[i_tbl + 1], "此表为原始记录，未经修正。")
+
+        # 4) 目录可跳转 + EPUB3 声明
+        self.assertIn('epub:type="toc"', nav_src)
+        nav_root = ET.fromstring(nav_src)
+        hrefs = []
+        for a in nav_root.iter():
+            if a.tag == XH + "a":
+                href = a.get("href")
+                if href:
+                    hrefs.append(href)
+        self.assertTrue(hrefs, "nav.xhtml 没有链接")
+        nav_dir = nav_name.rsplit("/", 1)[0] + "/"
+        for href in hrefs:
+            fname, _, frag = href.partition("#")
+            target = nav_dir + fname
+            with self.subTest(href=href):
+                self.assertIn(target, content_names, f"目录指向不存在的页：{href}")
+                if frag:
+                    self.assertIn(
+                        f'id="{frag}"', contents[target], f"锚点 {frag} 缺失"
+                    )
+
+        # 5) 表格整体在文件里未被截断（开闭成对，且中间行都在）
+        self.assertEqual(body_src.count("<table>"), body_src.count("</table>"))
+        for needle in ("观测项目", "温度", "湿度", "45%"):
+            self.assertIn(needle, body_src)
+
+
 class TestExportEndpoint(unittest.TestCase):
     """/api/export：导出 TXT/DOCX 端点。body 带 path 时跳过保存对话框（测试用）。"""
 
@@ -2725,6 +4492,108 @@ class TestExportEndpoint(unittest.TestCase):
             self.assertEqual(
                 out.read_bytes().decode("utf-8-sig").replace("\r\n", "\n"),
                 "\u3000\u3000缩进段\n\n普通段\n",
+            )
+        finally:
+            self._stop(server)
+
+    def test_txt_export_indent_modes_and_spacing(self):
+        # TXT 导出段落设置：first/hang/pl 全角空格前缀 + spb/spa 空行（2026-09-24）
+        server, base = self._start()
+        try:
+            out = Path(tempfile.mkdtemp(prefix="test_export_")) / "settings.txt"
+            res = self._post(
+                base,
+                {
+                    "format": "txt",
+                    "path": str(out),
+                    "pages": [
+                        {
+                            "page": 1,
+                            "html": (
+                                '<p data-ind="first" data-indv="2">首行缩进</p>'
+                                '<p data-pl="3">左缩进</p>'
+                                '<p data-ind="hang" data-indv="1" data-pl="2">悬挂缩进</p>'
+                                '<p data-spb="1">段前空行</p>'
+                                '<p data-spa="2">段后空行</p>'
+                                "<p>无属性段</p>"
+                            ),
+                        }
+                    ],
+                },
+            )
+            self.assertTrue(res["ok"], f"export failed: {res.get('error')}")
+            self.assertEqual(
+                out.read_bytes().decode("utf-8-sig").replace("\r\n", "\n"),
+                "\u3000\u3000首行缩进\n\n"
+                "\u3000\u3000\u3000左缩进\n\n"
+                "\u3000\u3000\u3000悬挂缩进\n\n"
+                "\n段前空行\n\n"
+                "段后空行\n\n\n\n"
+                "无属性段\n",
+            )
+        finally:
+            self._stop(server)
+
+    def test_txt_export_indent_clamps(self):
+        # TXT 导出缩进/间距 clamp 边界：first 至少 1、最多 8；负数/超大取 0/8/9
+        server, base = self._start()
+        try:
+            out = Path(tempfile.mkdtemp(prefix="test_export_")) / "clamp.txt"
+            res = self._post(
+                base,
+                {
+                    "format": "txt",
+                    "path": str(out),
+                    "pages": [
+                        {
+                            "page": 1,
+                            "html": (
+                                '<p data-ind="first" data-indv="0">零缩进</p>'
+                                '<p data-pl="100">超大左缩进</p>'
+                                '<p data-pl="-3">负左缩进</p>'
+                                '<p data-spb="50" data-spa="-1">间距超界</p>'
+                            ),
+                        }
+                    ],
+                },
+            )
+            self.assertTrue(res["ok"], f"export failed: {res.get('error')}")
+            self.assertEqual(
+                out.read_bytes().decode("utf-8-sig").replace("\r\n", "\n"),
+                "\u3000零缩进\n\n"
+                "\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000超大左缩进\n\n"
+                "负左缩进\n\n"
+                + "\n" * 9
+                + "间距超界\n",
+            )
+        finally:
+            self._stop(server)
+
+    def test_txt_export_spb_spa_independent(self):
+        # 两个块各自 spb/spa ⇒ 空行数按各插各的叠加（spb 在前、spa 在后互不抵消）
+        server, base = self._start()
+        try:
+            out = Path(tempfile.mkdtemp(prefix="test_export_")) / "both.txt"
+            res = self._post(
+                base,
+                {
+                    "format": "txt",
+                    "path": str(out),
+                    "pages": [
+                        {
+                            "page": 1,
+                            "html": (
+                                '<p data-spb="1" data-spa="1">上下都有</p>'
+                                "<p>下一段</p>"
+                            ),
+                        }
+                    ],
+                },
+            )
+            self.assertTrue(res["ok"], f"export failed: {res.get('error')}")
+            self.assertEqual(
+                out.read_bytes().decode("utf-8-sig").replace("\r\n", "\n"),
+                "\n上下都有\n\n\n下一段\n",
             )
         finally:
             self._stop(server)
@@ -4569,6 +6438,29 @@ class TestReocr(unittest.TestCase):
         """杂符包裹 \\〔^{x〕}\\ 折叠为〔x〕（归一仍可用）。"""
         self.assertEqual(_normalize_brackets("\\〔^{5〕}\\"), "〔5〕")
         self.assertEqual(_normalize_brackets("正文\\〔^{5〕}\\引注"), "正文〔5〕引注")
+
+    def test_normalize_brackets_strips_dollar_wrap_digit(self):
+        """OvisOCR2 $〔x〕$ 包裹：$ 为模型自造标记符，剥掉后仍归一为〔x〕。"""
+        self.assertEqual(_normalize_brackets("$〔5〕$"), "〔5〕")
+        self.assertEqual(_normalize_brackets("正文$〔5〕$引注"), "正文〔5〕引注")
+        self.assertEqual(_normalize_brackets("$[12]$"), "〔12〕")
+        self.assertEqual(_normalize_brackets("$【3】$"), "〔3〕")
+
+    def test_normalize_brackets_strips_dollar_wrap_letter(self):
+        """非数字内容（〔x〕）同样剥 $；全角圆括号 ）为正文标点，剥 $ 后原样保留。"""
+        self.assertEqual(_normalize_brackets("$〔x〕$"), "〔x〕")
+        self.assertEqual(_normalize_brackets("$〔x）$"), "〔x）")
+
+    def test_normalize_brackets_dollar_hug_preserves_parens(self):
+        """$（x）$ 剥 $ 后（x）仍原样保留（全角圆括号契约不变）。"""
+        self.assertEqual(_normalize_brackets("$（x）$"), "（x）")
+        self.assertEqual(_normalize_brackets("$(x)$"), "(x)")
+
+    def test_normalize_brackets_dollar_non_bracket_untouched(self):
+        """$ 不紧贴括号（价格/数学语境）不剥。"""
+        self.assertEqual(_normalize_brackets("价格$5元"), "价格$5元")
+        self.assertEqual(_normalize_brackets("$x$"), "$x$")
+        self.assertEqual(_normalize_brackets("$20$"), "$20$")
 
     # ---- /api/reocr 端点测试 ----
 
@@ -6838,7 +8730,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "editor_font_size": 14,
                     "img_mode": "",
                     "rule_all_pages_confirm": True,
-                    "popup_row1": ["bold", "italic", "heading", "p", "note", "paint", "remove"],
+                    "popup_row1": ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"],
                     "popup_row2": ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"],
                     "popup_rule_count": 5,
                 },
@@ -7053,7 +8945,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
             self.assertTrue(res["ok"])
             self.assertEqual(
                 res["ui_settings"]["popup_row1"],
-                ["bold", "italic", "heading", "p", "note", "paint", "remove"],
+                ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"],
             )
             self.assertEqual(
                 res["ui_settings"]["popup_row2"],
@@ -7193,6 +9085,567 @@ class TestUiSettingsEndpoint(unittest.TestCase):
             self.assertEqual(calls, [{"popup_row1": ["paint"]}])
         finally:
             self._stop(server)
+
+
+def _start_handler_server(state):
+    """启动一个 _CorrectionHandler 测试服务（返回 server, base_url）。"""
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    from correctmanage import _CorrectionHandler
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _CorrectionHandler)
+    server.daemon_threads = True
+    server.state = state
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def _basic_server_state():
+    """与 TestUiSettingsEndpoint._start 等价的默认 state（设置类端点用）。"""
+    import threading
+
+    return {
+        "pages": {1: "<p>原文</p>"},
+        "finished": threading.Event(),
+        "preview_cache": {},
+        "pdf_path": None,
+        "img_dir": None,
+        "preview_dpi": 110,
+        "preview_quality": 82,
+        "last_heartbeat": 0.0,
+        "gone_at": None,
+        "idle_timeout": 600.0,
+        "auto_finished": False,
+    }
+
+
+class TestAutoSaveConfigEndpoint(unittest.TestCase):
+    """/api/auto_save：矫正界面自动保存设置服务端持久化（config.json 顶层 auto_save）。"""
+
+    def _patch_cfg(self, auto_save=None):
+        import configmanage
+
+        cfg = {"model_choices": {}, "selected_model": None}
+        if auto_save is not None:
+            cfg["auto_save"] = auto_save
+        orig = configmanage.get_config
+        configmanage.get_config = lambda *a, **k: cfg
+        self.addCleanup(lambda: setattr(configmanage, "get_config", orig))
+        return cfg
+
+    def _patch_setter(self):
+        import configmanage
+
+        calls = []
+        orig = configmanage.set_auto_save
+        configmanage.set_auto_save = lambda ui: calls.append(ui)
+        self.addCleanup(lambda: setattr(configmanage, "set_auto_save", orig))
+        return calls
+
+    def test_get_returns_defaults_when_unset(self):
+        import requests
+
+        self._patch_cfg(None)  # 配置无 auto_save 键
+        server, base = _start_handler_server(_basic_server_state())
+        try:
+            res = requests.get(base + "/api/auto_save").json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(
+                res["auto_save"],
+                {"enabled": True, "interval_minutes": 5, "new_backup": True},
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_get_partial_stored_returns_merged_defaults(self):
+        import requests
+
+        self._patch_cfg({"enabled": False})  # 只存了 enabled
+        server, base = _start_handler_server(_basic_server_state())
+        try:
+            res = requests.get(base + "/api/auto_save").json()
+            self.assertTrue(res["ok"])
+            self.assertFalse(res["auto_save"]["enabled"])
+            self.assertEqual(res["auto_save"]["interval_minutes"], 5)
+            self.assertTrue(res["auto_save"]["new_backup"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_post_persists_and_round_trips(self):
+        import json as _json
+
+        import configmanage
+        import requests
+
+        # 真实持久化（临时 _CONFIG_PATH），验证 POST → 磁盘 → GET 往返
+        tmp = tempfile.mkdtemp(prefix="ptoe_autosave_")
+        path = str(Path(tmp) / "config.json")
+        orig_path = configmanage._CONFIG_PATH
+        configmanage._CONFIG_PATH = path
+        self.addCleanup(lambda: setattr(configmanage, "_CONFIG_PATH", orig_path))
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump({"model_choices": {}, "selected_model": None}, f)
+
+        server, base = _start_handler_server(_basic_server_state())
+        try:
+            payload = {
+                "auto_save": {
+                    "enabled": False,
+                    "interval_minutes": 30,
+                    "new_backup": False,
+                }
+            }
+            res = requests.post(base + "/api/auto_save", data=_json.dumps(payload)).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(
+                res["auto_save"],
+                {"enabled": False, "interval_minutes": 30, "new_backup": False},
+            )
+            # 磁盘上已落盘
+            disk = _json.loads(Path(path).read_text(encoding="utf-8"))
+            self.assertEqual(
+                disk["auto_save"],
+                {"enabled": False, "interval_minutes": 30, "new_backup": False},
+            )
+            # GET 往返一致
+            res = requests.get(base + "/api/auto_save").json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(
+                res["auto_save"],
+                {"enabled": False, "interval_minutes": 30, "new_backup": False},
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_post_flat_keys_accepted(self):
+        import json as _json
+
+        import configmanage
+        import requests
+
+        tmp = tempfile.mkdtemp(prefix="ptoe_autosave_")
+        path = str(Path(tmp) / "config.json")
+        orig_path = configmanage._CONFIG_PATH
+        configmanage._CONFIG_PATH = path
+        self.addCleanup(lambda: setattr(configmanage, "_CONFIG_PATH", orig_path))
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump({"model_choices": {}, "selected_model": None}, f)
+
+        server, base = _start_handler_server(_basic_server_state())
+        try:
+            res = requests.post(
+                base + "/api/auto_save",
+                data=_json.dumps({"enabled": False}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertFalse(res["auto_save"]["enabled"])
+            self.assertEqual(res["auto_save"]["interval_minutes"], 5)
+            self.assertTrue(res["auto_save"]["new_backup"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_post_invalid_interval_400(self):
+        import json as _json
+
+        import configmanage
+        import requests
+
+        tmp = tempfile.mkdtemp(prefix="ptoe_autosave_")
+        path = str(Path(tmp) / "config.json")
+        orig_path = configmanage._CONFIG_PATH
+        configmanage._CONFIG_PATH = path
+        self.addCleanup(lambda: setattr(configmanage, "_CONFIG_PATH", orig_path))
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump({"model_choices": {}, "selected_model": None}, f)
+
+        server, base = _start_handler_server(_basic_server_state())
+        try:
+            for bad in (0, 61, "5", None):
+                with self.subTest(bad=bad):
+                    res = requests.post(
+                        base + "/api/auto_save",
+                        data=_json.dumps({"auto_save": {"interval_minutes": bad}}),
+                    ).json()
+                    self.assertFalse(res["ok"])
+                    self.assertIn("interval_minutes", res["error"])
+            # 非法载荷不应落盘
+            disk = _json.loads(Path(path).read_text(encoding="utf-8"))
+            self.assertNotIn("auto_save", disk)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_post_invalid_body_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = _start_handler_server(_basic_server_state())
+        try:
+            bads = [
+                {"auto_save": "nope"},
+                {"auto_save": {"enabled": "x"}},
+                {"auto_save": {"new_backup": 1}},
+                {"enabled": []},
+            ]
+            for bad in bads:
+                with self.subTest(bad=bad):
+                    res = requests.post(
+                        base + "/api/auto_save", data=_json.dumps(bad)
+                    ).json()
+                    self.assertFalse(res["ok"])
+            self.assertEqual(calls, [], "非法载荷不应落盘")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestAutoSaveAction(unittest.TestCase):
+    """/api/autosave：自动保存动作——总是新建历史版本文件，不触碰前端标志。"""
+
+    def _state(self):
+        import threading
+
+        return {
+            "pages": {},
+            "finished": threading.Event(),
+            "preview_cache": {},
+            "pdf_path": None,
+            "img_dir": None,
+            "preview_dpi": 110,
+            "preview_quality": 82,
+            "last_heartbeat": 0.0,
+            "gone_at": None,
+            "idle_timeout": 600.0,
+            "auto_finished": False,
+            "convert_lock": threading.Lock(),
+            "pages_lock": threading.Lock(),
+            "history_prefix": "manual_autotest1",
+            "history_name": "手动录入",
+            "history_lock": threading.Lock(),
+            "proofread": {"errors": {}, "original": {}, "dismissed": {}},
+            "last_proofread_page": None,
+        }
+
+    def _serve(self, state):
+        import correctmanage as _cm
+
+        hist_dir = Path(tempfile.mkdtemp(prefix="test_autosave_hist_"))
+        _orig = _cm._history_dir
+        _cm._history_dir = lambda: hist_dir
+        self.addCleanup(lambda: setattr(_cm, "_history_dir", _orig))
+        self.addCleanup(lambda: shutil.rmtree(hist_dir, ignore_errors=True))
+        server, base = _start_handler_server(state)
+
+        def _cleanup():
+            # Windows 下必须先 shutdown 再 server_close（倒序 addCleanup 会写反）
+            server.shutdown()
+            server.server_close()
+
+        self.addCleanup(_cleanup)
+        return base, hist_dir
+
+    def _version_count(self, hist_dir):
+        return len(list(hist_dir.glob("manual_autotest1_*.json")))
+
+    def test_autosave_writes_new_history_version(self):
+        import json as _json
+
+        import requests
+
+        state = self._state()
+        base, hist_dir = self._serve(state)
+        body = _json.dumps({
+            "pages": [{"page": 1, "html": "<p>甲</p>"}, {"page": 3, "html": "<p>丙</p>"}],
+            "proofread": {
+                "errors": {"1": [{"start": 0, "end": 1, "wrong": "甲", "candidates": ["乙"]}]},
+                "original": {"1": "<p>甲</p>"},
+                "dismissed": {},
+            },
+            "last_proofread_page": 3,
+            "display_name": "测试书名",
+        })
+        res = requests.post(base + "/api/autosave", data=body).json()
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["saved"], 2)
+        # 新建了版本文件（计数 +1），且不上传即无旧文件
+        self.assertEqual(self._version_count(hist_dir), 1)
+        # 载荷快照往返一致
+        fp = sorted(hist_dir.glob("manual_autotest1_*.json"))[0]
+        data = _json.loads(fp.read_text(encoding="utf-8"))
+        self.assertEqual(data["pages"], {"1": "<p>甲</p>", "3": "<p>丙</p>"})
+        self.assertEqual(data["display_name"], "测试书名")
+        self.assertEqual(data["last_proofread_page"], 3)
+        self.assertEqual(
+            data["proofread"]["errors"],
+            {"1": [{"start": 0, "end": 1, "wrong": "甲", "candidates": ["乙"]}]},
+        )
+        # 后端 state 同步快照（与 /api/save 一致）
+        self.assertEqual(state["pages"], {1: "<p>甲</p>", 3: "<p>丙</p>"})
+        self.assertEqual(state["display_name"], "测试书名")
+        # 不动前端脏标志（这些键本就不该由后端维护）
+        self.assertNotIn("dirty", state)
+
+    def test_autosave_each_call_creates_new_version(self):
+        import json as _json
+
+        import requests
+
+        state = self._state()
+        base, hist_dir = self._serve(state)
+        for i in (1, 2, 3):
+            res = requests.post(
+                base + "/api/autosave",
+                data=_json.dumps({"pages": [{"page": 1, "html": f"<p>第{i}次</p>"}]}),
+            ).json()
+            self.assertTrue(res["ok"], res)
+            self.assertEqual(self._version_count(hist_dir), i)
+
+    def test_missing_pages_tolerated(self):
+        import json as _json
+
+        import requests
+
+        state = self._state()
+        base, hist_dir = self._serve(state)
+        # 缺 pages → 当作空列表，仍写版本（ok:true、saved=0）
+        res = requests.post(base + "/api/autosave", data=_json.dumps({})).json()
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["saved"], 0)
+        self.assertEqual(self._version_count(hist_dir), 1)
+
+    def test_malformed_body_fails_gracefully(self):
+        import json as _json
+
+        import requests
+
+        state = self._state()
+        base, hist_dir = self._serve(state)
+        # pages 非数组 → 400（{ok:false}，不抛异常）
+        res = requests.post(
+            base + "/api/autosave", data=_json.dumps({"pages": "nope"})
+        ).json()
+        self.assertFalse(res["ok"])
+        self.assertIn("pages", res["error"])
+        # 请求体非对象 → 400
+        res = requests.post(
+            base + "/api/autosave", data=_json.dumps([1, 2, 3])
+        ).json()
+        self.assertFalse(res["ok"])
+        self.assertEqual(self._version_count(hist_dir), 0)
+
+
+class TestReplaceRulesEndpoint(unittest.TestCase):
+    """/api/replace_rules：替换规则管理服务端持久化（config.json 顶层 replace_rules）。"""
+
+    def _builtin_ids(self):
+        import configmanage
+
+        return [r["id"] for r in configmanage.DEFAULT_CONFIG.get("replace_rules", [])]
+
+    def test_get_returns_builtin_defaults_when_unset(self):
+        import configmanage
+        import requests
+
+        orig = configmanage.get_config
+        configmanage.get_config = lambda *a, **k: {
+            "model_choices": {},
+            "selected_model": None,
+        }
+        self.addCleanup(lambda: setattr(configmanage, "get_config", orig))
+        server, base = _start_handler_server(_basic_server_state())
+        try:
+            res = requests.get(base + "/api/replace_rules").json()
+            self.assertTrue(res["ok"])
+            self.assertEqual([r["id"] for r in res["rules"]], self._builtin_ids())
+            br1 = next(r for r in res["rules"] if r["id"] == "br1")
+            self.assertEqual(br1["name"], "去括号保留内容")
+            self.assertEqual(br1["keep_groups"], [1])
+            self.assertTrue(br1["builtin"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_post_persists_full_replacement_and_round_trips(self):
+        import json as _json
+
+        import configmanage
+        import requests
+
+        tmp = tempfile.mkdtemp(prefix="ptoe_rules_")
+        path = str(Path(tmp) / "config.json")
+        orig_path = configmanage._CONFIG_PATH
+        configmanage._CONFIG_PATH = path
+        self.addCleanup(lambda: setattr(configmanage, "_CONFIG_PATH", orig_path))
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump({"model_choices": {}, "selected_model": None}, f)
+
+        server, base = _start_handler_server(_basic_server_state())
+        rules = [{
+            "id": "br1",
+            "name": "去括号保留内容",
+            "pattern": "[（(]([^（）()]*)[）)]",
+            "flags": "g",
+            "keep_groups": [1],
+            "replacement": "",
+            "builtin": True,
+            "enabled": True,
+        }, {
+            "name": "我的规则",  # 缺 id → 自动生成
+            "pattern": "abc",
+            "flags": "gi",
+            "keep_groups": [2, 1, 1],
+            "replacement": "x",
+            "builtin": False,
+            "enabled": True,
+        }]
+        try:
+            res = requests.post(
+                base + "/api/replace_rules",
+                data=_json.dumps({"rules": rules}),
+            ).json()
+            self.assertTrue(res["ok"], res)
+            self.assertEqual(len(res["rules"]), 2)
+            self.assertEqual(res["rules"][0]["id"], "br1")
+            self.assertEqual(res["rules"][0]["keep_groups"], [1])
+            # 第二条第 keep_groups 升序去重 + 缺 id 已生成
+            self.assertEqual(res["rules"][1]["keep_groups"], [1, 2])
+            self.assertTrue(res["rules"][1]["id"].startswith("r"))
+            # GET 往返一致
+            res = requests.get(base + "/api/replace_rules").json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(len(res["rules"]), 2)
+            self.assertEqual(res["rules"][1]["name"], "我的规则")
+            # 磁盘上已落盘（原子写后 configmanage 可读回同一份）
+            disk = configmanage.get_config(show_dialogs=False) or {}
+            self.assertEqual(len(disk["replace_rules"]), 2)
+            self.assertEqual(disk["replace_rules"][1]["flags"], "gi")
+            raw = _json.loads(Path(path).read_text(encoding="utf-8"))
+            self.assertEqual(raw["replace_rules"], res["rules"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_post_invalid_regex_400(self):
+        import json as _json
+
+        import requests
+
+        server, base = _start_handler_server(_basic_server_state())
+        try:
+            res = requests.post(
+                base + "/api/replace_rules",
+                data=_json.dumps({"rules": [{
+                    "name": "坏正则",
+                    "pattern": "[（(]([^（）()]*)[）)",  # 未闭合的中括号
+                    "flags": "g",
+                    "keep_groups": [],
+                    "replacement": "",
+                    "builtin": False,
+                    "enabled": True,
+                }]}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("正则", res["error"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_post_non_list_400(self):
+        import json as _json
+
+        import requests
+
+        server, base = _start_handler_server(_basic_server_state())
+        try:
+            res = requests.post(
+                base + "/api/replace_rules",
+                data=_json.dumps({"rules": "nope"}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("数组", res["error"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_post_missing_name_or_pattern_400(self):
+        import json as _json
+
+        import requests
+
+        server, base = _start_handler_server(_basic_server_state())
+        try:
+            cases = [
+                {"pattern": "x", "flags": "g"},  # 缺 name
+                {"name": "", "pattern": "x", "flags": "g"},  # name 空
+                {"name": "x"},  # 缺 pattern
+                {"name": "x", "pattern": ""},  # pattern 空
+            ]
+            for rule in cases:
+                with self.subTest(rule=rule):
+                    res = requests.post(
+                        base + "/api/replace_rules",
+                        data=_json.dumps({"rules": [rule]}),
+                    ).json()
+                    self.assertFalse(res["ok"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_post_bad_flags_or_keep_groups_400(self):
+        import json as _json
+
+        import requests
+
+        server, base = _start_handler_server(_basic_server_state())
+        try:
+            cases = [
+                {"name": "x", "pattern": "x", "flags": "s"},  # s 不支持
+                {"name": "x", "pattern": "x", "flags": "g", "keep_groups": [-1]},
+                {"name": "x", "pattern": "x", "flags": "g", "keep_groups": "1,2"},
+            ]
+            for rule in cases:
+                with self.subTest(rule=rule):
+                    res = requests.post(
+                        base + "/api/replace_rules",
+                        data=_json.dumps({"rules": [rule]}),
+                    ).json()
+                    self.assertFalse(res["ok"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_post_too_many_rules_400(self):
+        import json as _json
+
+        import requests
+
+        server, base = _start_handler_server(_basic_server_state())
+        try:
+            rules = [
+                {"name": f"r{i}", "pattern": "x", "flags": "g"}
+                for i in range(101)
+            ]
+            res = requests.post(
+                base + "/api/replace_rules",
+                data=_json.dumps({"rules": rules}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("100", res["error"])
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 class TestSetShortcutsConfig(unittest.TestCase):
@@ -7368,7 +9821,7 @@ class TestSetUiSettingsConfig(unittest.TestCase):
                 "editor_font_size": 14,
                 "img_mode": "",
                 "rule_all_pages_confirm": True,
-                "popup_row1": ["bold", "italic", "heading", "p", "note", "paint", "remove"],
+                "popup_row1": ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"],
                 "popup_row2": ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"],
                 "popup_rule_count": 5,
             },
@@ -7379,7 +9832,7 @@ class TestSetUiSettingsConfig(unittest.TestCase):
         cfg = self.cm.set_ui_settings({"popup_row1": "bold"})
         self.assertEqual(
             cfg["ui_settings"]["popup_row1"],
-            ["bold", "italic", "heading", "p", "note", "paint", "remove"],
+            ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"],
         )
         cfg = self.cm.set_ui_settings({"popup_row2": ["bogus", "note"]})
         self.assertEqual(
@@ -7389,7 +9842,7 @@ class TestSetUiSettingsConfig(unittest.TestCase):
         cfg = self.cm.set_ui_settings({"popup_row1": ["bold", "bold"]})  # 重复
         self.assertEqual(
             cfg["ui_settings"]["popup_row1"],
-            ["bold", "italic", "heading", "p", "note", "paint", "remove"],
+            ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"],
         )
         for bad in (99, -1, True, "5", None):
             cfg = self.cm.set_ui_settings({"popup_rule_count": bad})
@@ -7412,7 +9865,7 @@ class TestSetUiSettingsConfig(unittest.TestCase):
             POPUP_RULE_COUNT_DEFAULT,
         )
 
-        self.assertEqual(POPUP_ROW1_DEFAULT, ["bold", "italic", "heading", "p", "note", "paint", "remove"])
+        self.assertEqual(POPUP_ROW1_DEFAULT, ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"])
         self.assertEqual(POPUP_ROW2_DEFAULT, ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"])
         self.assertEqual(POPUP_RULE_COUNT_DEFAULT, 5)
 
@@ -7487,8 +9940,9 @@ class TestConfigEndpoint(unittest.TestCase):
         try:
             res = requests.get(base + "/api/config").json()
             self.assertTrue(res["ok"])
-            self.assertEqual(res["fonts"]["body"], "serif")
-            self.assertEqual(res["fonts"]["citation"], "cursive")
+            # 默认 = 不修改字体（空串），使用阅读器默认
+            self.assertEqual(res["fonts"]["body"], "")
+            self.assertEqual(res["fonts"]["citation"], "")
             self.assertEqual(res["citationItalicEnabled"], False)
         finally:
             self._stop(server)
@@ -11227,6 +13681,357 @@ class TestTable(unittest.TestCase):
             {"table", "thead", "tbody", "tfoot", "tr", "th", "td"},
             rulemanage.ALLOWED_TAGS,
         )
+
+
+class TestCharStyleAndDivider(unittest.TestCase):
+    """字符样式（span style）与分隔线（2026-09-27）。
+
+    字符样式载体 = <span style="...">，允许属性 text-align/font-size/
+    font-family/color（清洗与序列化共用 rulemanage.normalize_char_style）。
+    分隔线 = 非空 <p> + 基类 ptoe-divider + 可选后缀类 ptoe-divider-<style>。
+    """
+
+    def _docx_xml(self, html, fmt="docx"):
+        """导出 → 读回 word/document.xml 文本。"""
+        import zipfile
+
+        out = Path(tempfile.mkdtemp(prefix="t_csd_")) / f"a.{fmt}"
+        correctmanage.export_content_to_file(
+            [{"page": 1, "html": html}], fmt, str(out), title="书"
+        )
+        self.assertTrue(out.is_file())
+        with zipfile.ZipFile(out) as zf:
+            return zf.read("word/document.xml").decode("utf-8")
+
+    def _export_text(self, html, fmt):
+        out = Path(tempfile.mkdtemp(prefix="t_csd_")) / f"a.{fmt}"
+        correctmanage.export_content_to_file(
+            [{"page": 1, "html": html}], fmt, str(out), title="书"
+        )
+        return out.read_text(encoding="utf-8-sig")
+
+    # ---------- 字符样式：清洗与往返 ----------
+
+    def test_sanitize_keeps_canonical_char_style(self):
+        """span style 保留并归一（规范顺序、无尾分号）。"""
+        out = sanitize_html(
+            '<p>混<span style="color:#C00000;font-size:24px">红</span>排</p>'
+        )
+        self.assertIn('style="font-size:24px;color:#c00000"', out)
+
+    def test_sanitize_strips_unsafe_style_props(self):
+        """危险/未知属性被丢弃，只留白名单四项。"""
+        out = sanitize_html(
+            '<p><span style="position:absolute;top:1px;font-size:16px">x</span></p>'
+        )
+        self.assertIn('style="font-size:16px"', out)
+        self.assertNotIn("position", out)
+        self.assertNotIn("top:", out)
+
+    def test_sanitize_drops_style_when_all_props_invalid(self):
+        """属性全非法时整条 style 丢弃，不留空 style=""。"""
+        out = sanitize_html('<p><span style="position:absolute">x</span></p>')
+        self.assertNotIn("style=", out)
+
+    def test_sanitize_clamps_font_size(self):
+        """字号钳制到 8..72。"""
+        for given, want in (("200px", "72px"), ("2px", "8px"), ("12px", "12px")):
+            out = sanitize_html(f'<p><span style="font-size:{given}">x</span></p>')
+            self.assertIn(f'font-size:{want}', out, given)
+
+    def test_sanitize_rejects_unknown_font_family(self):
+        """字体名不在锁定字体栈内则丢弃 font-family，其余属性保留。"""
+        out = sanitize_html(
+            '<p><span style="font-family:Comic Sans MS;color:#ff0000">x</span></p>'
+        )
+        self.assertNotIn("font-family", out)
+        self.assertIn("color:#ff0000", out)
+
+    def test_sanitize_does_not_leak_style_onto_block(self):
+        """块级标签不接收 style（只 span 是字符样式载体）。"""
+        out = sanitize_html('<p style="font-size:24px">x</p>')
+        self.assertNotIn("font-size", out)
+
+    def test_char_style_survives_save_roundtrip(self):
+        """清洗 → 富文本块 → 渲染，样式不丢（保存往返）。"""
+        src = '<p>混<span style="font-size:24px;color:#c00000">红</span>排</p>'
+        blocks = _html_to_rich_blocks(sanitize_html(src))
+        runs = blocks[0]["runs"] if isinstance(blocks[0], dict) else blocks[0]
+        styled = [r for r in runs if (r.get("style") or "")]
+        self.assertTrue(styled, "富文本块丢失字符样式 run")
+        self.assertIn("font-size:24px", styled[0]["style"])
+        self.assertIn("color:#c00000", styled[0]["style"])
+
+    def test_inner_span_wins_over_outer(self):
+        """嵌套 span 时内层字符样式生效（就近原则）。"""
+        src = (
+            '<p><span style="font-size:30px">外<span style="font-size:10px">'
+            "内</span></span></p>"
+        )
+        blocks = _html_to_rich_blocks(sanitize_html(src))
+        runs = blocks[0]["runs"] if isinstance(blocks[0], dict) else blocks[0]
+        sizes = [r.get("style") or "" for r in runs if r["text"] == "内"]
+        self.assertTrue(sizes)
+        self.assertIn("font-size:10px", sizes[0])
+        self.assertNotIn("font-size:30px", sizes[0])
+
+    # ---------- 分隔线：清洗与往返 ----------
+
+    def test_sanitize_preserves_divider_classes(self):
+        """基类 + 后缀类都保留。"""
+        for style, cls in DIVIDER_STYLES.items():
+            out = sanitize_html(f'<p class="{DIVIDER_CLASS} {cls}">X</p>')
+            self.assertIn(f'class="{DIVIDER_CLASS} {cls}"', out, style)
+
+    def test_sanitize_strips_unrelated_class_on_divider(self):
+        """分隔线放行不放宽整个 class 白名单。"""
+        out = sanitize_html(
+            f'<p class="{DIVIDER_CLASS} {DIVIDER_STYLES["solid"]} evil">X</p>'
+        )
+        self.assertIn(DIVIDER_CLASS, out)
+        self.assertNotIn("evil", out)
+
+    def test_sanitize_preserves_unknown_divider_suffix(self):
+        """未知后缀前缀类同样放行（前缀判定，向后兼容）。"""
+        out = sanitize_html(f'<p class="{DIVIDER_CLASS} ptoe-divider-wavy">X</p>')
+        self.assertIn("ptoe-divider-wavy", out)
+
+    def test_divider_glyph_mapping(self):
+        """四种样式名 → 8 字形（宽高一致），未知名回退默认。"""
+        self.assertEqual(_divider_glyph("solid"), DIVIDER_GLYPHS["solid"])
+        self.assertEqual(_divider_glyph("double"), DIVIDER_GLYPHS["double"])
+        for glyph in DIVIDER_GLYPHS.values():
+            self.assertEqual(len(glyph), 8)
+        self.assertEqual(_divider_glyph("nope"), DIVIDER_GLYPHS["solid"])
+
+    def test_rich_blocks_yield_divider_block(self):
+        """富文本解析产出 kind=divider 块并带 style 标记。"""
+        blocks = _html_to_rich_blocks(
+            sanitize_html(f'<p class="{DIVIDER_CLASS} ptoe-divider-dashed">X</p>')
+        )
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["kind"], "divider")
+        self.assertEqual(blocks[0]["style"], "dashed")
+        self.assertEqual(blocks[0]["text"], DIVIDER_GLYPHS["dashed"])
+
+    def test_divider_never_merged_with_neighbours(self):
+        """合并段落不得跨过分隔线（版式元素独立成块）。"""
+        blocks = _html_to_rich_blocks(
+            sanitize_html(
+                '<p>前</p><p class="ptoe-divider ptoe-divider-solid">X</p><p>后</p>'
+            )
+        )
+        self.assertEqual(len(blocks), 3, blocks)
+        self.assertEqual(blocks[1]["kind"], "divider")
+
+    def test_apply_join_marks_skips_divider(self):
+        """join 标记不跨分隔线生效。"""
+        blocks = _html_to_rich_blocks(
+            sanitize_html(
+                '<p>前</p><p class="ptoe-divider ptoe-divider-solid">X</p><p>后</p>')
+        )
+        marked = _apply_join_marks(blocks)
+        # 分隔线块自身不带 join 标记
+        self.assertNotIn("join", (marked[1] or {}).get("attrs", {}))
+
+    # ---------- 导出：字符样式 ----------
+
+    def test_docx_char_style_emits_size_font_color(self):
+        """DOCX：24px → w:sz 36 半磅 + w:rFonts + w:color。"""
+        doc = self._docx_xml(
+            '<p>混<span style="font-size:24px;font-family:宋体, SimSun, serif;'
+            'color:#c00000">红</span>排</p>'
+        )
+        self.assertIn('<w:sz w:val="36"/>', doc)
+        self.assertIn('<w:color w:val="C00000"/>', doc)
+        self.assertIn("w:rFonts", doc)
+
+    def test_docx_heading_size_wins_over_span_size(self):
+        """标题块级字号优先于 span 字符字号（不出现两个冲突 w:sz）。"""
+        doc = self._docx_xml(
+            '<h1>标题<span style="font-size:8px">小</span></h1>'
+        )
+        self.assertNotIn('<w:sz w:val="16"/>', doc)
+
+    def test_docx_named_color_ignored_not_broken(self):
+        """颜色名在 DOCX 无对应值时忽略，不得写出 w:val="None"。"""
+        doc = self._docx_xml('<p><span style="color:red">x</span></p>')
+        self.assertNotIn('w:val="None"', doc)
+        self.assertNotIn('w:val="red"', doc)
+
+    def test_md_keeps_char_style_as_raw_html(self):
+        """MD：带样式的段落整块透传原始 HTML。"""
+        md = self._export_text(
+            '<p>混<span style="font-size:24px;color:#c00000">红</span>排</p>', "md"
+        )
+        self.assertIn('style="font-size:24px;color:#c00000"', md)
+        self.assertIn("红", md)
+
+    def test_md_divider_becomes_hr(self):
+        """MD：分隔线 → --- 分隔线。"""
+        for style, cls in DIVIDER_STYLES.items():
+            md = self._export_text(f'<p class="{DIVIDER_CLASS} {cls}">X</p>', "md")
+            self.assertIn("---", md, style)
+
+    def test_txt_keeps_glyph_and_drops_char_style(self):
+        """TXT：保留规范字形（字符样式在纯文本中天然丢弃）。"""
+        for style, cls in DIVIDER_STYLES.items():
+            txt = self._export_text(f'<p class="{DIVIDER_CLASS} {cls}">X</p>', "txt")
+            self.assertIn(DIVIDER_GLYPHS[style], txt, style)
+
+    # ---------- 导出：分隔线 ----------
+
+    def test_docx_divider_uses_real_borders(self):
+        """DOCX：分隔线走真实段落边框（single/dashed/dotted/double）。"""
+        want = {
+            "solid": "single",
+            "dashed": "dashed",
+            "dotted": "dotted",
+            "double": "double",
+        }
+        for style, cls in DIVIDER_STYLES.items():
+            doc = self._docx_xml(f'<p class="{DIVIDER_CLASS} {cls}">X</p>')
+            self.assertIn(f'<w:bottom w:val="{want[style]}"', doc, style)
+
+    def test_docx_divider_has_no_glyph_text(self):
+        """DOCX：分隔线为空段 + 边框，不残留字形文本。"""
+        doc = self._docx_xml(
+            f'<p class="{DIVIDER_CLASS} {DIVIDER_STYLES["solid"]}">'
+            f"{DIVIDER_GLYPHS['solid']}</p>"
+        )
+        self.assertNotIn("─", doc)
+
+    def test_docx_unknown_suffix_falls_back_to_single(self):
+        """未知后缀回退默认直线边框。"""
+        doc = self._docx_xml(f'<p class="{DIVIDER_CLASS} ptoe-divider-wavy">X</p>')
+        self.assertIn('<w:bottom w:val="single"', doc)
+
+    # ---------- 表格单元格作用域（显式契约） ----------
+
+    def test_table_cell_text_kept_but_char_style_dropped_in_docx(self):
+        """DOCX 表格单元格：文字保留、单元格内行内格式**不落**（显式作用域）。
+
+        见 _build_docx_table docstring：单元格取纯文本整体输出（表头加粗除外）。
+        需要保留单元格内格式请用 MD/EPUB 导出（整块透传原始 HTML）。
+        """
+        html = (
+            "<table><thead><tr><th>表头</th></tr></thead><tbody>"
+            '<tr><td>a<span style="font-size:16px">b</span></td></tr></tbody></table>'
+        )
+        doc = self._docx_xml(html)
+        self.assertIn("a", doc)      # 文字不丢
+        self.assertIn("b", doc)
+        self.assertNotIn('<w:sz w:val="32"/>', doc)  # 16px 样式未落 DOCX
+
+    def test_table_cell_char_style_preserved_for_md_epub(self):
+        """同一段表格 HTML 在 MD/EPUB 链路整块透传，单元格样式不丢。"""
+        html = (
+            "<table><thead><tr><th>表头</th></tr></thead><tbody>"
+            '<tr><td>a<span style="font-size:16px">b</span></td></tr></tbody></table>'
+        )
+        blocks = _html_to_rich_blocks(html)
+        self.assertEqual(blocks[0]["kind"], "table")
+        self.assertIn('style="font-size:16px"', blocks[0]["rows"][1][0])
+
+    # ---------- 智能清理不破坏新特性 ----------
+
+    def test_clean_page_html_keeps_char_style(self):
+        """清理按钮不剥字符样式。"""
+        src = '<p>混<span style="font-size:24px;color:#c00000">红</span>排</p>'
+        self.assertIn('style="font-size:24px;color:#c00000"', clean_page_html(src))
+
+    def test_clean_page_html_keeps_divider(self):
+        """清理按钮不剥分隔线 class。"""
+        src = f'<p class="{DIVIDER_CLASS} {DIVIDER_STYLES["solid"]}">X</p>'
+        self.assertIn(DIVIDER_CLASS, clean_page_html(src))
+
+    def test_clean_page_html_merge_keeps_divider_boundary(self):
+        """清理+合并段落时分隔线仍是独立块。"""
+        src = f'<p>前</p><p class="{DIVIDER_CLASS} {DIVIDER_STYLES["solid"]}">X</p>'
+        out = clean_page_html(src, merge_paragraphs=True)
+        self.assertIn(DIVIDER_CLASS, out)
+        self.assertIn("前", out)
+
+    def test_clean_page_html_drops_empty_divider(self):
+        """空分隔线段被丢（与 sanitize_html("<p></p>") == "" 的既有约定一致）。"""
+        src = f'<p class="{DIVIDER_CLASS} {DIVIDER_STYLES["solid"]}"> </p>'
+        self.assertEqual(clean_page_html(src), "")
+
+    # ---------- 回归：2026-09-27 取证发现的两处真实缺陷 ----------
+
+    def test_sanitize_keeps_char_style_inside_table_cell(self):
+        """清洗入口保留表格单元格内的字符样式 span（原先写到文档缓冲 → 丢失）。
+
+        单测 test_table_cell_char_style_preserved_for_md_epub 直测
+        _html_to_rich_blocks，绕过了清洗入口，故此前该缺陷未被覆盖。
+        """
+        src = (
+            "<table><tbody><tr><td>"
+            '<span style="font-size:20px;color:#c00">表内红字</span>'
+            "</td></tr></tbody></table>"
+        )
+        out = sanitize_html(src)
+        self.assertEqual(
+            out,
+            "<table><tbody><tr><td>"
+            '<span style="font-size:20px;color:#c00">表内红字</span>'
+            "</td></tr></tbody></table>",
+        )
+        # </table> 后不得遗留孤立块（原先是 <p><span …></p>，且二次清洗才闭合）
+        self.assertEqual(sanitize_html(out), out)
+
+    def test_sanitize_keeps_img_inside_table_cell(self):
+        """单元格内 <img> 留在单元格内（原先被搬到 </table> 之后的文档缓冲）。"""
+        src = (
+            "<table><tbody><tr><td>"
+            '<img src="data:image/png;base64,AA==" alt="p"/>'
+            "</td></tr></tbody></table>"
+        )
+        out = sanitize_html(src)
+        self.assertIn("</td></tr>", out)
+        self.assertLess(out.index("base64,AA=="), out.index("</td>"))
+        self.assertEqual(sanitize_html(out), out)
+
+    def test_docx_rpr_children_follow_schema_order(self):
+        """DOCX w:rPr 子元素按 CT_RPr schema 次序输出（Word 判损坏的根因）。"""
+        order = [
+            "rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps",
+            "strike", "dstrike", "outline", "shadow", "emboss", "imprint",
+            "noProof", "snapToGrid", "vanish", "webHidden", "color", "spacing",
+            "w", "kern", "position", "sz", "szCs", "highlight", "u", "effect",
+            "bdr", "shd", "fitText", "vertAlign", "rtl", "cs", "em", "lang",
+        ]
+        rank = {t: i for i, t in enumerate(order)}
+        doc = self._docx_xml(
+            '<p>a<span style="font-size:20px;color:#c00;font-family:SimHei">红</span>'
+            '<strong>粗</strong><s>删</s><sup>上</sup>'
+            '<span class="ptoe-charbox">框</span>'
+            '<mark class="ptoe-highlight">突</mark></p>'
+        )
+        rprs = re.findall(r"<w:rPr>(.*?)</w:rPr>", doc, flags=re.S)
+        self.assertTrue(rprs)
+        for rpr in rprs:
+            tags = re.findall(r"<w:(\w+)[ />]", rpr)
+            ranks = [rank[t] for t in tags if t in rank]
+            self.assertEqual(ranks, sorted(ranks), rpr)
+            # 每个属性只能出现一次（CT_RPr 里均为 maxOccurs=1）
+            self.assertEqual(len(tags), len(set(tags)), rpr)
+
+    def test_docx_rpr_places_rfonts_and_color_before_sz(self):
+        """逐字符样式的 rFonts/color 必须排在 w:sz 之前（本次修复的具体回归点）。"""
+        # font-family 走白名单栈（normalize 只放行 CHAR_FONT_STACKS 里的完整栈），
+        # DOCX 取栈首位作 w:ascii/hAnsi/eastAsia（见 _build_docx 内注释）
+        doc = self._docx_xml(
+            '<p><span style="font-size:20px;color:#c00;'
+            'font-family:黑体, SimHei, sans-serif">红</span></p>'
+        )
+        rpr = re.search(r"<w:rPr>(.*?)</w:rPr>", doc, flags=re.S).group(1)
+        self.assertIn('<w:rFonts w:ascii="黑体"', rpr)
+        self.assertIn('<w:color w:val="CC0000"/>', rpr)
+        self.assertIn('<w:sz w:val="30"/><w:szCs w:val="30"/>', rpr)
+        self.assertLess(rpr.index("rFonts"), rpr.index("<w:sz"))
+        self.assertLess(rpr.index("<w:color"), rpr.index("<w:sz"))
+        self.assertEqual(rpr.count("<w:color"), 1)
 
 
 if __name__ == "__main__":

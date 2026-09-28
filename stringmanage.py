@@ -48,14 +48,21 @@ _BRACKET_PAIR_RES = (
     re.compile(r"\[([^\[\]\n]{1,32})\]"),
     re.compile(r"［([^［］]*)］"),
 )
+# $ 包裹剥除（2026-09-21，与 correctmanage._strip_dollar_bracket_hug 同实现）：
+# OvisOCR2 重识别把原文 〔x〕 输出成 $〔x〕$——$ 为模型自造标记符，紧贴括号时剥掉。
+_DOLLAR_OPEN_BRACKET_RE = re.compile(r"\$+\s*([〔【［\[(（])")
+_DOLLAR_CLOSE_BRACKET_RE = re.compile(r"([〕】］\])）])\s*\$+")
 
 
 def normalize_brackets(text: str) -> str:
     """ULQ 模型杂符引注清理 + 括号对统一。
 
     ① ``（^{[1]】}`` 等垃圾包裹的数字引注 → ``〔1〕``；
-    ② 【x】/[x]/［x］（可能混用）→ 统一为 〔x〕。
+    ② 【x】/[x]/［x］（可能混用）→ 统一为 〔x〕；
+    ③ $ 紧贴括号的模型杂符包裹（如 $〔x〕$）→ 剥掉 $。
     """
+    text = _DOLLAR_OPEN_BRACKET_RE.sub(r"\1", text)
+    text = _DOLLAR_CLOSE_BRACKET_RE.sub(r"\1", text)
     text = _ULQ_JUNK_BRACKET_RE.sub(r"〔\1〕", text)
     for pat in _BRACKET_PAIR_RES:
         text = pat.sub(r"〔\1〕", text)

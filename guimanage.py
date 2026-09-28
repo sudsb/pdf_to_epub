@@ -249,6 +249,7 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
         <div class="card-title"><span class="ct-icon">★</span> 模型与引擎</div>
         <div class="form-row"><span class="form-label">当前模型</span><div class="form-ctrl"><select id="cfgSelectedModel"></select></div></div>
         <div class="form-row"><span class="form-label">推理引擎</span><div class="form-ctrl" style="display:flex;gap:16px;align-items:center;"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgEngine" value="llama" checked> llama.cpp</label><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgEngine" value="vllm"> vLLM-Omni</label><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgEngine" value="paddle"> PaddleOCR</label></div></div>
+        <div class="form-row"><span class="form-label">合并多行为段落</span><div class="form-ctrl"><input type="checkbox" id="cfgPaddleMergeLines" title="仅 PaddleOCR 引擎生效" aria-label="合并多行为段落（仅 PaddleOCR 引擎生效）"></div><div class="form-hint">把 PaddleOCR 识别出的多行文本合并成段落（仅 PaddleOCR 引擎生效，llama.cpp / vLLM-Omni 不使用）。</div></div>
         <div class="form-row"><span class="form-label">校正引擎</span><div class="form-ctrl" style="display:flex;gap:16px;align-items:center;"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgProofreadEngine" value="llama" checked> llama.cpp</label><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgProofreadEngine" value="vllm"> vLLM-Omni</label></div><div class="form-hint">矫正界面使用的引擎（PaddleOCR 仅用于转换的图片识别阶段，不参与矫正/重识别）。</div></div>
       </div>
       <div class="card">
@@ -516,7 +517,7 @@ function setEngine(eng){cfg.engine=eng;document.querySelectorAll(".engine-switch
 function updateEngineHint(){var eng=cfg.engine||"llama",hint;if(eng==="paddle"){hint="当前引擎: paddle | 本地推理，无需启动服务"}else{var port=eng==="llama"?(cfg.llama_server_args||{}).port||"8080":(cfg.vllm_server_args||{}).port||"8000";hint="当前引擎: "+eng+" | 默认端口: "+port}document.getElementById("engineHint").textContent=hint}
 function renderStatus(s){var badgeEl=document.getElementById("stRunning"),navBadge=document.getElementById("navStatusBadge"),label,cls;if(s.probe==="match"){label="运行中";cls="badge-green";navBadge.textContent="运行中";navBadge.className="nav-badge running"}else if(s.probe==="mismatch"){label="模型不匹配";cls="badge-yellow";navBadge.textContent="异常";navBadge.className="nav-badge stopped"}else{label="未运行";cls=s.busy?"badge-yellow":"badge-gray";navBadge.textContent=s.busy?"启动中":"未运行";navBadge.className="nav-badge "+(s.busy?"running":"stopped")}badgeEl.innerHTML='<span class="badge '+cls+'">'+label+"</span>";if(s.busy&&s.probe==="none")badgeEl.innerHTML+=' <span style="font-size:11px;color:var(--yellow);margin-left:6px;">启动中...</span>';document.getElementById("stModel").textContent=s.model_name||s.model_key||"--";document.getElementById("stPort").textContent=s.port||"--";document.getElementById("stEngine").textContent=s.engine||cfg.engine||"llama";if(s.engine){document.querySelectorAll(".engine-switch button").forEach(function(b){b.classList.toggle("active",b.dataset.eng===s.engine)});cfg.engine=s.engine}updateEngineHint();document.getElementById("btnStart").disabled=s.probe==="match"||s.busy;document.getElementById("btnStop").disabled=s.probe==="none"&&!s.busy;if(s.engine==="paddle"){badgeEl.innerHTML='<span class="badge badge-green">本地推理</span>';document.getElementById("stPort").textContent="--";navBadge.textContent="本地推理";navBadge.className="nav-badge running";document.getElementById("btnStart").disabled=true;document.getElementById("btnStop").disabled=true}if(s.last_error&&s.last_error!==_lastShownError){_lastShownError=s.last_error;addLog("服务错误: "+s.last_error,"log-err")}}
 function renderAll(){renderBasic();renderModels();renderArgs("llamaArgs",cfg.llama_server_args);renderArgs("vllmArgs",cfg.vllm_server_args);renderProofread();renderShortcuts();renderRules();renderConvert();document.querySelectorAll(".engine-switch button").forEach(function(b){b.classList.toggle("active",b.dataset.eng===(cfg.engine||"llama"))});updateEngineHint()}
-function renderBasic(){document.getElementById("cfgLlamaServer").value=cfg.llama_server||"";document.getElementById("cfgModelsDir").value=cfg.models_dir||"";document.getElementById("cfgBrowser").value=cfg.browser||"";document.getElementById("cfgGuiDisplay").value=(cfg.gui_display||"pywebview");document.getElementById("cfgOcrPrompt").value=cfg.ocr_prompt||"";var sel=document.getElementById("cfgSelectedModel");sel.innerHTML="";models.forEach(function(m){var o=document.createElement("option");o.value=m.key;o.textContent=m.key+" - "+m.name;sel.appendChild(o)});sel.value=cfg.selected_model||"";document.querySelectorAll('input[name="cfgEngine"]').forEach(function(r){r.checked=r.value===(cfg.engine||"llama")});document.querySelectorAll('input[name="cfgProofreadEngine"]').forEach(function(r){r.checked=r.value===(cfg.proofread_engine||"llama")});try{document.getElementById("cfgFontBody").value=(cfg.fonts&&cfg.fonts.body)||"";document.getElementById("cfgFontHeading").value=(cfg.fonts&&cfg.fonts.heading)||"";document.getElementById("cfgFontNote").value=(cfg.fonts&&cfg.fonts.note)||"";document.getElementById("cfgFontCitation").value=(cfg.fonts&&cfg.fonts.citation)||""}catch(e){}try{var ip=cfg.image_preprocess||{};document.getElementById("cfgImgPreEnabled").checked=!!ip.enabled;document.getElementById("cfgImgGray").checked=!!ip.gray;document.getElementById("cfgImgDenoise").checked=!!ip.denoise;document.getElementById("cfgImgSharpen").checked=!!ip.sharpen;document.getElementById("cfgImgBinarize").checked=!!ip.binarize;document.getElementById("cfgImgWorkers").value=(ip.workers!=null?ip.workers:"")}catch(e){}
+function renderBasic(){document.getElementById("cfgLlamaServer").value=cfg.llama_server||"";document.getElementById("cfgModelsDir").value=cfg.models_dir||"";document.getElementById("cfgBrowser").value=cfg.browser||"";document.getElementById("cfgGuiDisplay").value=(cfg.gui_display||"pywebview");document.getElementById("cfgOcrPrompt").value=cfg.ocr_prompt||"";var sel=document.getElementById("cfgSelectedModel");sel.innerHTML="";models.forEach(function(m){var o=document.createElement("option");o.value=m.key;o.textContent=m.key+" - "+m.name;sel.appendChild(o)});sel.value=cfg.selected_model||"";document.querySelectorAll('input[name="cfgEngine"]').forEach(function(r){r.checked=r.value===(cfg.engine||"llama")});document.querySelectorAll('input[name="cfgProofreadEngine"]').forEach(function(r){r.checked=r.value===(cfg.proofread_engine||"llama")});try{document.getElementById("cfgFontBody").value=(cfg.fonts&&cfg.fonts.body)||"";document.getElementById("cfgFontHeading").value=(cfg.fonts&&cfg.fonts.heading)||"";document.getElementById("cfgFontNote").value=(cfg.fonts&&cfg.fonts.note)||"";document.getElementById("cfgFontCitation").value=(cfg.fonts&&cfg.fonts.citation)||""}catch(e){}try{var ip=cfg.image_preprocess||{};document.getElementById("cfgImgPreEnabled").checked=!!ip.enabled;document.getElementById("cfgImgGray").checked=!!ip.gray;document.getElementById("cfgImgDenoise").checked=!!ip.denoise;document.getElementById("cfgImgSharpen").checked=!!ip.sharpen;document.getElementById("cfgImgBinarize").checked=!!ip.binarize;document.getElementById("cfgImgWorkers").value=(ip.workers!=null?ip.workers:"")}catch(e){}try{document.getElementById("cfgPaddleMergeLines").checked=cfg.paddle_merge_lines!==false}catch(e){}
 }
 function renderModels(){var tbody=document.getElementById("modelTbody");tbody.innerHTML="";var keys=Object.keys(cfg.model_choices||{});if(!keys.length){tbody.innerHTML='<tr><td colspan="7" class="empty-state">暂无模型，点击上方「添加模型」</td></tr>';return}keys.forEach(function(key){var m=cfg.model_choices[key],info=models.find(function(x){return x.key===key}),nameOk=info?info.name_exists:false,mmOk=info?info.mmproj_exists:false,tr=document.createElement("tr");tr.innerHTML='<td><input type="text" value="'+escH(key)+'" data-field="key" style="font-weight:600;background:#f8f9fb;"></td><td><input type="text" value="'+escH(m.name||"")+'" data-field="name"></td><td><input type="text" value="'+escH(m.mmproj||"")+'" data-field="mmproj"></td><td><input type="number" min="1" max="64" value="'+(m.workers!=null?m.workers:"")+'" data-field="workers" style="width:52px;"></td><td class="'+(nameOk?"file-ok":"file-miss")+'">'+(nameOk?"\u2713":"\u2717")+'</td><td class="'+(mmOk?"file-ok":"file-miss")+'">'+(mmOk?"\u2713":"\u2717")+'</td><td class="del-cell"><button class="del-btn" title="删除模型">\u2715</button></td>';tr.querySelector(".del-btn").onclick=function(){if(confirm("确定删除模型「"+key+"」？")){delete cfg.model_choices[key];models=models.filter(function(x){return x.key!==key});renderModels();toast("已删除模型 "+key,"ok")}};tbody.appendChild(tr)})}
 function addModel(){var nk="NEW",i=1;while(cfg.model_choices[nk])nk="NEW"+(i++);cfg.model_choices[nk]={name:"",mmproj:""};models.push({key:nk,name:"",mmproj:"",name_exists:false,mmproj_exists:false});renderModels();toast("已添加空模型行，请填写后保存","warn")}
@@ -545,6 +546,9 @@ function collectExtraConfig(){
       binarize: !!document.getElementById("cfgImgBinarize").checked,
       workers: parseInt(document.getElementById("cfgImgWorkers").value,10)||0
     };
+  }catch(e){/* element missing -> skip */}
+  try{
+    cfg.paddle_merge_lines = !!document.getElementById("cfgPaddleMergeLines").checked;
   }catch(e){/* element missing -> skip */}
   try{
     var ex=document.getElementById("cvtExclude").value.trim();
@@ -654,6 +658,44 @@ _CORRECT_URL_RE = re.compile(r"http://127\.0\.0\.1:(\d+)/")
 # 监控线程截获后存入 state["convert"]["prompt"]，浏览器弹窗选择后经
 # /api/convert/prompt 写回子进程 stdin。
 _PROMPT_MARKER = "__PTOE_PROMPT__"
+
+# 布尔型配置值的真值表（大小写不敏感）：与 mian.py _BOOL_TRUE_WORDS/_BOOL_FALSE_WORDS
+# 同表（GUI 与 CLI 的同名校验规则天然重复，与 engine/gui_display 的既有做法一致——
+# 两个入口各自校验，不跨模块 import 入口脚本）。
+_BOOL_TRUE_WORDS = ("true", "1", "on", "yes")
+_BOOL_FALSE_WORDS = ("false", "0", "off", "no")
+
+# paddle_merge_lines（PaddleOCR「多行合并成段落」开关）缺省值：config.json 里没有该键
+# 时（种子键尚未写回、或外部精简过的配置）一律按 True 处理。
+_PADDLE_MERGE_LINES_DEFAULT = True
+
+
+def _parse_bool_arg(value) -> bool | None:
+    """解析布尔型配置值：合法返回 True/False，非法返回 None。
+
+    接受 true/false、1/0、on/off、yes/no（大小写不敏感，允许首尾空白），
+    已有的 Python 布尔值直接透传（GUI 复选框 POST 上来就是 bool）。
+    """
+    if isinstance(value, bool):
+        return value
+    v = str(value).strip().lower()
+    if v in _BOOL_TRUE_WORDS:
+        return True
+    if v in _BOOL_FALSE_WORDS:
+        return False
+    return None
+
+
+def _paddle_merge_lines_value(cfg) -> bool:
+    """取配置里的 paddle_merge_lines；缺失/非法时回退 _PADDLE_MERGE_LINES_DEFAULT。"""
+    if not isinstance(cfg, dict):
+        return _PADDLE_MERGE_LINES_DEFAULT
+    raw = cfg.get("paddle_merge_lines")
+    if raw is None:
+        return _PADDLE_MERGE_LINES_DEFAULT
+    parsed = _parse_bool_arg(raw)
+    return _PADDLE_MERGE_LINES_DEFAULT if parsed is None else parsed
+
 
 # 仓库根目录：开发环境用 sys.executable 跑 mian.py 时定位脚本路径
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -1354,6 +1396,9 @@ class _GuiHandler(BaseHTTPRequestHandler):
             import configmanage
 
             cfg = configmanage.get_config(show_dialogs=False)
+            # paddle_merge_lines 缺省时按默认 True 下发，前端复选框才有确定初值
+            cfg = dict(cfg)
+            cfg["paddle_merge_lines"] = _paddle_merge_lines_value(cfg)
             models_dir = cfg.get("models_dir") or ""
             models = []
             for key, info in (cfg.get("model_choices") or {}).items():
@@ -1539,6 +1584,22 @@ class _GuiHandler(BaseHTTPRequestHandler):
             if gui_display not in ("pywebview", "browser"):
                 self._send(400, self._json({"ok": False, "error": "gui_display 仅支持 pywebview / browser"}))
                 return
+            if "paddle_merge_lines" in body:
+                # 布尔开关（PaddleOCR 多行合并成段落）：接受 bool 或同 mian.py 的
+                # true/false、1/0、on/off、yes/no 字符串，归一化成真正的布尔值再写盘
+                parsed = _parse_bool_arg(body.get("paddle_merge_lines"))
+                if parsed is None:
+                    self._send(
+                        400,
+                        self._json(
+                            {
+                                "ok": False,
+                                "error": "paddle_merge_lines 仅接受 true/false（也可写 1/0、on/off、yes/no）",
+                            }
+                        ),
+                    )
+                    return
+                body["paddle_merge_lines"] = parsed
             cfg.update(body)
             cfg = configmanage.validate_and_patch_config(cfg)
             with configmanage._CFG_LOCK:

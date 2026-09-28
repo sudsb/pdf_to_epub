@@ -99,13 +99,13 @@ def _atomic_write_json(path: str, obj: dict) -> None:
 # 弹出菜单（选中文字快捷菜单）可配置按钮候选池：(ui/app.js POPUP_ELIGIBLE_OPS 需与此保持同步)
 POPUP_ELIGIBLE_OPS = [
     "bold", "italic", "underline", "strike", "highlight", "charbox", "shade",
-    "sup", "sub", "heading", "p", "remove", "note",
+    "sup", "sub", "heading", "p", "remove", "note", "citation",
     "align_left", "align_center", "align_right", "centerbold",
     "flush", "indent", "merge",
     "marker_full", "marker_note", "marker_join", "marker_page",
     "paint",  # 格式刷（特殊按钮，非 OPS 项）
 ]
-POPUP_ROW1_DEFAULT = ["bold", "italic", "heading", "p", "note", "paint", "remove"]
+POPUP_ROW1_DEFAULT = ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"]
 POPUP_ROW2_DEFAULT = ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"]
 POPUP_RULE_COUNT_DEFAULT = 5
 POPUP_RULE_COUNT_MIN = 0
@@ -202,6 +202,11 @@ DEFAULT_CONFIG = {
     },
     # 推理引擎选择：'llama'（llama.cpp，默认）| 'vllm'（vLLM-Omni）| 'paddle'（PaddleOCR 本地推理）
     "engine": "llama",
+    # PaddleOCR「文本行合并成段落」开关（仅 engine=paddle 时生效）：
+    # true（默认）= 用 rec_boxes 坐标把同一段落的相邻文本行合并成一段（段落间仍用
+    # 换行分隔）；false = 保留逐行原样（每行一行）。关闭后在配置界面/GUI 复选框
+    # 或 `mian.py config set paddle_merge_lines false` 切换。
+    "paddle_merge_lines": True,
     # 校正/重识别引擎：'llama'（默认）| 'vllm'。与识别引擎 engine 键独立，用于矫正界面的深度校对与重识别
     "proofread_engine": "llama",
     # vLLM-Omni 可执行文件路径（如 "vllm" 或绝对路径）；空 = 仅连接模式
@@ -230,15 +235,71 @@ DEFAULT_CONFIG = {
     # 矫正界面鼠标手势绑定（op -> 手势字符串，如 "Middle+Up"）。与 shortcuts 同因
     # 持久化到 config.json（经 /api/mouse_shortcuts GET/POST 读写）。
     "mouse_shortcuts": {},
+    # 矫正界面自动保存（2026-09，经 /api/auto_save GET/POST 读写）：
+    # enabled 开关；interval_minutes 间隔分钟数（1-60）；new_backup=True 时
+    # 每次自动保存新建一个历史备份版本（走 /api/autosave，后台静默落盘）。
+    "auto_save": {
+        "enabled": True,
+        "interval_minutes": 5,
+        "new_backup": True,
+    },
     # 矫正界面格式规则（弹窗管理）：新模型每条 {id, name, mode(first|all), conditions:[{type, pattern, scope, formats}]}；
     # 旧模型 {id, name, formats, condition, else_formats} 读取时由 correctmanage._validate_format_rules 迁移
     "format_rules": [],
-    # 字体设置（2026-08）：正文/标题/注释/引用 独立字体，供 CSS 变量使用
+    # 替换规则（2026-09，矫正界面「替换规则管理」，经 /api/replace_rules 读写）：
+    # 列表，每项 {id, name, pattern, flags, keep_groups, replacement, builtin, enabled}。
+    # pattern 须能 re.compile；flags 仅支持 g/i/m/u（g=全局、i=忽略大小写、
+    # m=多行、u=unicode）；keep_groups 为要保留的捕获组序号（升序去重，组外内容
+    # 删除）；builtin=True 的内置规则在 UI 中不可删除。
+    "replace_rules": [
+        {
+            "id": "br1",
+            "name": "去括号保留内容",
+            "pattern": "[（(]([^（）()]*)[）)]",
+            "flags": "g",
+            "keep_groups": [1],
+            "replacement": "",
+            "builtin": True,
+            "enabled": True,
+        },
+        {
+            "id": "br2",
+            "name": "圈码去括号",
+            "pattern": "[〔\\[［【](\\d+)[〕\\]］】]",
+            "flags": "g",
+            "keep_groups": [1],
+            "replacement": "",
+            "builtin": True,
+            "enabled": True,
+        },
+        {
+            "id": "br3",
+            "name": "空括号删除",
+            "pattern": "([（(])\\s*([）)])",
+            "flags": "g",
+            "keep_groups": [],
+            "replacement": "",
+            "builtin": True,
+            "enabled": False,
+        },
+        {
+            "id": "br4",
+            "name": "连续标点压缩",
+            "pattern": "([，。！？；：、]{2,})",
+            "flags": "g",
+            "keep_groups": [],
+            "replacement": "，",
+            "builtin": True,
+            "enabled": False,
+        },
+    ],
+    # 字体设置（2026-08，2026-09 改下拉）：正文/标题/注释/引用 独立字体，供 CSS 变量使用；
+    # 默认空 = 不修改字体，使用阅读器默认（引用格式的内置默认宋体由 CSS fallback 兜底）
      "fonts": {
-        "body": "serif",
-        "heading": "sans-serif",
-        "note": "serif",
-        "citation": "cursive"
+        "body": "",
+        "heading": "",
+        "note": "",
+        "citation": ""
     },
     # 引用字体是否默认斜体（2026-08）
     "citationItalicEnabled": True,
@@ -820,3 +881,171 @@ def set_ui_settings(ui: dict) -> dict:
             with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
             return cfg
+
+
+_AUTO_SAVE_DEFAULTS = {"enabled": True, "interval_minutes": 5, "new_backup": True}
+
+
+def set_auto_save(cfg: dict) -> dict:
+    """设置矫正界面自动保存偏好（顶层键 auto_save）并持久化。
+
+    与 set_ui_settings 同构：锁内读配置、逐键校验、原子写回，返回新配置。
+    仅在确有变更时写盘（自动保存设置每次保存都会 POST，避免无谓磁盘写）。
+    线程安全。
+
+    校验：enabled/new_backup 必须为布尔；interval_minutes 必须为 1-60 的整数。
+    非法输入抛 ValueError（中文信息，HTTP 处理器转 400）。
+    """
+    if not isinstance(cfg, dict):
+        raise ValueError("auto_save 必须是对象")
+    clean = {}
+    if "enabled" in cfg:
+        v = cfg["enabled"]
+        if not isinstance(v, bool):
+            raise ValueError("enabled 必须是布尔值")
+        clean["enabled"] = v
+    if "interval_minutes" in cfg:
+        v = cfg["interval_minutes"]
+        if not isinstance(v, int) or isinstance(v, bool) or not (1 <= v <= 60):
+            raise ValueError("interval_minutes 必须是 1-60 的整数")
+        clean["interval_minutes"] = v
+    if "new_backup" in cfg:
+        v = cfg["new_backup"]
+        if not isinstance(v, bool):
+            raise ValueError("new_backup 必须是布尔值")
+        clean["new_backup"] = v
+    with _CFG_LOCK:
+        try:
+            if os.path.exists(_CONFIG_PATH):
+                with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                    stored = json.load(f)
+            else:
+                stored = DEFAULT_CONFIG.copy()
+            if not isinstance(stored.get("auto_save"), dict):
+                # Deep-copy nested auto_save to avoid mutating DEFAULT_CONFIG
+                stored["auto_save"] = dict(
+                    stored.get("auto_save") or _AUTO_SAVE_DEFAULTS
+                )
+            before = dict(stored["auto_save"])
+            stored["auto_save"].update(clean)
+            stored = validate_and_patch_config(stored)
+            if stored["auto_save"] != before:  # 无变更不写盘
+                _atomic_write_json(_CONFIG_PATH, stored)
+            return stored
+        except Exception as e:
+            print(f"[config] Error updating auto_save, fallback to default: {e}")
+            cfg = DEFAULT_CONFIG.copy()
+            if isinstance(cfg.get("auto_save"), dict):
+                cfg["auto_save"] = dict(cfg["auto_save"])
+            with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            return cfg
+
+
+# flags 支持集：g=全局、i=忽略大小写、m=多行、u=unicode（'s' 不支持，直接拒绝）
+_REPLACE_RULE_FLAGS = frozenset("gimu")
+_REPLACE_RULE_MAX = 100
+_REPLACE_RULE_NAME_MAX = 40
+_REPLACE_RULE_REPLACEMENT_MAX = 200
+
+
+def _validate_replace_rule(item) -> dict:
+    """单条替换规则校验 + 归一化，非法抛 ValueError（中文信息）。"""
+    if not isinstance(item, dict):
+        raise ValueError("每条替换规则必须是对象")
+    rid = item.get("id")
+    if not isinstance(rid, str) or not rid:
+        # 用户规则缺 id 时生成稳定 id（内置规则由 DEFAULT_CONFIG 提供固定 id）
+        import uuid
+
+        rid = "r" + uuid.uuid4().hex[:8]
+    name = item.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("规则名称（name）不能为空")
+    if len(name) > _REPLACE_RULE_NAME_MAX:
+        raise ValueError(f"规则名称过长（最多 {_REPLACE_RULE_NAME_MAX} 字符）")
+    pattern = item.get("pattern")
+    if not isinstance(pattern, str) or not pattern:
+        raise ValueError("正则表达式（pattern）不能为空")
+    import re
+
+    try:
+        re.compile(pattern)
+    except re.error as e:
+        raise ValueError(f"正则表达式无效：{e}") from e
+    flags = item.get("flags")
+    if flags is None:
+        flags = ""
+    if not isinstance(flags, str):
+        raise ValueError("flags 必须是字符串（g/i/m/u 组合）")
+    flags_norm = ""
+    for ch in flags.strip().lower():
+        if ch not in _REPLACE_RULE_FLAGS:
+            raise ValueError("flags 含不支持的修饰符（仅支持 g/i/m/u）")
+        if ch not in flags_norm:
+            flags_norm += ch
+    keep_groups = item.get("keep_groups")
+    if keep_groups is None:
+        keep_groups = []
+    if not isinstance(keep_groups, list) or not all(
+        isinstance(x, int) and not isinstance(x, bool) and x >= 0
+        for x in keep_groups
+    ):
+        raise ValueError("keep_groups 必须是非负整数数组")
+    keep = sorted(set(keep_groups))
+    replacement = item.get("replacement")
+    if replacement is None:
+        replacement = ""
+    if not isinstance(replacement, str):
+        raise ValueError("replacement 必须是字符串")
+    if len(replacement) > _REPLACE_RULE_REPLACEMENT_MAX:
+        raise ValueError(f"replacement 过长（最多 {_REPLACE_RULE_REPLACEMENT_MAX} 字符）")
+    builtin = item.get("builtin", False)
+    if not isinstance(builtin, bool):
+        raise ValueError("builtin 必须是布尔值")
+    enabled = item.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled 必须是布尔值")
+    return {
+        "id": rid,
+        "name": name.strip(),
+        "pattern": pattern,
+        "flags": flags_norm,
+        "keep_groups": keep,
+        "replacement": replacement,
+        "builtin": builtin,
+        "enabled": enabled,
+    }
+
+
+def set_replace_rules(rules: list) -> list:
+    """设置替换规则列表（顶层键 replace_rules）并持久化。
+
+    与 set_format_rules 同构：锁内读配置、逐条校验/归一化、原子写回，
+    仅在确有变更时写盘。返回归一化后的规则列表。
+    非法输入抛 ValueError（中文信息，HTTP 处理器转 400）。
+    """
+    if not isinstance(rules, list):
+        raise ValueError("replace_rules 必须是数组")
+    if len(rules) > _REPLACE_RULE_MAX:
+        raise ValueError(f"替换规则过多（上限 {_REPLACE_RULE_MAX} 条）")
+    clean = [_validate_replace_rule(r) for r in rules]
+    with _CFG_LOCK:
+        try:
+            if os.path.exists(_CONFIG_PATH):
+                with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            else:
+                cfg = DEFAULT_CONFIG.copy()
+            before = cfg.get("replace_rules")
+            cfg["replace_rules"] = clean
+            cfg = validate_and_patch_config(cfg)
+            if before != clean:  # 无变更不写盘
+                _atomic_write_json(_CONFIG_PATH, cfg)
+            return clean
+        except Exception as e:
+            print(f"[config] Error updating replace_rules, fallback to default: {e}")
+            cfg = DEFAULT_CONFIG.copy()
+            with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            return clean

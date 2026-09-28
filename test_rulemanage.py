@@ -27,6 +27,14 @@ from rulemanage import (
     op_group,
     ops_conflict,
     _is_dangerous,
+    normalize_char_style,
+    char_style_get,
+    CHAR_FONT_STACKS,
+    CHAR_STYLE_PROPS,
+    ALLOWED_SPAN_CLASSES,
+    INLINE_FORMAT_CLASSES,
+    _is_divider_block,
+    apply_block_format,
 )
 
 
@@ -374,6 +382,98 @@ class TestApplyRules(unittest.TestCase):
         new_html, err = apply_rules(html, rules, all_rules=True)
         self.assertIsNone(err)
         self.assertIn('class="ptoe-citation"', new_html)
+
+    def test_citation_partial_selection_inline(self):
+        """选区只覆盖段内部分字符：引用改为行内 span 包裹选中文字，
+        整段不加块级类，选区外前后缀保持原样（2026-09-22 修复）。"""
+        html = "<p>前缀引用内容后缀</p>"
+        rules = [{
+            "id": "r1",
+            "name": "引用部分选区",
+            "mode": "first",
+            "conditions": [{
+                "type": "contains",
+                "pattern": "",
+                "scope": "selection",
+                "formats": ["citation"],
+            }],
+        }]
+        # 全文 8 字："前缀引用内容后缀" → 选中 "引用内容"（偏移 2-6）
+        new_html, err = apply_rules(html, rules, all_rules=True, sel_start=2, sel_end=6)
+        self.assertIsNone(err)
+        self.assertEqual(
+            new_html,
+            '<p>前缀<span class="ptoe-citation">引用内容</span>后缀</p>',
+        )
+        # 无块级类（<p> 不带 class）；选区外前后缀均未被包裹
+        self.assertNotIn('<p class="ptoe-citation">', new_html)
+        self.assertEqual(new_html.count('<span class="ptoe-citation">'), 1)
+
+    def test_note_partial_selection_inline(self):
+        """注释同引用：选区只覆盖段内部分字符时行内 span 包裹，整段不加块级类。"""
+        html = "<p>前缀注释内容后缀</p>"
+        rules = [{
+            "id": "r1",
+            "name": "注释部分选区",
+            "mode": "first",
+            "conditions": [{
+                "type": "contains",
+                "pattern": "",
+                "scope": "selection",
+                "formats": ["note"],
+            }],
+        }]
+        # 选中 "注释内容"（偏移 2-6）
+        new_html, err = apply_rules(html, rules, all_rules=True, sel_start=2, sel_end=6)
+        self.assertIsNone(err)
+        self.assertEqual(
+            new_html,
+            '<p>前缀<span class="ptoe-note">注释内容</span>后缀</p>',
+        )
+        self.assertNotIn('<p class="ptoe-note">', new_html)
+
+    def test_citation_full_paragraph_selection_keeps_block_class(self):
+        """选区等于整段文字：保持块级类路径（<p class="ptoe-citation">），不产生行内 span。"""
+        html = "<p>整段引用</p>"
+        rules = [{
+            "id": "r1",
+            "name": "引用整段选区",
+            "mode": "first",
+            "conditions": [{
+                "type": "contains",
+                "pattern": "",
+                "scope": "selection",
+                "formats": ["citation"],
+            }],
+        }]
+        new_html, err = apply_rules(html, rules, all_rules=True, sel_start=0, sel_end=4)
+        self.assertIsNone(err)
+        self.assertEqual(new_html, '<p class="ptoe-citation">整段引用</p>')
+        self.assertNotIn('<span class="ptoe-citation">', new_html)
+
+    def test_citation_multi_block_partial_range_inline(self):
+        """选区从块1中部跨到块2中部：两个块都只在选中部分套行内 span，块级类都不加。"""
+        html = "<p>甲块内容</p><p>乙块内容</p>"
+        rules = [{
+            "id": "r1",
+            "name": "引用跨块部分选区",
+            "mode": "first",
+            "conditions": [{
+                "type": "contains",
+                "pattern": "",
+                "scope": "selection",
+                "formats": ["citation"],
+            }],
+        }]
+        # page_text = "甲块内容乙块内容"（8 字）→ 选中 [3,5) = 块1末字"容" + 块2首字"乙"
+        new_html, err = apply_rules(html, rules, all_rules=True, sel_start=3, sel_end=5)
+        self.assertIsNone(err)
+        self.assertIn('<span class="ptoe-citation">容</span>', new_html)
+        self.assertIn('<span class="ptoe-citation">乙</span>', new_html)
+        self.assertNotIn('<p class="ptoe-citation">', new_html)
+        # 选区外文本完整保留
+        self.assertIn('<p>甲块内', new_html)
+        self.assertIn('块内容</p>', new_html)
 
     def test_merge_blocks(self):
         html = "<p>第一段</p><p>第二段</p>"
@@ -1493,6 +1593,247 @@ class TestNewInlineFormats(unittest.TestCase):
         self.assertIn("underline", rule.conditions[0].formats)
         self.assertIn("bold", rule.conditions[0].formats)
         self.assertNotIn("fake_op", rule.conditions[0].formats)
+
+
+class TestCharStyleNormalize(unittest.TestCase):
+    """字符样式归一 normalize_char_style（2026-09-27）。"""
+
+    def test_canonical_order_and_no_trailing_semicolon(self):
+        """四属性按固定顺序输出，分隔符 ';' 且无尾分号。"""
+        raw = "color:#c00000;font-family:黑体, SimHei, sans-serif;font-size:20px;text-align:center"
+        self.assertEqual(
+            normalize_char_style(raw),
+            "text-align:center;font-size:20px;font-family:黑体, SimHei, sans-serif;color:#c00000",
+        )
+
+    def test_drops_unknown_and_dangerous_props(self):
+        """非白名单属性（含 position/top 等危险项）整条丢弃，不影响其余声明。"""
+        out = normalize_char_style(
+            "position:fixed;top:99px;left:0;font-size:20px;background:url(x);z-index:9999"
+        )
+        self.assertEqual(out, "font-size:20px")
+
+    def test_font_size_clamped_and_rounded(self):
+        """字号四舍五入到整数像素并钳制到 8..72。"""
+        self.assertEqual(normalize_char_style("font-size:5px"), "font-size:8px")
+        self.assertEqual(normalize_char_style("font-size:999px"), "font-size:72px")
+        self.assertEqual(normalize_char_style("font-size:20.4px"), "font-size:20px")
+        # 非 px 单位不接受
+        self.assertEqual(normalize_char_style("font-size:2em"), "")
+
+    def test_font_family_quoted_form_matches_stack(self):
+        """带引号/多空白的字体栈归一后命中白名单。"""
+        self.assertEqual(
+            normalize_char_style("font-family:\"黑体\",   SimHei, sans-serif"),
+            "font-family:黑体, SimHei, sans-serif",
+        )
+        # 不在白名单的字体栈被拒
+        self.assertEqual(normalize_char_style("font-family:Comic Sans, Papyrus"), "")
+
+    def test_all_ten_stacks_serialize_verbatim(self):
+        """10 项白名单字体栈逐项原样往返。"""
+        self.assertEqual(len(CHAR_FONT_STACKS), 10)
+        for stack in CHAR_FONT_STACKS:
+            self.assertEqual(normalize_char_style(f"font-family:{stack}"), f"font-family:{stack}")
+
+    def test_color_lowercases_hex_and_keeps_named(self):
+        """十六进制统一小写；颜色名原样透传（与 _COLOR_VALUE_RE 同形，刻意保留）。
+
+        3-8 位十六进制与 3-20 位颜色名均放行（与既有清洗链同形），
+        超出位数或非十六进制字符才整条丢弃。
+        """
+        self.assertEqual(normalize_char_style("color:#C00000"), "color:#c00000")
+        self.assertEqual(normalize_char_style("color:#abc"), "color:#abc")
+        self.assertEqual(normalize_char_style("color:#C00000FF"), "color:#c00000ff")
+        self.assertEqual(normalize_char_style("color:red"), "color:red")
+        # 非法颜色整条丢弃
+        self.assertEqual(normalize_char_style("color:#12"), "")
+        self.assertEqual(normalize_char_style("color:#1234567890"), "")
+        self.assertEqual(normalize_char_style("color:#xyzxyz"), "")
+        self.assertEqual(normalize_char_style("color:rgb(1,2,3)"), "")
+
+    def test_idempotent(self):
+        """幂等：normalize(normalize(x)) == normalize(x)。"""
+        raw = "position:fixed;font-size:20.6px;color:#ABC;font-family:楷体, KaiTi, serif;text-align:right"
+        once = normalize_char_style(raw)
+        self.assertEqual(normalize_char_style(once), once)
+        self.assertEqual(
+            once, "text-align:right;font-size:21px;font-family:楷体, KaiTi, serif;color:#abc"
+        )
+
+    def test_last_declaration_wins(self):
+        """同一属性重复出现后者覆盖前者，输出只留一条。"""
+        self.assertEqual(normalize_char_style("font-size:10px;font-size:30px"), "font-size:30px")
+
+    def test_empty_and_garbage_inputs(self):
+        """空串/无冒号/全非法 → 空串。"""
+        for raw in ("", "   ", "garbage;;:;x", "font-size", ";;;", "not-a-decl:1"):
+            self.assertEqual(normalize_char_style(raw), "", raw)
+
+    def test_char_style_get(self):
+        """char_style_get 取单条声明值；未知名/缺失返回 ''。"""
+        cs = "text-align:center;font-size:20px;color:#c00000"
+        self.assertEqual(char_style_get(cs, "font-size"), "20px")
+        self.assertEqual(char_style_get(cs, "color"), "#c00000")
+        self.assertEqual(char_style_get(cs, "font-family"), "")
+        self.assertEqual(char_style_get(cs, "position"), "")
+        self.assertEqual(char_style_get(cs, "BOGUS"), "")
+
+
+class TestCharStyleSanitizationAndRoundTrip(unittest.TestCase):
+    """span style 经解析/序列化/清洗的往返与白名单（2026-09-27）。"""
+
+    def test_parse_serialize_preserves_style(self):
+        """解析/序列化往返保留规范化后的 style。"""
+        html = '<p>a<span style="font-size:20px;color:#C00000">b</span>c</p>'
+        out = serialize_html(parse_html(html))
+        self.assertIn('style="font-size:20px;color:#c00000"', out)
+
+    def test_dangerous_props_dropped_in_pipeline(self):
+        """position 等危险属性在往返中被剥除，仅留白名单声明。"""
+        html = '<p>a<span style="position:fixed;font-size:14px">b</span>c</p>'
+        out = serialize_html(parse_html(html))
+        self.assertIn('style="font-size:14px"', out)
+        self.assertNotIn("position", out)
+
+    def test_bold_italic_style_combined(self):
+        """加粗/斜体类与字符样式共存，互不覆盖。"""
+        html = (
+            '<p>a<span class="ptoe-underline" style="font-size:16px">b</span>c</p>'
+        )
+        out = serialize_html(parse_html(html))
+        self.assertIn('class="ptoe-underline"', out)
+        self.assertIn('style="font-size:16px"', out)
+
+    def test_no_style_attribute_when_all_props_rejected(self):
+        """全部声明非法时不输出 style 属性（不留空 style=""）。"""
+        html = '<p>a<span style="position:fixed;top:0">b</span>c</p>'
+        out = serialize_html(parse_html(html))
+        self.assertNotIn("style=", out)
+
+    def test_style_round_trip_idempotent_through_parser(self):
+        """二次往返字节稳定（归一串可被再次解析为同串）。"""
+        html = '<p>x<span style="COLOR:#ABC;Font-Size:20px">y</span>z</p>'
+        once = serialize_html(parse_html(html))
+        twice = serialize_html(parse_html(once))
+        self.assertEqual(once, twice)
+
+    def test_allowed_span_classes_cover_all_inline_format_classes(self):
+        """类漂移守卫：8 项行内格式类必须全在 span 白名单内。"""
+        for cls in INLINE_FORMAT_CLASSES:
+            self.assertIn(cls, ALLOWED_SPAN_CLASSES, f"{cls} 未进 span 白名单")
+
+    def test_unknown_span_class_still_dropped(self):
+        """未知 class 仍被剥除（白名单未被放宽成全放行）。"""
+        html = '<p>a<span class="ptoe-underline evil-class">b</span>c</p>'
+        out = serialize_html(parse_html(html))
+        self.assertIn('class="ptoe-underline"', out)
+        self.assertNotIn("evil-class", out)
+
+
+class TestDividerBlockProtection(unittest.TestCase):
+    """分隔线段落（ptoe-divider）在规则引擎中的保护（2026-09-27）。"""
+
+    def _html(self, suffix="solid", glyph="────────"):
+        return (
+            f'<p>甲段落</p><p class="ptoe-divider ptoe-divider-{suffix}">{glyph}</p>'
+            "<p>丙段落</p>"
+        )
+
+    def _apply(self, html, needle, op, end_needle=None):
+        """按「文本内容」定位区间：end_needle 给定时取其**末尾**偏移。
+
+        注意：原样 HTML 的块间没有 \\n，分隔线自身的字形也参与纯文本偏移，
+        故 end 必须用 end_needle 的结尾位置，不能用 start+len(needle)。
+        """
+        root = parse_html(html)
+        text = collect_text_nodes(root)[0]
+        start = text.index(needle)
+        end = (
+            text.index(end_needle) + len(end_needle)
+            if end_needle
+            else start + len(needle)
+        )
+        ok = apply_block_format(root, collect_text_nodes(root)[1], start, end, op)
+        return ok, serialize_html(root)
+
+    def test_is_divider_block_detects_base_and_suffix(self):
+        """基类与任一后缀都判为分隔线（startswith 前缀，避免后缀漏判）。"""
+        for cls in (
+            "ptoe-divider",
+            "ptoe-divider-solid",
+            "ptoe-divider-dashed",
+            "ptoe-divider-dotted",
+            "ptoe-divider-double",
+            "ptoe-divider-wavy",
+        ):
+            root = parse_html(f'<p class="{cls}">X</p>')
+            el = root.children[0]
+            self.assertTrue(_is_divider_block(el), cls)
+
+    def test_is_divider_block_false_for_normal_paragraphs(self):
+        """普通段落/其它 class 不误判为分隔线。"""
+        for cls in ("", "ptoe-note", "ptoe-align-center", "ptoe-note ptoe-dividerless"):
+            root = parse_html(f'<p class="{cls}">X</p>')
+            self.assertFalse(_is_divider_block(root.children[0]), cls)
+        self.assertFalse(_is_divider_block(None))
+
+    def test_divider_classes_survive_round_trip(self):
+        """解析/序列化保留基类 + 后缀两个 class。"""
+        for suffix in ("solid", "dashed", "dotted", "double"):
+            html = f'<p class="ptoe-divider ptoe-divider-{suffix}">X</p>'
+            out = serialize_html(parse_html(html))
+            self.assertIn(f'class="ptoe-divider ptoe-divider-{suffix}"', out)
+
+    def test_block_format_refused_when_selection_starts_on_divider(self):
+        """选区起点是分隔线 → 一律拒绝块级格式，HTML 字节不变。"""
+        html = self._html()
+        for op in ("heading1", "align_center", "note", "merge", "flush", "indent"):
+            ok, out = self._apply(html, "────────", op)
+            self.assertFalse(ok, op)
+            self.assertEqual(out, html, op)
+
+    def test_merge_across_divider_refused(self):
+        """选区跨分隔线 → 拒绝合并（不吞线、不跨线拼正文）。"""
+        html = self._html()
+        ok, out = self._apply(html, "甲段落", "merge", "丙段落")
+        self.assertFalse(ok)
+        self.assertEqual(out, html)
+
+    def test_merge_with_adjacent_divider_refused(self):
+        """选区仅一个块、紧邻兄弟是分隔线 → 拒绝合并。"""
+        html = self._html()
+        ok, out = self._apply(html, "甲段落", "merge")
+        self.assertFalse(ok)
+        self.assertEqual(out, html)
+
+    def test_merge_stops_before_divider(self):
+        """合并在分隔线前收敛：线前两段合并，线后段落与线本身不动。"""
+        html = "<p>甲</p><p>乙</p><p class=\"ptoe-divider ptoe-divider-double\">X</p>"
+        ok, out = self._apply(html, "甲", "merge", "乙")
+        self.assertTrue(ok)
+        self.assertEqual(out, '<p>甲 乙</p><p class="ptoe-divider ptoe-divider-double">X</p>')
+
+    def test_merge_normal_paragraphs_regression(self):
+        """无分隔线时合并行为不变（回归）。"""
+        ok, out = self._apply("<p>甲</p><p>乙</p>", "甲", "merge", "乙")
+        self.assertTrue(ok)
+        self.assertEqual(out, "<p>甲 乙</p>")
+
+    def test_cross_block_format_excludes_middle_divider(self):
+        """跨块格式化跳过区间内的分隔线，其余块照常生效。"""
+        html = '<p>甲</p><p class="ptoe-divider ptoe-divider-dashed">X</p><p>丙</p>'
+        ok, out = self._apply(html, "甲", "heading1", "丙")
+        self.assertTrue(ok)
+        self.assertIn('<h1>甲</h1>', out)
+        self.assertIn('<h1>丙</h1>', out)
+        self.assertIn('<p class="ptoe-divider ptoe-divider-dashed">X</p>', out)
+
+    def test_normal_paragraph_format_regression(self):
+        """普通段落仍可被格式化（回归）。"""
+        ok, out = self._apply("<p>甲</p><p>乙</p>", "乙", "heading1")
+        self.assertTrue(ok)
+        self.assertEqual(out, "<p>甲</p><h1>乙</h1>")
 
 
 if __name__ == "__main__":

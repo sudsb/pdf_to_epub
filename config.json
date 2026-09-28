@@ -270,10 +270,10 @@
     }
   ],
   "fonts": {
-    "body": "serif",
-    "heading": "sans-serif",
-    "note": "serif",
-    "citation": "cursive"
+    "body": "",
+    "heading": "",
+    "note": "",
+    "citation": ""
   },
   "image_preprocess": {
     "enabled": true,
@@ -301,6 +301,7 @@
       "heading",
       "p",
       "note",
+      "citation",
       "paint",
       "remove"
     ],
@@ -316,5 +317,23 @@
     ]
   },
   "proofread_engine": "llama",
-  "mouse_shortcuts": {}
+  "mouse_shortcuts": {},
+  "replace_rules": [
+    {
+      "id": "r6b25222a",
+      "name": "坏正则",
+      "pattern": "[（(]([^（）()]*)[）)]",
+      "flags": "g",
+      "keep_groups": [],
+      "replacement": "",
+      "builtin": false,
+      "enabled": true
+    }
+  ],
+  "auto_save": {
+    "enabled": true,
+    "interval_minutes": 5,
+    "new_backup": true
+  },
+  "paddle_merge_lines": true
 }

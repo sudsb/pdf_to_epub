@@ -29,6 +29,11 @@ _MARKUP_RE = re.compile(
     flags=re.I,
 )
 
+# 表格外层标签（2026-09-27）：_render_fragment 把整表当**原子块**原样透传，
+# 只认这一对外层标签，内部结构标签（thead/tbody/tfoot/tr/td/th）保持透明。
+# 合成新开标签的正则一律不含 table——表格的 class/缩进属性属于单元格而非表格本身。
+_TABLE_TAG_RE = re.compile(r"</?table\b[^>]*>", flags=re.I)
+
 # 块级保留 class：注释（ptoe-note）+ 对齐类（ptoe-align-*）+ 换页（ptoe-page-break）
 _NOTE_CLASS = "ptoe-note"
 _ALIGN_CLASSES = ("ptoe-align-left", "ptoe-align-center", "ptoe-align-right")
@@ -44,6 +49,10 @@ _IMG_CLASSES = ("ptoe-img-full", "ptoe-img-fit", "ptoe-img-inline",
                 "ptoe-img-vtop", "ptoe-img-vmid", "ptoe-img-vbot")
 # 手动段落格式类：顶格和缩进、引文
 _FORMAT_CLASSES = ("ptoe-flush", "ptoe-indent", "ptoe-citation")
+# 可插入的分隔线 class 前缀（2026-09-27）：基类 ptoe-divider + 样式后缀
+# ptoe-divider-solid/dashed/dotted/double 两个类都要保留，故用 startswith 前缀判定
+# （若按精确成员判断，后缀类会被剥掉，导出后线型退回默认）
+_DIVIDER_CLASS_PREFIX = "ptoe-divider"
 
 # ---------------------------------------------------------------------------
 # 段落缩进/间距 data 属性 → 导出内联样式（2026-08-23）
@@ -119,27 +128,74 @@ def _strip_ws_text(s: str) -> str:
     return _WS_RUN_RE.sub(_sub, s)
 
 
+_TABLE_SPAN_RE = re.compile(r"<table\b[^>]*>.*?</table\s*>", flags=re.I | re.S)
+_TABLE_OPEN_RE = re.compile(r"<table\b[^>]*>", flags=re.I)
+
+
+def _table_spans(text: str) -> List[Tuple[int, int]]:
+    """返回 text 中所有表格的 (起, 止) 区间；未闭合的表格一直算到文末。"""
+    spans = [m.span() for m in _TABLE_SPAN_RE.finditer(text)]
+    for m in _TABLE_OPEN_RE.finditer(text):
+        if not any(s <= m.start() < e for s, e in spans):
+            spans.append((m.start(), len(text)))
+    return spans
+
+
+def _split_outside_tables(text: str, pattern: re.Pattern) -> List[str]:
+    """按 pattern 的位置前瞻切分 text，但**跳过表格区域内的匹配点**。
+
+    单元格里的 <h1>（外来 EPUB 的排版表格很常见）不是文章标题：按它切分会造出
+    伪章节 + 伪目录项。与 _render_fragment 的表格原子处理对齐（2026-09-27）。
+    """
+    spans = _table_spans(text)
+    cuts = [
+        m.start()
+        for m in pattern.finditer(text)
+        if not any(s <= m.start() < e for s, e in spans)
+    ]
+    parts: List[str] = []
+    prev = 0
+    for c in cuts:
+        parts.append(text[prev:c])
+        prev = c
+    parts.append(text[prev:])
+    return [p for p in parts if p.strip()]
+
+
 def _split_at_block_boundary(text: str, limit: int) -> List[str]:
-    """把超长章节文本按块边界（</p>/</h1-6> 之后）切成 ≤limit 的片段。
+    """把超长章节文本按块边界（</p>/</h1-6>/</table> 之后）切成 ≤limit 的片段。
 
     旧实现按任意字符偏移硬切，会把 HTML 标签拦腰截断 → 输出非法 XHTML，
     阅读器解析失败 → 目录点击跳转到该文件失效。无块边界可切时才退回硬切。
+    </table> 于 2026-09-27 补入：表格可远大于 limit（宽表/长表），若不在
+    </table> 处切，兜底硬切会把表格拦腰截断 → 表格结构碎裂 + 非法 XHTML。
     """
     if len(text) <= limit:
         return [text]
     chunks: List[str] = []
     start = 0
     n = len(text)
+    spans = _table_spans(text)  # 表格整体不可拆（见下方越界延后逻辑）
     while start < n:
         if n - start <= limit:
             chunks.append(text[start:])
             break
         seg = text[start : start + limit]
-        cut = max(seg.rfind("</p>"), *(seg.rfind(f"</h{i}>") for i in range(1, 7)))
+        cands = [(seg.rfind("</p>"), "</p>"), (seg.rfind("</table>"), "</table>")]
+        cands += [(seg.rfind(f"</h{i}>"), f"</h{i}>") for i in range(1, 7)]
+        cut, cut_tag = max(cands, key=lambda c: c[0])
         if cut <= 0:
             end = start + limit  # 无块边界：退回硬切（与旧行为一致）
         else:
-            end = start + cut + len("</p>")
+            end = start + cut + len(cut_tag)
+        # 切点落在表格内部（宽表/长表整体大于 limit，窗口内够不到 </table>）：
+        # 延到该表 </table> 之后。拦腰截断表格会产出非法 XHTML（每页一个
+        # 残缺 <table>）；limit 是软上限（见 render_content_pages 文档），
+        # 允许单块超限以换取表格完整。
+        for s, e in spans:
+            if s < end < e:
+                end = e
+                break
         chunks.append(text[start:end])
         start = end
     return chunks
@@ -167,7 +223,7 @@ def _self_close_img(html: str) -> str:
 
 
 def _block_class_html(attrs: str) -> str:
-    """从块标签属性中提取应保留的 class（ptoe-note, ptoe-note-label + 对齐类 + 换页 + 图片模式 + 手动格式类），返回 class 属性。"""
+    """从块标签属性中提取应保留的 class（ptoe-note, ptoe-note-label + 对齐类 + 换页 + 图片模式 + 手动格式类 + 分隔线），返回 class 属性。"""
     m = re.search(r'class="([^"]*)"', attrs)
     if not m:
         return ""
@@ -175,6 +231,8 @@ def _block_class_html(attrs: str) -> str:
         c
         for c in m.group(1).split()
         if c == _NOTE_CLASS or c == _NOTE_LABEL_CLASS or c in _ALIGN_CLASSES or c == _PAGE_BREAK_CLASS or c in _IMG_CLASSES or c in _FORMAT_CLASSES
+        # 分隔线（2026-09-27）：基类与样式后缀类同放（startswith 前缀判定）
+        or c.startswith(_DIVIDER_CLASS_PREFIX)
     ]
     return f' class="{" ".join(keep)}"' if keep else ""
 
@@ -194,8 +252,11 @@ _BOLD_NOTE_RE = re.compile(
 _NOTE_REPLACEMENT = "注释\uFF1A"
 
 # 给包含替换结果的最近块级祖先（p/h1-h6/div）注入 ptoe-note-label class
-# 正则：从匹配位置向前找最近的未闭合 <p...>/<hN...>/<div...> 开标签
-_BLOCK_OPEN_RE = re.compile(r'<(p|h[1-6]|div)\b[^>]*>', flags=re.IGNORECASE)
+# 正则：从匹配位置向前找最近的未闭合 <p...>/<hN...>/<div...> 开标签。
+# table 于 2026-09-27 加入：单元格里的「注释：」若越过表格去找祖先，会把
+# ptoe-note-label 挂到**表格之前的那个无关段落**上（该段落凭空失去首行缩进）。
+# 认 table 作硬边界后，最近祖先落在表格上，而表格本身不是可注入的块 → 跳过。
+_BLOCK_OPEN_RE = re.compile(r'<(p|h[1-6]|div|table)\b[^>]*>', flags=re.IGNORECASE)
 
 # 纯文本「注释」独立成段（无加粗标签，如 <p>注释：</p>）：整段内容仅为
 # 注释/注释：（允许首尾空白、<br/>、&nbsp;），给该块注入 ptoe-note-label 顶格显示，
@@ -269,6 +330,11 @@ def transform_note_labels(html: str) -> str:
         block_start = block_match.start()
         block_end = block_match.end()
         block_tag = block_match.group(1).lower()
+
+        # 最近块级祖先是表格：标签在单元格内，没有可顶格的段落祖先，
+        # 也不能把 ptoe-note-label 挂到表格上（否则整表被当注释块）→ 跳过。
+        if block_tag == "table":
+            continue
 
         # 避免重复处理同一个块级标签
         if block_start in processed_block_positions:
@@ -383,14 +449,25 @@ class CSSManager:
         nav.toc p, .cover p {
           text-indent: 0;
         }
+        /* 2026-09-24 起对齐类同时承载块级（p/h 整段对齐）与行内（span 句中/词上
+           独立对齐）两种语义：text-align 只对块级元素生效，span 需 display:block
+           才能渲染对齐；p/h 本来就是块，此声明对它们无害。 */
         .ptoe-align-center {
+          display: block;
           text-align: center;
         }
         .ptoe-align-left {
+          display: block;
           text-align: left;
         }
         .ptoe-align-right {
+          display: block;
           text-align: right;
+        }
+        /* 表格单元格上的对齐类保持 table-cell（display:block 会破坏表格布局） */
+        td.ptoe-align-left, td.ptoe-align-center, td.ptoe-align-right,
+        th.ptoe-align-left, th.ptoe-align-center, th.ptoe-align-right {
+          display: table-cell;
         }
         /* 对齐段落取消首行缩进（2026-08-15）：p 默认 text-indent 1.5em 会让
            居中/居右段落首行偏移，与矫正界面（无缩进）显示不一致 */
@@ -404,9 +481,12 @@ class CSSManager:
         p.ptoe-indent {
           text-indent: 2em;
         }
-        /* 引文格式：斜体显示 */
+        /* 引文格式：斜体 + 独立字体（默认宋体；矫正界面可配置引用字体）
+           2026-09-22 修复：EPUB 导出遵循 citationItalicEnabled 设置
+           （此前此处硬编码 italic，矫正界面关掉「启用引用斜体」后导出仍斜体） */
         .ptoe-citation {
-          font-style: italic;
+          font-style: {citation_font_style};
+          font-family: "宋体", SimSun, serif;
         }
         /* 新增行内格式（2026-09）：下划线/下加点/删除线/字符边框/底纹/突显/上标/下标 */
         .ptoe-underline {
@@ -448,6 +528,32 @@ class CSSManager:
           padding: 0;
           height: 0;
           overflow: hidden;
+        }
+        /* 可插入的分隔线（2026-09-27）：字形行居中 + 弱化色 + 四种线型区分。
+           标记形态为非空段落（8 个盒绘字符），空段会被清洗链路删除。
+           注意：CSS 会被内联进 XHTML 的 style 元素——注释里出现字面尖括号会被
+           当成标签导致整个文件非法，此处注释不含尖括号。 */
+        .ptoe-divider {
+          text-align: center;
+          text-indent: 0;
+          margin: 0.6em 0;
+          color: #999999;
+          white-space: nowrap;
+          overflow: hidden;
+        }
+        .ptoe-divider-solid {
+          letter-spacing: 0;
+          font-weight: normal;
+        }
+        .ptoe-divider-dashed {
+          letter-spacing: 0.12em;
+        }
+        .ptoe-divider-dotted {
+          letter-spacing: 0.12em;
+        }
+        .ptoe-divider-double {
+          letter-spacing: 0.05em;
+          font-weight: bold;
         }
         img {
           display: block;
@@ -559,7 +665,18 @@ class CSSManager:
         
 """
         # perform placeholder substitution for font family and line height
-        return css.replace('{font_family}', self.font_family).replace('{line_height}', str(self.line_height))
+        # 2026-09-22 修复：EPUB 导出遵循 citationItalicEnabled 设置——懒读配置
+        # （show_dialogs=False 保证 headless/测试不弹 tkinter 对话框），
+        # 缺键回退 True → italic（与既有默认行为逐字节一致）。
+        from configmanage import get_config
+
+        cfg = get_config(show_dialogs=False) or {}
+        citation_font_style = "italic" if cfg.get("citationItalicEnabled", True) else "normal"
+        return (
+            css.replace('{font_family}', self.font_family)
+            .replace('{line_height}', str(self.line_height))
+            .replace('{citation_font_style}', citation_font_style)
+        )
     def inject_styles(self, html_content: str, inline: bool = True) -> str:
         """If inline is True, inject a minimal style into the head of the document.
         Otherwise return original content unchanged (expect external style link).
@@ -695,20 +812,39 @@ class HTMLConverter:
     def render_toc_page(self, toc_items: List[Dict[str, Any]]) -> str:
         """Generate a nav.xhtml-like page (HTML5) for table of contents.
         toc_items: list of {'title': str, 'href': str, 'level': int}。
-        目录一律平铺为一级列表（2026-08-23 用户要求）：OCR 的 bbox title→<h2>
-        等杂讯标题曾把章节标题嵌成其他标题的二级条目，层级信息不可靠。
+        目录按标题层级渲染为树状：h1 顶层（<ol>），h2 及以下逐级嵌套在
+        其上级标题之下（2026-09-24 用户要求，替代此前的一律平铺一级列表——
+        手动矫正已能稳定产出 h1-h6，层级信息可靠）。层级缺失/非法按 1 处理；
+        首条目非 h1（无一级标题）时直接置于顶层。
         序号以文本显式输出（<span class="toc-num">N.</span>），不依赖阅读器
         list-style marker 渲染——多位数字（>9）在部分阅读器中被截断/数字叠加（2026-08）。
+        每级列表独立计数：新开一级从 1 重计（如第一章之下 1. 2. 小节）。
         """
         out: List[str] = []
-        counters = 0  # 平铺一级列表统一计数
+        # 已打开的嵌套列表层级（open_levels[-1] 为当前最内层）与各层当前计数
+        open_levels: List[int] = []
+        counters: List[int] = []
         for it in toc_items:
             t = self._escape_text(it.get('title', ''))
             href = self._escape_text(it.get('href', '#'))
-            counters += 1
-            out.append(f'<li><a href="{href}"><span class="toc-num">{counters}.</span>{t}</a></li>')
-        if out:
-            out.insert(0, '<ol>')
+            try:
+                level = max(1, int(it.get('level') or 1))
+            except (TypeError, ValueError):
+                level = 1
+            # 收尾：退到新条目所在层级（同级条目共用同一列表，计数延续）
+            while open_levels and open_levels[-1] > level:
+                open_levels.pop()
+                counters.pop()
+                out.append('</ol>')
+            # 开新嵌套列表（进入下一级标题）
+            if not open_levels or open_levels[-1] < level:
+                open_levels.append(level)
+                counters.append(0)
+                out.append('<ol>')
+            counters[-1] += 1
+            out.append(f'<li><a href="{href}"><span class="toc-num">{counters[-1]}.</span>{t}</a></li>')
+        while open_levels:
+            open_levels.pop()
             out.append('</ol>')
         # EPUB 3.3 §11 导航文档规范：目录 <nav> 必须带 epub:type="toc"，
         # 且 <html> 需声明 xmlns:epub 命名空间——否则严格阅读器（Apple Books、
@@ -766,6 +902,14 @@ class HTMLConverter:
         hcount = 0  # 标题锚点计数（每片段内 h1..hN）
         heading: Optional[Tuple[int, List[str]]] = None  # 当前标题 (级别, 文本缓冲)
         strip_ws = True  # 当前块是否清理文本空白符（居右段落与注释标签段豁免）
+        # 表格原子缓冲（2026-09-27）：in_table 为真时 token 原样累加进 table_buf，
+        # 期间不合成包裹、不做空白符清理、不动 hcount/toc_out/open_tag/strip_ws。
+        # 与 correctmanage.apply_markers 同源缺陷：<table> 不在本循环的块标签集合里
+        # （:866 只认 p|h1-6）时，其 token 累积进 cur 后会被后面的 <p> 认领
+        # （`if kind:` 为假 → 不 flush），或被 EOF 的 `kind or 'p'` 包成
+        # <p><table>…</table></p>——既是非法嵌套，又把表格后面的真段落一起吞掉。
+        in_table = False
+        table_buf: List[str] = []
 
         def _flush_block() -> None:
             nonlocal cur, kind, open_tag, heading
@@ -783,6 +927,27 @@ class HTMLConverter:
 
         for tok in re.split(r"(<[^>]+>)", text):
             if not tok:
+                continue
+            # 表格：整表收进 table_buf，闭合即整块入列——不走 _flush_block
+            # （那会合成 <p> 包裹，并把段落属性 style/class 误挂到表格上）
+            if _TABLE_TAG_RE.fullmatch(tok):
+                if tok.startswith("</"):
+                    in_table = False
+                    table_buf.append(tok)  # 闭合标签本身也要进缓冲，否则表格丢 </table>
+                    blocks.append("".join(table_buf))
+                    table_buf = []
+                else:
+                    if kind:
+                        _flush_block()
+                    in_table = True
+                    table_buf = [tok]
+                continue
+            if in_table:
+                # 表内 token（含结构标签与文本）原样累加：空白符是单元格内容的
+                # 一部分，不能过 _strip_ws_text，否则首尾空格/连续空格被吃掉。
+                # 也不走下面的 data-ptoe-marker 兜底（标记已由 apply_markers 消费，
+                # 删 token 会破坏表格结构），更不进块标签分支 → 无包裹/无 id/无 TOC。
+                table_buf.append(tok)
                 continue
             # 防御：标记 span 已由 apply_markers 提取，此处兜底剔除
             if "data-ptoe-marker" in tok:
@@ -828,6 +993,11 @@ class HTMLConverter:
             cur.append(tok)
             if heading is not None:
                 heading[1].append(tok)
+        if in_table:
+            # 未闭合的表格（外部脏数据）：整段原样收尾。表后残余 token 都已在
+            # table_buf 内，不合成 <p> 包裹，保守保持为一个整块。
+            blocks.append("".join(table_buf))
+            table_buf = []
         if kind or cur:
             if kind is None:
                 kind = 'p'
@@ -959,11 +1129,14 @@ class HTMLConverter:
         def split_h1_chapters(text: str, fallback_title: str) -> List[Dict[str, str]]:
             """正文含 <h1> 时按一级标题切分为多篇文章（每篇 = 一个 EPUB 内容页，新页开始）。
             merged 与 articles 分支共用（2026-08）：标题取首个 h1 内文（剥标签/unescape/压空白，
-            空回退 fallback_title），首个 h1 前的序言块沿用 fallback_title；无 <h1 单篇原样返回。"""
+            空回退 fallback_title），首个 h1 前的序言块沿用 fallback_title；无 <h1 单篇原样返回。
+            切分点只认表格**外**的 <h1>（2026-09-27）——单元格里的 h1 是表格排版，
+            不是章节标题，按它切会造出伪章节/伪目录项。"""
             if '<h1' not in text:
                 return [{'title': fallback_title, 'text': text}]
             out = []
-            for chunk in (c for c in re.split(r'(?=<h1(?:\s|>))', text) if c.strip()):
+            chunks = _split_outside_tables(text, re.compile(r'<h1(?:\s|>)', re.I))
+            for chunk in chunks:
                 m = re.search(r'<h1[^>]*>(.*?)</h1>', chunk, flags=re.S)
                 if m:
                     ch_title = html.unescape(re.sub(r'<[^>]+>', '', m.group(1))).strip()

@@ -709,5 +709,101 @@ class TestGuiPrompt(unittest.TestCase):
         self.assertEqual(mode, "restart")
 
 
+class TestConfigSetPaddleMergeLines(unittest.TestCase):
+    """mian.py `config set paddle_merge_lines`：白名单 + 布尔解析 + 中文错误（2026-09-28）。
+
+    隔离：monkeypatch configmanage._CONFIG_PATH 到临时文件（严禁写真实 config.json），
+    且 llama_server / models_dir 指向真实存在的临时路径——`config` 分支走
+    get_config()（show_dialogs=True），路径不存在会弹 tkinter 对话框卡住测试。
+    """
+
+    def setUp(self):
+        import configmanage
+
+        self._tmp = Path(tempfile.mkdtemp(prefix="test_mian_cfg_"))
+        self._exe = self._tmp / "llama-server.exe"
+        self._exe.write_bytes(b"stub")
+        self._cfg_path = self._tmp / "config.json"
+        base = configmanage.validate_and_patch_config(
+            {
+                "llama_server": str(self._exe),
+                "models_dir": str(self._tmp),
+                "engine": "llama",
+                "selected_model": "HY",
+                "model_choices": {"HY": {"name": "H.gguf", "mmproj": "H.mmproj"}},
+            }
+        )
+        self._cfg_path.write_text(
+            json.dumps(base, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        self._orig_cfg_path = configmanage._CONFIG_PATH
+        configmanage._CONFIG_PATH = str(self._cfg_path)
+
+    def tearDown(self):
+        import configmanage
+
+        configmanage._CONFIG_PATH = self._orig_cfg_path
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _stored(self):
+        """读回临时 config.json 里的 paddle_merge_lines 原始值（真实落盘副作用）。"""
+        return json.loads(self._cfg_path.read_text(encoding="utf-8")).get(
+            "paddle_merge_lines"
+        )
+
+    def _run(self, argv):
+        import contextlib
+        import io
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = mian.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_set_accepts_bool_words_and_stores_real_bool(self):
+        """合法值（true/0/YES/off）→ 退出 0 且 config.json 里存的是真正的布尔值。"""
+        for raw, expect in (("true", True), ("0", False), ("YES", True), ("off", False)):
+            rc, out, err = self._run(["config", "set", "paddle_merge_lines", raw])
+            self.assertEqual(rc, 0, f"值 {raw!r} 应被接受: {err}")
+            stored = self._stored()
+            self.assertIs(
+                stored, expect, f"值 {raw!r} 应落盘为 {expect}，实际 {stored!r}"
+            )
+
+    def test_set_invalid_value_reports_chinese_error_and_does_not_write(self):
+        """非法值 → stderr 中文提示 + 退出 1，且 config.json 一字未改。
+
+        setUp 已用 validate_and_patch_config 铺好完整配置，故后续 get_config()
+        不会因「回填缺省键」而重写文件，整份比对成立。
+        """
+        before = self._cfg_path.read_text(encoding="utf-8")
+        rc, _out, err = self._run(["config", "set", "paddle_merge_lines", "maybe"])
+        self.assertEqual(rc, 1)
+        self.assertIn("paddle_merge_lines 仅接受 true/false", err)
+        self.assertEqual(
+            self._cfg_path.read_text(encoding="utf-8"), before, "非法值不得写盘"
+        )
+
+    def test_paddle_merge_lines_reads_config_and_defaults_true(self):
+        """_paddle_merge_lines()：读盘里的值；键缺失/非法值 → 回退默认 True。
+
+        （`config show` 早已从 argparse 子命令里移除，主流程走不到打印分支，
+        故直接验证打印所用的取值函数本身。）
+        """
+        import configmanage
+
+        rc, _out, err = self._run(["config", "set", "paddle_merge_lines", "false"])
+        self.assertEqual(rc, 0, err)
+        self.assertIs(mian._paddle_merge_lines(), False, "应读到刚写入的 False")
+        with mock.patch.object(configmanage, "get_config", return_value={}):
+            self.assertIs(mian._paddle_merge_lines(), True, "键缺失应回退 True")
+        with mock.patch.object(
+            configmanage, "get_config", return_value={"paddle_merge_lines": "maybe"}
+        ):
+            self.assertIs(mian._paddle_merge_lines(), True, "非法值应回退 True")
+        self.assertIs(mian._parse_bool_arg(" On "), True)
+        self.assertIsNone(mian._parse_bool_arg("2"))
+
+
 if __name__ == "__main__":
     unittest.main()

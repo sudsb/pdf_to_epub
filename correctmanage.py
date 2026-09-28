@@ -160,16 +160,93 @@ _STYLE_TO_INLINE_CLASS = (
 _COLOR_VALUE_RE = re.compile(r"^#[0-9a-fA-F]{3,8}$|^[a-zA-Z]{3,20}$")
 # 行内格式类白名单：note/citation 等由规则引擎产生的行内 span 类 + 8 种统一行内包装格式
 # （单一事实来源 = rulemanage.INLINE_FORMAT_CLASSES；2026-09-19 防漂移）
+# 2026-09-24 补 ptoe-align-*：前端对部分选区用 <span class="ptoe-align-left|center|right">
+# 行内包裹（句中/词上独立对齐），须随保存落盘；对齐信息同时承载于 span 类上
+# （块级 p/h 仍走 _block_classes，两者互不影响）。
 _INLINE_FORMAT_CLASSES = {"ptoe-note", "ptoe-citation"} | set(
     getattr(rulemanage, "INLINE_FORMAT_CLASSES", ()) or ()
+) | set(_ALIGN_CLASSES)
+
+# 块级标签：p / h1-6 / div / table。div 与 sanitize_html 的处理保持一致（统一按
+# <p> 处理）：若把 <div> 当行内内容，未清洗数据（历史版本/外部直接调用
+# apply_markers）会被包成 <p><div …></div></p> 非法嵌套，并且注释段落识别失败
+# → 注释数量校验误报。
+#
+# table（2026-09-27 修复正文丢失）：table 必须自成一个顶层块并原样透传。此前 table
+# 不在块标签集合里，它的 token 会一路累积进 cur，随后有两种坏结局：
+#   1) 表格后面跟真段落时，<p> 处的 `if kind:` 为假 → 不 flush，而 kind 又被改成
+#      "p"，于是整张表被认领为该段落的内容，把表后的正文一起吞进包裹元素（丢字）；
+#   2) 表格在块流末尾时，EOF 的 `if kind or cur:` 用 `kind or "p"` 把表包进 <p>。
+# 两者都产出 render_block("p", "<table>…") = <p><table>…</table></p> 非法嵌套。
+#
+# 表格内部结构标签（thead/tbody/tfoot/tr/td/th）**刻意不进块标签集合**（保持透明、
+# 不参与切块）：它们只在 table 内合法、顶层不可能出现；一旦各自成为独立 kind，
+# render_block 会给每个结构标签单独裹一层，把整张表拆碎。单元格内也不会有块标签
+# ——_Sanitizer.handle_starttag 遇 td/th 内的 p/div/hN 只丢标签、保留行内内容，
+# handle_endtag 同理丢弃闭合标签，故 <td><p>…</p></td> 不会切断表格（未清洗的
+# 外部数据另由「表格整块原样透传」兜底）。
+_BLOCK_TAG_RE = re.compile(
+    r"</?(p|div|h[1-6]|table)([^>]*)>", flags=re.IGNORECASE
 )
 
-# 块级标签：p / h1-6 / div。div 与 sanitize_html 的处理保持一致（统一按 <p> 处理）：
-# 若把 <div> 当行内内容，未清洗数据（历史版本/外部直接调用 apply_markers）会被
-# 包成 <p><div …></div></p> 非法嵌套，并且注释段落识别失败 → 注释数量校验误报。
-_BLOCK_TAG_RE = re.compile(r"</?(p|div|h[1-6])([^>]*)>", flags=re.IGNORECASE)
-
 _PAGE_BREAK_CLASS = "ptoe-page-break"
+# 可插入的分隔线（直线/线段/点线/双线，2026-09-27）——单一事实来源。
+# 标记形态：<p class="ptoe-divider ptoe-divider-{style}">{字形×8}</p>
+# 必须是**非空**段落：sanitize_html._flush / _split_segments.flush /
+# _html_to_rich_blocks._flush / _clean_blocks 四处都以 `if not text` 删空块
+# （且 test_correctmanage 锁定 sanitize_html("<p></p>") == ""）。
+# class 有两个：基类 ptoe-divider + 样式后缀 ptoe-divider-<style>；白名单一律用
+# startswith("ptoe-divider") 前缀判定，两个类都要放行。
+DIVIDER_CLASS = "ptoe-divider"
+DIVIDER_STYLES = {
+    "solid": "ptoe-divider-solid",    # 直线 ── U+2500
+    "dashed": "ptoe-divider-dashed",  # 线段 ╌╌ U+254C
+    "dotted": "ptoe-divider-dotted",  # 点线 ╌┈ U+2508
+    "double": "ptoe-divider-double",  # 双线 ══ U+2550
+}
+# 每个分隔线固定 8 个字形（视觉宽度一致）
+DIVIDER_GLYPHS = {
+    "solid": "─" * 8,
+    "dashed": "╌" * 8,
+    "dotted": "┈" * 8,
+    "double": "═" * 8,
+}
+_DIVIDER_STYLE_BY_CLASS = {cls: name for name, cls in DIVIDER_STYLES.items()}
+# 缺省样式（未知/缺失后缀时用直线）
+DIVIDER_DEFAULT_STYLE = "solid"
+
+
+def _divider_glyph(style: str) -> str:
+    """分隔线样式名 → 8 字形串（未知样式回退默认）。"""
+    return DIVIDER_GLYPHS.get(style, DIVIDER_GLYPHS[DIVIDER_DEFAULT_STYLE])
+
+
+def _divider_class(attrs) -> str:
+    """块属性里是否带 ptoe-divider 前缀的 class；有则返回该类名，否则 ''。"""
+    d = dict(attrs) if not isinstance(attrs, str) else {}
+    classes = (d.get("class") or "").split()
+    for c in classes:
+        if c == DIVIDER_CLASS or c.startswith(DIVIDER_CLASS):
+            return c
+    return ""
+
+
+def _divider_style_from_attrs(attrs) -> str:
+    """块属性 → 分隔线样式名（solid/dashed/dotted/double；无分隔线类返回 ''）。"""
+    d = dict(attrs) if not isinstance(attrs, str) else {}
+    for c in (d.get("class") or "").split():
+        if c in _DIVIDER_STYLE_BY_CLASS:
+            return _DIVIDER_STYLE_BY_CLASS[c]
+    if _divider_class(d):
+        return DIVIDER_DEFAULT_STYLE
+    return ""
+
+
+def _block_has_divider(attrs: str) -> bool:
+    """块属性串（正则捕获的 attrs 文本）是否含 ptoe-divider 前缀类。"""
+    m = re.search(r'class="([^"]*)"', attrs or "")
+    return bool(m) and any(c.startswith(DIVIDER_CLASS) for c in m.group(1).split())
+
 _IMG_CLASSES = {
     "ptoe-img-full",
     "ptoe-img-fit",
@@ -1034,7 +1111,7 @@ def diff_reocr_texts(current: str, new_text: str) -> list:
 
 
 def _block_class_html(attrs: str) -> str:
-    """从块标签属性中提取应保留的 class（ptoe-note + 对齐类 + 换页 + 图片模式），返回 class 属性。"""
+    """从块标签属性中提取应保留的 class（ptoe-note + 对齐类 + 换页 + 图片模式 + 分隔线），返回 class 属性。"""
     m = re.search(r'class="([^"]*)"', attrs)
     if not m:
         return ""
@@ -1048,12 +1125,14 @@ def _block_class_html(attrs: str) -> str:
         or c == "ptoe-flush"
         or c == "ptoe-indent"
         or c == "ptoe-citation"
+        # 分隔线（2026-09-27）：基类 + 样式后缀两个类都要留，前缀判定
+        or c.startswith(DIVIDER_CLASS)
     ]
     return f' class="{" ".join(keep)}"' if keep else ""
 
 
 def _block_classes(attrs: list[tuple[str, str | None]]) -> list[str]:
-    """块级标签应保留的 class 列表（ptoe-note + 对齐类 + 换页 + 图片模式）。"""
+    """块级标签应保留的 class 列表（ptoe-note + 对齐类 + 换页 + 图片模式 + 分隔线）。"""
     keep: list[str] = []
     for k, v in attrs:
         if k == "class":
@@ -1066,6 +1145,8 @@ def _block_classes(attrs: list[tuple[str, str | None]]) -> list[str]:
                     or c == "ptoe-flush"
                     or c == "ptoe-indent"
                     or c == "ptoe-citation"
+                    # 分隔线（2026-09-27）：基类 + 样式后缀两个类都要留，前缀判定
+                    or c.startswith(DIVIDER_CLASS)
                 ):
                     keep.append(c)
     return keep
@@ -1473,10 +1554,10 @@ class _Sanitizer(HTMLParser):
                 buf.append(open_html)
                 stack.append(("span", open_html))
             else:
-                # 保留行内格式 span：对齐内联样式 + 白名单格式类；
+                # 保留行内格式 span：经校验的字符样式（style 载体）+ 白名单格式类；
                 # 外部/粘贴样式按等价语义折成格式类（2026-09-16 修复：原先只保留第一个
                 # 匹配的格式类，且 style 里的下划线/上下标被整条丢弃 → 导出后格式消失）
-                style = attrs_d.get("style", "")
+                style = attrs_d.get("style") or ""
                 classes = [
                     c
                     for c in (attrs_d.get("class") or "").split()
@@ -1486,20 +1567,20 @@ class _Sanitizer(HTMLParser):
                     if cls not in classes and pat.search(style):
                         classes.append(cls)
                 keep_attrs = []
-                style_parts: list[str] = []
-                if _ALIGN_STYLE_RE.search(style):
-                    # 规则引擎用内联样式实现多对齐共存：style="text-align:center"
-                    style_parts.append(style.strip().rstrip(";"))
-                # 文本颜色（浏览器 execCommand('foreColor') 可能产出 span style="color:..."）：
-                # 只保留经过校验的 color 声明，其余样式一律丢弃（防注入）。
-                # 注意：行内样式仅 text-align（对齐）与 color 按设计存活；其余粘贴进来的
-                # 行内样式（font-size/letter-spacing/…）一律丢弃 —— EPUB 便携性取舍（2026-09-19）
-                m_color = re.search(r"(?<![-\w])color\s*:\s*([^;\"]+)", style)
-                if m_color and _COLOR_VALUE_RE.match(m_color.group(1).strip()):
-                    style_parts.append(f"color:{m_color.group(1).strip()}")
-                if style_parts:
+                # 行内样式白名单（EPUB 便携性取舍，2026-09-19 起）：
+                # 只放行 4 条声明 text-align ; font-size ; font-family ; color——
+                #   text-align  规则引擎用内联样式实现多对齐共存
+                #   font-size    逐字符字号（整数 px，钳制 8..72）
+                #   font-family  逐字符字体（10 项字体栈白名单之一）
+                #   color        文本颜色（浏览器 execCommand('foreColor') /
+                #                #colorBtn 产出的 style="color:…"）
+                # 其余粘贴进来的行内样式（position/top/letter-spacing/…）一律丢弃（防注入）。
+                # 校验与规范序列化统一走 rulemanage.normalize_char_style（单一事实来源，
+                # 与 MiniDOMParser 规则引擎、ui/app.js 同一契约）；无存活声明则不输出 style。
+                norm_style = rulemanage.normalize_char_style(style)
+                if norm_style:
                     keep_attrs.append(
-                        f'style="{_html.escape(";".join(style_parts), quote=True)}"'
+                        f'style="{_html.escape(norm_style, quote=True)}"'
                     )
                 if classes:
                     keep_attrs.append(
@@ -1507,8 +1588,12 @@ class _Sanitizer(HTMLParser):
                     )
                 if keep_attrs:
                     open_html = f"<span {' '.join(keep_attrs)}>"
-                    self.buf.append(open_html)
-                    self.stack.append(("span", open_html))
+                    # 必须走 _inline_target()：单元格内须写入 _cell_buf/_cell_stack，
+                    # 否则开标签落到文档缓冲 buf、闭标签被 cell 栈丢弃 → 单元格样式
+                    # 丢失且 </table> 后多出一个孤立 <p><span …></p>（2026-09-27 修复）
+                    cbuf, cstack = self._inline_target()
+                    cbuf.append(open_html)
+                    cstack.append(("span", open_html))
                 # 其余 span 丢弃，仅保留文本内容
         elif tag == "img":
             # 插入的图片：仅保留 src（data URI 或相对路径）、alt 与显示模式 class
@@ -1521,7 +1606,9 @@ class _Sanitizer(HTMLParser):
                 ]
                 alt = (attrs_d.get("alt") or "插图")[:100]
                 cls_html = f' class="{" ".join(cls)}"' if cls else ""
-                self.buf.append(
+                # 同上：单元格内须写入单元格缓冲（否则图片被搬出表格）
+                ibuf, _ = self._inline_target()
+                ibuf.append(
                     f'<img src="{_html.escape(src, quote=True)}" alt="{_html.escape(alt, quote=True)}"{cls_html}/>'
                 )
         # 其余标签（a/...）丢弃，仅保留其文本内容
@@ -1770,9 +1857,23 @@ _FULL_TO_HALF = (
 )
 # 清理时剥掉的非白名单标签（保留 p/h1-6/strong/em/b/i/br/span/img，
 # b/i 留给 sanitize 归一化为 strong/em；其余剥掉但保留内容）
+# 2026-09-27：表格结构标签一并豁免（table/thead/tfoot/tbody/tr/th/td，
+# 即 _Sanitizer 表格累积模式消费的整套标签）。表格是 UI 主动插入的结构化
+# 内容，不是 OCR 残留标签；剥掉它会把单元格文本摊平成裸文本，再被后续 <p>
+# 认领 → 一次点击「清理」即毁表：
+#   <p>before</p><table>…<td>c1</td><td>c2</td>…</table><p>AFTER</p>
+#   → <p>before</p><p>c1c2AFTER</p>（表格消失，AFTER 段被吸收）
 _STRIP_TAG_RE = re.compile(
-    r"</?(?!p\b|h[1-6]\b|strong\b|em\b|b\b|i\b|br\b|span\b|img\b)[a-zA-Z][^>]*>"
+    r"</?(?!p\b|h[1-6]\b|strong\b|em\b|b\b|i\b|br\b|span\b|img\b"
+    r"|table\b|thead\b|tfoot\b|tbody\b|tr\b|th\b|td\b)[a-zA-Z][^>]*>"
 )
+
+# 表格整块识别（_clean_blocks 用，2026-09-27）：<table …> / </table>。
+# 与 htmlmanage._TABLE_TAG_RE 同样式（含属性、re.I）。
+_TABLE_OPEN_RE = re.compile(r"<table\b[^>]*>", flags=re.IGNORECASE)
+_TABLE_CLOSE_RE = re.compile(r"</table\s*>", flags=re.IGNORECASE)
+# blocks 里代表「整表原子块」的开标签哨兵（真实段落开标签不可能等于它）
+_TABLE_BLOCK = "<table>"
 
 # ---------------------------------------------------------------------------
 AUTO_FIX_SCORE = 0.85  # candidate score threshold to mark auto_fixable
@@ -2274,6 +2375,20 @@ _BRACKET_PAIR_RES = (
     re.compile(r"\[([^\[\]\n]{1,32})\]"),
     re.compile(r"［([^［］]*)］"),
 )
+# $ 包裹剥除（2026-09-21）：OvisOCR2（oo）重识别把原文 〔x〕 输出成 $〔x〕$
+# ——$ 是模型自造标记符，原图没有，必须在归一/对比前剥掉。策略：$ 紧贴括号
+# （可容忍中间空白）时剥除，含 【】/[]/［］/〔〕/（）/()。$ 也可能合法出现于
+# 价格/数学语境，但中文书籍 OCR 语境下 $ 紧贴括号几乎必为模型杂符，剥除安全；
+# 不紧贴括号的 $（如 $5、$x$）原样保留。
+_DOLLAR_OPEN_BRACKET_RE = re.compile(r"\$+\s*([〔【［\[(（])")
+_DOLLAR_CLOSE_BRACKET_RE = re.compile(r"([〕】］\])）])\s*\$+")
+
+
+def _strip_dollar_bracket_hug(text: str) -> str:
+    """剥掉紧贴括号的 $ 包裹（如 $〔x〕$ → 〔x〕）。"""
+    text = _DOLLAR_OPEN_BRACKET_RE.sub(r"\1", text)
+    text = _DOLLAR_CLOSE_BRACKET_RE.sub(r"\1", text)
+    return text
 
 
 def _clean_ulq_bracket_junk(text: str) -> str:
@@ -2326,7 +2441,8 @@ def _normalize_bracket_pairs(text: str) -> str:
 
 
 def _normalize_brackets(text: str) -> str:
-    """先清 ULQ 杂符包裹，再统一括号对。"""
+    """先剥 $ 紧贴括号包裹，再清 ULQ 杂符包裹，最后统一括号对。"""
+    text = _strip_dollar_bracket_hug(text)
     return _normalize_bracket_pairs(_clean_ulq_bracket_junk(text))
 
 
@@ -2334,12 +2450,15 @@ def _clean_bracket_junk_html(html: str) -> str:
     """对 HTML 片段做杂符括号清理（token 级，只动文本节点）。
 
     部分大模型会把原文的 〔x〕 引注识别成 \\〔^{x〕}\\ 这类杂符包裹格式
-    （\\ ^ { } 等无效字符夹着括号），这些字符进入矫正界面/对比前必须清除。
+    （\\ ^ { } 等无效字符夹着括号）；OvisOCR/o 系模型还会自造 $ 包裹引注
+    括号（$〔1〕$，注释见 _strip_dollar_bracket_hug）。这些字符进入矫正界面/
+    对比前必须清除。守卫字符集含 $：一旦命中即进入 _normalize_brackets
+    （其内部先 _strip_dollar_bracket_hug 剥 $ 紧贴括号，再做杂符清理 +
+    括号对统一，见 _ULQ_JUNK_BRACKET_RE）。
     逐 token 处理：`<...>` 与标记 span 原样保留（绝不能拆标签，否则会破坏
-    img 属性/标记结构），仅对文本 token 做 _normalize_brackets
-    （杂符清理 + 括号对统一，见 _ULQ_JUNK_BRACKET_RE）。
+    img 属性/标记结构），仅对文本 token 做 _normalize_brackets。
     """
-    if not html or re.search(r"[\\^~`|·{}]", html) is None:
+    if not html or re.search(r"[\\^~`|·{}$]", html) is None:
         return html
     if _TOKEN_RE.search(html) is None:
         return _normalize_brackets(html)
@@ -2732,13 +2851,54 @@ def _clean_blocks(
     合并启发式（保守，避免把真正的段落粘在一起）：仅合并两个无 class 的
     普通 <p> 块，且前块不以句末标点（。！？…；）结尾、前后块均非空。
     <h1-6> 与带 class 的 <p>（注释/对齐/图片）视为有结构意图，不合并。
+
+    表格是**原子块**（2026-09-27）：<table>…</table> 整表逐字节透传，既不切块、
+    不套文本处理（段首符号/中英标点/**/[n]），也不与任何相邻段落合并。
+    修复前表格 token 落进 cur，被后续 <p> 认领 → 单元格文本被摊平、表格整体
+    消失。清理器的规则都是**段落级**的；单元格是数据表列，套用半角→全角会
+    改写数值（18,5 / 1.5 / 3-4）与参考文献序号 [1]，属静默数据损坏。
+
+    收尾用 tbl_depth 计数而非「见到第一个 </table>」：<td> 内嵌套表时，内层
+    </table> 只是嵌套结束，若据此收尾，外层剩余的 </td></tr></table> 会落进
+    cur 并被兜底包成 <p>…</p>（非法嵌套，XHTML 解析直接报错）。
+    孤立 </table>（无开标签的脏数据）必须就地丢弃，不能落进 cur —— 同样会
+    产出非法的 <p></table></p>。
+    生产路径上 clean_page_html 必先过 sanitize_html，而 _Sanitizer 表格累积
+    模式总会闭合表格、丢弃嵌套表、剥除单元格内块级标签，故上述两条分支属
+    纵深防御：直接调用 _clean_blocks（测试/未来调用方）时才可能命中。
     """
     tokens = re.split(r"(<[^>]+>)", html)
     blocks: list[tuple[str, list[str]]] = []  # (开标签或 "<p>" 兜底, 块内 tokens)
     cur_open: str | None = None
     cur: list[str] = []
+    tbl_buf: list[str] | None = None  # 非 None = 正在累积整张表格
+    tbl_depth = 0  # <table> 嵌套深度：归零才收尾（内层 </table> 不得提前结束整表）
     for tok in tokens:
         if not tok:
+            continue
+        if tbl_buf is not None:
+            # 表内一切 token 原样累加（含 strong/span/空白文本 token）
+            if _TABLE_OPEN_RE.fullmatch(tok):
+                tbl_depth += 1  # <td> 内嵌套表：直到**外层** </table> 才收尾
+            elif _TABLE_CLOSE_RE.fullmatch(tok):
+                tbl_depth -= 1
+            tbl_buf.append(tok)
+            if tbl_depth == 0:
+                blocks.append((_TABLE_BLOCK, tbl_buf))
+                tbl_buf = None
+            continue
+        if _TABLE_OPEN_RE.fullmatch(tok) or _TABLE_CLOSE_RE.fullmatch(tok):
+            if tok.startswith("</"):
+                # 孤立 </table>（无对应开标签）：就地丢弃。若放行会落进 cur，
+                # 再被兜底包成 <p></table></p> —— 非法嵌套。
+                continue
+            # 表格开标签前先切出已累积的段落，避免表格被并进上一个块
+            if cur or cur_open is not None:
+                blocks.append((cur_open or "<p>", cur))
+            cur_open = None
+            cur = []
+            tbl_buf = [tok]
+            tbl_depth = 1
             continue
         if re.fullmatch(r"</?(p|h[1-6])([^>]*)>", tok, flags=re.IGNORECASE):
             if cur or cur_open is not None:
@@ -2749,11 +2909,16 @@ def _clean_blocks(
                 cur_open = tok
             continue
         cur.append(tok)
-    if cur or cur_open is not None:
+    if tbl_buf is not None:
+        # 未闭合表格（外部脏数据）：整段原样收尾，不套 <p> 包裹
+        blocks.append((_TABLE_BLOCK, tbl_buf))
+    elif cur or cur_open is not None:
         blocks.append((cur_open or "<p>", cur))
 
     # 块内文本处理（段首符号只作用于块开头第一个文本 token）
     for open_tag, toks in blocks:
+        if open_tag == _TABLE_BLOCK:
+            continue  # 表格：逐字节透传，不做任何文本处理
         first = True
         for i, t in enumerate(toks):
             if not t or t.startswith("<"):
@@ -2776,6 +2941,12 @@ def _clean_blocks(
     if merge_paragraphs:
         merged: list[tuple[str, list[str]]] = []
         for open_tag, toks in blocks:
+            if open_tag == _TABLE_BLOCK:
+                # 表格既不做合并源（下面两个分支要求两侧都是 "<p>"）也不做合并
+                # 目标（此处 open_tag != "<p>"）：作为合并屏障原样落列，表格两侧
+                # 的段落也不会跨过它粘在一起。
+                merged.append((open_tag, toks))
+                continue
             if (
                 merged
                 and open_tag == "<p>"
@@ -2817,6 +2988,12 @@ def _clean_blocks(
     # 重建（丢弃空块）
     parts: list[str] = []
     for open_tag, toks in blocks:
+        if open_tag == _TABLE_BLOCK:
+            # 表格：既不 strip 也不套 _close_of 闭合标签 —— 逐字节原样输出
+            raw = "".join(toks)
+            if raw:
+                parts.append(raw)
+            continue
         inner = "".join(toks).strip()
         if not inner:
             continue
@@ -2838,11 +3015,17 @@ def clean_page_html(
     merge_paragraphs=False（默认不合并）：段落合并已移出默认清理流程，
     仅在显式传入 merge_paragraphs=True 时生效（供格式规则/段落合并 op 使用）。
 
+    2026-09-21：剥除 $ 紧贴括号包裹（$〔1〕$ → 〔1〕）——OvisOCR/o 系模型
+    自造 $ 包裹引注括号；不紧贴括号的 $（价格 $5 / $x$ 等）原样保留。
+
     幂等：已清理的内容再次清理结果不变。
     """
     text = str(raw or "")
     if strip_tags:
         text = _STRIP_TAG_RE.sub("", text)
+    # $ 紧贴括号包裹剥除：必须在标签剥除后 / sanitize 前执行（此时括号
+    # 相邻关系最完整，且不依赖标签结构）；幂等（剥完一遍后无 $ 紧贴括号残留）。
+    text = _strip_dollar_bracket_hug(text)
     html = sanitize_html(text)
     return _clean_blocks(
         html,
@@ -3088,7 +3271,24 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
     # 2) 块内按标记切段；3) 收集注释段落；4) 按标记重排
     parsed: list[dict[str, Any]] = []
     for b in blocks:
-        segments, trailing = _split_segments(b["html"])
+        if b["kind"] == "table":
+            # 表格是**原子块**：整表作单个内容段原样透传，不切段、不参与合并。
+            # 不能走 _split_segments，两个原因：
+            #   1) 它的空内容门是「剥标签后无文字且不含 <img> 就丢段」——纯图片表
+            #      靠 <img> 侥幸存活，但空表/只有标记的表会被静默丢弃；
+            #   2) 它会在标记处切段并跨段重开行内标签，表格结构会被切成多段，
+            #      每段再各裹一层 <table> → 表格结构彻底碎掉。
+            # 同样不进 _merge_paragraph（_RENDERED_BLOCK_RE 只认 p/div，表格本
+            # 就不可合并）；push_content 的 `kind == "p"` 闸门同样天然拦下它。
+            #
+            # 表内的标记 span 只能丢弃：full/chapter/page/join 都无法在表内部表达
+            # （表内插不进文章或段落边界），与 _split_segments 消费标记的既有语义
+            # 一致（标记 span 及其 label 文本都不进正文）；表**前后**的标记不受
+            # 影响，照常作用于相邻段落。
+            segments = [(_MARKER_SPAN_RE.sub("", b["html"]), [])]
+            trailing: list[tuple[str, str]] = []
+        else:
+            segments, trailing = _split_segments(b["html"])
         parsed.append(
             {
                 "kind": b["kind"],
@@ -4614,6 +4814,33 @@ _DOCX_IMG_FRAC = {
     "ptoe-img-w75": 0.75,
     "ptoe-img-w100": 1.0,
 }
+# 分隔线样式 → OOXML 段落边框线型（2026-09-27）：用真正的边框而非字形文本，
+# 保证 Word 里线宽/线型可随主题缩放，也不受阅读字体盒绘字符缺失影响
+_DOCX_DIVIDER_BORDER = {
+    "solid": "single",
+    "dashed": "dashed",
+    "dotted": "dotted",
+    "double": "double",
+}
+# 字符样式字号 → w:sz 上下界（半磅）。与 CSS 端 8..72px 换算后约为
+# 12..108，取 2..3276（OOXML 规范硬界）以防 0 字号被 Word 吞掉
+_DOCX_MIN_SZ = 2
+_DOCX_MAX_SZ = 3276
+# CT_RPr（wordprocessingml 字符属性）的子元素固定次序，摘录本文件用到的部分：
+# rFonts < b < i < strike < color < sz(+szCs) < u < bdr < shd < vertAlign。
+# 序错会让 Word 判定文档损坏或静默丢弃格式（2026-09-27 取证修复）。
+_DOCX_RPR_ORDER = (
+    "rFonts",
+    "b",
+    "i",
+    "strike",
+    "color",
+    "sz",
+    "u",
+    "bdr",
+    "shd",
+    "vertAlign",
+)
 
 
 def _html_to_export_blocks(html: str) -> list[tuple]:
@@ -4773,8 +5000,12 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
     - 文本块：{"kind": "p"|"h1".."h6", "tag": 原始标签名, "text": 纯文本,
       "runs": [...], "align": ..., "note": bool, "attrs": 属性串,
       "inner": 内嵌 HTML, "indent": _rich_parse_indent 形状}；
+      每个 run 额外带 "style"（规范化字符样式串，rulemanage.normalize_char_style
+      产物，无格式时为 ""）——供 DOCX 导出 w:sz/w:rFonts/w:color 使用；
     - 图片块：{"kind": "img", "src", "alt", "cls"}（块内图片把周围文本
       拆成独立块，延续旧导出行为）。
+    - 分隔线块：{"kind": "divider", "style": solid|dashed|dotted|double,
+      "glyph": 8 字形, "text": 同一字形, "runs": [单条], ...}（2026-09-27）。
     标记 span（ptoe-marker）整体剥除（文本与 inner 均不含）。
     """
 
@@ -4789,6 +5020,7 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             self.inner: list[str] = []
             self.note = False
             self.indent = _rich_parse_indent({})
+            self.divider = ""  # 分隔线样式名（solid/dashed/dotted/double），非分隔线为 ""
             self.block_seen = False  # 是否已进入过块（孤立 img 不产生块）
             self.skip = 0  # >0 表示处于 script/style 等跳过区域
             # 栈元素：(tag, is_marker, fmt_dict) — fmt_dict 记录该 span 携带的行内格式类
@@ -4882,6 +5114,16 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             highlight = False
             sup = False
             sub = False
+            # 字符样式（字号/字体/颜色的 style 载体，2026-09-27）：栈自外向内，
+            # 由内向外取首个非空（最内层 span 的声明更具体，优先）
+            char_style = ""
+            for _, is_marker, fmt in reversed(self.stack):
+                if is_marker:
+                    continue
+                s = fmt.get("style") or ""
+                if s:
+                    char_style = s
+                    break
             for _, is_marker, fmt in self.stack:
                 if is_marker:
                     continue
@@ -4916,6 +5158,8 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                 "highlight": highlight,
                 "sup": sup,
                 "sub": sub,
+                # 规范化字符样式串（"" = 无）；DOCX 导出据此写 w:sz/w:rFonts/w:color
+                "style": char_style,
             }
 
         def _push_text(self, txt: str) -> None:
@@ -4947,6 +5191,8 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             self.inner = []
             self.note = "ptoe-note" in (d.get("class") or "").split()
             self.indent = _rich_parse_indent(d)
+            # 分隔线段落（2026-09-27）：class 前缀 ptoe-divider + 样式后缀
+            self.divider = _divider_style_from_attrs(d)
             self.block_seen = True
             self._join_at_start = False
             self._join_last = False
@@ -4967,23 +5213,46 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                 runs[-1]["text"] = runs[-1]["text"].rstrip()
             text = "".join(r["text"] for r in runs)
             if text:
-                block = {
-                    "kind": self.kind,
-                    "tag": self.tag,
-                    "text": text,
-                    "runs": runs,
-                    "align": _rich_align(self.attrs_str),
-                    "note": self.note,
-                    "attrs": self.attrs_str,
-                    "inner": inner,
-                    "indent": self.indent,
-                }
-                if self._join_at_start or self._join_last:
-                    block["join_prev"] = bool(self._join_at_start)
-                    block["join_next"] = bool(self._join_last)
-                self.blocks.append(block)
+                if self.divider:
+                    # 分隔线：整块是版式元素而非文字内容，导出为专用 kind。
+                    # 字形统一取自 DIVIDER_GLYPHS（不信任块内文本），保证 DOCX 边框
+                    # 段落 / MD 横线 / TXT 字形行三者一致；runs 只放字形，
+                    # TXT 导出无需改动即可原样输出。
+                    glyph = _divider_glyph(self.divider)
+                    self.blocks.append(
+                        {
+                            "kind": "divider",
+                            "style": self.divider,
+                            "glyph": glyph,
+                            "text": glyph,
+                            "runs": [{"text": glyph, "bold": False, "italic": False}],
+                            "tag": self.tag,
+                            "attrs": self.attrs_str,
+                            "inner": inner,
+                            "align": "center",
+                            "note": False,
+                            "indent": {},
+                        }
+                    )
+                else:
+                    block = {
+                        "kind": self.kind,
+                        "tag": self.tag,
+                        "text": text,
+                        "runs": runs,
+                        "align": _rich_align(self.attrs_str),
+                        "note": self.note,
+                        "attrs": self.attrs_str,
+                        "inner": inner,
+                        "indent": self.indent,
+                    }
+                    if self._join_at_start or self._join_last:
+                        block["join_prev"] = bool(self._join_at_start)
+                        block["join_next"] = bool(self._join_last)
+                    self.blocks.append(block)
             self.kind, self.tag, self.attrs_str = "p", "p", ""
             self.note = False
+            self.divider = ""
             self.indent = _rich_parse_indent({})
 
         def _emit_img(self, attrs) -> None:
@@ -5116,6 +5385,15 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                             fmt["sup"] = True
                         elif c == "ptoe-sub":
                             fmt["sub"] = True
+                    # 字符样式（字号/字体/颜色，style 载体，2026-09-27）：
+                    # 走与 sanitize_html 同一校验/序列化契约，保证 DOCX 导出
+                    # 拿到的值与落盘 HTML 一致
+                    if tag == "span" and not is_marker:
+                        norm = rulemanage.normalize_char_style(
+                            attrs_d.get("style") or ""
+                        )
+                        if norm:
+                            fmt["style"] = norm
                 # strong/b/em/i 标签也记录格式
                 if tag in ("strong", "b"):
                     fmt["bold"] = True
@@ -5259,8 +5537,9 @@ def _apply_join_marks(blocks: list[dict]) -> list[dict]:
         cur_join_next = cur.pop("join_next", False)
         cur_join_prev = cur.pop("join_prev", False)
 
-        if cur.get("kind") == "table":
-            # 表格块打断合并链（表格与文本不合并，前后段落标记不跨表格生效）
+        if cur.get("kind") in ("table", "divider"):
+            # 表格/分隔线块打断合并链（表格与文本不合并，前后段落标记不跨表格生效；
+            # 分隔线是独立版式元素，同理不能被 join 标记并入邻段，2026-09-27）
             out.append(cur)
             i += 1
             continue
@@ -5364,7 +5643,7 @@ def _data_uri_bytes(src: str) -> tuple[bytes, str] | None:
 def _norm_export_block(block: Any) -> dict:
     """兼容旧元组块与富文本字典块：统一归一为富文本块字典。
 
-    - dict → 原样返回（_html_to_rich_blocks 产物）；
+    - dict → 原样返回（_html_to_rich_blocks 产物，含 kind="divider" 分隔线块）；
     - ('img', src, alt, cls) → 图片块字典；
     - ('p'|'hN', 文本) → 无格式信息的普通文本块（runs 单条）。
     """
@@ -5430,6 +5709,13 @@ def _build_docx_table(
 
     algn：与 rows 同维的二维数组（单元格对齐 ""|"left"|"center"|"right"）；
     对齐为 center/right 时单元格段落输出 <w:jc>（left/空 不输出，与块段落一致）。
+
+    单元格内行内格式的**显式作用域**（2026-09-27）：本实现对每个单元格取纯文本
+    （_cell_plain_text）后整体输出，故单元格内的加粗/斜体/字符样式（span style 的
+    字号/字体/颜色）**一律不落到 DOCX**——与既有行为一致（表头行加粗是唯一例外，
+    由 header 标志整体加粗）。这是刻意的取舍：逐单元格还原行内 run 需要把富文本
+    块解析器下沉到单元格粒度，收益低于复杂度。文字内容不丢，只是格式丢失；
+    需要保留单元格内格式时请用 Markdown/EPUB 导出（两者整块透传原始 HTML）。
     """
     if not rows:
         return "<w:p/>"
@@ -5480,6 +5766,10 @@ def _build_docx(blocks: list[Any], path: str) -> None:
     - 段落设置 data-* 属性 → w:spacing/w:ind（1em≈240 twips、段前/后 1 行
       ≈360 twips、行距 ×240，与 htmlmanage._indent_style_attrs 同语义）；
     - 注释块（ptoe-note）→ 斜体 + 灰色（808080）；行内加粗/斜体逐 run 保留；
+    - 字符样式（span style 的字号/字体/颜色）→ 逐 run w:sz/w:rFonts/w:color
+      （标题块已有块级字号时不重复写 w:sz；命名色无法映射为 OOXML hex 故忽略）；
+    - 分隔线块（kind="divider"）→ 空段落 + 下边框，线型映射 single/dashed/
+      dotted/double（不写字形文本，避免阅读字体缺字）；
     - 图片块内嵌真实图片字节（data URI）：尺寸 class ptoe-img-w25/50/75/100
       → 宽度 5 英寸 × 比例，高度按固有宽高比；非 data URI 或解析失败 →
       以 [图片] 占位段落输出（与 TXT 一致）。
@@ -5551,6 +5841,20 @@ def _build_docx(blocks: list[Any], path: str) -> None:
             )
             continue
 
+        if block["kind"] == "divider":
+            # 分隔线（2026-09-27）→ 空段落 + 下边框；线型映射到 OOXML 枚举。
+            # 不写任何 <w:t> 文本：字形交给边框画，避免不同字体缺字。
+            style = block.get("style") or DIVIDER_DEFAULT_STYLE
+            val = _DOCX_DIVIDER_BORDER.get(style, "single")
+            parts.append(
+                "<w:p><w:pPr>"
+                '<w:pBdr><w:bottom w:val="' + val + '" w:sz="6" w:space="1" '
+                'w:color="999999"/></w:pBdr>'
+                '<w:spacing w:before="180" w:after="180"/>'
+                "</w:pPr></w:p>"
+            )
+            continue
+
         kind = block["kind"]
         runs = block.get("runs") or [
             {"text": block.get("text", ""), "bold": False, "italic": False}
@@ -5615,31 +5919,68 @@ def _build_docx(blocks: list[Any], path: str) -> None:
         sz = _DOCX_HEADING_SZ.get(lvl, 24) if is_heading else None
         run_xml_parts: list[str] = []
         for r in runs:
-            rpr = ""
+            # CT_RPr 子元素次序由 OOXML schema 固定（见 _DOCX_RPR_ORDER），乱序会让
+            # Word 判定文档损坏 / 静默丢弃格式。按槽位收集后按固定次序拼接，取代
+            # 旧代码的「按 if 顺序追加」（逐字符样式的 rFonts/color 追加在末尾，2026-09-27 修复）。
+            rpr_slot: dict[str, str] = {}
             if is_heading or r.get("bold"):
-                rpr += "<w:b/>"
+                rpr_slot["b"] = "<w:b/>"
             if r.get("italic") or note:
-                rpr += "<w:i/>"
+                rpr_slot["i"] = "<w:i/>"
             if note:
-                rpr += '<w:color w:val="808080"/>'
+                rpr_slot["color"] = '<w:color w:val="808080"/>'
             if r.get("underline"):
-                rpr += '<w:u w:val="single"/>'
+                rpr_slot["u"] = '<w:u w:val="single"/>'
             if r.get("underdot"):
-                rpr += '<w:u w:val="dotted"/>'
+                # w:u 只能出现一次：下加点与下划线同开时以下加点为准
+                rpr_slot["u"] = '<w:u w:val="dotted"/>'
             if r.get("strike"):
-                rpr += "<w:strike/>"
+                rpr_slot["strike"] = "<w:strike/>"
             if r.get("sup"):
-                rpr += '<w:vertAlign w:val="superscript"/>'
+                rpr_slot["vertAlign"] = '<w:vertAlign w:val="superscript"/>'
             if r.get("sub"):
-                rpr += '<w:vertAlign w:val="subscript"/>'
+                rpr_slot["vertAlign"] = '<w:vertAlign w:val="subscript"/>'
             if r.get("shade"):
-                rpr += '<w:shd w:val="clear" w:fill="EEF1F4"/>'
+                rpr_slot["shd"] = '<w:shd w:val="clear" w:fill="EEF1F4"/>'
             if r.get("highlight"):
-                rpr += '<w:shd w:val="clear" w:fill="E0E0E0"/>'
+                rpr_slot["shd"] = '<w:shd w:val="clear" w:fill="E0E0E0"/>'
             if r.get("charbox"):
-                rpr += '<w:bdr w:val="single" w:sz="4" w:space="1" w:color="333333"/>'
+                rpr_slot["bdr"] = (
+                    '<w:bdr w:val="single" w:sz="4" w:space="1" w:color="333333"/>'
+                )
             if sz:
-                rpr += f'<w:sz w:val="{sz}"/><w:szCs w:val="{sz}"/>'
+                rpr_slot["sz"] = f'<w:sz w:val="{sz}"/><w:szCs w:val="{sz}"/>'
+            # 字符样式（字号/字体/颜色，2026-09-27）：span style → w:sz/w:rFonts/w:color
+            cs = r.get("style") or ""
+            if cs:
+                cs_px = rulemanage.char_style_get(cs, "font-size")
+                # 标题已有块级字号且 w:sz 只能出现一次，标题内字符样式不再改字号
+                if cs_px and not sz:
+                    # CSS px → 半磅（half-point）：1px = 1/96 英寸，1pt = 1/72 英寸
+                    hp = int(round(float(cs_px[:-2]) * 0.75 * 2))
+                    hp = max(_DOCX_MIN_SZ, min(_DOCX_MAX_SZ, hp))
+                    rpr_slot["sz"] = f'<w:sz w:val="{hp}"/><w:szCs w:val="{hp}"/>'
+                cs_fam = rulemanage.char_style_get(cs, "font-family")
+                if cs_fam:
+                    # DOCX 的 w:ascii/hAnsi 只能取一个字体名：取栈首位（主字体），
+                    # eastAsia 同样取首位；引号已由 normalize 剥除
+                    fam = cs_fam.split(",")[0].strip().strip("'\"")
+                    if fam:
+                        rpr_slot["rFonts"] = (
+                            f'<w:rFonts w:ascii="{_docx_escape(fam)}" '
+                            f'w:hAnsi="{_docx_escape(fam)}" '
+                            f'w:eastAsia="{_docx_escape(fam)}"/>'
+                        )
+                cs_color = rulemanage.char_style_get(cs, "color")
+                if cs_color and re.fullmatch(r"#[0-9a-fA-F]{3,8}", cs_color):
+                    # 只接受十六进制（DOCX 颜色是 hex 枚举，命名色无法映射）
+                    hexv = cs_color[1:]
+                    if len(hexv) == 3:
+                        hexv = "".join(ch * 2 for ch in hexv)
+                    if len(hexv) in (6, 8):
+                        # w:color 只能出现一次：注释灰为底色，逐字符颜色覆盖
+                        rpr_slot["color"] = f'<w:color w:val="{hexv[:6].upper()}"/>'
+            rpr = "".join(rpr_slot[k] for k in _DOCX_RPR_ORDER if k in rpr_slot)
             t = _docx_escape(r.get("text", "")).replace(
                 "\n", '</w:t><w:br/><w:t xml:space="preserve">'
             )
@@ -5669,6 +6010,8 @@ def _build_md(blocks: list[Any], path: str) -> None:
       不丢失，且可被界面 Markdown 模式 mdToHtml 无损还原）；
     - 加粗 **…**、斜体 *…*（同时加粗斜体 ***…***）；<br> 已在解析时转为换行；
     - 图片 ![alt](src)，data URI 原样内联（单文件自包含，与 DOCX/EPUB 内嵌一致）；
+    - 字符样式（字号/字体/颜色，span style）与分隔线块（'---'）：Markdown 无对应
+      语法，分别走 raw HTML 整块透传与 GFM 分隔线记号；
     - 不做额外 Markdown 转义（与前端 inlineToMd 一致，避免同一内容两种输出）。
     编码 utf-8（无 BOM，Markdown 标准形态；TXT 才用 utf-8-sig）。
     """
@@ -5688,11 +6031,15 @@ def _build_md(blocks: list[Any], path: str) -> None:
         return "".join(out)
 
     def _has_inline_formats(inner: str) -> bool:
-        """检查 inner HTML 是否包含新增的行内格式类。"""
+        """检查 inner HTML 是否包含新增的行内格式类或字符样式 style 属性。"""
         for cls in ("ptoe-underline", "ptoe-underdot", "ptoe-strike", "ptoe-charbox",
                       "ptoe-shade", "ptoe-highlight", "ptoe-sup", "ptoe-sub"):
             if f'class="{cls}"' in inner or f"class='{cls}'" in inner:
                 return True
+        # 字符样式（2026-09-27）：Markdown 无字号/字体/颜色语法，走与行内格式类
+        # 相同的 raw HTML 整块透传，mdToHtml 可无损还原，不丢 span style
+        if 'style="' in inner or "style='" in inner:
+            return True
         return False
 
     parts: list[str] = []
@@ -5761,6 +6108,11 @@ def _build_md(blocks: list[Any], path: str) -> None:
                 tbl_lines.append(_md_sep(n))
                 tbl_lines.extend(_md_row(r) for r in rows)
             parts.append("\n".join(tbl_lines))
+            continue
+        if b["kind"] == "divider":
+            # 分隔线（2026-09-27）→ GFM 分隔线 '---'（Markdown 只有一个横线记号，
+            # 写 '- - -' 会与列表项混淆；四种线型差异由 EPUB/DOCX 承载）
+            parts.append("---")
             continue
         attrs = b.get("attrs") or ""
         inner = b.get("inner") or ""
@@ -5872,6 +6224,44 @@ def _ask_export_path(
     return req["result"]
 
 
+def _txt_indent_prefix(ind: dict) -> int:
+    """TXT 导出段首全角空格数（clamp 0..8）。
+
+    纯文本没有「续行」概念：
+    - data-ind=first + indv：首行缩进 → 全角空格前缀（既有行为，clamp 1..8）；
+    - data-ind=hang  + indv：悬挂缩进在 HTML 里是 margin-left + text-indent:-N，
+      落到纯文本 ≈ 整段右移 pl+indv（段左距）→ min(round(pl+indv),8)；
+    - data-pl（无 first/hang 时）：普通左缩进 → 每行前缀 min(round(pl),8)；
+    - data-pr / data-lh：纯文本无法表达，一律跳过（返回 0）。
+    """
+    mode = ind.get("ind")
+    indv = ind.get("indv")
+    pl = ind.get("pl")
+    if mode == "first":
+        n = indv if indv is not None else 2
+        # 既有行为：int 截断 + clamp 1..8（至少 1 个全角空格）
+        return max(1, min(8, int(n)))
+    if mode == "hang":
+        base = (pl or 0.0) + (indv if indv is not None else 0.0)
+        return max(0, min(8, int(round(base))))
+    if pl is not None:
+        return max(0, min(8, int(round(pl))))
+    return 0
+
+
+def _txt_spacing(v: Any) -> int:
+    """段前/段后空行数（clamp 0..9）。缺失/非法 → 0。
+
+    与 EPUB 语义一致但不跨介质换算：纯文本里 1 行间距 ≈ 1 个空行。
+    """
+    if v is None:
+        return 0
+    try:
+        return max(0, min(9, int(round(float(v)))))
+    except (TypeError, ValueError):
+        return 0
+
+
 def export_content_to_file(
     items: list[dict], fmt: str, out_path: str, title: str = "矫正导出"
 ) -> str:
@@ -5898,8 +6288,8 @@ def export_content_to_file(
     if fmt == "txt":
 
         def _txt_line(b: dict) -> str:
-            # 图片块以 [图片] 占位符表示；首行缩进（data-ind=first）
-            # 以全角空格前缀近似（纯文本唯一能承载的版式信息）
+            # 图片块以 [图片] 占位符表示；段落设置（缩进/间距）在纯文本中以
+            # 全角空格前缀与空行近似（见 _txt_indent_prefix / _txt_spacing）
             if b["kind"] == "img":
                 return "[图片]"
             if b["kind"] == "table":
@@ -5912,9 +6302,17 @@ def export_content_to_file(
                 )
             line = "".join(r["text"] for r in b["runs"])
             ind = b.get("indent") or {}
-            if ind.get("ind") == "first":
-                n = int(ind.get("indv") or 2)
-                line = "\u3000" * max(1, min(8, n)) + line
+            n = _txt_indent_prefix(ind)
+            if n:
+                line = "\u3000" * n + line
+            spb = _txt_spacing(ind.get("spb"))
+            spa = _txt_spacing(ind.get("spa"))
+            # 段前/段后空行：spb 前缀、spa 后缀（与段落间原有的 \n\n 叠加，
+            # 空行总数 = max(spb,spa) 之外的各插各的，互不抵消）
+            if spb:
+                line = "\n" * spb + line
+            if spa:
+                line = line + "\n" * spa
             return line
 
         text = "\n\n".join(_txt_line(b) for b in blocks) + "\n"
@@ -6645,6 +7043,251 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 "application/json; charset=utf-8",
             )
 
+    def _auto_save(self) -> None:
+        """矫正界面自动保存设置：GET 读取 / POST 写入 config.json 顶层 auto_save。
+
+        服务端持久化 —— correct_pages 每次运行随机端口，localStorage 按 origin
+        隔离会导致设置每运行失效（与 shortcuts / ui_settings 同因，2026-09）。
+        POST 接受 {auto_save: {...}} 或扁平键 {enabled, interval_minutes, new_backup}。
+        """
+        try:
+            from configmanage import get_config, set_auto_save, DEFAULT_CONFIG
+
+            if self.command == "GET":
+                cfg = get_config(show_dialogs=False) or {}
+                stored = cfg.get("auto_save")
+                if not isinstance(stored, dict):
+                    stored = {}
+                defaults = DEFAULT_CONFIG.get(
+                    "auto_save",
+                    {"enabled": True, "interval_minutes": 5, "new_backup": True},
+                )
+                merged = {
+                    "enabled": stored.get("enabled", defaults["enabled"]),
+                    "interval_minutes": stored.get(
+                        "interval_minutes", defaults["interval_minutes"]
+                    ),
+                    "new_backup": stored.get("new_backup", defaults["new_backup"]),
+                }
+                self._send(
+                    200,
+                    self._json({"ok": True, "auto_save": merged}),
+                    "application/json; charset=utf-8",
+                )
+                return
+            # POST: {auto_save: {...}} 或扁平键
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            body = json.loads(raw.decode("utf-8"))
+            if not isinstance(body, dict):
+                self._send(
+                    400,
+                    self._json({"ok": False, "error": "请求体必须为 JSON 对象"}),
+                    "application/json; charset=utf-8",
+                )
+                return
+            ui = body.get("auto_save")
+            if ui is None and any(
+                k in body for k in ("enabled", "interval_minutes", "new_backup")
+            ):
+                ui = body
+            if not isinstance(ui, dict):
+                self._send(
+                    400,
+                    self._json({"ok": False, "error": "auto_save 必须是对象"}),
+                    "application/json; charset=utf-8",
+                )
+                return
+            # 逐键严格校验（非法 → 400，不落盘）
+            clean = {}
+            if "enabled" in ui:
+                v = ui["enabled"]
+                if not isinstance(v, bool):
+                    self._send(
+                        400,
+                        self._json({"ok": False, "error": "enabled 必须是布尔值"}),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+                clean["enabled"] = v
+            if "interval_minutes" in ui:
+                v = ui["interval_minutes"]
+                if not isinstance(v, int) or isinstance(v, bool) or not (1 <= v <= 60):
+                    self._send(
+                        400,
+                        self._json(
+                            {"ok": False, "error": "interval_minutes 必须是 1-60 的整数"}
+                        ),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+                clean["interval_minutes"] = v
+            if "new_backup" in ui:
+                v = ui["new_backup"]
+                if not isinstance(v, bool):
+                    self._send(
+                        400,
+                        self._json({"ok": False, "error": "new_backup 必须是布尔值"}),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+                clean["new_backup"] = v
+            cfg = set_auto_save(clean)
+            merged = ((cfg or {}).get("auto_save")) or clean
+            self._send(
+                200,
+                self._json({"ok": True, "auto_save": merged}),
+                "application/json; charset=utf-8",
+            )
+        except Exception as e:  # noqa: BLE001
+            self._send(
+                500,
+                self._json({"ok": False, "error": str(e)}),
+                "application/json; charset=utf-8",
+            )
+
+    def _replace_rules(self) -> None:
+        """替换规则管理：GET 读取 / POST 写入 config.json 顶层 replace_rules。
+
+        服务端持久化（与 shortcuts / format_rules 同因）。规则结构
+        {id, name, pattern, flags, keep_groups, replacement, builtin, enabled}；
+        校验失败返回 400 中文错误，不落盘。
+        """
+        try:
+            from configmanage import (
+                get_config,
+                set_replace_rules,
+                DEFAULT_CONFIG,
+            )
+
+            if self.command == "GET":
+                cfg = get_config(show_dialogs=False) or {}
+                rules = cfg.get("replace_rules")
+                if not isinstance(rules, list):
+                    rules = list(DEFAULT_CONFIG.get("replace_rules", []))
+                self._send(
+                    200,
+                    self._json({"ok": True, "rules": rules}),
+                    "application/json; charset=utf-8",
+                )
+                return
+            # POST: {rules: [...]}
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            body = json.loads(raw.decode("utf-8"))
+            if not isinstance(body, dict):
+                self._send(
+                    400,
+                    self._json({"ok": False, "error": "请求体必须为 JSON 对象"}),
+                    "application/json; charset=utf-8",
+                )
+                return
+            rules = body.get("rules")
+            if not isinstance(rules, list):
+                self._send(
+                    400,
+                    self._json({"ok": False, "error": "rules 必须是数组"}),
+                    "application/json; charset=utf-8",
+                )
+                return
+            clean = set_replace_rules(rules)
+            self._send(
+                200,
+                self._json({"ok": True, "rules": clean}),
+                "application/json; charset=utf-8",
+            )
+        except ValueError as e:  # 校验失败 → 400（中文信息）
+            self._send(
+                400,
+                self._json({"ok": False, "error": str(e)}),
+                "application/json; charset=utf-8",
+            )
+        except Exception as e:  # noqa: BLE001
+            self._send(
+                500,
+                self._json({"ok": False, "error": str(e)}),
+                "application/json; charset=utf-8",
+            )
+
+    def _autosave_action(self) -> None:
+        """自动保存动作：POST /api/autosave。
+
+        载荷与 /api/save 相同（{pages, proofread, last_proofread_page, name,
+        display_name}，.get 容错）。与 save 的唯一区别：总是**新建**一个历史
+        版本文件（复用 _write_history_version 的 20 版上限/清理机制），供前端
+        后台静默备份当前进度；不改动 state["dirty"] 等前端标志（由浏览器自行
+        维护其脏状态语义）。不弹任何对话框。
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            body = json.loads(raw.decode("utf-8"))
+            if not isinstance(body, dict):
+                self._send(
+                    400,
+                    self._json({"ok": False, "error": "请求体必须为 JSON 对象"}),
+                    "application/json; charset=utf-8",
+                )
+                return
+            items = body.get("pages")
+            if items is None:
+                items = []
+            if not isinstance(items, list):
+                self._send(
+                    400,
+                    self._json({"ok": False, "error": "pages 必须是数组"}),
+                    "application/json; charset=utf-8",
+                )
+                return
+            state = self.server.state
+            # 与 /api/save 一致：写 pages 与「构建快照」共用一把锁（pages_lock），
+            # 保证与 /api/pages 读取、/api/history/load 写入互斥。
+            saved = 0
+            lock = state.get("pages_lock")
+            with lock if lock is not None else nullcontext():
+                for item in items:
+                    try:
+                        n = int(item.get("page"))
+                    except (TypeError, ValueError):
+                        continue
+                    state["pages"][n] = sanitize_html(
+                        str(item.get("html") or "")
+                    )
+                    saved += 1
+                pages_snapshot = dict(state["pages"])
+            # 历史记录名 / 重命名显示名（无文件模式打开历史版本后沿用）
+            if body.get("name"):
+                state["history_name"] = str(body.get("name"))
+            if body.get("display_name"):
+                state["display_name"] = str(body.get("display_name"))
+            # 文字纠错状态随历史缓存落盘（与 save 同构，.get 容错）
+            if body.get("proofread"):
+                state["proofread"] = {
+                    "errors": body["proofread"].get("errors") or {},
+                    "original": body["proofread"].get("original") or {},
+                    "dismissed": body["proofread"].get("dismissed") or {},
+                }
+            if body.get("last_proofread_page") is not None:
+                try:
+                    state["last_proofread_page"] = int(
+                        body["last_proofread_page"]
+                    )
+                except (TypeError, ValueError):
+                    pass
+            # 自动保存：总是新建历史版本（后台静默）
+            # S4：写入失败返回 False → 前端报错提示（不静默丢数据）
+            ok = _write_history_version(state)
+            payload = {"ok": ok, "saved": saved}
+            if not ok:
+                payload["error"] = "历史缓存写入失败（磁盘错误或权限不足？）"
+            self._send(200, self._json(payload), "application/json; charset=utf-8")
+        except Exception as e:  # noqa: BLE001 — 界面出错要回给浏览器而不是崩溃
+            self._send(
+                500,
+                self._json({"ok": False, "error": str(e)}),
+                "application/json; charset=utf-8",
+            )
+
     def _config(self) -> None:
         """字体/界面配置：POST 写入 config.json fonts + citationItalicEnabled。
 
@@ -6896,6 +7539,12 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
         if path == "/api/ui_settings":
             self._ui_settings()
             return
+        if path == "/api/auto_save":
+            self._auto_save()
+            return
+        if path == "/api/replace_rules":
+            self._replace_rules()
+            return
         if path == "/api/config":
             # 字体/界面配置：GET 读取 config.json fonts + citationItalicEnabled
             from configmanage import get_config
@@ -6910,10 +7559,10 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     {
                         "ok": True,
                         "fonts": {
-                            "body": fonts.get("body", "serif"),
-                            "heading": fonts.get("heading", "sans-serif"),
-                            "note": fonts.get("note", "serif"),
-                            "citation": fonts.get("citation", "cursive"),
+                            "body": fonts.get("body", ""),
+                            "heading": fonts.get("heading", ""),
+                            "note": fonts.get("note", ""),
+                            "citation": fonts.get("citation", ""),
                         },
                         "citationItalicEnabled": bool(
                             cfg.get("citationItalicEnabled", False)
@@ -7890,6 +8539,12 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
         if path == "/api/ui_settings":
             self._ui_settings()
             return
+        if path == "/api/auto_save":
+            self._auto_save()
+            return
+        if path == "/api/replace_rules":
+            self._replace_rules()
+            return
         if path == "/api/config":
             self._config()
             return
@@ -8588,6 +9243,10 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     self._json({"ok": False, "error": str(e)}),
                     "application/json; charset=utf-8",
                 )
+            return
+        if path == "/api/autosave":
+            # 自动保存动作：与 /api/save 同载荷，但总是新建历史版本（后台静默）
+            self._autosave_action()
             return
         if path not in ("/api/save", "/api/stage", "/api/finish"):
             self._send(404, b"not found", "text/plain")
@@ -9388,10 +10047,19 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
 .editable h5::before{content:"H5";color:#1C2733;}
 .editable h6::before{content:"H6";color:#5A6B7C;}
 .ptoe-align-left{text-align:left;} .ptoe-align-center{text-align:center;} .ptoe-align-right{text-align:right;}
+/* 2026-09-24：行内对齐 span（部分选区包裹 <span class="ptoe-align-*">…</span>），
+   与 EPUB 导出 CSS（htmlmanage 同规则，含 th/td 兼容）保持一致 */
+.editable span.ptoe-align-left{display:block;text-align:left;}
+.editable span.ptoe-align-center{display:block;text-align:center;}
+.editable span.ptoe-align-right{display:block;text-align:right;}
+.editable th span.ptoe-align-left,.editable td span.ptoe-align-left{display:inline;text-align:left;}
+.editable th span.ptoe-align-center,.editable td span.ptoe-align-center{display:inline;text-align:center;}
+.editable th span.ptoe-align-right,.editable td span.ptoe-align-right{display:inline;text-align:right;}
 .ptoe-marker{background:#fff3bf;border:1px solid #e8c24a;border-radius:3px;padding:0 4px;font-size:12px;color:#8a6d00;cursor:help;user-select:all;}
 .ptoe-search{background:#fff1a8;border-radius:2px;padding:0 2px;color:inherit;}
 .editable mark.ptoe-search{background:#fff1a8;color:inherit;border-radius:2px;padding:0 2px;}
  .editable .ptoe-note{font-size:12px;color:#556677;}
+ .editable .ptoe-citation{font-family:var(--font-citation,'宋体',SimSun,serif);font-style:var(--citation-italic, italic);}
 .pop-btn:hover{background:#eef3fb;border-color:var(--accent);}
 /* 全局延迟提示：悬停超过设定时间才显示（含快捷键），延迟可在「快捷键」设置中调整 */
 #tip{position:fixed;z-index:80;display:none;background:#1c2733;color:#fff;font-size:12px;line-height:1.5;padding:5px 9px;border-radius:4px;max-width:320px;pointer-events:none;}
@@ -9445,10 +10113,12 @@ body.paint-mode{cursor:copy;}
 .img-pop-btn:hover{background:#eef3fb;border-color:var(--accent);}
 #errOk{background:#2e8b57;color:#fff;border:none;border-radius:4px;padding:2px 10px;cursor:pointer;font-size:14px;}
 #errNo{background:#c0392b;color:#fff;border:none;border-radius:4px;padding:2px 10px;cursor:pointer;font-size:14px;}
-/* 文字纠错下拉菜单 / 文字包围 / 上标下标 */
-#proofreadMenu, #charWrapMenu, #supSubMenu{position:fixed;z-index:70;background:#fff;border:1px solid #ddd;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.15);min-width:120px;padding:4px;display:none;}
-#proofreadMenu button, #charWrapMenu button, #supSubMenu button{display:block;width:100%;text-align:left;padding:6px 10px;border:none;background:none;cursor:pointer;border-radius:4px;font-size:13px;}
-#proofreadMenu button:hover, #charWrapMenu button:hover, #supSubMenu button:hover{background:#f0f0f0;}
+/* 文字纠错下拉菜单 / 文字包围 / 上标下标 / 分隔线 */
+/* 分隔线菜单 #dividerMenu 必须与前三个同构：openDropMenu 写 left/top 并 display:block，
+   缺 position:fixed 时坐标被忽略、static 块又被 sticky 的 #toolbar 盖住 → 点击像没反应。 */
+#proofreadMenu, #charWrapMenu, #supSubMenu, #dividerMenu{position:fixed;z-index:70;background:#fff;border:1px solid #ddd;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.15);min-width:120px;padding:4px;display:none;}
+#proofreadMenu button, #charWrapMenu button, #supSubMenu button, #dividerMenu button{display:block;width:100%;text-align:left;padding:6px 10px;border:none;background:none;cursor:pointer;border-radius:4px;font-size:13px;}
+#proofreadMenu button:hover, #charWrapMenu button:hover, #supSubMenu button:hover, #dividerMenu button:hover{background:#f0f0f0;}
 /* 下拉指示符：小号低对比三角，提示「校」为下拉菜单；菜单展开时按钮高亮 */
 #proofreadBtn .ptoe-caret{font-size:9px;color:#8a97a6;margin-left:3px;vertical-align:1px;}
 #popup .sep{width:100%;height:0;border-top:1px solid var(--border);margin:2px 0;}
@@ -9520,9 +10190,32 @@ body.paint-mode{cursor:copy;}
 .indent-grid select{padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;background:#fff;}
 .indent-preview{border:1px dashed var(--border);border-radius:6px;padding:10px 12px;margin:8px 0 12px;min-height:56px;overflow:auto;background:#fafbfc;}
 .indent-preview p{margin:0;}
+/* 段落设置应用范围（2026-09-24：选中段落 / 当前页全部正文段落 / 全部正文） */
+.indent-mode-row{display:flex;gap:14px;flex-wrap:wrap;font-size:13px;margin:6px 0 2px;padding:6px 10px;background:#f2f5f9;border:1px solid var(--border);border-radius:6px;}
+.indent-mode-row label{display:flex;align-items:center;gap:5px;cursor:pointer;color:#33475b;}
+.indent-mode-row input[type="radio"]{margin:0;accent-color:var(--accent,#316dca);cursor:pointer;}
 /* 插入表格弹窗：行列数输入与「首行表头」勾选（外层复用 .search-modal/.export-actions） */
 #tableModalBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
 .table-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 14px;margin:10px 0;font-size:13px;}
+/* 字符格式弹窗（2026-09-27）：外层复用 .search-modal/.export-actions/.indent-mode-row */
+#charFormatModalBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+#cfSizeNum{width:86px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;}
+#cfFontSel{max-width:190px;}
+#cfPreview p{margin:0;}
+/* 分隔线下拉菜单里的字形预览（与正文里最终写入的 8 字形串一致） */
+#dividerMenu .div-glyph{margin-left:8px;font-family:monospace;color:var(--text-muted);letter-spacing:0;}
+#dividerMenu .div-dashed{letter-spacing:.12em;}
+#dividerMenu .div-dotted{letter-spacing:.12em;}
+#dividerMenu .div-double{font-weight:bold;letter-spacing:.05em;}
+/* 分隔线（2026-09-27）：与 htmlmanage 导出 EPUB 的规则保持一致（同一份视觉预期）。
+   标记形态 = 非空段落 + 两个类：基类 + 样式后缀（correctmanage.DIVIDER_STYLES）。
+   四种样式必须一眼可辨；居中、不继承段首缩进、不受逐字符字号/颜色影响。 */
+.editable p.ptoe-divider{text-align:center;text-indent:0;margin:.6em 0;color:#999999;white-space:nowrap;overflow:hidden;font-size:1em;letter-spacing:0;}
+.editable p.ptoe-divider-solid{letter-spacing:0;font-weight:normal;}
+.editable p.ptoe-divider-dashed{letter-spacing:.12em;}
+.editable p.ptoe-divider-dotted{letter-spacing:.12em;}
+.editable p.ptoe-divider-double{letter-spacing:.05em;font-weight:bold;}
+.editable p.ptoe-divider span{color:inherit;font-size:inherit;font-family:inherit;}
 .table-grid label{display:flex;align-items:center;gap:6px;white-space:nowrap;}
 .table-grid input[type="number"]{width:72px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;}
 .export-desc{font-size:13px;color:#5a6b7c;margin:0 0 14px;line-height:1.6;}
@@ -9547,6 +10240,60 @@ body.paint-mode{cursor:copy;}
 .sr-ctx{color:#33414f;line-height:1.5;word-break:break-all;}
 .sr-ctx mark{background:#ffe08a;color:#5c4000;border-radius:2px;padding:0 2px;}
 .sr-empty{color:#8a97a6;padding:6px 2px;}
+/* 2026-09：搜索范围分段按钮 + 保留组 chips + 替换规则列表 */
+.scope-seg{display:inline-flex;background:rgba(0,0,0,.06);border-radius:8px;padding:2px;gap:2px;}
+.scope-btn{border:0;background:transparent;border-radius:6px;padding:4px 10px;font-size:12px;color:#5a6b7c;cursor:pointer;}
+.scope-btn:hover{color:#1c2733;}
+.scope-btn.active{background:#fff;color:#1c2733;box-shadow:0 1px 3px rgba(0,0,0,.15);font-weight:600;}
+.search-row-group{display:flex;align-items:center;gap:6px;margin-bottom:6px;}
+.srow-label{flex:none;min-width:2.6em;font-size:12px;color:#8a97a6;text-align:right;}
+.kg-row{display:none;align-items:center;gap:6px;margin:2px 0 6px;padding:4px 8px;background:rgba(59,111,255,.06);border:1px solid rgba(59,111,255,.25);border-radius:6px;}
+.kg-hint{flex:none;font-size:12px;color:#3b6fff;font-weight:600;}
+.kg-chips{display:flex;flex-wrap:wrap;gap:4px;}
+.kg-chip{border:1px solid var(--border);background:#fff;border-radius:999px;padding:2px 9px;font-size:12px;color:#5a6b7c;cursor:pointer;}
+.kg-chip:hover{border-color:#3b6fff;color:#3b6fff;}
+.kg-chip.on{background:#3b6fff;border-color:#3b6fff;color:#fff;font-weight:600;}
+.sr-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:2px 0 6px;}
+.sr-rules-btn{border:1px solid rgba(59,111,255,.4);background:rgba(59,111,255,.08);color:#3b6fff;border-radius:6px;padding:3px 10px;font-size:12px;cursor:pointer;}
+.sr-rules-btn:hover{background:rgba(59,111,255,.16);}
+#rrList{max-height:320px;overflow:auto;}
+.rr-item{border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:8px;background:#fff;}
+.rr-item-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:13px;}
+.rr-name{font-weight:600;color:#1c2733;}
+.rr-builtin{flex:none;font-size:11px;color:#fff;background:#8a97a6;border-radius:4px;padding:1px 6px;}
+.rr-pat{font-size:12px;background:rgba(0,0,0,.05);border-radius:4px;padding:1px 6px;color:#7c3aed;}
+.rr-repl{font-size:12px;color:#5a6b7c;}
+.rr-item-acts{display:flex;gap:6px;margin-top:8px;}
+.rr-item-acts button{border:1px solid var(--border);background:#fff;border-radius:6px;padding:3px 10px;font-size:12px;cursor:pointer;}
+.rr-item-acts button:hover{border-color:#3b6fff;color:#3b6fff;}
+.rr-item-acts button.danger:hover{border-color:#c62828;color:#c62828;}
+.rr-edit-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px;margin-top:4px;}
+.rr-edit-grid label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:#33414f;}
+.rr-edit-grid input{padding:5px 8px;border:1px solid var(--border);border-radius:6px;font:inherit;width:100%;box-sizing:border-box;}
+.search-head{display:flex;align-items:center;gap:10px;}
+.search-head h3{margin:0;flex:none;}
+.search-head .scope-seg{margin-left:auto;}
+/* 搜索高亮在亮色下的蓝色调（替换默认黄，排在其后以覆盖） */
+.sr-ctx mark{background:#cfe0ff;color:#2047d8;}
+/* 暗色模式适配（2026-09） */
+.dark .scope-seg{background:rgba(255,255,255,.08);}
+.dark .scope-btn{color:#9aa7b8;}
+.dark .scope-btn:hover{color:#e8edf4;}
+.dark .scope-btn.active{background:#2a3442;color:#e8edf4;box-shadow:0 1px 3px rgba(0,0,0,.4);}
+.dark .kg-row{background:rgba(59,111,255,.12);border-color:rgba(59,111,255,.4);}
+.dark .kg-chip{background:#2a3442;border-color:#46525f;color:#b8c2cf;}
+.dark .kg-chip:hover{border-color:#3b6fff;color:#8fb0ff;}
+.dark .kg-chip.on{background:#3b6fff;border-color:#3b6fff;color:#fff;}
+.dark .sr-rules-btn{background:rgba(59,111,255,.2);color:#8fb0ff;border-color:rgba(59,111,255,.5);}
+.dark .rr-item{background:#24303e;border-color:#3a4653;}
+.dark .rr-name{color:#e8edf4;}
+.dark .rr-pat{background:rgba(255,255,255,.08);color:#c9a8ff;}
+.dark .rr-repl{color:#9aa7b8;}
+.dark .rr-item-acts button{background:#2a3442;border-color:#46525f;color:#c7d0da;}
+.dark .rr-edit-grid input{background:#2a3442;border-color:#46525f;color:#e8edf4;}
+.dark .rr-edit-grid label{color:#b8c2cf;}
+.dark .sr-ctx mark{background:rgba(59,111,255,.35);color:#d7e5ff;}
+.dark .sr-item{background:#24303e;border-color:#3a4653;}
 #modalBg{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
 #finishModalBg{position:fixed;inset:0;z-index:70;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
 #historyModalBg{position:fixed;inset:0;z-index:70;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
@@ -9604,6 +10351,8 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
 #formatRulesModalBg .fr-cond{font-size:13px;color:#33414f;}
 #frRuleModalBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
 #frFmtPopupBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+#replaceRulesModalBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+#rrEditModalBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
 #frRuleModalBg .fr-opts{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:13px;}
 #frRuleModalBg .fr-opts label{display:inline-flex;align-items:center;gap:3px;color:#33414f;}
 #frFmtPopupBg .fr-opts{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:13px;}
@@ -9649,11 +10398,14 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <button type="button" class="ic-btn" id="redoBtn" onmousedown="event.preventDefault()" disabled title="前进下一步 (Ctrl+Y / Ctrl+Shift+Z)" aria-label="前进 (Ctrl+Y)">
         <svg viewBox="0 0 24 24"><path d="M21 7v6h-6"/><path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3L21 13"/></svg>
       </button>
-      <label style="display:inline-flex;align-items:center;gap:2px;"><select id="fontSizeSel" aria-label="字号" title="字号" style="height:28px;padding:0 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text);font:inherit;">
-        <option value="12">12</option><option value="13">13</option><option value="14" selected>14</option>
-        <option value="15">15</option><option value="16">16</option><option value="17">17</option>
-        <option value="18">18</option><option value="20">20</option>
-      </select></label>
+      <!-- 编辑器显示字号（仅视图，不写入内容；与「字符格式」弹窗的逐字符字号区分） -->
+      <label style="display:inline-flex;align-items:center;gap:2px;" title="编辑器显示字号：只改变编辑区文字的显示大小，不修改正文、不写入内容（真正改文字字号请用「字符格式」）">
+        <span aria-hidden="true" style="font-size:12px;line-height:1;color:var(--text-muted);letter-spacing:.5px;user-select:none;">Aa</span>
+        <select id="fontSizeSel" aria-label="编辑器显示字号（仅影响视图，不写入内容）" title="编辑器显示字号（仅影响视图，不写入内容）" style="height:28px;padding:0 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text);font:inherit;">
+          <option value="12">12</option><option value="13">13</option><option value="14" selected>14</option>
+          <option value="15">15</option><option value="16">16</option><option value="17">17</option>
+          <option value="18">18</option><option value="20">20</option>
+        </select></label>
     </div>
     <!-- Zone 2: 格式/插入 -->
     <div class="tb-group" role="group" aria-label="格式/插入">
@@ -9674,6 +10426,9 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       </button>
       <button type="button" class="ic-btn" data-op="note" onmousedown="event.preventDefault()" title="注释：把当前块设为注释（小字灰色） (Ctrl+Shift+N)" aria-label="注释 (Ctrl+Shift+N)">
         <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><line x1="10" y1="9" x2="8" y2="9"/></svg>
+      </button>
+      <button type="button" class="ic-btn" data-op="citation" onmousedown="event.preventDefault()" title="引用：把选中内容设为引用（斜体 + 独立字体，默认宋体；整块/光标处则切换整段）" aria-label="引用">
+        <svg viewBox="0 0 24 24"><text x="12" y="16" text-anchor="middle" font-size="14" fill="currentColor" stroke="none">引</text></svg>
       </button>
       <button type="button" class="ic-btn" data-op="strip_ws" onmousedown="event.preventDefault()" title="去空（去除段落内全部空白，保留换行）" aria-label="去空">
         <svg viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
@@ -9699,7 +10454,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
           </select>
           <button type="button" class="tb-btn" id="imgExternalBtn" role="menuitem" onmousedown="event.preventDefault()" title="从本地文件选择图片，插入到文字光标处" aria-label="插入外部图片">插入图片</button>
           <input type="file" id="imgExternalInput" accept="image/*" style="display:none"/>
-          <button type="button" class="tb-btn" id="indentDlgBtn" role="menuitem" onmousedown="event.preventDefault()" title="段落设置：左/右缩进、首行/悬挂缩进、段前段后与行距（导出 EPUB 生效）" aria-label="段落设置">段落设置</button>
+          <button type="button" class="tb-btn" id="dividerBtn" role="menuitem" onmousedown="event.preventDefault()" title="分隔线下拉菜单：在光标处插入一行分隔线（直线 / 线段 / 点线 / 双线）" aria-label="插入分隔线">分隔线 <span class="ptoe-caret">▾</span></button>
           <button type="button" class="tb-btn" id="tableBtn" role="menuitem" onmousedown="event.preventDefault()" title="插入表格：在光标处插入空表格，行/列数与是否带表头可设（Ctrl+Alt+T）" aria-label="插入表格">插入表格</button>
         </div>
       </div>
@@ -9712,6 +10467,14 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <button type="button" class="tb-btn" id="mdToggleBtn" title="切换 Markdown 源码 / 富文本编辑模式（详见帮助） (Ctrl+Shift+D)">Markdown</button>
       <button type="button" class="tb-btn" id="cleanBtn" title="智能清理：合并被 OCR 拆散的小段落、清除段首 #/* 等符号、归一化中英文标点、移除残留的 HTML 标签 (Ctrl+Shift+C)">清理</button>
       <button type="button" class="tb-btn" id="proofreadBtn" title="文字纠错下拉菜单：校正当前页 / 应用全部候选 / 清除标注 / 回退原文 (Ctrl+K)" aria-label="文字纠错 (Ctrl+K)">校 <span class="ptoe-caret">▾</span></button>
+      <!-- 字符格式（2026-09-27）：逐字符 字号/字体/颜色 弹窗入口 + 清除。并入「文本工具」
+           组而非另开一组，避免工具栏多出第 9 个分组、第三行 -->
+      <button type="button" class="ic-btn" id="charFormatBtn" onmousedown="event.preventDefault()" title="字符格式：为选中文字设置逐字符的字号（8-72 像素）、字体与颜色" aria-label="字符格式">
+        <svg viewBox="0 0 24 24"><path d="M4 19 9.5 5h1L16 19"/><line x1="6" y1="14" x2="14" y2="14"/><line x1="17" y1="19V9"/><line x1="21" y1="19v-5"/><line x1="20" y1="12h2"/></svg>
+      </button>
+      <button type="button" class="ic-btn" id="charFmtClearBtn" onmousedown="event.preventDefault()" title="清除字符格式：移除选中文字的逐字符字号/字体/颜色（整段选中即为整段）" aria-label="清除字符格式">
+        <svg viewBox="0 0 24 24"><path d="M5 17 12 10l3 3 4-4"/><line x1="4" y1="20" x2="20" y2="20"/><path d="M4 4l16 16"/></svg>
+      </button>
       <button type="button" class="ic-btn" data-op="align_left" onmousedown="event.preventDefault()" title="居左 (Ctrl+Shift+Left)" aria-label="居左 (Ctrl+Shift+Left)">
         <svg viewBox="0 0 24 24"><line x1="3" y1="6" x2="15" y2="6"/><line x1="3" y1="12" x2="15" y2="12"/><line x1="3" y1="18" x2="15" y2="18"/></svg>
       </button>
@@ -9727,6 +10490,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <button type="button" class="ic-btn" data-op="indent" onmousedown="event.preventDefault()" title="缩进" aria-label="缩进">
         <svg viewBox="0 0 24 24"><line x1="3" y1="6" x2="21" y2="6"/><line x1="9" y1="12" x2="21" y2="12"/><line x1="9" y1="18" x2="21" y2="18"/></svg>
       </button>
+      <button type="button" class="ic-btn" id="indentDlgBtn" onmousedown="event.preventDefault()" title="段落设置：左/右缩进、首行/悬挂缩进、段前段后与行距（导出 EPUB 生效）" aria-label="段落设置">¶</button>
     </div>
 
     <!-- Zone 4: 标记 -->
@@ -9844,9 +10608,6 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
     </div>
   </div>
   <div class="ctx-sep"></div>
-  <button type="button" class="ctx-item" data-ctx="reocr">重识别</button>
-  <button type="button" class="ctx-item" data-ctx="insertimg">插入图片</button>
-  <button type="button" class="ctx-item" data-ctx="clear">清除</button>
   <div class="ctx-item ctx-sub" data-ctx="marker">插入标记 <span class="ctx-arrow">▸</span>
     <div class="ctx-submenu" id="ctxMarkerSub">
       <button type="button" class="ctx-item" data-ctx-marker="join">段落标记</button>
@@ -9864,6 +10625,21 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <button type="button" class="ctx-item" data-ctx-wrap="shade">底纹</button>
     </div>
   </div>
+  <div class="ctx-sep"></div>
+  <button type="button" class="ctx-item" data-ctx="insertimg">插入图片</button>
+  <div class="ctx-item ctx-sub" data-ctx="rules">格式规则 <span class="ctx-arrow">▸</span>
+    <div class="ctx-submenu" id="ctxRulesSub"></div>
+  </div>
+  <button type="button" class="ctx-item" data-ctx="reocr">重识别</button>
+  <button type="button" class="ctx-item" data-ctx="clear">清除校正</button>
+  <button type="button" class="ctx-item" data-ctx="applypr">应用校正</button>
+  <button type="button" class="ctx-item" data-ctx="clearfmt">清除格式</button>
+  <div class="ctx-sep"></div>
+  <button type="button" class="ctx-item" data-ctx="clearpage">清空</button>
+  <button type="button" class="ctx-item" data-ctx="fmtall">格式化</button>
+  <div class="ctx-sep"></div>
+  <button type="button" class="ctx-item" data-ctx="save">保存</button>
+  <button type="button" class="ctx-item" data-ctx="stage">暂存</button>
   <div class="ctx-item ctx-sub" data-ctx="export">导出 <span class="ctx-arrow">▸</span>
     <div class="ctx-submenu" id="ctxExportSub">
       <button type="button" class="ctx-item" data-ctx-export="txt">txt格式</button>
@@ -9872,14 +10648,6 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <button type="button" class="ctx-item" data-ctx-export="epub">epub格式</button>
     </div>
   </div>
-  <div class="ctx-item ctx-sub" data-ctx="rules">添加规则 <span class="ctx-arrow">▸</span>
-    <div class="ctx-submenu" id="ctxRulesSub"></div>
-  </div>
-  <button type="button" class="ctx-item" data-ctx="clearpage">清空</button>
-  <button type="button" class="ctx-item" data-ctx="fmtall">格式化</button>
-  <div class="ctx-sep"></div>
-  <button type="button" class="ctx-item" data-ctx="save">保存</button>
-  <button type="button" class="ctx-item" data-ctx="stage">暂存</button>
 </div>
 <div id="proofreadMenu">
   <button type="button" id="prMenuCorrect" role="menuitem">校正</button>
@@ -9911,25 +10679,103 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   <button type="button" data-sup="sup" role="menuitem">上标</button>
   <button type="button" data-sup="sub" role="menuitem">下标</button>
 </div>
-<div id="searchModalBg"><div class="modal search-modal">
-  <div class="search-head"><h3>搜索 / 替换</h3><button type="button" id="searchCloseBtn" class="x-btn" title="关闭搜索" aria-label="关闭搜索">✕</button></div>
-  <div class="search-row">
-    <input type="text" id="searchInput" placeholder="搜索词（可正则）">
-    <label class="search-regex" title="勾选后按正则表达式搜索，否则按普通文本"><input type="checkbox" id="searchRegex">正则</label>
-    <button type="button" id="searchBtn" class="primary">搜索</button>
-    <button type="button" id="searchClearBtn" class="primary" title="清除全部文字标记与搜索结果" aria-label="清除搜索">清理</button>
+<!-- 分隔线菜单（2026-09-27）：四种样式，字形预览即最终写入内容 -->
+<div id="dividerMenu" class="tb-menu">
+  <button type="button" data-div="solid" role="menuitem" title="实线分隔线">直线 <span class="div-glyph div-solid">────────</span></button>
+  <button type="button" data-div="dashed" role="menuitem" title="线段分隔线">线段 <span class="div-glyph div-dashed">╌╌╌╌╌╌╌╌</span></button>
+  <button type="button" data-div="dotted" role="menuitem" title="点线分隔线">点线 <span class="div-glyph div-dotted">┈┈┈┈┈┈┈</span></button>
+  <button type="button" data-div="double" role="menuitem" title="双线分隔线">双线 <span class="div-glyph div-double">════════</span></button>
+</div>
+<!-- 字符格式弹窗（2026-09-27）：逐字符 字号/字体/颜色，样式落在 span 的 style 上 -->
+<div id="charFormatModalBg"><div class="modal search-modal" role="dialog" aria-modal="true" aria-label="字符格式">
+  <div class="search-head">
+    <h3>字符格式</h3>
+    <button type="button" class="x-btn" id="cfCloseBtn" title="关闭 (Esc)" aria-label="关闭字符格式">✕</button>
   </div>
-  <div class="search-row">
-    <input type="text" id="replaceInput" placeholder="替换为">
-    <button type="button" id="replaceBtn" title="替换当前选中的匹配（支持正则）">替换当前</button>
-    <button type="button" id="replaceAllBtn" title="把当前搜索词在所有页面中替换为「替换为」的内容（支持正则）">全部替换</button>
+  <p class="export-desc">为选中的文字设置逐字符的字号、字体与颜色，随内容保存并在导出 EPUB / Word / Markdown 时生效。不修改的内容项请选「不修改」。</p>
+  <div class="indent-mode-row" role="radiogroup" aria-label="字符格式作用范围">
+    <label title="仅作用于当前选中文字（无选中时按光标所在整块）"><input type="radio" name="cfMode" id="cfModeSel" checked> 选中内容</label>
+    <label title="作用于当前页的全部文字段落"><input type="radio" name="cfMode" id="cfModePage"> 当前页</label>
+    <label title="作用于全书全部文字段落（整书一次撤销，需确认）"><input type="radio" name="cfMode" id="cfModeAll"> 全部</label>
+  </div>
+  <div class="indent-grid">
+    <label title="字号：8-72 整数像素（留空或选「不修改」则不改）">字号
+      <select id="cfSizeSel">
+        <option value="">不修改</option>
+        <option value="8">8</option><option value="9">9</option><option value="10">10</option>
+        <option value="11">11</option><option value="12">12</option><option value="14">14</option>
+        <option value="16">16</option><option value="18">18</option><option value="20">20</option>
+        <option value="22">22</option><option value="24">24</option><option value="28">28</option>
+        <option value="32">32</option><option value="36">36</option><option value="42">42</option>
+        <option value="48">48</option><option value="56">56</option><option value="64">64</option>
+        <option value="72">72</option>
+      </select>
+      <input type="number" id="cfSizeNum" min="8" max="72" step="1" placeholder="自定义 8-72" aria-label="自定义字号（8-72 像素）">
+    </label>
+    <label title="字体：仅下列 10 种字体栈可写入内容，其余会被丢弃">字体
+      <select id="cfFontSel">
+        <option value="">不修改</option>
+        <option value="宋体, SimSun, serif">宋体</option>
+        <option value="黑体, SimHei, sans-serif">黑体</option>
+        <option value="楷体, KaiTi, serif">楷体</option>
+        <option value="仿宋, FangSong, serif">仿宋</option>
+        <option value="微软雅黑, Microsoft YaHei, sans-serif">微软雅黑</option>
+        <option value="等线, DengXian, sans-serif">等线</option>
+        <option value="serif">serif（衬线）</option>
+        <option value="sans-serif">sans-serif（无衬线）</option>
+        <option value="monospace">monospace（等宽）</option>
+        <option value="cursive">cursive（手写）</option>
+      </select>
+    </label>
+    <label title="文字颜色">颜色
+      <span id="cfColorSwatch" aria-hidden="true" style="display:inline-block;width:26px;height:22px;border:1px solid var(--border);border-radius:4px;vertical-align:middle;background:#1c2733;"></span>
+      <button type="button" class="tb-btn" id="cfColorBtn" style="height:22px;" title="选择文字颜色" aria-label="选择文字颜色">选色</button>
+      <button type="button" class="tb-btn" id="cfColorClearBtn" style="height:22px;" title="不修改颜色" aria-label="不修改颜色">不修改</button>
+    </label>
+  </div>
+  <div class="indent-preview" id="cfPreview"><p>预览：示例文字 ABC 123，可查看字号、字体与颜色的实际效果。</p></div>
+  <div class="export-actions">
+    <button type="button" id="cfClearBtn" title="清除所选范围内的逐字符字号/字体/颜色">清除字符格式</button>
+    <button type="button" id="cfCancelBtn" title="取消，不做任何修改">取消</button>
+    <button type="button" id="cfOkBtn" class="primary" title="把字符格式应用到所选范围（选中内容/当前页/全部）">确定</button>
+  </div>
+</div></div>
+<div id="searchModalBg"><div class="modal search-modal">
+  <div class="search-head">
+    <h3>搜索 / 替换</h3>
+    <div class="scope-seg" role="radiogroup" aria-label="搜索范围" title="搜索/替换/高亮的生效范围">
+      <button type="button" class="scope-btn active" data-scope="all">全部页</button>
+      <button type="button" class="scope-btn" data-scope="page">当前页</button>
+    </div>
+    <button type="button" id="searchCloseBtn" class="x-btn" title="关闭搜索" aria-label="关闭搜索">✕</button>
+  </div>
+  <div class="search-row-group">
+    <div class="srow-label">搜索</div>
+    <div class="search-row">
+      <input type="text" id="searchInput" placeholder="搜索词（可正则）">
+      <label class="search-regex" title="勾选后按正则表达式搜索，否则按普通文本"><input type="checkbox" id="searchRegex">正则</label>
+      <button type="button" id="searchBtn" class="primary">搜索</button>
+      <button type="button" id="searchClearBtn" class="primary" title="清除全部文字标记与搜索结果" aria-label="清除搜索">清理</button>
+    </div>
+  </div>
+  <div class="search-row-group">
+    <div class="srow-label">替换</div>
+    <div class="search-row">
+      <input type="text" id="replaceInput" placeholder="替换为（$1 引用捕获组）">
+      <button type="button" id="replaceBtn" title="替换当前选中的匹配（支持正则）">替换当前</button>
+      <button type="button" id="replaceAllBtn" title="把当前搜索词在范围内全部替换为「替换为」的内容（支持正则）">全部替换</button>
+    </div>
+  </div>
+  <div class="kg-row" id="keepGroupsRow" title="正则带捕获组时启用「部分替换」：勾选的组原样保留，只替换其余部分；组0=整段匹配全部保留">
+    <span class="kg-hint">保留组</span>
+    <div class="kg-chips" id="keepGroupsChips"></div>
   </div>
   <div class="search-nav">
     <button type="button" id="searchPrevBtn" title="上一个匹配" aria-label="上一个匹配">↑</button>
     <span id="searchPos"></span>
     <button type="button" id="searchNextBtn" title="下一个匹配" aria-label="下一个匹配">↓</button>
   </div>
-  <div class="sr-head"><span id="srCount"></span></div>
+  <div class="sr-head"><span id="srCount"></span><button type="button" id="replaceRulesOpenBtn" class="sr-rules-btn" title="把带保留组的替换保存为规则，一键复用">替换规则</button></div>
   <div id="searchList"></div>
 </div></div>
 <div id="exportModalBg"><div class="modal search-modal">
@@ -9947,7 +10793,12 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
 </div></div>
 <div id="indentModalBg"><div class="modal search-modal">
   <div class="search-head"><h3>段落设置</h3><button type="button" id="indCloseBtn" class="x-btn" title="关闭段落设置" aria-label="关闭段落设置">✕</button></div>
-  <p style="font-size:12px;color:#5a6b7c;margin:4px 0;">作用于当前选中/光标所在段落（可跨多段）。缩进单位为字符，间距单位为行；设置随内容保存并在导出 EPUB 时生效。</p>
+  <p style="font-size:12px;color:#5a6b7c;margin:4px 0;">缩进单位为字符，间距单位为行；设置随内容保存并在导出 EPUB 时生效。</p>
+  <div class="indent-mode-row" role="radiogroup" aria-label="段落设置应用范围">
+    <label title="仅作用于当前选中/光标所在的段落（可跨多段）"><input type="radio" name="indMode" id="indModeSel" checked> 选中段落</label>
+    <label title="作用于当前页的全部正文段落（p/div/h1-h6）"><input type="radio" name="indMode" id="indModePage"> 当前页全部正文段落</label>
+    <label title="作用于全书全部正文段落（整书一次撤销）"><input type="radio" name="indMode" id="indModeAll"> 全部正文</label>
+  </div>
   <div class="indent-grid">
     <label>左缩进 <input type="number" id="indLeft" step="0.5" min="0" max="16"> 字符</label>
     <label>右缩进 <input type="number" id="indRight" step="0.5" min="0" max="16"> 字符</label>
@@ -9972,8 +10823,8 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   </div>
   <div class="indent-preview" id="indPreview"><p>预览：段落文本示例，用于查看缩进与间距效果。The quick brown fox 123.</p></div>
   <div class="export-actions">
-    <button type="button" id="indClearBtn" title="清除所选段落的全部缩进与间距设置">清除格式</button>
-    <button type="button" id="indOkBtn" class="primary" title="把设置应用到所选段落">确定</button>
+    <button type="button" id="indClearBtn" title="清除所选范围内的全部缩进与间距设置">清除格式</button>
+    <button type="button" id="indOkBtn" class="primary" title="把设置应用到所选范围（选中段落/当前页/全部）">确定</button>
   </div>
 </div></div>
 <div id="tableModalBg"><div class="modal search-modal">
@@ -10011,16 +10862,64 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <div style="margin-top:8px;"><button type="button" id="resetMouseShortcutsBtn">恢复默认</button></div>
     </div>
     <div class="settings-panel" id="panel-fonts" style="display:none;">
-      <p style="font-size:12px;color:#5a6b7c;margin:8px 0;">设置各类文本的字体族（CSS font-family），留空则使用浏览器默认。修改后实时生效，保存到配置文件。</p>
+      <p style="font-size:12px;color:#5a6b7c;margin:8px 0;">设置各类文本的字体（CSS font-family）。默认「不修改」= 使用阅读器默认字体，不额外指定。</p>
       <div style="display:grid;grid-template-columns:120px 1fr;gap:8px 12px;align-items:center;margin-top:8px;">
         <label>正文字体</label>
-        <input type="text" id="fontBody" placeholder="如：serif, 'Microsoft YaHei', sans-serif" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+        <select id="fontBody" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+          <option value="">默认（不修改，使用阅读器默认）</option>
+          <option value="宋体, SimSun, serif">宋体</option>
+          <option value="黑体, SimHei, sans-serif">黑体</option>
+          <option value="楷体, KaiTi, serif">楷体</option>
+          <option value="仿宋, FangSong, serif">仿宋</option>
+          <option value="微软雅黑, Microsoft YaHei, sans-serif">微软雅黑</option>
+          <option value="等线, DengXian, sans-serif">等线</option>
+          <option value="serif">serif（衬线）</option>
+          <option value="sans-serif">sans-serif（无衬线）</option>
+          <option value="monospace">monospace（等宽）</option>
+          <option value="cursive">cursive（手写）</option>
+        </select>
         <label>标题字体</label>
-        <input type="text" id="fontHeading" placeholder="如：sans-serif, 'Microsoft YaHei', serif" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+        <select id="fontHeading" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+          <option value="">默认（不修改，使用阅读器默认）</option>
+          <option value="宋体, SimSun, serif">宋体</option>
+          <option value="黑体, SimHei, sans-serif">黑体</option>
+          <option value="楷体, KaiTi, serif">楷体</option>
+          <option value="仿宋, FangSong, serif">仿宋</option>
+          <option value="微软雅黑, Microsoft YaHei, sans-serif">微软雅黑</option>
+          <option value="等线, DengXian, sans-serif">等线</option>
+          <option value="serif">serif（衬线）</option>
+          <option value="sans-serif">sans-serif（无衬线）</option>
+          <option value="monospace">monospace（等宽）</option>
+          <option value="cursive">cursive（手写）</option>
+        </select>
         <label>注释字体</label>
-        <input type="text" id="fontNote" placeholder="如：serif, 'KaiTi', sans-serif" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+        <select id="fontNote" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+          <option value="">默认（不修改，使用阅读器默认）</option>
+          <option value="宋体, SimSun, serif">宋体</option>
+          <option value="黑体, SimHei, sans-serif">黑体</option>
+          <option value="楷体, KaiTi, serif">楷体</option>
+          <option value="仿宋, FangSong, serif">仿宋</option>
+          <option value="微软雅黑, Microsoft YaHei, sans-serif">微软雅黑</option>
+          <option value="等线, DengXian, sans-serif">等线</option>
+          <option value="serif">serif（衬线）</option>
+          <option value="sans-serif">sans-serif（无衬线）</option>
+          <option value="monospace">monospace（等宽）</option>
+          <option value="cursive">cursive（手写）</option>
+        </select>
         <label>引用字体</label>
-        <input type="text" id="fontCitation" placeholder="如：cursive, 'FangSong', serif" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+        <select id="fontCitation" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+          <option value="">默认（不修改，使用阅读器默认）</option>
+          <option value="宋体, SimSun, serif">宋体</option>
+          <option value="黑体, SimHei, sans-serif">黑体</option>
+          <option value="楷体, KaiTi, serif">楷体</option>
+          <option value="仿宋, FangSong, serif">仿宋</option>
+          <option value="微软雅黑, Microsoft YaHei, sans-serif">微软雅黑</option>
+          <option value="等线, DengXian, sans-serif">等线</option>
+          <option value="serif">serif（衬线）</option>
+          <option value="sans-serif">sans-serif（无衬线）</option>
+          <option value="monospace">monospace（等宽）</option>
+          <option value="cursive">cursive（手写）</option>
+        </select>
       </div>
       <div style="margin-top:12px;padding-top:8px;border-top:1px solid var(--border);">
         <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
@@ -10045,6 +10944,19 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
         <input type="checkbox" id="ruleAllPagesConfirm" style="width:16px;height:16px;">
         格式规则应用到全部页前需确认
+      </label>
+      <h4 style="margin:16px 0 4px;">自动备份</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">编辑过程中按间隔自动备份到本地历史，防止意外丢失。备份不改变「已保存」状态，也进入历史版本管理。</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:8px;">
+        <input type="checkbox" id="autoSaveEnabled" style="width:16px;height:16px;">
+        启用自动备份
+      </label>
+      <label style="font-size:13px;display:flex;align-items:center;gap:8px;">间隔（分钟）
+        <input type="number" id="autoSaveInterval" min="1" max="60" step="1" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="autoSaveNewBackup" style="width:16px;height:16px;">
+        每次备份生成新历史版本（不勾选则更新最近一版）
       </label>
       <div style="margin-top:12px;"><button type="button" id="resetUiSettingsBtn">恢复默认</button></div>
     </div>
@@ -10095,6 +11007,31 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
     <button type="button" id="formatRuleNewBtn" class="primary">新建规则</button>
     <button type="button" id="formatRulesApplyAllBtn" title="按列表顺序执行全部规则；冲突格式（对齐/块标签互斥、remove 与其他）自动跳过">应用全部规则</button>
+  </div>
+</div></div>
+<div id="replaceRulesModalBg"><div class="modal" style="max-width:680px;">
+  <div class="search-head"><h3>替换规则</h3><button type="button" id="replaceRulesCloseBtn" class="x-btn" title="关闭" aria-label="关闭">✕</button></div>
+  <p style="font-size:12px;color:#5a6b7c;margin-top:0;">把带保留组的正则替换保存为规则，一键应用到当前页或全部页面。规则与「替换当前/全部替换」使用相同的保留组语义：勾选保留的捕获组原样保留，只替换其余部分。</p>
+  <div id="rrList"></div>
+  <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
+    <button type="button" id="rrNewBtn" class="primary">新建规则</button>
+  </div>
+</div></div>
+<div id="rrEditModalBg"><div class="modal" style="max-width:640px;">
+  <div class="search-head"><h3 id="rrEditTitle">新建替换规则</h3><button type="button" id="rrEditCloseBtn" class="x-btn" title="关闭" aria-label="关闭">✕</button></div>
+  <div class="rr-edit-grid">
+    <label>规则名称 <input type="text" id="rrName" placeholder="如：章标题去圈码"></label>
+    <label>正则表达式 <input type="text" id="rrPattern" placeholder="/第([一二三四五六七八九十百千]+)章/ 或 第([一二三四五六七八九十百千]+)章"></label>
+    <label>标志 <input type="text" id="rrFlags" placeholder="i m s u（忽略留空）" title="可选：i 忽略大小写 / m 多行 / s 点号匹配换行 / u Unicode"></label>
+    <label>替换为 <input type="text" id="rrReplacement" placeholder="如：$1 章（$1 引用捕获组）"></label>
+  </div>
+  <div class="kg-row" id="rrKeepGroupsRow" title="捕获组原样保留，只替换其余部分；组0=整段匹配全部保留">
+    <span class="kg-hint">保留组</span>
+    <div class="kg-chips" id="rrKeepChips"></div>
+  </div>
+  <div style="margin-top:12px;display:flex;justify-content:flex-end;gap:8px;">
+    <button type="button" id="rrEditCancelBtn">取消</button>
+    <button type="button" id="rrEditSaveBtn" class="primary">保存规则</button>
   </div>
 </div></div>
 <div id="frRuleModalBg"><div class="modal" style="max-width:760px;">

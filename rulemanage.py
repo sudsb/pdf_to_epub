@@ -74,6 +74,19 @@ INLINE_FORMAT_CLASSES = (
     "ptoe-sub",
 )
 
+# span 上允许保留的 class 全集（MiniDOMParser 白名单的单一事实来源）。
+# = 8 个行内包装格式类（INLINE_FORMAT_CLASSES，构造时求值，永不漂移）
+#   + 标记/注释/引用 + 行内 ptoe-align-*（前端部分选区对齐用 span 承载）。
+# 字符格式（字号/字体/颜色）走 style 属性，不需要也不新增 class。
+ALLOWED_SPAN_CLASSES = frozenset(INLINE_FORMAT_CLASSES) | {
+    "ptoe-marker",
+    "ptoe-note",
+    "ptoe-citation",
+    "ptoe-align-left",
+    "ptoe-align-center",
+    "ptoe-align-right",
+}
+
 # 空元素（void elements）——无闭合标签、无子节点
 VOID_TAGS = {"br", "img", "hr", "input", "meta", "link", "base", "area", "col", "embed", "param", "source", "track", "wbr"}
 
@@ -107,6 +120,123 @@ def _indent_data_valid(k: str, v: str) -> bool:
     if k == "data-ind":
         return v in _INDENT_MODES
     return bool(_INDENT_NUM_RE.match(v))
+
+
+# =============================================================================
+# 字符级样式（字号 / 字体 / 颜色）——单一事实来源（2026-09-27）
+#
+# 载体 = span 的 style 属性。最多四条声明，且**恒按下列固定顺序重新序列化**：
+#     text-align ; font-size ; font-family ; color
+# 白名单之外的任何 CSS 属性一律丢弃（position/top/letter-spacing/… 不存活），
+# 延续 2026-09-19 定的 EPUB 便携性取舍：只放行可移植的字符格式子集。
+#
+# 放在 rulemanage 而非 correctmanage：correctmanage 已 import rulemanage，
+# 反向 import 会成环。前端（ui/app.js）镜像同一契约（同样的属性顺序与白名单）。
+# =============================================================================
+
+# 声明顺序即序列化顺序（幂等的基础）
+CHAR_STYLE_PROPS = ("text-align", "font-size", "font-family", "color")
+
+# 允许的字体栈（10 项，序列化时原样输出）
+CHAR_FONT_STACKS = (
+    "宋体, SimSun, serif",
+    "黑体, SimHei, sans-serif",
+    "楷体, KaiTi, serif",
+    "仿宋, FangSong, serif",
+    "微软雅黑, Microsoft YaHei, sans-serif",
+    "等线, DengXian, sans-serif",
+    "serif",
+    "sans-serif",
+    "monospace",
+    "cursive",
+)
+_CHAR_FONT_STACK_SET = frozenset(CHAR_FONT_STACKS)
+
+# 字号上下限（像素）与对齐取值
+CHAR_SIZE_MIN = 8
+CHAR_SIZE_MAX = 72
+CHAR_ALIGN_VALUES = ("left", "center", "right")
+
+_FONT_SIZE_RE = re.compile(r"^(\d{1,4}(?:\.\d+)?)\s*px$", re.IGNORECASE)
+# font-family 归一：去引号 + 折叠空白，使 '"黑体", SimHei, sans-serif' 也能命中白名单
+_FONT_QUOTE_RE = re.compile(r"[\"']")
+_FONT_WS_RE = re.compile(r"\s+")
+# 颜色取值白名单。
+# 与 correctmanage._COLOR_VALUE_RE **刻意同形**（# + 3-8 位十六进制，或 3-20 位颜色名）：
+# 字符样式是既有清洗链的延伸而非新契约，若此处收窄为 #rgb/#rrggbb，
+# <font color> 转换与 position 过滤等既有行为会出现分叉（同一属性两种规则），
+# 且会推翻 test_correctmanage 既有的 color:red 断言。十六进制统一转小写，
+# 颜色名原样透传；DOCX 导出侧另行只映射十六进制（命名色无法表达为 OOXML 枚举）。
+CHAR_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{3,8}$|^[a-zA-Z]{3,20}$")
+
+
+def _canon_font_family(raw: str) -> str:
+    """字体栈归一（去引号/折叠空白）；不在白名单则返回 ''。"""
+    v = _FONT_QUOTE_RE.sub("", str(raw or ""))
+    v = _FONT_WS_RE.sub(" ", v).strip()
+    return v if v in _CHAR_FONT_STACK_SET else ""
+
+
+def _canon_char_decl(prop: str, val: str) -> str:
+    """校验并归一单条声明，返回归一后的值（非法返回 ''）。"""
+    if prop == "text-align":
+        v = val.strip().lower()
+        return v if v in CHAR_ALIGN_VALUES else ""
+    if prop == "font-size":
+        m = _FONT_SIZE_RE.match(val.strip())
+        if not m:
+            return ""
+        # 四舍五入到整数像素后钳制到 8..72
+        px = int(round(float(m.group(1))))
+        return f"{max(CHAR_SIZE_MIN, min(CHAR_SIZE_MAX, px))}px"
+    if prop == "font-family":
+        return _canon_font_family(val)
+    if prop == "color":
+        v = val.strip()
+        if not CHAR_COLOR_RE.match(v):
+            return ""
+        # 十六进制统一小写（颜色名原样）
+        return v.lower() if v.startswith("#") else v
+    return ""
+
+
+def normalize_char_style(raw: str) -> str:
+    """原始 style 串 → 规范化后的字符样式串（无存活声明时返回 ""）。
+
+    行为要点：
+    - 只保留 CHAR_STYLE_PROPS 中的 4 条声明，其余 CSS 属性（含 position/top 等）丢弃；
+    - 固定顺序 text-align ; font-size ; font-family ; color，分隔符 ';' 且无尾分号；
+    - **幂等**：normalize_char_style(normalize_char_style(x)) == normalize_char_style(x)；
+    - 同一属性重复出现时后者覆盖前者（与 CSS 层叠一致），输出只留一条。
+    """
+    vals: dict[str, str] = {}
+    for decl in str(raw or "").split(";"):
+        if not decl.strip():
+            continue
+        prop, sep, val = decl.partition(":")
+        if not sep:
+            continue
+        key = prop.strip().lower()
+        if key not in CHAR_STYLE_PROPS:
+            continue
+        canon = _canon_char_decl(key, val)
+        if canon:
+            vals[key] = canon
+    return ";".join(f"{k}:{vals[k]}" for k in CHAR_STYLE_PROPS if k in vals)
+
+
+def char_style_get(raw: str, prop: str) -> str:
+    """取规范化字符样式中的单个声明值（不存在或非法返回 ''）。"""
+    key = str(prop or "").strip().lower()
+    if key not in CHAR_STYLE_PROPS:
+        return ""
+    norm = normalize_char_style(raw)
+    prefix = f"{key}:"
+    for part in norm.split(";"):
+        if part.startswith(prefix):
+            return part[len(prefix):]
+    return ""
+
 
 # 冲突组（照抄前端 FORMAT_OP_GROUPS / opsConflict）
 FORMAT_OP_GROUPS = {
@@ -400,32 +530,31 @@ class MiniDOMParser(HTMLParser):
                 self.stack.append(ElementNode(f"__skip_{tag}"))
                 return
 
-        # span 特殊处理：只保留 data-ptoe-marker 与允许的 class（ptoe-marker、ptoe-note、ptoe-citation、以及 7 个新行内格式 class）
+        # span 特殊处理：只保留 data-ptoe-marker、允许的 class 与经校验的字符样式
+        # （2026-09-27 修复两处静默丢失）：
+        #   ① style 曾被整条丢弃 —— 每应用一次格式规则就会抹掉 #colorBtn 产出的
+        #      style="color:…" 以及逐字符字号/字体（现按 normalize_char_style 放行）；
+        #   ② 允许类集合曾手写硬编码，遗漏 ptoe-underdot（明明在 INLINE_FORMAT_CLASSES）
+        #      与行内 ptoe-align-*（前端对部分选区用行内 span 包裹对齐）——
+        #      现从 INLINE_FORMAT_CLASSES 派生，构造时求值一次，永不再漂移。
         if tag == "span":
             new_attrs = {}
-            allowed_span_classes = {
-                "ptoe-marker",
-                "ptoe-note",
-                "ptoe-citation",
-                "ptoe-underline",
-                "ptoe-strike",
-                "ptoe-charbox",
-                "ptoe-shade",
-                "ptoe-highlight",
-                "ptoe-sup",
-                "ptoe-sub",
-            }
             for k, v in attr_dict.items():
                 if k == "data-ptoe-marker":
                     new_attrs[k] = v
                 elif k == "class" and isinstance(v, list):
-                    filtered = [c for c in v if c in allowed_span_classes]
+                    filtered = [c for c in v if c in ALLOWED_SPAN_CLASSES]
                     if filtered:
                         new_attrs[k] = filtered
+                elif k == "style":
+                    # 字符样式：白名单校验 + 规范序列化；无存活声明则整条丢弃
+                    norm = normalize_char_style(str(v))
+                    if norm:
+                        new_attrs[k] = norm
             attr_dict = new_attrs
 
-        # p/h1-h6 保留 class（ptoe-note/ptoe-citation/ptoe-align-*/ptoe-flush/ptoe-indent）
-        # 与段落设置 data-* 属性（缩进/间距/行距）
+        # p/h1-h6 保留 class（ptoe-note/ptoe-citation/ptoe-align-*/ptoe-flush/
+        # ptoe-indent/ptoe-divider*）与段落设置 data-* 属性（缩进/间距/行距）
         if tag in BLOCK_TAGS:
             new_attrs = {}
             for k, v in attr_dict.items():
@@ -434,6 +563,8 @@ class MiniDOMParser(HTMLParser):
                         c for c in v
                         if c in {"ptoe-note", "ptoe-citation", "ptoe-flush", "ptoe-indent"}
                         or c.startswith("ptoe-align-")
+                        # 分隔线段落（2026-09-27）：基类 + 样式后缀两个类都要留
+                        or c.startswith("ptoe-divider")
                     ]
                     if allowed:
                         new_attrs[k] = allowed
@@ -813,6 +944,10 @@ def apply_inline_format(nodes_info: list[TextNodeInfo], start_off: int, end_off:
     elif op == "note":
         # note 作为行内格式：包裹在 <span class="ptoe-note"> 中
         return _wrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "span", {"class": "ptoe-note"})
+    elif op == "citation":
+        # 引用作为行内格式：包裹在 <span class="ptoe-citation"> 中（与块级类同名，
+        # sanitize/导出链路的白名单已支持行内 span 保此类，见 :403-409/:849-850）
+        return _wrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "span", {"class": "ptoe-citation"})
     elif op.startswith("align_"):
         # align_* 作为行内格式：用内联样式包裹，允许多个不同对齐在同一块内
         pos = op[6:]  # left/center/right
@@ -1002,6 +1137,48 @@ def _unwrap_inline_class(nodes_info: list[TextNodeInfo], start_node: TextNode, s
     return True
 
 
+def _blocks_text_extent(nodes_info: list[TextNodeInfo], blocks: list[ElementNode]) -> tuple[int | None, int | None]:
+    """计算 blocks 覆盖的纯文本区间 [first_start, last_end)（2026-09-22 新增）。
+
+    每个文本节点沿 .parent 链向上查找是否落在任一 block（按 id() 身份比较）；
+    块内直属文本与嵌套行内元素（span/strong/em 等）内的文本都计入。
+    返回 (first_start, last_end)，即含文本块的最早 start / 最晚 end；
+    没有任何文本节点落在给定块内时返回 (None, None)。
+    """
+    block_ids = {id(b) for b in blocks}
+    first_start: int | None = None
+    last_end: int | None = None
+    for info in nodes_info:
+        cur: Node | None = info.node
+        while cur is not None:
+            if id(cur) in block_ids:
+                break
+            cur = cur.parent
+        if cur is None:
+            continue  # 该文本节点不在任何目标块内
+        if first_start is None or info.start < first_start:
+            first_start = info.start
+        if last_end is None or info.end > last_end:
+            last_end = info.end
+    return first_start, last_end
+
+
+def _is_divider_block(el: ElementNode | None) -> bool:
+    """块是否带 ptoe-divider class（分隔线段落，2026-09-27）。
+
+    class 有两个：基类 ptoe-divider + 样式后缀 ptoe-divider-solid/dashed/dotted/double。
+    判定用「前缀 + 空或连字符」：既让未知后缀（ptoe-divider-wavy，将来新增线型）
+    也算分隔线（规则不得改写版式元素），又不会把 ptoe-dividerless 这类
+    恰好以此前缀开头、无连字符分隔的无关 class 误判进来。
+    """
+    if el is None or not isinstance(el, ElementNode):
+        return False
+    for c in (el.attrs.get("class") or "").split():
+        if c == "ptoe-divider" or c.startswith("ptoe-divider-"):
+            return True
+    return False
+
+
 def apply_block_format(
     root: ElementNode,
     nodes_info: list[TextNodeInfo],
@@ -1010,11 +1187,14 @@ def apply_block_format(
     op: str,
     block_conflicts: dict[int, set[str]] | None = None,
     ignore_block_conflicts: bool = False,
+    selection_driven: bool = False,
 ) -> bool:
     """
     在指定偏移范围所在的块级元素上应用块级格式。
     op: p, heading1-6, note, citation, align_left/center/right, merge
     ignore_block_conflicts: 用于 match_formats，允许同块多匹配各自独立应用格式
+    selection_driven: 区间源自用户选区（scope=selection）时为 True——引用/注释
+        选区只覆盖块的一部分时改走行内 span，避免整段变色（2026-09-22）。
     """
     rng = range_from_offsets(nodes_info, start_off, end_off)
     if not rng:
@@ -1035,15 +1215,23 @@ def apply_block_format(
     if not start_block:
         return False
 
+    # 分隔线段落（ptoe-divider，2026-09-27）：整块就是一行字形，是用户手动插入的
+    # 版式元素。任何块级格式（标题/对齐/缩进/合并）都不得作用其上——否则一条恰好
+    # 命中字形行的正则会把分隔线变成标题，或把它与相邻段落 merge 掉。
+    if _is_divider_block(start_block):
+        return False
+
     # 对于 merge 操作：将选区覆盖的全部块（start_block..end_block）合并为一段
     # （与前端 _mergeSelectedBlocks 语义一致）；选区未跨块时退化为合并下一个兄弟块。
     if op == "merge":
         if not start_block.parent:
             return False
         # 收集受影响的块（从 start_block 到 end_block，与下方通用收集逻辑一致）
+        # 遇到分隔线即停（2026-09-27）：分隔线是独立版式元素，合并既不能吞掉它，
+        # 也不能跨过它把两侧正文拼到一起（那会改变文段顺序）
         merge_blocks: list[ElementNode] = []
         cur_block = start_block
-        while cur_block:
+        while cur_block and not _is_divider_block(cur_block):
             merge_blocks.append(cur_block)
             if cur_block is end_block:
                 break
@@ -1072,6 +1260,9 @@ def apply_block_format(
             for i in range(idx + 1, len(siblings)):
                 sib = siblings[i]
                 if isinstance(sib, ElementNode) and sib.tag in BLOCK_TAGS:
+                    # 紧邻兄弟就是分隔线 → 无可合并目标（不跨线合并）
+                    if _is_divider_block(sib):
+                        return False
                     next_block = sib
                     break
             if not next_block:
@@ -1097,8 +1288,7 @@ def apply_block_format(
     while cur_block:
         blocks.append(cur_block)
         if cur_block is end_block:
-            break
-        # 找下一个兄弟块
+            break        # 找下一个兄弟块
         if not cur_block.parent:
             break
         siblings = cur_block.parent.children
@@ -1114,6 +1304,11 @@ def apply_block_format(
                 break
         cur_block = nxt
 
+    # 跨块区间里的分隔线块同样排除（start_block 已单独守卫，这里补中间块）
+    blocks = [b for b in blocks if not _is_divider_block(b)]
+    if not blocks:
+        return False
+
     # per-block first-wins 冲突（2026-08）：同一块内先到先得，不同块互不影响。
     # 原实现用全局 applied_ops/_seen_groups 跟踪，导致「匹配对象分别设置了独立格式」
     # 时，第二个匹配块因同组已全局命中而被错误跳过（如两段各设 heading1 只剩一段）。
@@ -1126,6 +1321,16 @@ def apply_block_format(
         if not filtered:
             return False
         blocks = filtered
+
+    # 引用/注释选区只覆盖块的一部分 → 行内 span 包裹（2026-09-22 修复：原实现整块加类，
+    # 选中段内几个字会把整个段落变为引用/注释样式，未选中内容格式被破坏）。
+    # 仅 selection_driven（scope=selection 的用户选区）触发；page 作用域的正则/contains
+    # 匹配区间仍走块级类（保持 test_note_idempotent_multiple_matches 等既有语义：匹配
+    # 落在同一段落时块类幂等添加一次，而不是逐匹配拆成多个行内 span）。
+    if op in ("citation", "note") and selection_driven:
+        first_start, last_end = _blocks_text_extent(nodes_info, blocks)
+        if first_start is not None and last_end is not None and (start_off > first_start or end_off < last_end):
+            return apply_inline_format(nodes_info, start_off, end_off, op)
 
     if op == "p":
         for b in blocks:
@@ -1331,6 +1536,7 @@ def _apply_op(
     inline_ops: set[str] = _INLINE_LEAF_OPS,
     block_conflicts: dict[int, set[str]] | None = None,
     ignore_block_conflicts: bool = False,
+    selection_driven: bool = False,
 ) -> bool:
     """应用单个格式操作；成功后就地刷新 nodes_info。
 
@@ -1338,11 +1544,15 @@ def _apply_op(
     变的只是"节点→偏移”映射。不在每次成功修改后刷新 nodes_info，后续匹配会
     命中已脱离树的旧节点（parent.children.index 抛 ValueError 被静默吞掉），
     症状：同一节点内多个匹配只有最后一个被格式化（匹配对象混乱）。
+
+    selection_driven: 区间是否源自用户选区（scope=selection）。块级引用/注释
+    仅在 selection_driven 且区间只覆盖块的一部分时转为行内 span（2026-09-22）；
+    page 作用域的正则/contains 匹配区间仍走块级类，保持既有幂等语义。
     """
     if op in inline_ops:
         ok = apply_inline_format(nodes_info, start_off, end_off, op)
     else:
-        ok = apply_block_format(root, nodes_info, start_off, end_off, op, block_conflicts, ignore_block_conflicts)
+        ok = apply_block_format(root, nodes_info, start_off, end_off, op, block_conflicts, ignore_block_conflicts, selection_driven)
     if ok:
         nodes_info[:] = collect_text_nodes(root)[1]
     return ok
@@ -1629,7 +1839,8 @@ def _apply_pattern_conds(
                     continue
                 if _has_remove_p:
                     continue
-                _apply_op(root, nodes_info, match_start, match_end, op, inline_ops, block_conflicts)
+                _apply_op(root, nodes_info, match_start, match_end, op, inline_ops, block_conflicts,
+                          selection_driven=bool(sel))
                 applied_ops.append(op)
                 if op == "remove":
                     _has_remove_p = True
@@ -1652,11 +1863,14 @@ def _apply_fmt_entry(
     # 确定应用范围
     if page_scope:
         range_start, range_end = 0, len(page_text)
+        selection_driven = False
     elif selection:
         range_start, range_end = selection
+        selection_driven = True
     else:
         # 无选区且非 page scope：不应用（前端 paragraph scope 退回整页，这里同理）
         range_start, range_end = 0, len(page_text)
+        selection_driven = False
 
     # 块级冲突改由 apply_block_format 按块 first-wins 处理（不同块互不影响）；
     # 此处仅保留 remove 与任意已应用操作冲突的全局语义。
@@ -1666,7 +1880,8 @@ def _apply_fmt_entry(
             continue
         if _has_remove_f:
             continue
-        _apply_op(root, nodes_info, range_start, range_end, op, _INLINE_LEAF_OPS, block_conflicts)
+        _apply_op(root, nodes_info, range_start, range_end, op, _INLINE_LEAF_OPS, block_conflicts,
+                  selection_driven=selection_driven)
         applied_ops.append(op)
         if op == "remove":
             _has_remove_f = True

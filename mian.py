@@ -91,6 +91,51 @@ def parse_exclude_spec(spec) -> set[int]:
     except Exception:
         return excluded
 
+
+# 布尔型配置值的真值表（大小写不敏感）：paddle_merge_lines 等开关型键共用
+_BOOL_TRUE_WORDS = ("true", "1", "on", "yes")
+_BOOL_FALSE_WORDS = ("false", "0", "off", "no")
+
+
+def _parse_bool_arg(value) -> bool | None:
+    """解析布尔型配置值：合法返回 True/False，非法返回 None。
+
+    接受 true/false、1/0、on/off、yes/no（大小写不敏感，允许首尾空白），
+    已有的 Python 布尔值直接透传。其它值一律返回 None，由调用方给中文错误提示
+    （CLI 走 stderr + 退出码 1，GUI 走 {ok:false,error}）。
+    """
+    if isinstance(value, bool):
+        return value
+    v = str(value).strip().lower()
+    if v in _BOOL_TRUE_WORDS:
+        return True
+    if v in _BOOL_FALSE_WORDS:
+        return False
+    return None
+
+
+def _paddle_merge_lines() -> bool:
+    """读取 config.json 的 paddle_merge_lines（PaddleOCR「多行合并成段落」开关）。
+
+    走 get_config(show_dialogs=False) 读取（避免 tkinter 弹窗）；键缺失（旧配置，
+    或 DEFAULT_CONFIG 尚未补种子键）时回退默认 True，存了非法值同样回退 True，
+    保证本键对 OCR 主流程而言永远是「有值可用」而不是崩溃。
+    """
+    try:
+        from configmanage import get_config
+
+        cfg = get_config(show_dialogs=False)
+    except Exception:
+        return True
+    if not isinstance(cfg, dict):
+        return True
+    raw = cfg.get("paddle_merge_lines")
+    if raw is None:
+        return True
+    parsed = _parse_bool_arg(raw)
+    return True if parsed is None else parsed
+
+
 # 5 档 DPI：档位 -> 实际分辨率。档位越高图片 token 越多（约线性）、识别越精细但越慢。
 DPI_LEVELS = {0: 100, 1: 150, 2: 200, 3: 300, 4: 600}
 
@@ -1728,7 +1773,7 @@ def main(argv: list[str] | None = None) -> int:
     config_set_p = config_sub.add_parser("set", help="修改配置项（key=value）")
     config_set_p.add_argument(
         "key",
-        help="配置键名（llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / browser / gui_display / window_maximized / tabs_position / llama_server_args.<参数> / vllm_server_args.<参数> / proofread.<param>）",
+        help="配置键名（llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / browser / gui_display / window_maximized / tabs_position / paddle_merge_lines / llama_server_args.<参数> / vllm_server_args.<参数> / proofread.<param>）",
     )
     config_set_p.add_argument("value", help="配置值")
 
@@ -1900,6 +1945,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"    {mark}{mk}: name={mv.get('name')}, mmproj={mv.get('mmproj')}"
                 )
             print(f"  ocr_prompt: {cfg.get('ocr_prompt', '')}")
+            print(f"  paddle_merge_lines: {_paddle_merge_lines()}")
             sargs = cfg.get("llama_server_args", {}) or {}
             print("  llama_server_args:")
             for ak, av in sargs.items():
@@ -1945,9 +1991,10 @@ def main(argv: list[str] | None = None) -> int:
                 "gui_display",
                 "window_maximized",
                 "tabs_position",
+                "paddle_merge_lines",
             ):
                 print(
-                    "Error: 可修改的键名仅限 llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / browser / gui_display / window_maximized / tabs_position / llama_server_args.<参数名> / vllm_server_args.<参数名> / proofread.<param>",
+                    "Error: 可修改的键名仅限 llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / browser / gui_display / window_maximized / tabs_position / paddle_merge_lines / llama_server_args.<参数名> / vllm_server_args.<参数名> / proofread.<param>",
                     file=sys.stderr,
                 )
                 return 1
@@ -1974,6 +2021,16 @@ def main(argv: list[str] | None = None) -> int:
                     return 1
                 # 归一化存储为 "true"/"false" 字符串（与其他 bool-ish 键风格一致）
                 value = "true" if v in ("true", "1") else "false"
+            if key == "paddle_merge_lines":
+                # 布尔开关：true/false、1/0、on/off、yes/no 均接受，存为真正的布尔值
+                parsed = _parse_bool_arg(value)
+                if parsed is None:
+                    print(
+                        "Error: paddle_merge_lines 仅接受 true/false（也可写 1/0、on/off、yes/no）",
+                        file=sys.stderr,
+                    )
+                    return 1
+                value = parsed
             update_config(key, value)
             print(f"{key} = {value}")
             return 0
