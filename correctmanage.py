@@ -1183,6 +1183,37 @@ def _block_data_attrs(attrs: list[tuple[str, str | None]]) -> list[tuple[str, st
     return keep
 
 
+_INDENT_DATA_ATTR_RE = re.compile(
+    r'(data-(?:pl|pr|ind|indv|spb|spa|lh))="([^"]*)"', flags=re.I
+)
+
+
+def _block_indent_attr_html(attrs: str) -> str:
+    """从块标签**属性串**提取段落设置 data 属性，返回 ' data-x="1" …' 或 ''。
+
+    apply_markers 按块重建开标签（render_block）时必须用它：只保留 class 的旧实现
+    会把「段落设置」面板写入的 data-pl/data-ind/data-spb/data-lh 等全部剥掉，
+    htmlmanage._indent_style_attrs 拿不到任何属性 → 导出 EPUB 退回默认顶格排版
+    （用户可见症状：段前缩进/首行缩进/行距等设置不生效，2026-09-30 修复）。
+    取值规则与 _block_data_attrs 一致：data-ind 只认 first/hang，其余只认数值，
+    重复属性只留第一个，保证输出标签属性合法且可被 XHTML 解析。
+    """
+    keep: list[str] = []
+    seen: set[str] = set()
+    for m in _INDENT_DATA_ATTR_RE.finditer(attrs or ""):
+        k, v = m.group(1).lower(), m.group(2).strip()
+        if not v or k in seen:
+            continue
+        if k == "data-ind":
+            if v not in _INDENT_MODES:
+                continue
+        elif not _INDENT_NUM_RE.match(v):
+            continue
+        seen.add(k)
+        keep.append(f'{k}="{v}"')
+    return f' {" ".join(keep)}' if keep else ""
+
+
 def _normalize_note(text: str) -> str:
     """注释文本规范：ASCII 半角括号统一为中文全角括号（（ ））。"""
     return text.replace("(", "（").replace(")", "）")
@@ -3255,7 +3286,10 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
                     kind = "p" if tag == "div" else tag
                     tag_attrs = m.group(2) or ""
                     note = _NOTE_CLASS in tag_attrs
-                    attrs = _block_class_html(tag_attrs)
+                    # class + 段落设置 data-* 都要留：data-* 是 htmlmanage
+                    # _indent_style_attrs 转内联缩进/间距的唯一来源，剥掉则导出
+                    # EPUB 退回默认顶格（见 _block_indent_attr_html 注释）
+                    attrs = _block_class_html(tag_attrs) + _block_indent_attr_html(tag_attrs)
                 continue
             cur.append(tok)
         if kind or cur:

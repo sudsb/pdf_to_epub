@@ -2859,6 +2859,158 @@ class TestExport(unittest.TestCase):
         self.assertIn(f"![插图]({png})", text)
 
 
+class TestApplyMarkersIndentAttrs(unittest.TestCase):
+    """apply_markers：段落设置 data-* 属性必须随块标签一起保留（2026-09-30）。
+
+    用户症状：矫正界面「段落设置」设了首行缩进/段前段后/行距，导出 EPUB 后
+    全部退回默认顶格。根因：apply_markers 按块重建开标签时只保留 class
+    （_block_class_html），data-pl/data-ind/data-spb/data-lh 等被剥掉 →
+    htmlmanage._indent_style_attrs 拿不到任何属性 → 输出无内联样式的 <p>，
+    阅读器套用 CSS 默认 p { text-indent: 0 }。
+    无标记路径（structured['pages'] 直传）本就正常，本类锁定标记路径。
+    """
+
+    # 标记 span 的 data-ptoe-marker 必须是第一个属性（_MARKER_SPAN_RE 要求），
+    # 且与 sanitize_html 的输出属性顺序一致
+    FULL = '<span data-ptoe-marker="full" class="ptoe-marker">全文</span>'
+
+    def _arts(self, *page_texts):
+        return apply_markers(
+            [{"page": i + 1, "text": t} for i, t in enumerate(page_texts)]
+        )
+
+    def _run(self, *page_texts):
+        """单篇文章 → 该文章 HTML。"""
+        arts = self._arts(*page_texts)
+        self.assertEqual(len(arts), 1, f"期望 1 篇文章，实得 {len(arts)}")
+        return arts[0]["text"]
+
+    # ---------- 1) 各属性逐项保留 ----------
+
+    def test_first_line_indent_kept(self):
+        out = self._run(f"<p>{self.FULL}</p><p data-ind=\"first\" data-indv=\"2\">甲</p>")
+        self.assertIn('<p data-ind="first" data-indv="2">甲</p>', out)
+
+    def test_hanging_indent_kept(self):
+        out = self._run(f"<p>{self.FULL}</p><p data-ind=\"hang\" data-indv=\"2\">甲</p>")
+        self.assertIn('<p data-ind="hang" data-indv="2">甲</p>', out)
+
+    def test_spacing_and_line_height_kept(self):
+        out = self._run(
+            f"<p>{self.FULL}</p>"
+            '<p data-pl="3" data-pr="1" data-spb="1" data-spa="0.5" data-lh="1.8">甲</p>'
+        )
+        for frag in (
+            'data-pl="3"',
+            'data-pr="1"',
+            'data-spb="1"',
+            'data-spa="0.5"',
+            'data-lh="1.8"',
+        ):
+            self.assertIn(frag, out)
+
+    def test_indent_attrs_kept_without_any_marker(self):
+        """无标记（走 pages 直传分支的等价路径）也须保留——本类锁定重建逻辑本身。"""
+        out = self._run('<p data-ind="first" data-indv="2">甲</p>')
+        self.assertIn('<p data-ind="first" data-indv="2">甲</p>', out)
+
+    def test_heading_indent_attrs_kept(self):
+        out = self._run(f'<h1>{self.FULL}</h1><h2 data-pl="2" data-spb="1">标题</h2>')
+        self.assertIn('<h2 data-pl="2" data-spb="1">标题</h2>', out)
+
+    # ---------- 2) 与 class 并存 / 多文章分界 ----------
+
+    def test_class_and_indent_attrs_both_kept(self):
+        out = self._run(
+            f"<p>{self.FULL}</p>"
+            '<p class="ptoe-align-center" data-ind="first" data-indv="2">甲</p>'
+        )
+        self.assertIn('class="ptoe-align-center"', out)
+        self.assertIn('data-ind="first"', out)
+        self.assertIn('data-indv="2"', out)
+        # 属性顺序：class 在前（沿用 _block_class_html 输出位置）
+        self.assertIn(
+            '<p class="ptoe-align-center" data-ind="first" data-indv="2">甲</p>', out
+        )
+
+    def test_both_articles_keep_own_attrs(self):
+        arts = self._arts(
+            '<p data-ind="first" data-indv="2">甲</p>',
+            f'<p>尾{self.FULL}</p><p data-pl="4">乙</p>',
+        )
+        self.assertEqual(len(arts), 2, f"期望全文标记分出 2 篇，实得 {len(arts)}")
+        self.assertIn('data-ind="first"', arts[0]["text"])
+        self.assertIn('data-pl="4"', arts[1]["text"])
+
+    # ---------- 3) 段落合并：保留首段属性（既有约定） ----------
+
+    def test_join_merge_keeps_first_block_indent_attrs(self):
+        out = self._run(
+            f"<p>{self.FULL}</p>",
+            '<p data-pl="3">甲</p>',
+            '<p data-pl="9"><span data-ptoe-marker="join">段落</span>乙</p>',
+        )
+        self.assertIn("<p data-pl=\"3\">甲乙</p>", out)
+        self.assertNotIn('data-pl="9"', out)
+
+    # ---------- 4) 非法值与重复属性 ----------
+
+    def test_invalid_values_dropped(self):
+        out = self._run(
+            f"<p>{self.FULL}</p>"
+            '<p data-ind="bogus" data-pl="abc" data-indv="2">甲</p>'
+        )
+        self.assertNotIn("data-ind=", out)
+        self.assertNotIn("data-pl=", out)
+        self.assertIn('data-indv="2"', out)  # 合法兄弟属性照旧保留
+
+    def test_duplicate_attr_keeps_first(self):
+        out = self._run(
+            f"<p>{self.FULL}</p><p data-pl=\"3\" data-pl=\"9\">甲</p>"
+        )
+        self.assertEqual(out.count("data-pl="), 1)
+        self.assertIn('data-pl="3"', out)
+
+    def test_no_attrs_leaves_plain_tag(self):
+        out = self._run(f"<p>{self.FULL}</p><p>甲</p>")
+        self.assertIn("<p>甲</p>", out)
+
+    # ---------- 5) 端到端：EPUB 正文拿到内联缩进样式 ----------
+
+    def test_epub_output_has_inline_indent_styles(self):
+        """核心回归：导出 EPUB 的 content xhtml 必须含 text-indent 等内联样式。"""
+        page = (
+            f"<p>{self.FULL}</p>"
+            '<p data-ind="first" data-indv="2">首行缩进</p>'
+            '<p data-pl="3" data-spb="1" data-lh="1.8">段前行距</p>'
+        )
+        page = sanitize_html(page)
+        arts = self._arts(page)
+        out_dir = Path(tempfile.mkdtemp(prefix="ptoe_indent_epub_"))
+        self.addCleanup(shutil.rmtree, out_dir, ignore_errors=True)
+        conv = htmlmanage.HTMLConverter(output_dir=str(out_dir))
+        conv.convert_document(
+            {
+                "meta": {"title": "书名", "author": "作者"},
+                "pages": [{"page": 1, "text": page}],
+                "paragraphs": [{"page": 1, "text": page}],
+                "body": page,
+                "articles": arts,
+            },
+            merge_pages=True,
+        )
+        bodies = [
+            p.read_text(encoding="utf-8")
+            for p in sorted(out_dir.glob("OEBPS/content_*.xhtml"))
+        ]
+        self.assertTrue(bodies, "未生成 content xhtml")
+        body = "\n".join(bodies)
+        self.assertIn("style=\"text-indent:2em\"", body)
+        self.assertIn("margin-left:3em", body)
+        self.assertIn("margin-top:1.5em", body)
+        self.assertIn("line-height:1.8", body)
+
+
 class TestApplyMarkersTableBlock(unittest.TestCase):
     """apply_markers：<table> 自成顶层块，原样透传（2026-09-27 内容丢失修复）。
 
