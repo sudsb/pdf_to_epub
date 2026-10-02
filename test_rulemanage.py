@@ -12,6 +12,7 @@ Covers:
 - Chinese text offset correctness
 """
 
+import re
 import unittest
 from rulemanage import (
     parse_html,
@@ -34,7 +35,10 @@ from rulemanage import (
     ALLOWED_SPAN_CLASSES,
     INLINE_FORMAT_CLASSES,
     _is_divider_block,
+    _is_caption_block,
     apply_block_format,
+    ElementNode,
+    TextNode,
 )
 
 
@@ -895,6 +899,52 @@ class TestApplyRules(unittest.TestCase):
         # img 应该被保留
         self.assertIn('src="x.png"', new_html)
         self.assertIn('class="ptoe-img-full"', new_html)
+        # 2026-10-01 回归：非自闭合 <img> 曾把「尾部」吞成 img 的子节点，
+        # 而 to_html 序列化空元素时丢弃 children → 尾文凭空消失。
+        self.assertIn('尾部', new_html)
+
+    def test_void_tag_does_not_swallow_following_text(self):
+        """空元素不得入栈：img/br/hr 与非白名单空元素都不能吃掉后续文字。
+
+        浏览器 innerHTML 序列化对 void 元素永不输出自闭合斜杠，故非自闭合形态
+        是矫正界面格式规则的**默认**输入，而非边界情况。
+        """
+        rules = [{
+            "id": "r1", "name": "加粗", "mode": "first",
+            "conditions": [{
+                "type": "contains", "pattern": "前文",
+                "scope": "page", "formats": ["bold"],
+            }],
+        }]
+        # 非自闭合 img（浏览器 innerHTML 的真实形态）
+        cases: list[str] = [
+            '<p>前文<img src="x.png">尾部</p>',
+            '<p>前文<br>尾部</p>',
+            '<p>前文<hr>尾部</p>',
+            # 非白名单空元素（__skip_ 压栈后无 endtag 可出栈）
+            '<p>前文<input type="hidden">尾部</p>',
+            '<p>前文<source src="a.mp4">尾部</p>',
+        ]
+        for html in cases:
+            with self.subTest(html=html):
+                new_html, err = apply_rules(html, rules, all_rules=True)
+                assert err is None and new_html is not None
+                self.assertIn('尾部', new_html,
+                              f"尾文被空元素吞掉: {html} -> {new_html}")
+
+    def test_img_selfclosed_and_not_both_keep_tail(self):
+        """自闭合与非自闭合两种形态必须产出等价结果。"""
+        rules = [{
+            "id": "r1", "name": "加粗", "mode": "first",
+            "conditions": [{
+                "type": "contains", "pattern": "前文",
+                "scope": "page", "formats": ["bold"],
+            }],
+        }]
+        a, _ = apply_rules('<p>前文<img src="x.png"/>尾部</p>', rules, all_rules=True)
+        b, _ = apply_rules('<p>前文<img src="x.png">尾部</p>', rules, all_rules=True)
+        assert a is not None and b is not None
+        self.assertEqual(a, b)
 
     def test_single_rule_by_id(self):
         html = "<p>测试A 测试B</p>"
@@ -1834,6 +1884,435 @@ class TestDividerBlockProtection(unittest.TestCase):
         ok, out = self._apply("<p>甲</p><p>乙</p>", "乙", "heading1")
         self.assertTrue(ok)
         self.assertEqual(out, "<p>甲</p><h1>乙</h1>")
+
+
+# 题注段落的固定写法：一条真实链路上会出现的说明文字（含「图N」编号，
+# 恰好是最容易被正则命中的形态），以及它的精确 HTML 形态。
+CAPTION_TEXT = "图1示例插图"
+CAPTION_HTML = '<p class="ptoe-caption">图1示例插图</p>'
+
+
+class TestCaptionBlockProtection(unittest.TestCase):
+    """题注段落（ptoe-caption）在规则引擎中的版式保护（2026-10 图文混合）。
+
+    题注 = 图片块之后的独立说明段落。与 ptoe-divider 同为「用户手动放置的版式
+    元素」，但对标的是配图：题注-图片是一对，拆开或搬走就失去意义。故规则引擎对
+    题注采取与分隔线**完全一致**的四道保护：
+      ① 选区起点落在题注 → 一律拒绝（apply_block_format 开头早退）；
+      ② merge 收集遇题注即停（不跨题注把两侧正文拼起来）；
+      ③ merge 退化为合并下一兄弟时，紧邻题注直接拒绝（不把题注并进邻段）；
+      ④ 跨块区间剔除中间的题注（区间其余块照常生效）。
+    判定口径与解析侧块级白名单**逐字一致**（2026-10-01 修正）：「精确相等 或
+    前缀+连字符」。修前解析白名单只放行精确相等的 ptoe-caption，与本判定的前缀
+    口径分叉（见 test_suffixed_caption_class_protected_end_to_end）。
+    """
+
+    def _apply(self, html, needle, op, end_needle=None):
+        """按「文本内容」定位区间后应用块级格式，返回 (是否应用, 序列化结果)。
+
+        与 TestDividerBlockProtection._apply 同口径：end_needle 给定时取其**末尾**
+        偏移（块间无 \\n，字形与题注文本都参与纯文本偏移，不能用 start+len）。
+        """
+        root = parse_html(html)
+        text = collect_text_nodes(root)[0]
+        start = text.index(needle)
+        end = (
+            text.index(end_needle) + len(end_needle)
+            if end_needle
+            else start + len(needle)
+        )
+        ok = apply_block_format(root, collect_text_nodes(root)[1], start, end, op)
+        return ok, serialize_html(root)
+
+    def _html(self):
+        """题注夹在两段正文中间的最小三块结构。"""
+        return f"<p>甲段</p>{CAPTION_HTML}<p>乙段</p>"
+
+    # ---------- 1. 判定函数单测 ----------
+
+    def test_is_caption_block_detects_base_and_suffix(self):
+        """基类与「前缀+连字符」后缀都判为题注。
+
+        这里**直构 ElementNode** 而不走 parse_html：即便解析侧白名单已改成严格
+        前缀（2026-10-01 修正），直构仍是测判定函数本身口径的唯一干净途径——
+        走解析器会把「判定」与「白名单」两个环节混在一起，白名单一改就分不清是
+        判定退化还是白名单放行。两条链路由 test_suffixed_caption_* 与
+        test_caption_lookalike_class_not_protected 各自钉死。
+        """
+        for cls in ("ptoe-caption", "ptoe-caption-xxx", "ptoe-caption-solid"):
+            self.assertTrue(_is_caption_block(ElementNode("p", {"class": cls})), cls)
+        # 基类与后缀类都走一遍真实解析路径（白名单放行 → 判定成立）
+        for cls in ("ptoe-caption", "ptoe-caption-solid"):
+            with self.subTest(cls=cls):
+                root = parse_html(f'<p class="{cls}">{CAPTION_TEXT}</p>')
+                self.assertTrue(_is_caption_block(root.children[0]), cls)
+        # 多类共存时只看题注类本身
+        self.assertTrue(
+            _is_caption_block(ElementNode("p", {"class": "ptoe-note ptoe-caption"}))
+        )
+
+    def test_is_caption_block_false_for_lookalike_classes(self):
+        """严格口径：形似前缀的无关 class 不误判（防 ptoe-captionx 类漏保护反噬）。
+
+        与解析侧白名单同口径（2026-10-01 修正后）：判定与白名单都必须剥掉
+        ptoe-captionx，两侧任一被改成宽松 startswith 都算回归。
+        """
+        for cls in ("ptoe-captionx", "ptoe-captionless", "ptoe-note",
+                    "ptoe-citations", "ptoe-divider", "", "caption"):
+            self.assertFalse(
+                _is_caption_block(ElementNode("p", {"class": cls})), cls
+            )
+        # 无 class 键 / 空 class 串
+        self.assertFalse(_is_caption_block(ElementNode("p", {})))
+        # None 与非 ElementNode（文本节点）都必须 False，不得抛异常
+        self.assertFalse(_is_caption_block(None))
+        self.assertFalse(_is_caption_block(TextNode("题注")))
+
+    # ---------- 2. 起点守卫（保护①） ----------
+
+    def test_block_format_refused_when_selection_starts_on_caption(self):
+        """选区起点是题注 → 一律拒绝块级格式，输出逐字节不变。"""
+        html = self._html()
+        for op in ("heading1", "note", "align_center", "indent", "flush", "merge"):
+            with self.subTest(op=op):
+                ok, out = self._apply(html, CAPTION_TEXT, op)
+                self.assertFalse(ok)
+                self.assertEqual(out, html)
+
+    def test_rules_matching_caption_text_are_noop(self):
+        """端到端：一条命中题注文字的规则不得改写题注（走真实 apply_rules）。
+
+        覆盖用户实际配置的形态——规则条件 contains「图1」，formats 为标题/注释/
+        对齐/缩进/合并五种块级格式。若无保护，heading1 会把题注变成 h1（进而进
+        EPUB 目录），merge 会把题注并进邻段。
+        """
+        html = self._html()
+        for op in ("heading1", "note", "align_center", "indent", "merge"):
+            with self.subTest(op=op):
+                rules = [{
+                    "id": "r1", "name": op, "mode": "all",
+                    "conditions": [{
+                        "type": "contains", "pattern": "图1",
+                        "scope": "page", "formats": [op],
+                    }],
+                }]
+                out, err = apply_rules(html, rules, all_rules=True)
+                self.assertIsNone(err)
+                self.assertEqual(out, html)
+
+    # ---------- 3. merge 三形态（保护②③） ----------
+
+    def test_merge_across_caption_refused(self):
+        """选区跨题注 → 拒绝合并（不吞题注、不跨题注拼正文）。
+
+        真·负控：去掉保护后 merge 收集会拿到 [甲段, 题注, 乙段] 并合成一段，
+        输出与本用例的「逐字节不变」断言不同。
+        """
+        html = self._html()
+        ok, out = self._apply(html, "甲段", "merge", "乙段")
+        self.assertFalse(ok)
+        self.assertEqual(out, html)
+
+    def test_merge_with_adjacent_caption_refused(self):
+        """选区仅一个块、紧邻兄弟是题注 → 拒绝合并（题注不被并进上一段）。"""
+        html = f"<p>甲段</p>{CAPTION_HTML}"
+        ok, out = self._apply(html, "甲段", "merge")
+        self.assertFalse(ok)
+        self.assertEqual(out, html)
+
+    def test_merge_before_caption_still_merges(self):
+        """题注**之前**的两个块照常合并，题注本身不被改动（保护不过度）。"""
+        html = f"<p>甲段</p><p>乙段</p>{CAPTION_HTML}"
+        ok, out = self._apply(html, "甲段", "merge", "乙段")
+        self.assertTrue(ok)
+        self.assertEqual(out, f"<p>甲段 乙段</p>{CAPTION_HTML}")
+
+    def test_merge_after_caption_still_merges(self):
+        """题注**之后**的两个块照常合并，题注本身不被改动（保护不过度）。
+
+        本条是回归闸门而非负控：去掉保护后输出相同。它锁住的是「起点守卫不得
+        顺着兄弟链误伤后续块」——merge 收集在题注处停止后仍要让区间内其余块生效。
+        """
+        html = f"{CAPTION_HTML}<p>甲段</p><p>乙段</p>"
+        ok, out = self._apply(html, "甲段", "merge", "乙段")
+        self.assertTrue(ok)
+        self.assertEqual(out, f"{CAPTION_HTML}<p>甲段 乙段</p>")
+
+    # ---------- 4. 跨块非 merge（保护④） ----------
+
+    def test_cross_block_format_excludes_middle_caption(self):
+        """跨块格式化跳过区间内的题注，首尾块照常生效。"""
+        html = f"<h2>甲</h2>{CAPTION_HTML}<h2>乙</h2>"
+        ok, out = self._apply(html, "甲", "heading1", "乙")
+        self.assertTrue(ok)
+        self.assertIn("<h1>甲</h1>", out)
+        self.assertIn("<h1>乙</h1>", out)
+        self.assertIn(CAPTION_HTML, out)
+
+    def test_regex_span_really_crosses_caption_and_leaves_it_intact(self):
+        """真·负控：正则匹配区间确实跨过题注块，题注仍逐字节保留。
+
+        ⚠️ 本用例存在的理由：第一版「区间压着题注」用例在开/关保护两种模式下
+        输出完全相同 → 断言恒 PASS（假绿）。根因是 merge 收集循环在
+        `cur_block is end_block` 处就 break，根本没走到题注。
+        因此这里先断言匹配区间**真的跨过题注**（纯文本里题注文字落在 match 内），
+        再断言题注原样——去掉保护时题注会被改写成 h1，用例必 FAIL。
+        """
+        html = f"<p>甲段乙段</p>{CAPTION_HTML}<p>丙段</p>"
+        plain = collect_text_nodes(parse_html(html))[0]
+        rules = [{
+            "id": "r1", "name": "标题1", "mode": "all",
+            "conditions": [{
+                "type": "regex", "pattern": r"甲段乙段[\s\S]*丙段",
+                "scope": "page", "formats": ["heading1"],
+            }],
+        }]
+        out, err = apply_rules(html, rules, all_rules=True)
+        self.assertIsNone(err)
+        # 前置条件：匹配区间真的跨过题注（否则本用例退化为假绿）
+        self.assertIn(CAPTION_TEXT, plain)
+        self.assertLess(plain.index("甲段"), plain.index(CAPTION_TEXT))
+        self.assertLess(plain.index(CAPTION_TEXT), plain.index("丙段"))
+        self.assertIn("<h1>甲段乙段</h1>", out)
+        self.assertIn("<h1>丙段</h1>", out)
+        self.assertIn(CAPTION_HTML, out)
+
+    # ---------- 5. 回归：前缀不误伤 + 分隔线不受影响 ----------
+
+    def test_caption_lookalike_class_not_protected(self):
+        """ptoe-captionx 不受保护：合并照常（证明保护不是「凡 ptoe-caption* 都拦」）。"""
+        html = '<p>甲段</p><p class="ptoe-captionx">X</p><p>乙段</p>'
+        ok, out = self._apply(html, "甲段", "merge", "乙段")
+        self.assertTrue(ok)
+        self.assertEqual(out, "<p>甲段 X 乙段</p>")
+        # 口径分叉守卫（2026-10-01）：解析期白名单**同样**必须剥掉 ptoe-captionx。
+        # 这是「严格前缀」与「宽松 startswith」唯一的可观测差异——若白名单照抄
+        # 分隔线的宽松口径，题注判定(_is_caption_block，严格)与白名单就会分叉：
+        # 白名单放行而判定不认（fail-open，无害但两侧口径不一致），日后任一侧
+        # 改口径都极易漏掉另一侧。本断言把「两侧口径必须一致」钉死。
+        self.assertNotIn(
+            "ptoe-captionx", serialize_html(parse_html(html))
+        )
+        self.assertIn('class="ptoe-caption-s"',
+                      serialize_html(parse_html('<p class="ptoe-caption-s">X</p>')))
+
+    def test_divider_protection_unaffected(self):
+        """题注保护未改变分隔线的既有行为（2026-09-27 回归）。"""
+        div = '<p class="ptoe-divider ptoe-divider-dashed">X</p>'
+        # 起点守卫
+        ok, out = self._apply(f"<p>甲</p>{div}<p>丙</p>", "X", "heading1")
+        self.assertFalse(ok)
+        self.assertEqual(out, f"<p>甲</p>{div}<p>丙</p>")
+        # 跨线合并拒绝
+        ok, out = self._apply(f"<p>甲</p>{div}<p>丙</p>", "甲", "merge", "丙")
+        self.assertFalse(ok)
+        self.assertEqual(out, f"<p>甲</p>{div}<p>丙</p>")
+        # 线前合并仍生效
+        ok, out = self._apply(f"<p>甲</p><p>乙</p>{div}", "甲", "merge", "乙")
+        self.assertTrue(ok)
+        self.assertEqual(out, f"<p>甲 乙</p>{div}")
+
+    def test_caption_and_divider_neighbours_independent(self):
+        """题注与分隔线相邻：各自的保护互不干扰（题注仍受保护，分隔线仍受保护）。"""
+        div = '<p class="ptoe-divider ptoe-divider-double">X</p>'
+        html = f"<p>甲段</p>{div}{CAPTION_HTML}<p>乙段</p>"
+        ok, out = self._apply(html, CAPTION_TEXT, "heading1")
+        self.assertFalse(ok)
+        self.assertEqual(out, html)
+        ok, out = self._apply(html, "X", "heading1")
+        self.assertFalse(ok)
+        self.assertEqual(out, html)
+
+    # ---------- 6. 目录不泄漏 ----------
+
+    def test_caption_never_enters_toc(self):
+        """题注是普通段落（不是标题），走真实 _render_fragment 不进目录。
+
+        这是保护①的最终目的：一条命中「图1」的规则若把题注改成 h1，题注就会
+        作为目录条目出现在 nav.xhtml 里。此处直接断言 toc 收集结果不含题注文字。
+        """
+        import tempfile
+
+        import htmlmanage
+
+        conv = htmlmanage.HTMLConverter(tempfile.mkdtemp(prefix="t_cap_"))
+        toc: list = []
+        body = conv._render_fragment(
+            f"<h1>第一章</h1><p>正文。</p>{CAPTION_HTML}", toc_out=toc
+        )
+        self.assertIn(CAPTION_HTML, body)
+        titles = [t["title"] for t in toc]
+        self.assertEqual(titles, ["第一章"], toc)
+        self.assertNotIn(CAPTION_TEXT, titles)
+
+    # ---------- 7. 解析往返 ----------
+
+    def test_caption_class_survives_round_trip(self):
+        """解析 → 序列化保留 ptoe-caption（白名单漏登记会被静默剥掉，同型 bug）。"""
+        out = serialize_html(parse_html(CAPTION_HTML))
+        self.assertEqual(out, CAPTION_HTML)
+        # 走一遍真实规则链路后 class 仍在（每应用一次规则都不该被剥掉）
+        rules = [{
+            "id": "r1", "name": "加粗", "mode": "all",
+            "conditions": [{
+                "type": "contains", "pattern": "示例插图",
+                "scope": "page", "formats": ["bold"],
+            }],
+        }]
+        out, err = apply_rules(CAPTION_HTML, rules, all_rules=True)
+        self.assertIsNone(err)
+        self.assertIn('class="ptoe-caption"', out)
+        self.assertIn("<strong>示例插图</strong>", out)
+
+    # ---------- 8. 带连字符后缀的题注端到端保护（2026-10-01 已修） ----------
+
+    def test_suffixed_caption_class_protected_end_to_end(self):
+        """ptoe-caption-xxx 端到端受保护（解析期白名单已改为严格前缀）。
+
+        历史 bug：_is_caption_block 用「精确相等 或 前缀+连字符」口径，但解析侧
+        块级白名单（MiniDOMParser.handle_starttag 的 BLOCK_TAGS 分支）只放行
+        **精确相等**的 "ptoe-caption"，ptoe-caption-xxx 在解析期即被剥掉 →
+        带后缀的题注在链路上根本不带该 class，_is_caption_block 的前缀分支成了
+        端到端死代码。
+
+        修复口径：白名单保留集合内的精确 "ptoe-caption"（基类），另加一行
+        `c.startswith("ptoe-caption-")`。**刻意不用**分隔线的宽松
+        startswith("ptoe-divider")：宽松口径会把 ptoe-captionx 这类无连字符的
+        无关 class 误判为受保护，与 _is_caption_block 的严格口径分叉
+        （见同文件 test_caption_lookalike_class_not_protected）。
+
+        本用例即当初挂 @unittest.expectedFailure 的探针，修复后已转正。
+        """
+        html = '<p>甲段</p><p class="ptoe-caption-s">图1示例插图</p><p>乙段</p>'
+        self.assertIn('class="ptoe-caption-s"', serialize_html(parse_html(html)))
+        ok, out = self._apply(html, CAPTION_TEXT, "merge", "乙段")
+        self.assertFalse(ok, "带后缀的题注应受保护（跨它合并须被拒绝）")
+        self.assertEqual(out, html)
+
+
+# ===========================================================================
+# float 绕排图片类白名单（2026-10 图文混合）
+# ===========================================================================
+
+class TestFloatImgClassWhitelist(unittest.TestCase):
+    """ptoe-img-float-left / right 经「解析 → 应用规则 → 序列化」往返仍存活。
+
+    背景：MiniDOMParser 的 img 分支有一份独立的 class 白名单
+    （handle_starttag 的 `allowed_img_classes`，2026-10-01 加 float 时补齐）。
+    漏登记的后果**不是报错而是静默丢类**：矫正界面的格式规则每次应用都会重解析
+    页面 HTML，没进白名单的图片类当场消失 —— 图片从绕排悄悄退回独占块，
+    而规则本身报 success。本类锁死这条链路。
+
+    白名单**恰好少一项**时本类会红（已用 %TEMP% 副本做真·负控验证，见报告）。
+    """
+
+    _LEFT = "ptoe-img-float-left"
+    _RIGHT = "ptoe-img-float-right"
+
+    def _page(self, *classes):
+        """绕排图所在页：图与后文同段（CSS float 必须同段文字才绕排）。
+
+        多个类以**多个参数**传入（别塞进一个字符串再靠 or 兜底 —— 那会把
+        后面的类悄悄丢掉，写测试时真踩过：or 短路使 w50 无声消失）。
+        """
+        joined = " ".join(c for c in classes if c) or self._LEFT
+        return (
+            f'<p>绕排段落：<img class="{joined}" src="a.png" alt="插图"/>'
+            f'文字继续绕排。</p><p>乙段</p>'
+        )
+
+    def test_float_classes_survive_parse_serialize(self):
+        """① 解析 → 序列化往返存活（含配套的尺寸 / 垂直对齐类）。"""
+        for cls in (self._LEFT, self._RIGHT, f"{self._LEFT} ptoe-img-w50",
+                    f"{self._RIGHT} ptoe-img-w25 ptoe-img-vtop"):
+            with self.subTest(cls=cls):
+                out = serialize_html(parse_html(self._page(cls)))
+                got = (_class_of(out, "img") or "").split()
+                for c in cls.split():
+                    self.assertIn(c, got, out)
+
+    def test_float_classes_survive_inline_rule(self):
+        """② 应用行内规则（加粗）后 float 类仍在（规则不许顺手改图片版式）。"""
+        out, err = apply_rules(
+            self._page(), [{
+                "id": "r1", "name": "加粗", "enabled": True,
+                "conditions": [{"type": "contains", "pattern": "文字",
+                                "formats": ["bold"], "mode": "all"}],
+                "formats": [],
+            }], all_rules=True
+        )
+        self.assertIsNone(err)
+        self.assertIn(self._LEFT, (_class_of(out, "img") or "").split())
+        self.assertIn("<strong>", out)
+        self.assertIn("绕排段落：", out)
+
+    def test_float_classes_survive_block_rule(self):
+        """③ 应用块级规则（居中）后 float 类仍在，段落拿到 ptoe-align-center。"""
+        out, err = apply_rules(
+            self._page(self._RIGHT, "ptoe-img-w50"), [{
+                "id": "r2", "name": "居中", "enabled": True,
+                "conditions": [{"type": "contains", "pattern": "文字",
+                                "formats": ["align_center"], "mode": "all"}],
+                "formats": [],
+            }], all_rules=True
+        )
+        self.assertIsNone(err)
+        got = (_class_of(out, "img") or "").split()
+        self.assertIn(self._RIGHT, got)
+        self.assertIn("ptoe-img-w50", got)
+        self.assertIn("ptoe-align-center", out)
+
+    def test_float_img_survives_merge_of_its_paragraph(self):
+        """④ 绕排图所在段被 merge 进相邻段后，图片与 float 类都不丢。"""
+        root = parse_html(self._page())
+        text = collect_text_nodes(root)[0]
+        start, end = text.index("绕排段落"), len(text)
+        ok = apply_block_format(root, collect_text_nodes(root)[1], start, end, "merge")
+        out = serialize_html(root)
+        self.assertTrue(ok)
+        self.assertIn(self._LEFT, (_class_of(out, "img") or "").split())
+        self.assertIn("乙段", out)
+
+    def test_img_keeps_src_and_alt_alongside_float_class(self):
+        """⑤ src / alt 与 float 类共存（图片本身仍可被加载与替换）。"""
+        out = serialize_html(parse_html(self._page()))
+        img = _img_tag_of(out)
+        self.assertIn('src="a.png"', img)
+        self.assertIn('alt="插图"', img)
+        self.assertIn(self._LEFT, img)
+
+    def test_non_whitelisted_img_classes_stripped(self):
+        """负控：白名单外的图片类**确实**会被剥（证明上几条不是「全放行」的假绿）。
+
+        这里刻意不写 float 的近似名（如 ptoe-img-floatw）—— img 白名单用精确
+        成员判断（不是前缀），近似名与 block 侧 ptoe-caption 的口径不同，
+        混用会让人误以为两边一致。
+        """
+        out = serialize_html(parse_html(
+            self._page("ptoe-img-float-left ptoe-img-shadow ptoe-float-left")
+        ))
+        got = (_class_of(out, "img") or "").split()
+        self.assertIn(self._LEFT, got)
+        self.assertNotIn("ptoe-img-shadow", got)
+        self.assertNotIn("ptoe-float-left", got)
+
+
+def _class_of(html: str, tag: str) -> str | None:
+    """取首个 <tag> 的 class 属性值（无则 None）——反序列化后属性序不定，
+    不能按 substrings 猜，故按标签取。"""
+    m = re.search(r"<%s\b([^>]*)>" % re.escape(tag), html)
+    if not m:
+        return None
+    c = re.search(r'\bclass\s*=\s*"([^"]*)"', m.group(1))
+    return c.group(1) if c else None
+
+
+def _img_tag_of(html: str) -> str:
+    """取首个 <img> 开标签原文。"""
+    m = re.search(r"<img\b[^>]*>", html)
+    if not m:
+        raise AssertionError(f"未找到 img 标签：{html!r}")
+    return m.group(0)
 
 
 if __name__ == "__main__":

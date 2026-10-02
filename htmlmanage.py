@@ -44,11 +44,16 @@ _NOTE_LABEL_CLASS = "ptoe-note-label"
 # 尺寸 class（ptoe-img-w25/50/75/100）控制图片宽度百分比
 # 位置 class（ptoe-img-left/center/right）控制图片对齐
 _IMG_CLASSES = ("ptoe-img-full", "ptoe-img-fit", "ptoe-img-inline",
+                # 浮动绕排（2026-10 图文混合）：与 ptoe-img-inline 互斥，
+                # 类挂在 img 自身上（float 必须作用在图片元素上文字才绕排）
+                "ptoe-img-float-left", "ptoe-img-float-right",
                 "ptoe-img-w25", "ptoe-img-w50", "ptoe-img-w75", "ptoe-img-w100",
                 "ptoe-img-left", "ptoe-img-center", "ptoe-img-right",
                 "ptoe-img-vtop", "ptoe-img-vmid", "ptoe-img-vbot")
 # 手动段落格式类：顶格和缩进、引文
 _FORMAT_CLASSES = ("ptoe-flush", "ptoe-indent", "ptoe-citation")
+# 题注类（2026-10 图文混合）：图片块之后的独立说明段落，普通 p，不参与标题/目录收集
+_CAPTION_CLASS = "ptoe-caption"
 # 可插入的分隔线 class 前缀（2026-09-27）：基类 ptoe-divider + 样式后缀
 # ptoe-divider-solid/dashed/dotted/double 两个类都要保留，故用 startswith 前缀判定
 # （若按精确成员判断，后缀类会被剥掉，导出后线型退回默认）
@@ -211,6 +216,262 @@ def _is_img_page(text: str) -> bool:
     return not re.search(r'[\u4e00-\u9fffA-Za-z0-9]', stripped)
 
 
+# ---------------------------------------------------------------------------
+# 图片样式内联化（2026-10）：导出 EPUB 时把图片 class 的等价声明写进行内 style
+# ---------------------------------------------------------------------------
+# 动机：目标阅读器（静读天下会整体覆盖出版方 CSS、微信阅读无 WebView、只认 Safari
+# 抄来的极简 UA 样式表）都**不可靠地**执行 OEBPS/style.css 里的规则，而行内 style
+# 属性特异性最高、且能穿透用户样式表——是这三家唯一可靠的通道。
+# 存储侧继续只用 class（sanitize 会剥 style，且历史 JSON 不该变大），
+# 仅在 convert_document 写章节 xhtml 之前做一次后处理。
+#
+# 事实源 = CSSManager.generate_stylesheet 的图片规则（img / p.ptoe-img-* img /
+# img.ptoe-img-inline / .ptoe-img-w* / img.ptoe-img-v* / img.ptoe-img-float-* / p.ptoe-img-*），
+# 值必须与该 CSS 一致，不要两处各写一套。
+# img 侧应用顺序按「CSS 特异性 + 源内出现次序」升序（后者覆盖同名属性）：
+#   A img            (0,0,1)  display:block; max-width:100%; height:auto
+#   F .ptoe-img-w*   (0,1,0)  width:N%
+#   E img.inline     (0,1,1)  display:inline-block; max-width:100%; height:auto; vertical-align:middle
+#   G img.v*         (0,1,1)  vertical-align:X（源内晚于 E → 覆盖 E 的 middle）
+#   H img.float-*    (0,1,1)  float:X + display:inline-block + max-width + margin（源内最后）
+#   B/C/D p.ptoe-img-full|fit img (0,1,2)  最高特异性，最后应用
+# p 侧（块级模式/对齐 class 落在包裹 p 上）见下方 _P_ALIGN_DECLS / _P_FULL_DECLS。
+_IMG_BASE_DECLS = (("display", "block"), ("max-width", "100%"), ("height", "auto"))
+_IMG_INLINE_DECLS = (("display", "inline-block"), ("max-width", "100%"),
+                     ("height", "auto"), ("vertical-align", "middle"))
+# p.ptoe-img-full img, p.ptoe-img-fit img 声明的 img 侧结果
+_IMG_MODE_DECLS = (("display", "inline-block"), ("max-width", "100%"),
+                   ("vertical-align", "middle"))
+# p.ptoe-img-full img（源内晚于上一条，同特异性 → 覆盖 width/height）
+_IMG_FULL_DECLS = (("width", "100%"), ("height", "100%"), ("object-fit", "contain"))
+# 尺寸 class → 宽度百分比（与 CSS .ptoe-img-w25/50/75/100 一致）
+_IMG_WIDTH_PCT = {"ptoe-img-w25": "25%", "ptoe-img-w50": "50%",
+                  "ptoe-img-w75": "75%", "ptoe-img-w100": "100%"}
+# 垂直对齐 class → vertical-align（与 CSS img.ptoe-img-vtop/vmid/vbot 一致）
+_IMG_VALIGN = {"ptoe-img-vtop": "top", "ptoe-img-vmid": "middle",
+               "ptoe-img-vbot": "bottom"}
+# 浮动绕排 class → float（与 CSS img.ptoe-img-float-left/right 一致，值逐字相同）
+# 缩排 → float 值 → margin shorthand。margin 刻意给「内侧 + 下侧」两项：
+#   内侧 0.5em 是图片与绕排文字的间距（em 随正文字号缩放，不会贴图），
+#   下侧 0.4em 是图片下沿与后续整宽文字的间距；
+#   另一侧（外侧）留 0，让图片真正贴到版心边缘，不产生无谓的窄边。
+# display:inline-block 是**刻意的降级声明**：见 generate_stylesheet 里同名的
+# CSS 注释——忽略 float 的阅读器会退化成行内图（宽度走 ptoe-img-w*），不塌成独占块。
+_IMG_FLOAT_DECLS = {
+    "ptoe-img-float-left": (("float", "left"), ("display", "inline-block"),
+                            ("max-width", "100%"), ("margin", "0 0.5em 0.4em 0")),
+    "ptoe-img-float-right": (("float", "right"), ("display", "inline-block"),
+                             ("max-width", "100%"), ("margin", "0 0 0.4em 0.5em")),
+}
+# 行内 style 的声明输出顺序（固定，便于产物比对与断言）
+# float/margin 插在新位置，但既有声明的**相对**次序不变 → 老产物逐字节不变。
+_IMG_DECL_ORDER = ("display", "float", "max-width", "width", "height", "object-fit",
+                   "margin", "vertical-align")
+# ---------------------------------------------------------------------------
+# 块级包裹（p 标签）的等价声明 —— 事实源仍是 generate_stylesheet 的图片规则：
+#   p.ptoe-img-full { page-break-before:always; page-break-after:always;
+#                     margin:0; padding:0; text-align:center; height:100% }
+#   p.ptoe-img-left|center|right { text-align: … }
+#   p.ptoe-img-full:first-child { page-break-before:auto }（位置覆盖，必须照抄）
+# 层叠顺序（源内出现次序，升序覆盖）：full 的声明先，左/中/右类后（源内更晚）。
+# 故意不内联：margin/padding（纯观感，且 EPUB 基础样式已给 p margin）、
+#             text-indent（EPUB 基础样式无首行缩进，CSS 里的 text-indent:0 是
+#             针对编辑器首行缩进设的）、
+#             p 的 height:100%（与 img 的 height 同理：父高 auto 的引擎会把图压扁）。
+_P_ALIGN_DECLS = {"ptoe-img-left": ("text-align", "left"),
+                  "ptoe-img-center": ("text-align", "center"),
+                  "ptoe-img-right": ("text-align", "right")}
+_P_FULL_DECLS = (("page-break-before", "always"), ("page-break-after", "always"),
+                 ("text-align", "center"))
+_P_FULL_FIRST_CHILD_DECLS = (("page-break-before", "auto"),)
+_P_IMG_DECL_ORDER = ("page-break-before", "page-break-after", "margin", "padding",
+                     "text-align", "height", "text-indent")
+# 会「重置」元素计数的容器开标签：其内部第一个元素子节点才是 :first-child
+_P_CONTAINER_TAGS = ("body", "td", "th", "div", "li", "blockquote", "section",
+                     "article", "tr", "table", "tbody", "thead", "tfoot", "dd", "dt")
+_P_CONTAINER_OPEN_RE = re.compile(
+    r"<(%s)\b" % "|".join(_P_CONTAINER_TAGS), flags=re.I)
+# 完整匹配 p 开标签（属性串可能含引号内的 >，故不能简单用 [^>]* 切）
+_P_TAG_RE = re.compile(r"<p\b((?:[^>\"']|\"[^\"]*\"|'[^']*')*?)(/?)>", flags=re.I)
+# 属性值里可能含尖括号的引号串（data URI / alt）不能被当成标签边界
+_HTML_TAG_SCAN_RE = re.compile(r"<(?:[^>\"']|\"[^\"]*\"|'[^']*')+>")
+_IMG_TAG_RE = re.compile(r"<img\b((?:[^>\"']|\"[^\"]*\"|'[^']*')*?)(/?)>", flags=re.I)
+_IMG_OPEN_RE = re.compile(r"<img\b", flags=re.I)
+_P_CLOSE_RE = re.compile(r"</p\s*>$", flags=re.I)
+_CLASS_ATTR_RE = re.compile(r'class="([^"]*)"')
+_HAS_STYLE_RE = re.compile(r"\sstyle\s*=", flags=re.I)
+_HAS_WIDTH_ATTR_RE = re.compile(r"\swidth\s*=", flags=re.I)
+
+
+def _img_classes_in(attrs: str) -> set:
+    """取出属性串里属于图片 class 的那些类名（其余类忽略）。"""
+    m = _CLASS_ATTR_RE.search(attrs or "")
+    if not m:
+        return set()
+    return {c for c in m.group(1).split() if c in _IMG_CLASSES}
+
+
+def _img_declarations(classes: set) -> Dict[str, str]:
+    """图片 class 集合 → 等价 CSS 声明字典（按上面的层叠顺序覆盖）。"""
+    d: Dict[str, str] = dict(_IMG_BASE_DECLS)
+    for cls in ("ptoe-img-w25", "ptoe-img-w50", "ptoe-img-w75", "ptoe-img-w100"):
+        if cls in classes:
+            d["width"] = _IMG_WIDTH_PCT[cls]
+    if "ptoe-img-inline" in classes:
+        d.update(_IMG_INLINE_DECLS)
+    for cls in ("ptoe-img-vtop", "ptoe-img-vmid", "ptoe-img-vbot"):
+        if cls in classes:
+            d["vertical-align"] = _IMG_VALIGN[cls]
+    if "ptoe-img-full" in classes or "ptoe-img-fit" in classes:
+        # 块级模式：CSS 的选择器是「p.ptoe-img-* img」，class 实际落在包裹 p 上
+        # （编辑器的行内/块级互转会把它从 img 上摘掉）。契约未规定「class 只留在
+        # img 上、没有 p 包裹」时的块级语义——按「同一张图的显示模式」等价处理，
+        # 与 class 落在 p 上的常见形态逐字节一致。
+        d.update(_IMG_MODE_DECLS)
+        if "ptoe-img-full" in classes:
+            # 任务 B：内联侧故意去掉 height 和 object-fit（只留 width:100%），
+            # 以规避「按百分比解析高度且父高为 auto」的引擎把图压扁的风险；
+            # <style> 侧仍保留 height:100%;object-fit:contain 给合规阅读器使用
+            # ——这是内联声明与 CSS 声明之间唯一且有意的不一致。
+            d.update(_IMG_FULL_DECLS)
+            d.pop("height", None)
+            d.pop("object-fit", None)
+        else:
+            d["height"] = "auto"  # p.ptoe-img-fit img { height: auto; }
+    # 浮动绕排（2026-10 图文混合）：源内最后一条 img 侧规则 → 放在层叠末尾。
+    # 与 ptoe-img-inline 互斥（前端负责去重，这里不做自动解冲突，只保证 float 优先）。
+    for cls in ("ptoe-img-float-left", "ptoe-img-float-right"):
+        if cls in classes:
+            d.update(_IMG_FLOAT_DECLS[cls])
+            # 浮动图刻意不内联 height（与 ptoe-img-full 同理，见上方注释）：
+            # 只给 width + max-width，比例由图片自身宽高比决定，避免引擎压扁。
+            d.pop("height", None)
+    return d
+
+
+def _img_inline_tag(tag: str, p_classes: set) -> str:
+    """给单个 img 开标签补行内 style（+ width 属性）；无需内联时原样返回。
+
+    已带 style 的 img 一律不动（不覆盖、不重复追加 style 属性——重复属性违 XHTML）。
+    只处理携带图片 class 的 img（自身 class 或所在 p 的 class），
+    外来/无 class 的图片保持逐字节不变。
+    """
+    m = _IMG_TAG_RE.fullmatch(tag)
+    if not m:
+        return tag
+    attrs, slash = m.group(1), m.group(2)
+    if _HAS_STYLE_RE.search(attrs):
+        return tag
+    classes = _img_classes_in(attrs) | p_classes
+    if not classes:
+        return tag
+    decls = _img_declarations(classes)
+    parts = [f"{prop}:{decls[prop]}" for prop in _IMG_DECL_ORDER if prop in decls]
+    if not parts:
+        return tag
+    extra = f' style="{";".join(parts)}"'
+    # width 属性：覆盖「只认 HTML 属性、不认 CSS」的引擎；仅给百分比宽度时补，
+    # 单给 width 不给 height 可保住图片原始纵横比（HTML 替换元素尺寸规则）。
+    width = decls.get("width")
+    if width and not _HAS_WIDTH_ATTR_RE.search(attrs):
+        extra += f' width="{width}"'
+    return f"{tag[:4]}{attrs.rstrip()}{extra}{slash}>"
+
+
+def _p_block_declarations(classes: set, first_child: bool) -> Dict[str, str]:
+    """包裹 p 的图片 class → 等价块级声明（按 CSS 源内次序覆盖）。
+
+    层叠：先 p.ptoe-img-full 的分页/居中，再由左/中/右类覆盖 text-align
+    （CSS 里 p.ptoe-img-left/center/right 出现在 p.ptoe-img-full 之后，同特异性）。
+    first_child 对应 CSS 的 p.ptoe-img-full:first-child { page-break-before:auto }
+    ——该位置覆盖必须照抄，否则封面/内容首块的全画幅图后面会多出空白页
+    （2026-08 为此专门加的规则）。
+    """
+    d: Dict[str, str] = {}
+    if "ptoe-img-full" in classes:
+        d.update(_P_FULL_DECLS)
+        if first_child:
+            d.update(_P_FULL_FIRST_CHILD_DECLS)
+    for cls in ("ptoe-img-left", "ptoe-img-center", "ptoe-img-right"):
+        if cls in classes:
+            d.update({_P_ALIGN_DECLS[cls][0]: _P_ALIGN_DECLS[cls][1]})
+    return d
+
+
+def _p_inline_tag(tag: str, first_child: bool) -> str:
+    """给承载图片模式的 p 开标签补行内 style；无需内联时原样返回。
+
+    守卫与 _img_inline_tag 同款：已带 style 的 p 一律不动（不覆盖、不重复追加，
+    重复属性违 XHTML）；不带任何图片 class 的 p 也一律不动（普通段落不能被
+    加上任何东西）；块级声明为空（类只在 img 上、或 p 的 CSS 只有被故意
+    省略的 margin/padding/text-indent/height）时同样原样返回。
+    """
+    m = _P_TAG_RE.fullmatch(tag)
+    if not m:
+        return tag
+    attrs, slash = m.group(1), m.group(2)
+    if _HAS_STYLE_RE.search(attrs):
+        return tag
+    classes = _img_classes_in(attrs)
+    if not classes:
+        return tag
+    decls = _p_block_declarations(classes, first_child)
+    parts = [f"{prop}:{decls[prop]}" for prop in _P_IMG_DECL_ORDER if prop in decls]
+    if not parts:
+        return tag
+    return f"{tag[:2]}{attrs.rstrip()} style=\"{';'.join(parts)}\"{slash}>"
+
+
+def _inline_img_styles(text: str) -> str:
+    """章节文本后处理：把图片 class 的等价声明内联到 img 与包裹 p 标签上。
+
+    块级图片类（全画幅/局部/左中右）常落在包裹的 p 上，img 自身无 class，
+    因此按标签序列跟踪当前开着的 p 的图片 class（与 _render_fragment 的分词同思路，
+    但此处不重排任何标签：非 img 片段逐字节原样拷贝）。
+
+    p 侧内联会复查 CSS 的 :first-child 位置覆盖（需知道该 p 前是否已有元素子节点，
+    遇到容器开标签则重新计数）；已带 style 的 p 与不含图片 class 的 p 都不动，
+    因此本函数幂等：第二次调用全部因已有 style 而跳过。
+    """
+    if '<img' not in (text or '').lower():
+        return text
+    out: List[str] = []
+    p_classes: set = set()
+    seen_element = False
+    pos = 0
+    for m in _HTML_TAG_SCAN_RE.finditer(text):
+        tok = m.group(0)
+        if tok[:1] != '<':
+            continue
+        if _IMG_OPEN_RE.match(tok):
+            seen_element = True
+            new = _img_inline_tag(tok, p_classes)
+            if new != tok:
+                out.append(text[pos:m.start()])
+                out.append(new)
+                pos = m.end()
+                continue
+        elif _P_CLOSE_RE.match(tok):
+            p_classes = set()
+            seen_element = True
+        else:
+            mp = _P_TAG_RE.fullmatch(tok)
+            if mp:
+                new = _p_inline_tag(tok, first_child=not seen_element)
+                seen_element = True
+                if new != tok:
+                    out.append(text[pos:m.start()])
+                    out.append(new)
+                    pos = m.end()
+                p_classes = _img_classes_in(mp.group(1))
+                continue
+            # 容器开标签之后又是新的一层父子关系，:first-child 重新计数
+            seen_element = not _P_CONTAINER_OPEN_RE.match(tok)
+    if not out:
+        return text
+    return ''.join(out) + text[pos:]
+
+
 # 防御性自闭合 <img> 标签（XHTML 规范要求空元素必须自闭合）。
 # sanitize_html 已确保 img 自闭合，但阅读器对未自闭合的 <img> 容错不一，
 # 此处做最终兜底：把 <img ...> 转为 <img .../>，已自闭合的不重复处理。
@@ -223,7 +484,7 @@ def _self_close_img(html: str) -> str:
 
 
 def _block_class_html(attrs: str) -> str:
-    """从块标签属性中提取应保留的 class（ptoe-note, ptoe-note-label + 对齐类 + 换页 + 图片模式 + 手动格式类 + 分隔线），返回 class 属性。"""
+    """从块标签属性中提取应保留的 class（ptoe-note, ptoe-note-label + 对齐类 + 换页 + 图片模式 + 手动格式类 + 题注 + 分隔线），返回 class 属性。"""
     m = re.search(r'class="([^"]*)"', attrs)
     if not m:
         return ""
@@ -231,6 +492,9 @@ def _block_class_html(attrs: str) -> str:
         c
         for c in m.group(1).split()
         if c == _NOTE_CLASS or c == _NOTE_LABEL_CLASS or c in _ALIGN_CLASSES or c == _PAGE_BREAK_CLASS or c in _IMG_CLASSES or c in _FORMAT_CLASSES
+        # 题注（2026-10 图文混合）：白名单未同步会剥掉类 → EPUB 里题注样式全丢
+        # （与分隔线同型的「样式丢失」缺陷）
+        or c == _CAPTION_CLASS
         # 分隔线（2026-09-27）：基类与样式后缀类同放（startswith 前缀判定）
         or c.startswith(_DIVIDER_CLASS_PREFIX)
     ]
@@ -617,6 +881,44 @@ class CSSManager:
         img.ptoe-img-vtop { vertical-align: top; }
         img.ptoe-img-vmid { vertical-align: middle; }
         img.ptoe-img-vbot { vertical-align: bottom; }
+        /* 浮动绕排（2026-10 图文混合）：类挂在 img 元素自身上，文字从侧边绕排。
+           这是 CSSManager 「避免现代布局特性」的**刻意例外**——依据是目标阅读器
+           多看的第一方扩展规范实测支持 float 绕排；而本文件其余规则保持保守。
+           display:inline-block 是配套的**降级声明**（不是冗余）：忽略 float 的
+           阅读器（微信阅读无 WebView、静读天下整体覆盖出版方 CSS）会退回
+           「按 ptoe-img-w* 宽度比例行内排版、文字接在图片后面」，
+           即现有 ptoe-img-inline 的行为，图片不会塌成独占块——
+           所以两条规则都写 float 与 inline-block 的组合，而非裸 float。
+           margin 内侧 0.5em（与绕排文字的间距，em 随字号缩放，不贴图）
+                下侧 0.4em（图片下沿与后续整宽文字的间距）；外侧留 0 贴版心。
+           宽度仍由上面的 .ptoe-img-w* 档位控制，本组规则不写 width。
+           注意：CSS 会被内联进 XHTML 的 style 元素——注释里出现字面尖括号会被
+           当成标签导致整个文件非法，此处注释不含尖括号。 */
+        img.ptoe-img-float-left {
+          float: left;
+          display: inline-block;
+          max-width: 100%;
+          height: auto;
+          margin: 0 0.5em 0.4em 0;
+        }
+        img.ptoe-img-float-right {
+          float: right;
+          display: inline-block;
+          max-width: 100%;
+          height: auto;
+          margin: 0 0 0.4em 0.5em;
+        }
+        /* 题注（2026-10 图文混合）：图片块之后的独立说明段落，声明与矫正界面
+           编辑器样式逐字一致（全局契约固定，不在两处各写一套）。题注是普通段落，
+           不参与标题收集，故不会进目录。
+           注意：CSS 会被内联进 XHTML 的 style 元素——注释里出现字面尖括号会被当成
+           标签导致整个文件非法，此处注释不含尖括号。 */
+        p.ptoe-caption {
+          font-size: 0.85em;
+          color: #666;
+          text-align: center;
+          margin: 0.2em 0 0.6em;
+        }
         /* 表格（2026-09-20）：矫正界面插入的表格走通用边框样式。
            注意：CSS 会被内联进 XHTML 的 style 元素——注释里出现字面
            尖括号会被当成标签导致整个文件非法，此处注释不含尖括号。 */
@@ -1041,6 +1343,10 @@ class HTMLConverter:
                 # 应用加粗注释标签转换（注　　释：+ 顶格 class）
                 chunk = transform_note_labels(chunk)
                 body = self._render_fragment(chunk, toc_out=toc)
+                # 图文样式内联化：img 与包裹 p 的等价声明写进行内 style
+                # （必须放在 _render_fragment 之后——它会按白名单重建块开标签，
+                # 只回填 class 与缩进 data-*，写在它之前的 style 属性会被丢弃）
+                body = _inline_img_styles(body)
 
                 # compose XHTML document
                 html_doc = (
@@ -1219,6 +1525,15 @@ class HTMLConverter:
                         except Exception:
                             # ignore copy errors; leave original src
                             pass
+
+        # 图片样式内联化（2026-10）：此刻 src 已换成 Images/ 相对路径（正斜杠），
+        # 正好是内联化该做的时机——写在图片提取之后、章节写盘之前，
+        # 后续的整页图判定/封面取图/TOC 收集都不受影响（都在文本层或标签无关处）。
+        # 只改这一次产出的内存副本：存储侧 pages[i].text 不动。
+        # img 侧的内联在这里生效并被后续流程保留；p 侧的内联会被 _render_fragment
+        # 重建块开标签时丢弃，最终生效的是 render_content_pages 里那次调用。
+        for ch in chapters:
+            ch['text'] = _inline_img_styles(ch.get('text', ''))
 
         # cover：整页图片页独立为封面（cover.xhtml，仅图片无书名页——2026-08-15
         # 用户明确不要书名页，书名保留在 EPUB 元数据与导航栏目录条目中）；

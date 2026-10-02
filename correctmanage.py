@@ -116,6 +116,10 @@ _BLOCK_RE = re.compile(r"h[1-6]")
 _SKIP_TAGS = {"script", "style", "head", "iframe", "object", "embed"}
 _MARKER_RE = re.compile(r"^(?:full|join|note|page|chapter:\d{1,2})$")
 _NOTE_CLASS = "ptoe-note"
+# 题注（2026-10 图文混合）：图片块之后的独立说明段落 <p class="ptoe-caption">。
+# 纯样式承载类（无行内语义），须随保存/导出落盘；漏进 _block_classes/_block_class_html
+# 会被 sanitize 静默剥掉，症状为「保存后题注样式丢失」（本项目已有同型 bug）。
+_CAPTION_CLASS = "ptoe-caption"
 
 
 _ALIGN_CLASSES = {"ptoe-align-center", "ptoe-align-left", "ptoe-align-right"}
@@ -251,6 +255,11 @@ _IMG_CLASSES = {
     "ptoe-img-full",
     "ptoe-img-fit",
     "ptoe-img-inline",
+    # 浮动绕排（2026-10 图文混合）：与 ptoe-img-inline 互斥，类挂在 img 自身上
+    # （float 必须作用在图片元素上文字才会绕排；挂在包裹 p 上无法生效）。
+    # 宽度仍复用既有的 ptoe-img-w* 档位，不新增尺寸类。
+    "ptoe-img-float-left",
+    "ptoe-img-float-right",
     "ptoe-img-w25",
     "ptoe-img-w50",
     "ptoe-img-w75",
@@ -1111,7 +1120,7 @@ def diff_reocr_texts(current: str, new_text: str) -> list:
 
 
 def _block_class_html(attrs: str) -> str:
-    """从块标签属性中提取应保留的 class（ptoe-note + 对齐类 + 换页 + 图片模式 + 分隔线），返回 class 属性。"""
+    """从块标签属性中提取应保留的 class（ptoe-note + 对齐类 + 换页 + 图片模式 + 题注 + 分隔线），返回 class 属性。"""
     m = re.search(r'class="([^"]*)"', attrs)
     if not m:
         return ""
@@ -1125,6 +1134,7 @@ def _block_class_html(attrs: str) -> str:
         or c == "ptoe-flush"
         or c == "ptoe-indent"
         or c == "ptoe-citation"
+        or c == _CAPTION_CLASS
         # 分隔线（2026-09-27）：基类 + 样式后缀两个类都要留，前缀判定
         or c.startswith(DIVIDER_CLASS)
     ]
@@ -1132,7 +1142,7 @@ def _block_class_html(attrs: str) -> str:
 
 
 def _block_classes(attrs: list[tuple[str, str | None]]) -> list[str]:
-    """块级标签应保留的 class 列表（ptoe-note + 对齐类 + 换页 + 图片模式 + 分隔线）。"""
+    """块级标签应保留的 class 列表（ptoe-note + 对齐类 + 换页 + 图片模式 + 题注 + 分隔线）。"""
     keep: list[str] = []
     for k, v in attrs:
         if k == "class":
@@ -1145,6 +1155,7 @@ def _block_classes(attrs: list[tuple[str, str | None]]) -> list[str]:
                     or c == "ptoe-flush"
                     or c == "ptoe-indent"
                     or c == "ptoe-citation"
+                    or c == _CAPTION_CLASS
                     # 分隔线（2026-09-27）：基类 + 样式后缀两个类都要留，前缀判定
                     or c.startswith(DIVIDER_CLASS)
                 ):
@@ -4876,6 +4887,30 @@ _DOCX_RPR_ORDER = (
     "vertAlign",
 )
 
+# ---- 题注（ptoe-caption）版式契约（2026-10 非 EPUB 导出落地）--------------------
+# 权威样式 = 编辑器 CSS（.editable p.ptoe-caption）与 htmlmanage EPUB CSS 的同源值：
+#     font-size:0.85em; color:#666; text-align:center; margin:0.2em 0 0.6em
+# EPUB 侧由 htmlmanage 的 style.css 承载（无此文件即可），本组常量供 TXT/DOCX/MD
+# 三条非 EPUB 链路各自换算：字号比例 / 颜色 / 对齐三值只定义一次，避免散落各处。
+_CAPTION_FONT_SCALE = 0.85
+# 颜色：CSS 侧沿用契约字面量 #666；OOXML w:color 是无 # 的 6 位十六进制枚举，
+# 故另存一份 666666（同为 rgb(102,102,102)，不改变实际观感）
+_CAPTION_COLOR_CSS = "#666"
+_CAPTION_COLOR_HEX = "666666"
+_CAPTION_JC = "center"
+# Markdown 内联样式串：GFM 没有字号/颜色/居中语法，但 HTML 块允许 style 属性，
+# 于是「保留 class（mdToHtml 可无损还原题注）+ 补内联样式（无样式表的渲染器也能
+# 正确显示）」双保险。margin 一并内联以还原题注与图之间的紧凑间距。
+_CAPTION_MD_STYLE = (
+    f"font-size:{_CAPTION_FONT_SCALE}em;color:{_CAPTION_COLOR_CSS};"
+    f"text-align:{_CAPTION_JC};margin:0.2em 0 0.6em"
+)
+# DOCX 正文基准字号（半磅）：五号 10.5pt = 21。题注按 0.85em 换算 →
+# 21 × 0.85 = 17.85 半磅。OOXML 字号只接受整数半磅，必须四舍五入（截断会偏小
+# 0.4pt），结果 18 半磅 = 9pt。
+_DOCX_BODY_SZ = 21
+_DOCX_CAPTION_SZ = int(round(_DOCX_BODY_SZ * _CAPTION_FONT_SCALE))
+
 
 def _html_to_export_blocks(html: str) -> list[tuple]:
     """已清洗 HTML → 块列表，供 TXT/DOCX 导出。
@@ -5032,12 +5067,20 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
 
     块形状：
     - 文本块：{"kind": "p"|"h1".."h6", "tag": 原始标签名, "text": 纯文本,
-      "runs": [...], "align": ..., "note": bool, "attrs": 属性串,
-      "inner": 内嵌 HTML, "indent": _rich_parse_indent 形状}；
+      "runs": [...], "align": ..., "note": bool, "caption": bool（题注块，
+      2026-10：非 EPUB 导出据此还原「小号灰字居中」，块上仍保留 class 供 raw
+      透传/往返）, "attrs": 属性串, "inner": 内嵌 HTML,
+      "indent": _rich_parse_indent 形状}；
       每个 run 额外带 "style"（规范化字符样式串，rulemanage.normalize_char_style
       产物，无格式时为 ""）——供 DOCX 导出 w:sz/w:rFonts/w:color 使用；
-    - 图片块：{"kind": "img", "src", "alt", "cls"}（块内图片把周围文本
-      拆成独立块，延续旧导出行为）。
+    - 图片块：{"kind": "img", "src", "alt", "cls"}；**独占整块**时即此四键形状
+      （历史契约，勿改）。图片与前后文本同属一个源段落时（段内行内图，
+      2026-10 图文混合）追加第 5 键 "meta": {"inline": True, "part": <源段落序号>}，
+      相邻的两个纯文本块同时带 "part"，供 Markdown 导出把「文字 + 图 + 文字」
+      合并回同一段（GFM 支持段内 ![alt](src)，是唯一能表达图文同段的格式）；
+      TXT/DOCX 忽略 meta，维持「文字 / 图 / 文字」三段的既有降级行为不变。
+      注：带 class/data- 属性或行内格式类的段落整块 raw HTML 透传（既有规则），
+      其段内图不参与合并，同样不丢内容。
     - 分隔线块：{"kind": "divider", "style": solid|dashed|dotted|double,
       "glyph": 8 字形, "text": 同一字形, "runs": [单条], ...}（2026-09-27）。
     标记 span（ptoe-marker）整体剥除（文本与 inner 均不含）。
@@ -5053,6 +5096,7 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             self.runs: list[dict] = []
             self.inner: list[str] = []
             self.note = False
+            self.caption = False  # 题注块（ptoe-caption），2026-10 非 EPUB 导出版式
             self.indent = _rich_parse_indent({})
             self.divider = ""  # 分隔线样式名（solid/dashed/dotted/double），非分隔线为 ""
             self.block_seen = False  # 是否已进入过块（孤立 img 不产生块）
@@ -5079,6 +5123,11 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             self.tbl_has_span = False  # 是否出现过 colspan/rowspan
             self.tbl_align_head: list[list[str]] = []  # thead 行对齐（并行 tbl_head）
             self.tbl_align_body: list[list[str]] = []  # tbody 行对齐（并行 tbl_body）
+            # 图文混合（2026-10）：源段落序号（同一 <p> 内被图片切开的多块共用
+            # 同一序号），段内行内图与相邻文本块据此在 Markdown 导出里合并为一段。
+            self._part_seq = 0  # 已开块计数（1 起）
+            self._part = 0  # 当前源段落序号
+            self._pend_imgs: list[dict] = []  # 本段落内已产出、待确认是否段内的图片块
 
         def _tbl_cell_end(self) -> None:
             """结束当前单元格：cell inner html 附加到当前行（空单元格保留）。"""
@@ -5213,6 +5262,8 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
 
         def _open_block(self, tag: str, attrs) -> None:
             self._flush()
+            self._part_seq += 1
+            self._part = self._part_seq
             d: dict[str, str] = {}
             parts: list[str] = []
             for k, v in attrs:
@@ -5224,6 +5275,9 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             self.runs = []
             self.inner = []
             self.note = "ptoe-note" in (d.get("class") or "").split()
+            # 题注块（2026-10）：登记到块模型，供 DOCX（0.85 倍字号 + 灰 + 居中）与
+            # Markdown（内联样式）两条非 EPUB 链路还原版式
+            self.caption = _CAPTION_CLASS in (d.get("class") or "").split()
             self.indent = _rich_parse_indent(d)
             # 分隔线段落（2026-09-27）：class 前缀 ptoe-divider + 样式后缀
             self.divider = _divider_style_from_attrs(d)
@@ -5276,6 +5330,7 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                         "runs": runs,
                         "align": _rich_align(self.attrs_str),
                         "note": self.note,
+                        "caption": self.caption,
                         "attrs": self.attrs_str,
                         "inner": inner,
                         "indent": self.indent,
@@ -5283,23 +5338,48 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                     if self._join_at_start or self._join_last:
                         block["join_prev"] = bool(self._join_at_start)
                         block["join_next"] = bool(self._join_last)
+                    if self._pend_imgs and self.kind == "p" and not self.divider:
+                        # 图文同段的「后」半边：与段内图片共用同一源段落序号
+                        block["part"] = self._part
                     self.blocks.append(block)
+            # 图文混合（2026-10）：本块有文本 → 此前同一源段落内产出的图片块与
+            # 本块构成「图文同段」，补 meta（Markdown 导出据此合并回一段）。
+            # 图片独占整块（text 为空）时不补，四键形状保持不变；分隔线块是版式
+            # 元素而非文字内容，也不参与合并。
+            if text and self._pend_imgs and self.kind == "p" and not self.divider:
+                for ib in self._pend_imgs:
+                    ib.setdefault("meta", {"inline": True, "part": self._part})
+            self._pend_imgs = []
             self.kind, self.tag, self.attrs_str = "p", "p", ""
             self.note = False
+            self.caption = False
             self.divider = ""
             self.indent = _rich_parse_indent({})
 
         def _emit_img(self, attrs) -> None:
             d = dict(attrs)
-            self._flush()
-            self.blocks.append(
-                {
-                    "kind": "img",
-                    "src": d.get("src") or "",
-                    "alt": d.get("alt") or "插图",
-                    "cls": d.get("class") or "",
-                }
+            # 图文同段判定（2026-10）：图片之前同块内已有非空白文本 → 与前文同段；
+            # 仅普通文字段落参与（分隔线块是版式元素，div 块走 raw HTML 透传）。
+            had_text = (
+                self.kind == "p"
+                and not self.divider
+                and bool("".join(r["text"] for r in self.runs).strip())
             )
+            self._flush()
+            blk = {
+                "kind": "img",
+                "src": d.get("src") or "",
+                "alt": d.get("alt") or "插图",
+                "cls": d.get("class") or "",
+            }
+            self.blocks.append(blk)
+            if had_text:
+                blk["meta"] = {"inline": True, "part": self._part}
+                prev = self.blocks[-2]
+                if prev.get("kind") == "p":
+                    # 图文同段的「前」半边（Markdown 合并用；分隔线/表格等不动）
+                    prev["part"] = self._part
+            self._pend_imgs.append(blk)
 
         def handle_starttag(self, tag, attrs) -> None:
             if tag in _SKIP_TAGS:
@@ -5546,10 +5626,18 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
 
 
 def _can_join_merge(a: dict, b: dict) -> bool:
+    """两块能否按 join 标记合并成一个段落。
+
+    题注块（ptoe-caption）不参与合并（2026-10）：合并后只保留前一块的属性，
+    题注要么被相邻正文吞掉（属性丢失），要么把整段正文都降级成 0.85em 灰字居中
+    ——两种都是版式损坏，故在合并前就拦掉（与注释↔正文不混并同一取向）。
+    """
     return (
         a.get("kind") == "p"
         and b.get("kind") == "p"
         and a.get("note") == b.get("note")
+        and not _is_caption_block(a)
+        and not _is_caption_block(b)
     )
 
 
@@ -5677,14 +5765,20 @@ def _data_uri_bytes(src: str) -> tuple[bytes, str] | None:
 def _norm_export_block(block: Any) -> dict:
     """兼容旧元组块与富文本字典块：统一归一为富文本块字典。
 
-    - dict → 原样返回（_html_to_rich_blocks 产物，含 kind="divider" 分隔线块）；
-    - ('img', src, alt, cls) → 图片块字典；
-    - ('p'|'hN', 文本) → 无格式信息的普通文本块（runs 单条）。
+    - dict → 原样返回（_html_to_rich_blocks 产物，含 kind="divider" 分隔线块
+      与图文同段图片块的 "meta" 附加键）；
+    - ('img', src, alt, cls[, meta]) → 图片块字典（第 5 元组元素为段内元信息，
+      缺省即无 meta，形状与历史一致）；
+    - ('p'|'hN', 文本) → 无格式信息的普通文本块（runs 单条；旧元组没有题注
+      语义，caption 恒 False）。
     """
     if isinstance(block, dict):
         return block
     if block[0] == "img":
-        return {"kind": "img", "src": block[1], "alt": block[2], "cls": block[3]}
+        out = {"kind": "img", "src": block[1], "alt": block[2], "cls": block[3]}
+        if len(block) > 4 and isinstance(block[4], dict):
+            out["meta"] = block[4]
+        return out
     kind, text = str(block[0]), str(block[1])
     return {
         "kind": kind,
@@ -5693,10 +5787,39 @@ def _norm_export_block(block: Any) -> dict:
         "runs": [{"text": text, "bold": False, "italic": False}],
         "align": "",
         "note": False,
+        "caption": False,
         "attrs": "",
         "inner": "",
         "indent": {},
     }
+
+
+def _img_inline_part(block: dict) -> object:
+    """图片块的「段内行内图」源段落序号；非段内图片返回 None。
+
+    meta 只在「图片与前后文本同属一个源段落」时由 _html_to_rich_blocks 附加；
+    独占整块的图片没有 meta，块形状与历史四键完全一致（_html_to_export_blocks
+    的 ('img', src, alt, cls) 元组同样没有 meta）。
+    """
+    meta = block.get("meta")
+    if not isinstance(meta, dict) or not meta.get("inline"):
+        return None
+    part = meta.get("part")
+    return part if isinstance(part, int) else None
+
+
+def _is_caption_block(block: dict) -> bool:
+    """块是否为题注段落（class 含 ptoe-caption）。
+
+    主判据是 _html_to_rich_blocks 在 _open_block 里登记的 "caption" 布尔键；
+    键缺失时回退到 attrs 属性串的 class 解析（与 _rich_align 同一手法），使旧元组
+    归一后的块（_norm_export_block，无 caption 键）与手工构造的块也能被识别，
+    与 _img_inline_part「meta 缺失即无附加语义」的向后兼容风格一致。
+    """
+    if block.get("caption"):
+        return True
+    m = re.search(r'class="([^"]*)"', str(block.get("attrs") or ""))
+    return _CAPTION_CLASS in (m.group(1) if m else "").split()
 
 
 def _docx_escape(text: str) -> str:
@@ -5800,6 +5923,10 @@ def _build_docx(blocks: list[Any], path: str) -> None:
     - 段落设置 data-* 属性 → w:spacing/w:ind（1em≈240 twips、段前/后 1 行
       ≈360 twips、行距 ×240，与 htmlmanage._indent_style_attrs 同语义）；
     - 注释块（ptoe-note）→ 斜体 + 灰色（808080）；行内加粗/斜体逐 run 保留；
+    - 题注块（ptoe-caption，2026-10）→ 居中 + 灰色 666666 + 0.85 倍字号
+      （_DOCX_CAPTION_SZ = round(21 半磅 × 0.85) = 18 半磅；CSS 0.85em 的 DOCX
+      对应物），对应 CSS 的 text-align:center / color:#666 / font-size:0.85em；
+      显式对齐类仍优先（同标题默认居中的处置方式）；
     - 字符样式（span style 的字号/字体/颜色）→ 逐 run w:sz/w:rFonts/w:color
       （标题块已有块级字号时不重复写 w:sz；命名色无法映射为 OOXML hex 故忽略）；
     - 分隔线块（kind="divider"）→ 空段落 + 下边框，线型映射 single/dashed/
@@ -5898,6 +6025,9 @@ def _build_docx(blocks: list[Any], path: str) -> None:
         align = block.get("align") or ""
         indent = block.get("indent") or {}
         note = bool(block.get("note"))
+        # 题注（2026-10）：块登记了 caption（或 class 里带 ptoe-caption，见
+        # _is_caption_block）即按题注版式输出——居中 + 灰 666666 + 0.85 倍字号
+        caption = _is_caption_block(block)
 
         # -- pPr（按 OOXML schema 顺序：pBdr → spacing → ind → jc → outlineLvl）--
         ppr_parts: list[str] = []
@@ -5943,14 +6073,19 @@ def _build_docx(blocks: list[Any], path: str) -> None:
         if ind_attrs:
             ppr_parts.append(f"<w:ind{ind_attrs}/>")
         jc = align  # center / right / justify
-        if is_heading and not jc:
-            jc = "center"  # 与 EPUB 一致：标题默认居中
+        if not jc and (is_heading or caption):
+            # 与 EPUB 一致：标题默认居中；题注的 CSS 契约 text-align:center 同理
+            # （显式对齐类优先，与标题默认居中的既有处置方式一致）
+            jc = "center"
         if jc:
             ppr_parts.append(f'<w:jc w:val="{jc}"/>')
         if is_heading:
             ppr_parts.append(f'<w:outlineLvl w:val="{lvl - 1}"/>')
 
         sz = _DOCX_HEADING_SZ.get(lvl, 24) if is_heading else None
+        if caption and not is_heading:
+            # 题注字号：CSS 0.85em × 正文基准（五号 21 半磅）= 18 半磅（9pt）
+            sz = _DOCX_CAPTION_SZ
         run_xml_parts: list[str] = []
         for r in runs:
             # CT_RPr 子元素次序由 OOXML schema 固定（见 _DOCX_RPR_ORDER），乱序会让
@@ -5963,6 +6098,10 @@ def _build_docx(blocks: list[Any], path: str) -> None:
                 rpr_slot["i"] = "<w:i/>"
             if note:
                 rpr_slot["color"] = '<w:color w:val="808080"/>'
+            if caption:
+                # 题注灰（CSS #666 → OOXML 十六进制 666666）；w:color 只能出现一次，
+                # 题注与注释不共存（不参与 join 合并），此处以题注为准
+                rpr_slot["color"] = f'<w:color w:val="{_CAPTION_COLOR_HEX}"/>'
             if r.get("underline"):
                 rpr_slot["u"] = '<w:u w:val="single"/>'
             if r.get("underdot"):
@@ -6044,8 +6183,18 @@ def _build_md(blocks: list[Any], path: str) -> None:
       不丢失，且可被界面 Markdown 模式 mdToHtml 无损还原）；
     - 加粗 **…**、斜体 *…*（同时加粗斜体 ***…***）；<br> 已在解析时转为换行；
     - 图片 ![alt](src)，data URI 原样内联（单文件自包含，与 DOCX/EPUB 内嵌一致）；
+      **段内行内图**（meta.inline，_html_to_rich_blocks 判定）与同一源段落的前后
+      纯文本段落合并为同一个 Markdown 段落（图文同段语义，2026-10）；整块透传
+      raw HTML 的块（带 class/data- 或行内格式类）不参与合并，图片自成一段；
     - 字符样式（字号/字体/颜色，span style）与分隔线块（'---'）：Markdown 无对应
       语法，分别走 raw HTML 整块透传与 GFM 分隔线记号；
+    - **题注段（ptoe-caption，2026-10）**：GFM 同样没有「字号/颜色/居中」语法，
+      故沿用 raw HTML 透传通道输出带 class 的块（界面 Markdown 模式 mdToHtml 可
+      无损还原题注），并**补一份内联 style**（_CAPTION_MD_STYLE）——纯 class 在没有
+      本项目样式表的渲染器（VSCode 预览 / GitHub / 各类阅读器）里不产生任何视觉
+      差异，等于退化成普通段落，这里正是要补的缺口。不用 *斜体* / **粗** 记号：
+      那表达的是「字形强调」而非「题注」语义，且 mdToHtml 还原时会退化成 <em>，
+      题注类直接丢失（不可逆）。
     - 不做额外 Markdown 转义（与前端 inlineToMd 一致，避免同一内容两种输出）。
     编码 utf-8（无 BOM，Markdown 标准形态；TXT 才用 utf-8-sig）。
     """
@@ -6076,12 +6225,50 @@ def _build_md(blocks: list[Any], path: str) -> None:
             return True
         return False
 
-    parts: list[str] = []
-    for raw in blocks:
-        b = _norm_export_block(raw)
+    def _raw_passthrough(b: dict) -> bool:
+        """块是否整块原样透传原始 HTML（判据单一来源：输出分支与合并逻辑共用）。"""
+        attrs = b.get("attrs") or ""
+        inner = b.get("inner") or ""
+        return bool("class=" in attrs or "data-" in attrs or _has_inline_formats(inner))
+
+    def _merge_part(b: dict) -> object:
+        """该块可与同段内容合并时的源段落序号；不可合并返回 None。
+
+        只认「纯文本 <p>」：标题、整块透传 raw HTML 的块、表格、分隔线一律不合并
+        ——把 Markdown 记号塞进已闭合的 HTML 标签里既不生效（GFM 不解析 HTML 块内
+        语法）也会破坏 mdToHtml 的往返还原。
+        """
+        part = b.get("part")
+        if not isinstance(part, int) or b.get("kind") != "p" or _raw_passthrough(b):
+            return None
+        return part
+
+    def _raw_html_block(b: dict, attrs: str) -> str:
+        """按标签 + 属性串 + inner 组装一个 raw HTML 块片段（与 raw 透传同形状）。"""
+        tag = b.get("tag") or b["kind"]
+        inner = b.get("inner") or ""
+        return f"<{tag}{(' ' + attrs) if attrs else ''}>{inner}</{tag}>"
+
+    def _caption_md_html(b: dict) -> str:
+        """题注块 → 带内联样式的 raw HTML 片段（2026-10）。
+
+        class 保留（mdToHtml 无损还原题注），style 补齐视觉契约；块上已自带
+        style 时不再叠加（重复声明无效，且会让 XHTML 属性重复）。
+        """
+        attrs = b.get("attrs") or ""
+        if "style=" not in attrs:
+            attrs = f'{attrs} style="{_CAPTION_MD_STYLE}"'.strip()
+        return _raw_html_block(b, attrs)
+
+    def _block_md(b: dict) -> tuple[str, object] | None:
+        """块 → (Markdown 片段, 可合并的源段落序号|None)；None = 该块不产出片段。"""
         if b["kind"] == "img":
-            parts.append(f"![{b.get('alt') or ''}]({b.get('src') or ''})")
-            continue
+            # 图文混合（2026-10）：段内行内图携带 meta.inline+part，可与同源段落
+            # 的纯文本段落合并成一段；独占整块的图片 part=None，自成一段。
+            return (
+                f"![{b.get('alt') or ''}]({b.get('src') or ''})",
+                _img_inline_part(b),
+            )
         if b["kind"] == "table":
             # 表格 → GFM 管线表（表头行 + | --- | --- | 分隔线）；无表头时补
             # 空表头行 + 分隔线，保证首行显示为数据行。
@@ -6090,12 +6277,11 @@ def _build_md(blocks: list[Any], path: str) -> None:
             # （与 colspan/rowspan 同一兜底路径）。
             if b.get("has_span"):
                 # 防御：含 colspan/rowspan 的表格无法用管线表表达 → 整块 raw HTML 透传
-                parts.append(b.get("raw") or "")
-                continue
+                return (b.get("raw") or "", None)
             rows: list[list[str]] = b.get("rows") or []
             algn: list[list[str]] = b.get("algn") or []
             if not rows:
-                continue
+                return None
 
             def _md_row(cells: list[str]) -> str:
                 return "| " + " | ".join(_md_cell_text(c) for c in cells) + " |"
@@ -6118,8 +6304,7 @@ def _build_md(blocks: list[Any], path: str) -> None:
                 col_aligns.append(next(iter(vals), ""))
             if raw_fallback:
                 # 同一列单元格对齐各异：管线表无法表达 → 整块 raw HTML 透传
-                parts.append(b.get("raw") or "")
-                continue
+                return (b.get("raw") or "", None)
 
             def _md_sep(cols: int) -> str:
                 # GFM 分隔符：左 :--- / 中 :---: / 右 ---:；无对齐 ---
@@ -6141,27 +6326,40 @@ def _build_md(blocks: list[Any], path: str) -> None:
                 tbl_lines.append("| " + " | ".join("" for _ in range(n)) + " |")
                 tbl_lines.append(_md_sep(n))
                 tbl_lines.extend(_md_row(r) for r in rows)
-            parts.append("\n".join(tbl_lines))
-            continue
+            return ("\n".join(tbl_lines), None)
         if b["kind"] == "divider":
             # 分隔线（2026-09-27）→ GFM 分隔线 '---'（Markdown 只有一个横线记号，
             # 写 '- - -' 会与列表项混淆；四种线型差异由 EPUB/DOCX 承载）
-            parts.append("---")
-            continue
+            return ("---", None)
+        if _is_caption_block(b):
+            # 题注段（2026-10）：raw HTML 通道 + 内联样式（居中/小号/灰色在 GFM
+            # 里无语法，见 _caption_md_html 的取舍说明）。part 恒 None——题注是
+            # 独立版式元素，绝不与相邻段落合并成同一段 Markdown。
+            return (_caption_md_html(b), None)
         attrs = b.get("attrs") or ""
-        inner = b.get("inner") or ""
         # 带属性块、或含新增行内格式类：原样透传（与前端 htmlToMd 规则一致）
-        if "class=" in attrs or "data-" in attrs or _has_inline_formats(inner):
-            tag = b.get("tag") or b["kind"]
-            parts.append(
-                f"<{tag}{(' ' + attrs) if attrs else ''}>{inner}</{tag}>"
-            )
-            continue
+        if _raw_passthrough(b):
+            return (_raw_html_block(b, attrs), None)
         kind = b["kind"]
         if kind.startswith("h") and len(kind) == 2 and kind[1].isdigit():
-            parts.append("#" * int(kind[1]) + " " + _inline(b["runs"]))
+            return ("#" * int(kind[1]) + " " + _inline(b["runs"]), None)
+        return (_inline(b["runs"]), _merge_part(b))
+
+    # 图文混合（2026-10）：把「文字 / 段内行内图 / 文字」按源段落序号拼回同一段。
+    # GFM 支持段内 ![alt](src)，这是唯一能表达「图文同段」的导出格式；TXT/DOCX
+    # 维持「文字 / 图 / 文字」三段的既有降级行为（见 _html_to_rich_blocks）。
+    parts: list[str] = []
+    open_part: object = None  # 上一片段的可合并源段落序号（None = 不可追加）
+    for raw in blocks:
+        res = _block_md(_norm_export_block(raw))
+        if res is None:
+            continue
+        md, part = res
+        if part is not None and part == open_part:
+            parts[-1] += md
         else:
-            parts.append(_inline(b["runs"]))
+            parts.append(md)
+        open_part = part
     Path(path).write_text("\n\n".join(parts) + "\n", encoding="utf-8")
 
 
@@ -6324,6 +6522,9 @@ def export_content_to_file(
         def _txt_line(b: dict) -> str:
             # 图片块以 [图片] 占位符表示；段落设置（缩进/间距）在纯文本中以
             # 全角空格前缀与空行近似（见 _txt_indent_prefix / _txt_spacing）
+            # 题注（ptoe-caption）在此**有意降级为普通段落**：纯文本没有字号、
+            # 颜色、对齐的概念，题注与正文同样是一行文字，逐字节维持现状即可；
+            # 需要「小号灰字居中」版式请用 DOCX（w:sz/w:color/w:jc）或 EPUB 导出。
             if b["kind"] == "img":
                 return "[图片]"
             if b["kind"] == "table":
@@ -10054,7 +10255,11 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
 .img-panel{position:relative;min-width:0;overflow:hidden;background:#fff;border:1px solid var(--border);border-radius:4px;padding:4px;}
 .img-panel img{width:100%;height:auto;display:block;background:#fff;cursor:zoom-in;}
 .badge{position:absolute;top:8px;left:8px;background:rgba(0,0,0,.55);color:#fff;font-size:11px;padding:2px 8px;border-radius:10px;pointer-events:none;}
-.editable{height:0;min-height:100%;overflow-y:auto;padding:10px 14px;border:1px solid var(--border);border-radius:4px;line-height:1.7;font-size:var(--editor-font-size);outline:none;}
+/* overflow-x 显式声明（2026-10）：此前只写 overflow-y:auto，横向滚动条靠
+   「overflow-x 的 visible 与 overflow-y 的非 visible 同时出现时，visible 计算为
+   auto」这条隐式规则才成立；一旦 overflow-y 被改成 visible（如窄屏媒体查询），
+   溢出内容就会直接顶出编辑区。宽表格/长图超宽时显式 auto 保证出横滚条 */
+.editable{height:0;min-height:100%;overflow-y:auto;overflow-x:auto;padding:10px 14px;border:1px solid var(--border);border-radius:4px;line-height:1.7;font-size:var(--editor-font-size);outline:none;}
 .editable:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(47,111,237,.15);}
 .editable h1{font-size:1.5em;} .editable h2{font-size:1.38em;} .editable h3{font-size:1.26em;}
 .editable h4{font-size:1.16em;} .editable h5{font-size:1.07em;} .editable h6{font-size:1em;}
@@ -10194,6 +10399,21 @@ body.paint-mode{cursor:copy;}
 .editable img.ptoe-img-vtop{vertical-align:top;}
 .editable img.ptoe-img-vmid{vertical-align:middle;}
 .editable img.ptoe-img-vbot{vertical-align:bottom;}
+/* 浮动绕排（2026-10 图文混合）：ptoe-img-float-left / ptoe-img-float-right，
+   类挂在 img 自身上（float 必须作用在图片元素上，挂在包裹 p 标签上文字不绕排），
+   宽度仍复用既有的 ptoe-img-w* 档位；与 ptoe-img-inline 互斥（前端负责去重）。
+   display:inline-block 是**刻意的降级声明**：目标阅读器多看实测支持 CSS float 绕排，
+   而忽略 float 的阅读器（微信阅读无 WebView、静读天下覆盖出版方 CSS）会退化成
+   「按 ptoe-img-w* 比例行内排版、文字接在图片后面」，即现有行内图行为，
+   绝不塌成独占块——所以绝不写成裸 float。
+   margin 取值：内侧 0.5em（图片与绕排文字的间距，em 随正文字号缩放，不贴图）
+              + 下侧 0.4em（图片底部与后续整宽文字的间距，勿让文字紧贴图片下沿）。
+   声明值与 htmlmanage 的 EPUB style.css、ui/epubedit.html 三处逐字相同（勿单边改动）。 */
+.editable img.ptoe-img-float-left{float:left;display:inline-block;max-width:100%;height:auto;margin:0 0.5em 0.4em 0;}
+.editable img.ptoe-img-float-right{float:right;display:inline-block;max-width:100%;height:auto;margin:0 0 0.4em 0.5em;}
+/* 题注（2026-10 图文混合）：图片块之后的独立说明段落 <p class="ptoe-caption">。
+   样式值与 htmlmanage 导出 EPUB 的题注规则保持同一份契约（勿单边改动）。 */
+.editable p.ptoe-caption{font-size:0.85em;color:#666;text-align:center;margin:0.2em 0 0.6em;}
 /* 插入表格（2026-09）：编辑区内表格渲染；边框/表头底色走 CSS 变量，暗色主题自适应。
    2026-09 反馈修复：默认撑满行宽（width:100%）、单元格最小宽度 + 顶对齐 */
 .editable table{border-collapse:collapse;margin:.5em 0;width:100%;max-width:100%;}

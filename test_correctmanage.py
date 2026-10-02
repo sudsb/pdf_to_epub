@@ -14186,5 +14186,303 @@ class TestCharStyleAndDivider(unittest.TestCase):
         self.assertEqual(rpr.count("<w:color"), 1)
 
 
+# 题注段落的固定写法（与 test_imgtxt.CAPTION_TEXT 同源：真实链路上的图注形态）
+CAP_TEXT = "图1示例插图"
+CAP_HTML = '<p class="ptoe-caption">图1示例插图</p>'
+
+
+class TestExportCaption(unittest.TestCase):
+    """题注（ptoe-caption）在四种导出格式下的降级与保真（2026-10 图文混合）。
+
+    题注是图片的配套说明段落，四条导出链路的保真度依次递减，这是**有意设计**
+    而非缺陷（本项目的取舍：EPUB 是唯一原生支持图文的格式）：
+
+      ┌ epub │ 原生保留 class，EPUB CSS 渲染题注版式（由 test_imgtxt 覆盖）
+      ├ docx │ 降级为居中 + 灰色 + 0.85 倍字号（用 w:jc/w:color/w:sz 显式表达）
+      ├ md   │ 降级为带 style 的 raw <p>（GFM 无题注概念，style 交给阅读器）
+      └ txt  │ 降级为普通文本行（纯文本无版式概念，不含任何 class 残留）
+
+    本类锁死的三件事：
+      ① 转换前后的状态复位（连调两次导出结果一致）；
+      ② 段落版式隔离——题注出现后**后续正文不得继承**题注的居中/灰色/小字号；
+      ③ 旧版元组形状（无 dict 的 attrs）经 _norm_export_block 不崩溃，且能手工
+         补 attrs 后被重新识别为题注（历史 JSON 的向后兼容）。
+    """
+
+    def _out(self, suffix):
+        import tempfile as _tf
+
+        return Path(_tf.mkdtemp(prefix="t_cap_")) / f"a{suffix}"
+
+    def _items(self, extra=""):
+        return [
+            {
+                "page": 1,
+                "html": (
+                    f'<p class="ptoe-caption">图1示例插图</p>'
+                    f"<p>正文甲</p><p>正文乙</p>{extra}"
+                ),
+            }
+        ]
+
+    def _export(self, fmt, suffix, items):
+        from correctmanage import export_content_to_file
+
+        out = self._out(suffix)
+        export_content_to_file(items, fmt, str(out), title="书")
+        return out
+
+    # ---------- 1. TXT：有损降级，但内容在、class 不残留 ----------
+
+    def test_export_txt_caption_degrades_to_plain_text(self):
+        out = self._export("txt", ".txt", self._items())
+        text = out.read_bytes().decode("utf-8-sig").replace("\r\n", "\n")
+        self.assertIn(CAP_TEXT, text)
+        self.assertIn("正文甲", text)
+        # 纯文本无版式概念：不得留下任何 class 名或 style 痕迹
+        self.assertNotIn("ptoe-caption", text)
+        self.assertNotIn("style", text.lower())
+
+    def test_export_txt_caption_own_line(self):
+        """题注独占一行（不被并进正文段落）。"""
+        out = self._export("txt", ".txt", self._items())
+        lines = out.read_bytes().decode("utf-8-sig").replace("\r\n", "\n").splitlines()
+        self.assertIn(CAP_TEXT, lines)
+        self.assertIn("正文甲", lines)
+
+    # ---------- 2. Markdown：raw <p> + 契约 style 完整透传 ----------
+
+    def test_export_md_caption_keeps_class_and_style(self):
+        out = self._export("md", ".md", self._items())
+        text = out.read_text(encoding="utf-8")
+        self.assertIn('class="ptoe-caption"', text)
+        self.assertIn(CAP_TEXT, text)
+        # MD style 串必须四项齐全——少一项就是「改了 CSS 没同步 _CAPTION_MD_STYLE」
+        for decl in ("font-size:0.85em", "color:#666",
+                     "text-align:center", "margin:0.2em 0 0.6em"):
+            with self.subTest(decl=decl):
+                self.assertIn(decl, text)
+
+    def test_export_md_caption_not_merged_into_body(self):
+        """题注前后的正文各自独立成块，题注不被 merge 吞掉。"""
+        out = self._export("md", ".md", self._items())
+        text = out.read_text(encoding="utf-8")
+        # 题注 p 与正文 p 必须是不同的 <p> 元素
+        cap_idx = text.index(f'class="ptoe-caption"')
+        self.assertIn("正文甲", text[cap_idx:])
+        self.assertNotIn(CAP_TEXT, text.split('class="ptoe-caption"')[0])
+
+    # ---------- 3. DOCX：w:jc=center + w:color=666666 + 0.85 倍字号 ----------
+
+    def _docx(self, items):
+        import zipfile
+
+        out = self._export("docx", ".docx", items)
+        with zipfile.ZipFile(out) as zf:
+            return zf.read("word/document.xml").decode("utf-8")
+
+    def test_export_docx_caption_centered_gray_small(self):
+        doc = self._docx(self._items())
+        self.assertIn('<w:jc w:val="center"/>', doc)
+        self.assertIn('<w:color w:val="666666"/>', doc)
+        # 0.85 × 21pt = 17.85 → 四舍五入 18 半磅（DOCX 用半磅单位）
+        self.assertIn('<w:sz w:val="18"/><w:szCs w:val="18"/>', doc)
+        self.assertIn(CAP_TEXT, doc)
+
+    def test_export_docx_body_not_caption_styled(self):
+        """版式隔离：正文段不得被套上题注的居中/灰/小字号。
+
+        ⚠️ 真·负控：若题注判定的 caption 分支被去掉、题注块误走正文分支，正文
+        断言仍会通过（题注反而不带版式了）——所以本用例同时断言两个方向：正文段
+        干净（无 jc/color/18），题注段有版式（有 center+color+18）。任一侧失守
+        都能定位。
+
+        注：正文段不写 w:sz 是正常实现（字号走文档默认样式继承），故此处只断言
+        「不含题注版式声明」，不断言正文的 w:sz 值。
+        """
+        import re
+        import zipfile
+
+        out = self._export("docx", ".docx", self._items())
+        with zipfile.ZipFile(out) as zf:
+            doc = zf.read("word/document.xml").decode("utf-8")
+        paras = re.findall(r"<w:p[ >].*?</w:p>", doc, flags=re.S)
+        body = [p for p in paras if "正文甲" in p]
+        self.assertTrue(body, "应找到正文段")
+        p = body[0]
+        self.assertNotIn('w:jc w:val="center"', p)
+        self.assertNotIn('w:color w:val="666666"', p)
+        self.assertNotIn('w:sz w:val="18"', p)
+        cap = [x for x in paras if CAP_TEXT in x]
+        self.assertTrue(cap, "应找到题注段")
+        self.assertIn('w:jc w:val="center"/>', cap[0])
+        self.assertIn('w:color w:val="666666"/>', cap[0])
+
+    def test_export_docx_caption_precedes_body(self):
+        """文档顺序：题注在前、正文在后（题注不参与重排）。"""
+        doc = self._docx(self._items())
+        self.assertLess(doc.index(CAP_TEXT), doc.index("正文甲"))
+
+    # ---------- 4. EPUB：走 htmlmanage，class 原样保留 ----------
+
+    def test_export_epub_caption_class_kept(self):
+        import zipfile
+
+        out = self._export("epub", ".epub", self._items())
+        with zipfile.ZipFile(out) as zf:
+            content = "\n".join(
+                zf.read(n).decode("utf-8")
+                for n in zf.namelist() if n.endswith(".xhtml")
+            )
+        self.assertIn('class="ptoe-caption"', content)
+        self.assertIn(CAP_TEXT, content)
+        # 题注不该混进目录
+        nav = ""
+        with zipfile.ZipFile(out) as zf:
+            for n in zf.namelist():
+                if n.endswith("nav.xhtml"):
+                    nav = zf.read(n).decode("utf-8")
+        self.assertNotIn(CAP_TEXT, nav)
+
+    # ---------- 5. 状态复位：连调两次结果一致 ----------
+
+    def test_export_repeated_is_idempotent(self):
+        """同一 items 连导两次 → 两次输出逐字节相同（无跨次状态残留）。
+
+        ⚠️ 保留本用例的原因：题注版式常量 `_CAPTION_*` 与 rich blocks 里的
+        caption 标记若在导出过程中被写回模块级或 items 被就地改写，第二次
+        导出会出现「上一轮的题注段落重复出现」或「第二段失去题注版式」。
+        """
+        for fmt, suffix in (("txt", ".txt"), ("md", ".md"), ("docx", ".docx")):
+            with self.subTest(fmt=fmt):
+                out1 = self._export(fmt, suffix, self._items())
+                out2 = self._export(fmt, suffix, self._items())
+                if fmt == "docx":
+                    import zipfile
+
+                    with zipfile.ZipFile(out1) as a, zipfile.ZipFile(out2) as b:
+                        # document.xml 只在去掉生成时间戳后可比
+                        xa = a.read("word/document.xml").decode("utf-8")
+                        xb = b.read("word/document.xml").decode("utf-8")
+                        self.assertEqual(self._strip_docx_meta(xa), self._strip_docx_meta(xb))
+                else:
+                    self.assertEqual(out1.read_bytes(), out2.read_bytes())
+
+    def _strip_docx_meta(self, doc):
+        import re
+
+        doc = re.sub(r'<w:date w:val="[^"]*"/>', "", doc)
+        return re.sub(r"<dcterms:created[^>]*>.*?</dcterms:created>", "", doc, flags=re.S)
+
+    def test_export_items_not_mutated(self):
+        """items 传入的 html 不得被导出流程就地改写（调用方的数据要能复用）。"""
+        from correctmanage import export_content_to_file
+
+        items = self._items()
+        snapshot = [dict(i) for i in items]
+        out = self._out(".md")
+        export_content_to_file(items, "md", str(out), title="书")
+        self.assertEqual(items, snapshot)
+
+    # ---------- 6. 段落版式隔离（MD 侧） ----------
+
+    def test_export_md_body_not_caption_styled(self):
+        """题注出现后，后续正文仍是普通段落（不被继承 style/class）。"""
+        out = self._export("md", ".md", self._items())
+        text = out.read_text(encoding="utf-8")
+        for frag in ('class="ptoe-caption"', "font-size:0.85em", "color:#666"):
+            self.assertEqual(
+                text.count(frag), 1,
+                f"{frag!r} 只应出现在题注这一段（实际 {text.count(frag)} 次）",
+            )
+        # 纯正文段落不带任何 style
+        for line in text.splitlines():
+            if "正文甲" in line:
+                self.assertNotIn("style", line)
+                self.assertNotIn("ptoe-caption", line)
+
+    # ---------- 7. join 隔离：题注不参与段落合并 ----------
+
+    def test_join_mark_before_caption_not_merged(self):
+        """题注前后的正文即便都带「段」标记，也不得跨越题注合并。"""
+        from correctmanage import (
+            _apply_join_marks,
+            _html_to_rich_blocks,
+        )
+
+        html = (
+            f'<p class="ptoe-marker" data-ptoe-marker="join">x</p>'
+            f"{CAP_HTML}"
+            f'<p class="ptoe-marker" data-ptoe-marker="join">y</p>'
+            "<p>正文甲</p><p>正文乙</p>"
+        )
+        blocks = _apply_join_marks(_html_to_rich_blocks(html))
+        texts = [b.get("text", "") for b in blocks]
+        self.assertIn(CAP_TEXT, texts)
+        # 合并结果里题注必须仍是独立一块
+        cap_idx = texts.index(CAP_TEXT)
+        self.assertNotIn(CAP_TEXT, "".join(t for t in texts[:cap_idx]))
+
+    def test_join_mark_pair_with_caption_inbetween_not_merged(self):
+        """两个 join 标记被题注隔开 → 不合并（题注不能被卷进正文）。"""
+        from correctmanage import (
+            _apply_join_marks,
+            _html_to_rich_blocks,
+        )
+
+        html = (
+            '<p class="ptoe-marker" data-ptoe-marker="join">x</p>'
+            "<p>正文甲</p>"
+            f"{CAP_HTML}"
+            '<p class="ptoe-marker" data-ptoe-marker="join">y</p>'
+            "<p>正文乙</p>"
+        )
+        blocks = _apply_join_marks(_html_to_rich_blocks(html))
+        texts = [b.get("text", "") for b in blocks]
+        self.assertIn(CAP_TEXT, texts)
+        self.assertNotIn("正文甲正文乙", texts)
+
+    # ---------- 8. 旧形状兼容（历史 JSON 的元组形状） ----------
+
+    def test_old_tuple_blocks_do_not_crash(self):
+        """旧版 rich block 元组经规范化不得崩溃，且 caption 显式为 False。
+
+        `_is_caption_block` 要求 dict 输入（内部走 block.get），旧元组必须先经
+        `_norm_export_block` 归一；归一函数把 caption 硬置 False（宁可漏判也不
+        误判，见其 docstring）。
+        """
+        from correctmanage import _norm_export_block
+
+        legacy = ("p", "正文甲")
+        norm = _norm_export_block(legacy)
+        self.assertIsInstance(norm, dict)
+        self.assertEqual(norm.get("text"), "正文甲")
+        self.assertIs(norm.get("caption"), False)
+
+    def test_norm_tuple_is_not_caption(self):
+        """旧元组归一后不会被判成题注（不得因文本像题注就误套版式）。"""
+        from correctmanage import _is_caption_block, _norm_export_block
+
+        norm = _norm_export_block(("p", CAP_TEXT))
+        self.assertFalse(_is_caption_block(norm))
+
+    def test_caption_recognized_from_attrs_string(self):
+        """attrs 为字符串形态时按 class 分词判定（_is_caption_block 的兜底路径）。"""
+        from correctmanage import _is_caption_block
+
+        self.assertTrue(
+            _is_caption_block({"attrs": 'class="ptoe-caption"', "text": CAP_TEXT})
+        )
+        # 多类共存时按空格分词精确比对，不做子串匹配
+        self.assertTrue(
+            _is_caption_block({"attrs": 'class="ptoe-note ptoe-caption"'})
+        )
+        self.assertFalse(_is_caption_block({"attrs": 'class="ptoe-captionx"'}))
+        # caption 显式标记优先于 attrs
+        self.assertTrue(_is_caption_block({"caption": True, "attrs": ""}))
+        # 无 attrs 键不得抛异常
+        self.assertFalse(_is_caption_block({}))
+
+
 if __name__ == "__main__":
     unittest.main()

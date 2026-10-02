@@ -126,6 +126,30 @@ body{margin:0;font-family:"Microsoft YaHei",system-ui,sans-serif;background:var(
 }
 .art-body:focus{box-shadow:var(--focus-ring);}
 .art-body p{margin:.4em 0;}
+/* 题注（2026-10 图文混合）：图片块之后的独立说明段落 p.ptoe-caption。
+   样式值与矫正界面（correctmanage.py）、EPUB 导出（htmlmanage.py）保持同一份
+   契约（勿单边改动）；此处不写 .art-body 前缀无法压过上面的 .art-body p{margin:.4em 0}，
+   故沿用与 correctmanage 一致的「容器 + 元素 + 类」双段选择器。
+   保存走同一个 convert_document，导出结果正确，此处只是编辑时预览。 */
+.art-body p.ptoe-caption{font-size:0.85em;color:#666;text-align:center;margin:0.2em 0 0.6em;}
+/* 浮动绕排图片（2026-10 图文混合）：ptoe-img-float-left / ptoe-img-float-right，
+   类挂在 img 元素自身上，文字从侧边绕排；与 ptoe-img-inline 互斥（前端负责去重）。
+   声明值与矫正界面（correctmanage.py）、EPUB 导出（htmlmanage.py）保持同一份契约
+   （勿单边改动）。display:inline-block 是配套的降级声明：忽略 float 的阅读器会退回
+   行内图行为而非独占块，故不写裸 float。
+   margin 内侧 0.5em（与绕排文字的间距）+ 下侧 0.4em（图片下沿与后续文字的间距）。
+   声明值与 correctmanage.py、htmlmanage.py 的 EPUB style.css 三处逐字相同（勿单边改动）。
+   沿用与 correctmanage 一致的「容器 + 元素 + 类」双段选择器，压过浏览器默认 img 样式。 */
+.art-body img.ptoe-img-float-left{float:left;display:inline-block;max-width:100%;height:auto;margin:0 0.5em 0.4em 0;}
+.art-body img.ptoe-img-float-right{float:right;display:inline-block;max-width:100%;height:auto;margin:0 0 0.4em 0.5em;}
+/* 浮动绕排的宽度档位（ptoe-img-w25/50/75/100，契约同 htmlmanage.export 的内联声明）：
+   预览必须同时有宽度规则，否则图片按自然尺寸（再被上面的 max-width:100% 夹到满栏）
+   渲染，float 在预览里看不出绕排效果。保存走同一个 convert_document，
+   导出时宽度会内联进 style，值与此处一致。 */
+.art-body .ptoe-img-w25{width:25%;}
+.art-body .ptoe-img-w50{width:50%;}
+.art-body .ptoe-img-w75{width:75%;}
+.art-body .ptoe-img-w100{width:100%;}
 /* 标题级别指示（2026-09）：与矫正界面一致——h2-h6 块「H2..H6」徽章（::before）+
    级别色浅底条；纯显示层，不序列化进保存/导出的正文。EPUB 正文不含 h1。 */
 .art-body h2,.art-body h3,.art-body h4,.art-body h5,.art-body h6{border-radius:3px;}

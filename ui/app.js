@@ -23,7 +23,7 @@ const OPS = [
   ['proofread_correct','校正'], ['proofread_reocr','重识别'], ['proofread_apply','应用'],
   ['proofread_clear','清除标注'], ['proofread_revert','回退'],
   ['proofread_accept', '采纳纠错'], ['proofread_ignore', '忽略纠错'],
-  ['insert_table', '插入表格'],
+  ['insert_table', '插入表格'], ['insert_caption', '插入题注'],
 ];
 const OP_ICON = {
   bold:'<span class="ic-b">B</span>', italic:'<span class="ic-i">I</span>',
@@ -45,6 +45,7 @@ const OP_TIP = {
   marker_page:'换页标记（从此处之后的内容显示在新的一页）',
   proofread_accept: '采纳纠错（替换为候选字）', proofread_ignore: '忽略纠错（消除标注）',
   insert_table: '插入表格（行列可设，默认 3 行 × 4 列，可选手表头）',
+  insert_caption: '插入题注（为选中的图片在其后插入可编辑的题注段落）',
   strip_ws: '去空（去除段落内全部空白，保留换行）',
   // 新增内联格式提示
   underline:'下划线', strike:'删除线', charbox:'字符边框',
@@ -68,6 +69,7 @@ const DEFAULTS = {
   proofread_clear:'Ctrl+Shift+X', proofread_revert:'Ctrl+Shift+Z',
   proofread_accept: 'Enter', proofread_ignore: 'Escape',
   insert_table: 'Ctrl+Alt+T',
+  insert_caption: 'Ctrl+Alt+G', // 2026-10-01：Alt+G 已被「合并段落」占用，改用带 Ctrl 的组合
 };
 // 鼠标中键手势（与键盘快捷键同一套操作体系）：手势是稀缺资源，默认只绑定对齐三件套。
 const MOUSE_GESTURES = [
@@ -178,7 +180,12 @@ function applyUiPrefs() {
   const s = document.getElementById('fontSizeSel');
   if (s) s.value = fs;
   const im = document.getElementById('imgModeSel');
-  if (im && uiSettings && uiSettings.img_mode) im.value = uiSettings.img_mode;
+  // 图片模式值域归一（2026-10-01 起 5 种）：历史值 full/fit/inline 原样沿用；
+  // 空/未知值不写进 select（否则 value 变空，插入时会拼出 ptoe-img-<空> 类）
+  if (im) {
+    const m = normalizeImgMode(uiSettings && uiSettings.img_mode);
+    if (m) im.value = m;
+  }
 }
 // 提示文字：操作说明 + 对应快捷键（若有绑定）
 function tipTextFor(op) {
@@ -394,6 +401,202 @@ function saveStr(key, v) { try { localStorage.setItem(key, String(v)); } catch (
 function loadInt(key, def) { try { const v = parseInt(localStorage.getItem(key), 10); return isFinite(v) ? v : def; } catch (e) { return def; } }
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
+// ============================================================================
+// 块不变量防御（2026-10-01 图文混排）
+// ============================================================================
+// .editable 的核心不变量是「一行一块」（块 = p/div/h1-h6）。所有块级操作
+// （对齐/缩进/合并/清除格式/字符格式）都靠它遍历：_blocksBetween 只接受块、
+// _boundaryBlockInRange 用 closest('p,div,h1-h6') 定位起止块、applyToSelectedBlocks
+// 按块逐个应用。裸 <img> 直接挂在 .editable 直属位置时，它既不是起止块、
+// 也不在两边界块之间 → 块级操作对它静默失效（点了没反应也没报错）。
+//
+// 约定：行内图（ptoe-img-inline）必须始终待在某个块内。三个入口共用下面两个
+// 函数：①行内插入用带 <p> 的 HTML；②布局互转不再把 img 从 <p> 里搬出；
+// ③事后收编（兜底，覆盖粘贴/撤销/格式规则等所有可能造出裸图的路径）。
+// 回归判据：document.querySelectorAll('.editable > img').length === 0
+// 幂等：可重复调用。
+// 题注类（块级 ptoe-caption，契约见下方「图片题注」小节）—— 声明提前到这里，
+// 供 applyOp('remove') 的保护名单（:3000 附近）在声明前引用。
+const CAPTION_CLASS = 'ptoe-caption';
+const BLOCK_TAG_RE = /^(P|DIV|H[1-6])$/;
+// 是否块元素（排除 .editable 自身——它是 DIV，但不算「一行一块」里的块）
+function isBlockEl(el) {
+  return !!(el && el.tagName && BLOCK_TAG_RE.test(el.tagName));
+}
+// .editable 直属是否存在裸 <img>（不使用选择器：O(子节点数)，可放在 input 热路径）
+function hasLooseImg(ed) {
+  if (!ed) return false;
+  const kids = ed.childNodes;
+  for (let i = 0; i < kids.length; i++) {
+    const n = kids[i];
+    if (n.nodeType === 1 && n.tagName === 'IMG') return true;
+  }
+  return false;
+}
+// 收编 .editable 直属的裸 <img>：就地建 <p> 包裹，并把紧邻的裸文本节点并入该块，
+// 避免产生「文本/图混杂的非块节点」（裸文本节点同样不在任何块内，块级操作也够不着）。
+// 返回被收编的块数组（无则空数组）。可重复调用（幂等）。
+function adoptLooseImgs(ed) {
+  if (!ed) return [];
+  const loose = [];
+  const kids = Array.prototype.slice.call(ed.childNodes);
+  for (const n of kids) {
+    if (n.nodeType === 1 && n.tagName === 'IMG') loose.push(n);
+  }
+  if (!loose.length) return [];
+  const made = [];
+  for (const img of loose) {
+    const p = document.createElement('p');
+    // 先取紧邻的前/后裸文本节点链（须在移动前取：img 移入 p 后其兄弟关系已变），
+    // 再按 原序 → img → 原序 的顺序搬进新块，保持内容先后不变。
+    const before = [];
+    let prev = img.previousSibling;
+    while (prev && prev.nodeType === 3) { before.push(prev); prev = prev.previousSibling; }
+    before.reverse();
+    const after = [];
+    let next = img.nextSibling;
+    while (next && next.nodeType === 3) { after.push(next); next = next.nextSibling; }
+    ed.insertBefore(p, img);
+    for (const t of before) p.appendChild(t);
+    p.appendChild(img);
+    for (const t of after) p.appendChild(t);
+    made.push(p);
+  }
+  return made;
+}
+
+// ============================================================================
+// 图片布局模式（2026-10-01 文字绕排 float）
+// ============================================================================
+// 契约（类名逐字固定；校正界面 CSS 与 htmlmanage（EPUB）侧各有一份，后端 lane 同步注册）：
+//   ptoe-img-float-left / ptoe-img-float-right 挂在 **<img> 自身**上；
+//   宽度档位**复用** ptoe-img-w25 / ptoe-img-w50（不新增宽度类）。
+// 互斥：行内用 display:inline-block + vertical-align，绕排用 float + margin，
+//   同挂会让其中一个失效 → 同一张图只能有一种「内嵌定位类」，切换时互斥清理由
+//   applyImgLayoutMode 统一负责（图片弹窗「布局」按钮与右键「图片绕排」共用这一处）。
+//   vertical-align（ptoe-img-vtop/vmid/vbot）对 float 无意义（float 已脱离文本行基线），
+//   切到绕排时一并清掉，避免留下脏状态。
+// 块不变量：绕排图仍待在 <p> 内 —— 而且必须与后文**同段**，CSS float 才能绕排；
+//   .editable 直属裸 <img> 由 adoptLooseImgs / syncContent 兜底收编（与行内同一套）。
+// 说明：_imgSizeClasses / _imgPosClasses / _imgVAlignClasses（文件后段声明的 const）
+//   只在本节的**函数体内**被引用（调用发生在加载完成之后），不存在 TDZ 风险。
+const IMG_MODES = ['full', 'fit', 'inline', 'float-left', 'float-right'];
+const IMG_FLOAT_CLASSES = ['ptoe-img-float-left', 'ptoe-img-float-right'];
+// 绕排宽度上限 75%：100% 宽等于独占整行，文字无路可绕（钳一档，不禁用 100% 按钮）
+const IMG_FLOAT_MAX_SIZE = 'ptoe-img-w75';
+// 模式名 → <img> 上的绕排类（非绕排模式返回空串）
+function floatClassOf(mode) { return mode === 'float-left' || mode === 'float-right' ? 'ptoe-img-' + mode : ''; }
+function isFloatMode(mode) { return !!floatClassOf(mode); }
+// 内嵌式布局：定位类挂在 img 自身（行内 / 绕排），与块级 full/fit（类挂 <p>）相对
+function isEmbeddedMode(mode) { return mode === 'inline' || isFloatMode(mode); }
+// 值域归一：ptoe_img_mode / ui_settings.img_mode 是**持久化**的（localStorage +
+//   config.json），值域从 3 种扩到 5 种后历史值（full/fit/inline）必须原样继续可用；
+//   空/未知值返回 ''，由调用方决定回退 —— 绝不把非法值当模式名拼出 ptoe-img-<垃圾> 类。
+function normalizeImgMode(v) { return IMG_MODES.indexOf(v) >= 0 ? v : ''; }
+function isFloatImg(imgEl) { return !!(imgEl && IMG_FLOAT_CLASSES.some((c) => imgEl.classList.contains(c))); }
+// 图片是否「内嵌」在文字段里（行内或绕排）——决定删除时是否连带删掉整个 <p>
+function isEmbeddedImg(imgEl) { return !!(imgEl && (imgEl.classList.contains('ptoe-img-inline') || isFloatImg(imgEl))); }
+function clampFloatSize(imgEl) {
+  if (imgEl.classList.contains('ptoe-img-w100')) {
+    imgEl.classList.remove('ptoe-img-w100');
+    imgEl.classList.add(IMG_FLOAT_MAX_SIZE);
+  }
+}
+// 统一布局切换：把 imgEl 切到 mode（full/fit/inline/float-left/float-right）。
+//   图片弹窗「布局」按钮、右键「图片绕排」共用；互斥规则只此一处。
+//   不负责撤销/落盘/重排（由调用方 histRun + syncContent + scheduleRemeasure 收尾）。
+//   返回归一化后的模式名。
+function applyImgLayoutMode(mode, imgEl, pEl, ed) {
+  const val = normalizeImgMode(mode) || 'full';
+  if (isEmbeddedMode(val)) {
+    // ---- 行内 / 绕排：定位类挂在 <img> 上，图与后文同段 ----
+    // 保留/补上 <p> 包裹（2026-10-01 起行内也不再把 img 从 <p> 里搬出，否则破坏
+    // 「一行一块」不变量）；没有块就现建一个收编（adoptLooseImgs 同一处理）。
+    let wrap = (!isEmbeddedImg(imgEl) && pEl && pEl !== ed && isBlockEl(pEl) && pEl.parentNode) ? pEl : null;
+    if (!wrap) {
+      const par = imgEl.parentNode;
+      if (par && par !== ed && isBlockEl(par)) wrap = par;  // 历史遗留的裸图其实在块内
+      else wrap = adoptLooseImgs(ed)[0] || null;
+    }
+    if (wrap) {
+      // 块级布局类（ptoe-img-full/fit/left/center/right）在内嵌模式下无意义：
+      // 它们作用于「整块」布局，留在段落上会把同行文字一起居中/顶格。
+      _imgPosClasses.forEach((c) => wrap.classList.remove(c));
+      wrap.classList.remove('ptoe-img-full', 'ptoe-img-fit');
+    }
+    imgEl.classList.remove('ptoe-img-full', 'ptoe-img-fit');
+    // ★互斥★：清掉另一种内嵌定位类 + 垂直对齐类，再按目标模式挂上唯一一种
+    imgEl.classList.remove('ptoe-img-inline');
+    IMG_FLOAT_CLASSES.forEach((c) => imgEl.classList.remove(c));
+    _imgVAlignClasses.forEach((c) => imgEl.classList.remove(c));
+    if (isFloatMode(val)) {
+      imgEl.classList.add(floatClassOf(val));
+      clampFloatSize(imgEl);
+    } else {
+      imgEl.classList.add('ptoe-img-inline');
+    }
+    if (!_imgSizeClasses.some((c) => imgEl.classList.contains(c))) imgEl.classList.add('ptoe-img-w50');
+  } else {
+    // ---- 全画幅 / 局部：类挂 <p>，图独占一段 ----
+    // 从内嵌模式（行内/绕排）切来时图与文字同段 → 必须另起一个 <p> 把图摘出去，
+    // 否则整段文字会被并进图片块（全画幅/局部都是整块布局）。
+    let wrap = (!isEmbeddedImg(imgEl) && pEl && pEl.tagName === 'P') ? pEl : null;
+    if (!wrap) {
+      wrap = document.createElement('p');
+      const par = imgEl.parentNode;
+      if (par && par !== ed && par.tagName === 'P') par.insertAdjacentElement('afterend', wrap);
+      else if (par) par.insertBefore(wrap, imgEl);
+      else ed.appendChild(wrap);
+      wrap.appendChild(imgEl);
+    }
+    wrap.className = val === 'full' ? 'ptoe-img-full ptoe-img-center' : 'ptoe-img-fit ptoe-img-center';
+    imgEl.classList.remove('ptoe-img-inline');
+    IMG_FLOAT_CLASSES.forEach((c) => imgEl.classList.remove(c));
+    _imgVAlignClasses.forEach((c) => imgEl.classList.remove(c));
+    if (val === 'full') {
+      // 全画幅独占整页：清除尺寸 class，保证「大小的改变不影响导出图片效果」
+      _imgSizeClasses.forEach((c) => imgEl.classList.remove(c));
+    }
+  }
+  return val;
+}
+// 图片布局模式的两处 UI 出口（工具栏「插入图片」下拉 imgModeSel、图片设置弹窗
+// 「布局」行）写在 correctmanage._UI_HTML 里，本节运行时注入绕排两个条目：
+// 幂等 + 空守卫；节点缺失时静默跳过（不影响快捷键与其它功能）。
+// 图片弹窗的点击是 #imgPopup 上的**事件委托** → 注入的按钮自动走同一处理分支。
+const IMG_MODE_LABELS = { 'float-left': '绕排（左）', 'float-right': '绕排（右）' };
+function _injectFloatLayoutUI() {
+  const sel = document.getElementById('imgModeSel');
+  if (sel && !sel.querySelector('option[value="float-left"]')) {
+    ['float-left', 'float-right'].forEach(function (mode) {
+      const o = document.createElement('option');
+      o.value = mode;
+      o.textContent = IMG_MODE_LABELS[mode];
+      sel.appendChild(o);
+    });
+  }
+  const pop = document.getElementById('imgPopup');
+  if (pop) {
+    // 插入锚点：inline 布局按钮之后。必须**逐个后移**——insertBefore(b, ref.nextSibling)
+    // 不会改变 ref.nextSibling 指向，连续两次插入会得到 float-right,float-left 反序。
+    let ref = pop.querySelector('.img-pop-btn[data-img-op="layout"][data-img-val="inline"]');
+    ['float-left', 'float-right'].forEach(function (mode) {
+      if (pop.querySelector('.img-pop-btn[data-img-val="' + mode + '"]')) return;
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'img-pop-btn';
+      b.dataset.imgOp = 'layout';
+      b.dataset.imgVal = mode;
+      b.textContent = IMG_MODE_LABELS[mode];
+      b.title = (mode === 'float-left'
+        ? '绕排（左）：图片浮在左侧，文字从右侧绕排（默认 50% 宽度）'
+        : '绕排（右）：图片浮在右侧，文字从左侧绕排（默认 50% 宽度）');
+      if (ref && ref.parentNode) { ref.parentNode.insertBefore(b, ref.nextSibling); ref = b; }
+      else pop.appendChild(b);
+    });
+  }
+}
+
 // 快捷键表内的中键标签样式（HTML/CSS 由 correctmanage 维护，这里注入以免依赖其改动）
 (function injectMouseShortcutStyles() {
   if (document.getElementById('mouseShortcutStyles')) return;
@@ -465,8 +668,11 @@ function htmlToMd(html) {
 function inlineMd(t) {
   // 行内 Markdown → HTML：md 记号转标签，原样 HTML（标记 span）放行，
   // 其余文本转义（防止裸 < 破坏下游解析）
+  // 2026-10-01：链接分支加负向先行 (?<!!) —— 图片语法 ![alt](src) 原样透传
+  // （不含 <img>，没有标签可放行，转成 <a href="data:…"> 是错的）。分组序号不变
+  //（(?<!!) 是非捕获零宽断言，m[6] 仍是链接分组）。
   const out = [];
-  const re = /(`[^`]+`)|(\*\*[^*]+\*\*)|(__[^_]+__)|(\*[^*\s][^*]*\*)|(_[^_\s][^_]*_)|(\[[^\]]+\]\([^)]+\))|(<[^>]+>)/g;
+  const re = /(`[^`]+`)|(\*\*[^*]+\*\*)|(__[^_]+__)|(\*[^*\s][^*]*\*)|(_[^_\s][^_]*_)|(?<!!)(\[[^\]]+\]\([^)]+\))|(<[^>]+>)/g;
   let last = 0, m;
   const s = String(t);
   while ((m = re.exec(s))) {
@@ -557,12 +763,29 @@ function _injectIndentStyles(html) {
     return '<' + tag + attrs + ' style="' + st + '"' + (slf || '') + '>';
   });
 }
+// md 源码模式逐行转义（2026-10-01）：整行 esc 会把 raw HTML 的 <img> 变成
+// 可见的转义文本 → 行内图在源码模式下「看不见」。这里只放行 <img ...> 标签本身
+// （正则抠出原样输出），其余文本仍逐字符转义——不整行裸奔放行任意 HTML。
+// 同时兼顾 ![alt](src) 图片语法：! 后面的 [alt](src) 会被 esc 成 &nbsp;… 之外的
+// 普通文本原样显示（方括号/圆括号不是 HTML 字符，esc 后视觉不变），仍可编辑。
+const MD_IMG_TAG_RE = /<img\b[^>]*>/gi;
+function escKeepImgs(line) {
+  const s = String(line == null ? '' : line);
+  if (s.indexOf('<img') < 0) return esc(s); // 快速返回：绝大多数行不含 <img
+  let out = '', last = 0, m;
+  MD_IMG_TAG_RE.lastIndex = 0;
+  while ((m = MD_IMG_TAG_RE.exec(s))) {
+    out += esc(s.slice(last, m.index)) + m[0];
+    last = m.index + m[0].length;
+  }
+  return out + esc(s.slice(last));
+}
 function displayHtml(i) {
   let base;
   if (!mdMode) base = contentMap.has(i) ? contentMap.get(i) : pages[i].text;
   else {
     const src = mdSourceMap.has(i) ? mdSourceMap.get(i) : htmlToMd(pages[i].text);
-    base = String(src).split('\n').map(function(l) { return '<div>' + esc(l) + '</div>'; }).join('\n');
+    base = String(src).split('\n').map(function(l) { return '<div>' + escKeepImgs(l) + '</div>'; }).join('\n');
   }
   // 2026-09-15：块间 \n 归一（见 _ensureBlockNewlines）。放在搜索高亮注入前，
   // 返回的 html（含 \n）用于 pageRow 渲染/格式规则应用，引擎与浏览器 textContent
@@ -807,6 +1030,10 @@ function syncContent(ed) {
   const row = ed.closest('.page-row');
   if (!row) return;
   const i = Number(row.dataset.i);
+  // 块不变量兜底（2026-10-01）：任何路径（粘贴/撤销/格式规则/历史载入…）造出的
+  // 裸 <img>（.editable 直属）都在落盘前收编进 <p>——否则它不在任何块内，
+  // 对齐/缩进/合并/清除格式对它静默失效。md 模式不适用（源码按行 div 渲染）。
+  if (!mdMode && hasLooseImg(ed)) adoptLooseImgs(ed);
   if (mdMode) mdSourceMap.set(i, editableSource(ed));
   else contentMap.set(i, _stripSearchMarks(stripIndentStyles(_stripMultiSelClass(ed.innerHTML))));
 }
@@ -870,7 +1097,26 @@ function pageRow(p, i) {
     if (k === 'Backspace' || k === 'Delete' || k === 'Enter' || (k && k.length === 1)) histBeginInput(i);
   });
   ed.addEventListener('compositionstart', () => { histBeginInput(i); });
-  ed.addEventListener('paste', () => { histBeginInput(i); });
+  // 粘贴的表格嵌套防护（2026-10-01）：①光标在表格内粘贴；②剪贴板 HTML 自带嵌套
+  // table（Word/网页粘贴的常见形态）。两者都会生成嵌套 table，服务端 _Sanitizer
+  // 压平内层 → 用户看到「表格莫名少了一层」。保守：拒绝粘贴 + 中文提示，不改内容。
+  // 被拒时不开历史快照（DOM 不变，开了会产生一条空撤销条目）。
+  ed.addEventListener('paste', (ev) => {
+    if (caretInTable(ed)) {
+      ev.preventDefault();
+      showToast('光标在表格内：已阻止粘贴（避免生成嵌套表格），请先移出表格', 'warn');
+      return;
+    }
+    const cd = ev && ev.clipboardData;
+    let html = '';
+    try { html = cd && typeof cd.getData === 'function' ? (cd.getData('text/html') || '') : ''; } catch (e2) { html = ''; }
+    if (htmlHasNestedTable(html)) {
+      ev.preventDefault();
+      showToast('剪贴板内容含嵌套表格：已阻止粘贴（避免表格层级被压平）', 'warn');
+      return;
+    }
+    histBeginInput(i);
+  });
   ed.addEventListener('focus', updateStatus);
   ed.addEventListener('blur', updateStatus);
   const insBtn = row.querySelector('.img-insert');
@@ -936,7 +1182,8 @@ function insertImage(row, i) {
 }
 
 // 把 dataUrl 图片插入到第 i 页文字光标处（整页图插入 / 外部插入 / 裁剪插入共用）。
-// modeOverride 可选：显式指定插入模式（full/fit/inline），缺省读 imgModeSel 下拉框。
+// modeOverride 可选：显式指定插入模式（full/fit/inline/float-left/float-right），
+// 缺省读 imgModeSel 下拉框（值经 normalizeImgMode 归一，非法值回退 full）。
 function viewportPage() {
   // 1) 优先用已挂载行的真实渲染位置（getBoundingClientRect），免受 heights[] 脏数据
   //    影响——虚拟列表只有可见行挂载，挂载行的实际位置即当前视图的真实布局。
@@ -983,14 +1230,27 @@ function insertImageDataUrl(dataUrl, size, i, modeOverride) {
     const row = ed.closest('.page-row');
     i = row ? Number(row.dataset.i) : 0;
   }
-  const mode = modeOverride || document.getElementById('imgModeSel').value;
-  // 插入图片：mode 决定全画幅/局部/行内。
+  // 值域归一：modeOverride 可能是外部传入的任意串（含历史持久化值），空/未知回退 full
+  const mode = normalizeImgMode(modeOverride)
+    || normalizeImgMode(document.getElementById('imgModeSel').value)
+    || 'full';
+  // 插入图片：mode 决定全画幅/局部/行内/绕排（左·右）。
   // 全画幅=整块居中占满行宽（默认 w100）；局部=整块按原尺寸居中；
-  // 行内=裸 <img> 嵌在文字光标处（50% 宽度），文字环绕。
+  // 行内=图嵌在自己的 <p> 里（50% 宽度）。
+  // 2026-10-01：行内图也带 <p> 包裹——.editable 的「一行一块」不变量要求图永远
+  // 在块内（裸 <img> 直属 .editable 会让块级操作对它静默失效）。光标在段落中间时
+  // 由浏览器自行拆段（图独占一段、前后文字各自成段）；不在块内也不会产生裸图。
   const isInline = (mode === 'inline');
+  const isFloat = isFloatMode(mode);
   let html;
-  if (isInline) {
-    html = '<img class="ptoe-img-inline ptoe-img-w50" src="' + dataUrl + '" alt="插图"/>';
+  if (isFloat) {
+    // 绕排：<img> **不套 <p>**、直接插在光标处 —— 图与后文必须同段，后端 CSS 的
+    // float 才能让文字绕到图的另一侧。块不变量同样成立（图在段落内，.editable
+    // 直属不会出现裸 img）；万一光标不在任何块里，下面的 hasLooseImg/adoptLooseImgs
+    // 兜底建 <p> 收编。
+    html = '<img class="' + floatClassOf(mode) + ' ptoe-img-w50" src="' + dataUrl + '" alt="插图"/>';
+  } else if (isInline) {
+    html = '<p><img class="ptoe-img-inline ptoe-img-w50" src="' + dataUrl + '" alt="插图"/></p>';
   } else {
     const imgClass = mode === 'full' ? ' class="ptoe-img-w100"' : '';
     // Default to center alignment for newly inserted block images. If the
@@ -1014,12 +1274,17 @@ function insertImageDataUrl(dataUrl, size, i, modeOverride) {
       } else if (!document.execCommand('insertHTML', false, html)) {
         ed.appendChild(document.createElement('div')).innerHTML = html;
       }
+      // 防御性收编：若引擎把图留在 .editable 直属（拆段行为因浏览器而异），
+      // 就地包一层 <p> 并把相邻裸文本并入该块（块不变量，见 adoptLooseImgs）
+      if (!mdMode && hasLooseImg(ed)) adoptLooseImgs(ed);
     });
   } finally { inDiscreteOp = false; }
   syncContent(ed); markDirty(i); scheduleRemeasure(i);
   histEnd(before, '插入图片');
   if (size >= 2 * 1024 * 1024) {
     showToast('已插入图片（图片较大，保存/打包可能变慢）', 'warn');
+  } else if (isFloat) {
+    showToast('已插入图片（' + IMG_MODE_LABELS[mode] + '，文字绕排，点击图片可改布局/大小）', 'ok');
   } else if (isInline) {
     showToast('已插入图片（行内，50% 宽度，点击图片可调整大小/位置）', 'ok');
   } else {
@@ -1073,6 +1338,35 @@ function _restoreEditableRange(range) {
 }
 let _tblCaretRange = null; // 打开表格弹窗时的光标快照（弹窗 focus 输入框会夺焦，确认插入时恢复它）
 
+// 光标/选区是否落在 ed 内的某个表格里（表内插表 → 嵌套 table，服务端 _Sanitizer
+// 会把内层压平 → 用户看到「表格莫名少了一层」。保守拒绝，见 insertTable/paste）
+function rangeInTable(range, ed) {
+  if (!range || !ed) return false;
+  for (const n of [range.startContainer, range.endContainer]) {
+    const el = n && (n.nodeType === 3 ? n.parentElement : n);
+    if (el && el.closest) {
+      const t = el.closest('table');
+      if (t && ed.contains(t)) return true;
+    }
+  }
+  return false;
+}
+function caretInTable(ed) {
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount || !ed) return false;
+  for (let k = 0; k < sel.rangeCount; k++) {
+    if (rangeInTable(sel.getRangeAt(k), ed)) return true;
+  }
+  return false;
+}
+// 剪贴板 HTML 是否含嵌套 table（Word/网页粘贴的常见形态）
+function htmlHasNestedTable(html) {
+  const s = String(html == null ? '' : html);
+  if (s.toLowerCase().indexOf('<table') < 0) return false;
+  const d = document.createElement('div');
+  d.innerHTML = s;
+  return !!d.querySelector('table table');
+}
 // 在光标处插入表格：目标页优先取当前视口页（与 insertImageDataUrl 一致），再回退
 // 到最近聚焦的编辑区。Markdown 源码模式下插入 raw HTML（源码可见可编辑），
 // mdToHtml 对 <table 开头的行原样透传 → 切回富文本表格完整保留。
@@ -1090,6 +1384,13 @@ function insertTable(rows, cols, header) {
   if (i == null) {
     const row = ed.closest('.page-row');
     i = row ? Number(row.dataset.i) : 0;
+  }
+  // 表格嵌套防护（2026-10-01）：光标已在表格内时插表会生成嵌套 table，服务端
+  // _Sanitizer 把内层压平 → 用户看到「表格莫名少了一层」。保守拒绝 + 中文提示。
+  // 光标可能在打开弹窗时被输入框夺走，故一并检查弹窗快照 _tblCaretRange。
+  if (caretInTable(ed) || rangeInTable(_tblCaretRange, ed)) {
+    showToast('光标在表格内：请先移出表格（点表格外的正文）再插入新表格', 'warn');
+    return;
   }
   const html = buildTableHtml(rows, cols, !!header);
   const before = histBegin('插入表格', [i]);
@@ -2937,15 +3238,16 @@ function applyOp(op) { const ed = currentEditable(); if (!ed) return;
     if (/^H[1-6]$/.test(block.tagName) || block.tagName === 'DIV') {
       block = _convertBlockTag(block, 'p');
     }
-    // 文本格式块类清除（ptoe-img-* 图片段落布局类例外保留）
-    const imgClasses = [];
+    // 文本格式块类清除（ptoe-img-* 图片段落布局类 + ptoe-caption 题注类例外保留：
+    // 题注类不是「文本格式」，清掉它会让图注失去居中小字外观）
+    const keepClasses = [];
     for (const c of block.classList) {
-      if (c.indexOf('ptoe-img-') === 0) imgClasses.push(c);
+      if (c.indexOf('ptoe-img-') === 0 || c === CAPTION_CLASS) keepClasses.push(c);
     }
     for (const c of ['ptoe-note', 'ptoe-citation', 'ptoe-align-left', 'ptoe-align-center', 'ptoe-align-right', 'ptoe-flush', 'ptoe-indent']) {
       block.classList.remove(c);
     }
-    for (const c of imgClasses) block.classList.add(c);
+    for (const c of keepClasses) block.classList.add(c);
     // 缩进 data 属性与内联 style（缩进样式）一并移除
     for (const a of _IND_ATTRS) block.removeAttribute(a);
     if (block.hasAttribute('style')) block.removeAttribute('style');
@@ -5319,6 +5621,7 @@ let _ctxEscCapture = null; // 菜单打开期间的临时 Esc 捕获监听（cap
 let _ctxEditable = null; // 被右键的 .editable（右键目标页）
 let _ctxRange = null;    // 右键位置 caretRangeFromPoint 的 range（标记插入精确定位，jsdom 无则 null）
 let _ctxClipText = '';    // 右键打开时保存的选区文本（复制/粘贴 fallback）
+let _ctxImg = null;      // 右键正好点在 <img> 上时的目标图（图片绕排用；否则回退页内首图）
 
 function closeContextMenu() {
   ctxMenuOpen = false;
@@ -5329,6 +5632,7 @@ function closeContextMenu() {
   _ctxEditable = null; // 防陈旧右键目标泄漏到后续工具栏操作
   _ctxRange = null;
   _ctxClipText = '';
+  _ctxImg = null;
 }
 
 function toggleCtxSub(parent) {
@@ -5459,6 +5763,31 @@ function ctxInsertImage() {
   if (sel) { sel.removeAllRanges(); sel.addRange(range); }
   _lastEditableRange = range.cloneRange();
   insertImage(row, i);
+}
+// 右键菜单「图片绕排▸」（2026-10-01）：把右键目标页的某张图切成绕排布局。
+// 目标图选取优先级：① _ctxImg（右键正好点在 <img> 上，见 contextmenu 监听）
+// ② 右键目标页里的第一张图（用户右键在页内图片附近）。取不到则提示。
+// 走 applyImgLayoutMode —— 与图片弹窗「布局」按钮共用同一处互斥规则，
+// 并用 histRun 记一步撤销（与工具栏布局切换一致）。
+function ctxImgFloat(val) {
+  const mode = normalizeImgMode(val);
+  if (!isFloatMode(mode)) { showToast('未知的图片绕排模式', 'warn'); return; }
+  const ed = ctxTargetEditable();
+  if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
+  const row = ed.closest('.page-row');
+  const i = row ? Number(row.dataset.i) : -1;
+  // 先算好目标（ctxRun 内 closeContextMenu 会清空 _ctxEditable/_ctxImg）
+  let img = (_ctxImg && ed.contains(_ctxImg)) ? _ctxImg : ed.querySelector('img');
+  if (!img) { showToast('本页没有图片，无法设置绕排', 'warn'); return; }
+  const pEl = img.closest('p');
+  ctxRun(function () {
+    histRun('图片绕排', [i], function () {
+      applyImgLayoutMode(mode, img, pEl, ed);
+      syncContent(ed);
+    });
+    scheduleRemeasure(i);
+  });
+  showToast('已设置为' + (IMG_MODE_LABELS[mode] || mode), 'ok');
 }
 // ---------------------------------------------------------------------------
 // 右键菜单「复制 / 粘贴」（2026-09-13 重写）
@@ -5629,8 +5958,34 @@ function _insertAtCaret(html, text) {
   }
   return false;
 }
+// 「粘贴被拒绝」的哨兵（区别于 false=没插进去）：被拒绝时已弹出**具体原因**提示，
+// 调用方 ctxPasteFormat/ctxPasteText 据此跳过泛化的「粘贴失败：请在编辑区按 Ctrl+V」，
+// 避免两条 toast 互相覆盖、把「表格嵌套防护」说成普通失败。
+const PASTE_REJECTED = { ptoeRejected: true };
+// 右键粘贴的插入点是否落在 ed 内的表格里。插入点优先是右键捕获的 range
+// （右键不改选区，见 _ctxEditable/_ctxRange），range 失效时 _ctxPastePosition
+// 保留现有选区/光标 → 此时回退到实时选区判定。语义与原生 paste 监听一致。
+function _ctxPasteTargetInTable(ed, range) {
+  if (!ed) return false;
+  if (range && ed.contains(range.startContainer)) return rangeInTable(range, ed);
+  return caretInTable(ed);
+}
 function _ctxPasteHtml(html, ed, ri, range) {
-  if (!_ctxPastePosition(ed, range)) { showToast('请先点击某一页的文字', 'warn'); return false; }
+  if (!ed) { showToast('请先点击某一页的文字', 'warn'); return PASTE_REJECTED; }
+  // 表格嵌套防护（2026-10-01，与原生 paste 监听对齐）：①插入点在表格内粘贴；
+  // ②剪贴板 HTML 自带嵌套 table（Word/网页粘贴的常见形态）。两者都会生成嵌套
+  // table，服务端 _Sanitizer 压平内层 → 用户看到「表格莫名少了一层」。拒绝条件、
+  // 提示文案与原生路径逐字一致。**守卫必须在任何 DOM 改动与 histBegin/histRun
+  // 之前**：被拒时内容不变，开快照会留下一条空撤销条目（原生路径同理不 histBeginInput）。
+  if (_ctxPasteTargetInTable(ed, range)) {
+    showToast('光标在表格内：已阻止粘贴（避免生成嵌套表格），请先移出表格', 'warn');
+    return PASTE_REJECTED;
+  }
+  if (htmlHasNestedTable(html)) {
+    showToast('剪贴板内容含嵌套表格：已阻止粘贴（避免表格层级被压平）', 'warn');
+    return PASTE_REJECTED;
+  }
+  if (!_ctxPastePosition(ed, range)) { showToast('请先点击某一页的文字', 'warn'); return PASTE_REJECTED; }
   return histRun('粘贴（格式）', [ri], () => {
     const wrap = document.createElement('div');
     wrap.innerHTML = html;
@@ -5642,7 +5997,7 @@ function _ctxPasteHtml(html, ed, ri, range) {
   });
 }
 function _ctxPasteTextInsert(text, ed, ri, range) {
-  if (!_ctxPastePosition(ed, range)) { showToast('请先点击某一页的文字', 'warn'); return false; }
+  if (!_ctxPastePosition(ed, range)) { showToast('请先点击某一页的文字', 'warn'); return PASTE_REJECTED; }
   return histRun('粘贴（纯文本）', [ri], () => {
     const ok = _insertAtCaret('', text);
     syncContent(ed);
@@ -5658,6 +6013,7 @@ async function ctxPasteFormat(ed, ri, range) {
     const ok = clip.html
       ? _ctxPasteHtml(clip.html, ed, ri, range)
       : _ctxPasteTextInsert(clip.text, ed, ri, range);
+    if (ok === PASTE_REJECTED) return; // 已弹出具体拒绝原因（表格嵌套防护等），不再叠加泛化提示
     if (ok) showToast(clip.html ? '已粘贴（含格式）' : '已粘贴纯文本', 'ok');
     else showToast('粘贴失败：请在编辑区按 Ctrl+V', 'warn');
     return;
@@ -5668,7 +6024,9 @@ async function ctxPasteText(ed, ri, range) {
   if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
   const clip = await _clipboardRead(false);
   if (clip && clip.text) {
-    if (_ctxPasteTextInsert(clip.text, ed, ri, range)) showToast('已粘贴纯文本', 'ok');
+    const ok = _ctxPasteTextInsert(clip.text, ed, ri, range);
+    if (ok === PASTE_REJECTED) return; // 同上：已给出具体原因
+    if (ok) showToast('已粘贴纯文本', 'ok');
     else showToast('粘贴失败：请在编辑区按 Ctrl+V', 'warn');
     return;
   }
@@ -5769,6 +6127,8 @@ ctxMenu.addEventListener('click', (e) => {
     if (wr) { ctxRun(() => applyInlineClass(ctxTargetEditable(), 'ptoe-' + wr, {toggle: true})); return; }
     const ex = subBtn.dataset.ctxExport;
     if (ex) { ctxExportRun(ex); return; }
+    const ifv = subBtn.dataset.ctxImgfloatVal;
+    if (ifv) { ctxImgFloat(ifv); return; }
     return;
   }
   // 一级父项（插入标记 / 导出）：点击切换二级菜单展开
@@ -5872,6 +6232,35 @@ function openCtxSub(sub) {
   sub.classList.add('open');
   orientCtxSubs(); // 展开即定向（边缘裁切修复）
 }
+// 右键菜单「图片绕排▸」（2026-10-01，绕排布局）：ctx 菜单 HTML 在 correctmanage 侧，
+// 这里运行时注入一条 .ctx-sub 父项 + 两个叶子，复用既有 hover-intent / orientCtxSubs
+// 机制（下方 forEach 绑定会对本函数刚插入的节点生效 —— **必须在本段绑定之前调用**）。
+// 叶子 data-ctx-imgfloat-val 的点击分发在 ctxMenu click 监听里（事件委托，
+// 对后插入的子节点同样生效）。幂等 + 空守卫；目标页无图片时点击给出提示。
+function _injectCtxImgFloat() {
+  if (!ctxMenu || ctxMenu.querySelector('.ctx-item[data-ctx="imgfloat"]')) return;
+  const item = document.createElement('div');
+  item.className = 'ctx-item ctx-sub';
+  item.dataset.ctx = 'imgfloat';
+  item.innerHTML = '图片绕排 <span class="ctx-arrow">›</span>';
+  const sub = document.createElement('div');
+  sub.className = 'ctx-submenu';
+  sub.id = 'ctxImgFloatSub';
+  ['float-left', 'float-right'].forEach(function (mode) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'ctx-item';
+    b.dataset.ctxImgfloatVal = mode;
+    b.textContent = IMG_MODE_LABELS[mode];
+    sub.appendChild(b);
+  });
+  item.appendChild(sub);
+  // 锚点：既有的「插入标记 ▸」父项（无锚点则追加到菜单末尾）
+  const anchor = ctxMenu.querySelector('.ctx-item[data-ctx="marker"]');
+  if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(item, anchor.nextSibling);
+  else ctxMenu.appendChild(item);
+}
+_injectCtxImgFloat();
 ctxMenu.querySelectorAll('.ctx-sub').forEach(sub => {
   sub.addEventListener('mouseenter', () => {
     _ctxCancelTimers();
@@ -5901,6 +6290,8 @@ document.addEventListener('contextmenu', (e) => {
     suppressPopupUntil = performance.now() + 300;
     _ctxEditable = ed; // 记录右键目标页：页级操作（清除/重识别/应用/插入标记）与光标位置解耦
     _ctxRange = null;
+    // 右键点在图片上 → 记录该图（图片绕排子菜单用；点在别处则回退页内首图）
+    _ctxImg = (e.target && e.target.tagName === 'IMG') ? e.target : null;
     if (document.caretRangeFromPoint) {
       const r = document.caretRangeFromPoint(e.clientX, e.clientY);
       if (r && ed.contains(r.startContainer)) _ctxRange = r;
@@ -6552,10 +6943,12 @@ const _imgVAlignClasses = ['ptoe-img-vtop', 'ptoe-img-vmid', 'ptoe-img-vbot'];
 function showImgPopup(rect) {
   const pop = document.getElementById('imgPopup');
   pop.style.display = 'flex';
-  // 行内图片 → 显示「位置（行内）」顶/中/底行；块级图片 → 显示「位置」左/中/右行
-  const isInline = !!( _imgKey && _imgKey.imgEl
-    && _imgKey.imgEl.classList.contains('ptoe-img-inline'));
-  document.getElementById('imgPosRow').style.display = isInline ? 'none' : 'flex';
+  // 行内图片 → 显示「位置（行内）」顶/中/底行；块级图片 → 显示「位置」左/中/右行；
+  // 绕排图片 → 两行都收起（方向由「布局」左/右 决定，vertical-align 对 float 无意义）
+  const imgEl0 = _imgKey && _imgKey.imgEl;
+  const isFloat = isFloatImg(imgEl0);
+  const isInline = !!(imgEl0 && imgEl0.classList.contains('ptoe-img-inline'));
+  document.getElementById('imgPosRow').style.display = (isInline || isFloat) ? 'none' : 'flex';
   document.getElementById('imgVPosRow').style.display = isInline ? 'flex' : 'none';
   const r = pop.getBoundingClientRect();
   let left = rect.left + rect.width / 2 - r.width / 2;
@@ -6577,6 +6970,7 @@ function _updateImgLayoutActive() {
   let cur = '';
   if (pEl && pEl.classList && pEl.classList.contains('ptoe-img-full')) cur = 'full';
   else if (pEl && pEl.classList && pEl.classList.contains('ptoe-img-fit')) cur = 'fit';
+  else if (isFloatImg(imgEl)) cur = imgEl.classList.contains('ptoe-img-float-right') ? 'float-right' : 'float-left';
   else if (imgEl.classList.contains('ptoe-img-inline')) cur = 'inline';
   pop.querySelectorAll('button[data-img-op="layout"]').forEach(function (b) {
     b.classList.toggle('active', b.dataset.imgVal === cur);
@@ -7104,7 +7498,15 @@ document.getElementById('imgPopup').addEventListener('click', function (e) {
     // 大小操作保持弹窗打开，便于连续调整
   } else if (op === 'pos') {
     // 设置图片位置：行内图片 → vertical-align（顶/中/底）；
-    // 块级图片 → 交换 ptoe-img-left/center/right class（p 的 text-align）
+    // 块级图片 → 交换 ptoe-img-left/center/right class（p 的 text-align）。
+    // 绕排图两个位置行都收起（见 showImgPopup）；此处仍兜底：万一收到 left/right
+    // 落到 else 分支，会把类写到段落上 —— 绕排图与文字同段，改段落对齐会波及同行
+    // 文字，故直接忽略并提示用「布局」切方向。
+    const isFloatImgNow = isFloatImg(imgEl);
+    if (isFloatImgNow) {
+      showToast('绕排图片的方向请用「布局」的绕排（左/右）切换', 'warn');
+      return;
+    }
     const isInline = imgEl.classList.contains('ptoe-img-inline');
     histRun('设置图片位置', [i], function () {
       if (isInline) {
@@ -7120,37 +7522,12 @@ document.getElementById('imgPopup').addEventListener('click', function (e) {
     // 位置操作保持弹窗打开
   } else if (op === 'layout') {
     // 设置图片布局：全画幅=导出时独占一页（前后内容另起一页，大小设置不影响导出）；
-    // 局部=与前后内容共占一页（导出保留大小设置）；行内=嵌在文字中间
-    const isInline = imgEl.classList.contains('ptoe-img-inline');
+    // 局部=与前后内容共占一页（导出保留大小设置）；行内=嵌在文字中间；
+    // 绕排（左/右）=图与后文同段，文字绕到图的另一侧（2026-10-01）。
+    // 五个模式统一走 applyImgLayoutMode（互斥清理由该函数单点负责：
+    // 行内 ↔ 绕排互斥 + vertical-align 类清理 + 100% 宽度钳 75%）。
     histRun('设置图片布局', [i], function () {
-      if (val === 'inline') {
-        // 行内：从 <p> 包裹中解出裸 <img>（空包裹一并移除）
-        if (!isInline && pEl && pEl !== ed && pEl.parentNode) {
-          pEl.parentNode.insertBefore(imgEl, pEl.nextSibling);
-          if (!pEl.textContent.trim() && !pEl.querySelector('img')) pEl.parentNode.removeChild(pEl);
-        }
-        imgEl.classList.remove('ptoe-img-full', 'ptoe-img-fit');
-        imgEl.classList.add('ptoe-img-inline');
-        if (!_imgSizeClasses.some(function (c) { return imgEl.classList.contains(c); })) imgEl.classList.add('ptoe-img-w50');
-      } else {
-        // 全画幅/局部：确保有块级 <p> 包裹（行内裸图先包一层）
-        let wrap = (!isInline && pEl && pEl.tagName === 'P') ? pEl : null;
-        if (!wrap) {
-          wrap = document.createElement('p');
-          const par = imgEl.parentNode;
-          if (par && par !== ed && par.tagName === 'P') par.insertAdjacentElement('afterend', wrap);
-          else if (par) par.insertBefore(wrap, imgEl);
-          else ed.appendChild(wrap);
-          wrap.appendChild(imgEl);
-        }
-        wrap.className = val === 'full' ? 'ptoe-img-full ptoe-img-center' : 'ptoe-img-fit ptoe-img-center';
-        imgEl.classList.remove('ptoe-img-inline');
-        _imgVAlignClasses.forEach(function (c) { imgEl.classList.remove(c); });
-        if (val === 'full') {
-          // 全画幅独占整页：清除尺寸 class，保证「大小的改变不影响导出图片效果」
-          _imgSizeClasses.forEach(function (c) { imgEl.classList.remove(c); });
-        }
-      }
+      applyImgLayoutMode(val, imgEl, pEl, ed);
       syncContent(ed);
     });
     scheduleRemeasure(i);
@@ -7169,8 +7546,185 @@ document.getElementById('imgPopup').addEventListener('click', function (e) {
     });
     scheduleRemeasure(i);
     hideImgPopup();
+  } else if (op === 'caption') {
+    // 题注：插入/定位题注段落（自带 histBegin/histEnd，不与外层 histRun 嵌套）
+    insertCaption(imgEl);
+    hideImgPopup(); // 光标已进入题注，顺手关窗并清空 _imgKey（避免下次复用旧图）
   }
 });
+
+// ============================================================================
+// 图片题注（2026-10-01）
+// ============================================================================
+// 契约（其余部分由并行 lane 提供，前端只管形态与位置）：
+//   类名固定 ptoe-caption；样式固定 font-size:0.85em;color:#666;text-align:center;
+//   margin:0.2em 0 0.6em —— 校正界面 CSS 与 htmlmanage（EPUB）各一份。
+// 题注是**块级** <p>：天然满足「一行一块」不变量（不产生 .editable 直属裸节点），
+// 行高架构不受影响（行高由左栏预览图按栏宽等比撑出）。
+// 可编辑：光标落在题注内容处，直接打字；可删除：它就是普通段落，整段删即可。
+// 幂等：图片块后紧邻的题注段落不重复插入，直接聚焦。
+// 注：CAPTION_CLASS 的声明在文件头「块不变量防御」小节（applyOp 也用它）。
+// 规范题注段落 HTML：内含 <br>，让空题注也有行高、光标可见（随后直接打字）
+function buildCaptionHtml(text) {
+  const t = text == null ? '' : String(text);
+  return '<p class="' + CAPTION_CLASS + '">' + (t ? esc(t) : '<br>') + '</p>';
+}
+// 解析题注目标图片：①图片弹窗当前图；②选区覆盖到的图；③光标所在块内的第一张图。
+// 都没有 → null（调用方给中文提示，绝不静默失败）。
+function _captionTargetImg(ed) {
+  if (!ed) return null;
+  if (_imgKey && _imgKey.imgEl && _imgKey.imgEl.isConnected && ed.contains(_imgKey.imgEl)) return _imgKey.imgEl;
+  const imgs = Array.prototype.slice.call(ed.querySelectorAll('img'));
+  if (!imgs.length) return null;
+  const sel = window.getSelection();
+  const range = sel && sel.rangeCount ? sel.getRangeAt(0) : null;
+  const canIntersect = !!(range && range.intersectsNode);
+  if (range && canIntersect && !sel.isCollapsed) {
+    for (const img of imgs) {
+      const b = img.closest('p,div,h1,h2,h3,h4,h5,h6');
+      if (b && b !== ed && range.intersectsNode(b)) return img;
+    }
+    return null; // 非折叠选区没覆盖到任何图 → 不猜（提示用户）
+  }
+  if (range) {
+    let n = range.startContainer;
+    if (n && n.nodeType === 3) n = n.parentElement;
+    const b = n && n.closest ? n.closest('p,div,h1,h2,h3,h4,h5,h6') : null;
+    if (b && b !== ed) {
+      const inBlock = b.querySelector('img');
+      if (inBlock) return inBlock;
+    }
+  }
+  return null;
+}
+// 聚焦题注内容（光标置于 <br> 之前）；不做任何内容改写
+function _focusCaption(cap) {
+  if (!cap || !cap.isConnected) return;
+  const ed = cap.closest('.editable');
+  if (ed) ed.focus();
+  try {
+    const r = document.createRange();
+    r.setStart(cap, 0);
+    r.collapse(true);
+    const s = window.getSelection();
+    s.removeAllRanges();
+    s.addRange(r);
+  } catch (e) { /* 光标定位失败不影响题注内容本身 */ }
+  setStatus('题注：直接输入文字（整段可删）');
+}
+// 在图片块之后插入题注段落。可从图片弹窗按钮（传 imgEl）、工具栏按钮或
+// 快捷键（不传，走选区/光标推断）触发。返回题注块，无目标返回 null。
+function insertCaption(imgEl) {
+  let ed = null;
+  if (imgEl && imgEl.isConnected) ed = imgEl.closest('.editable');
+  if (!ed) {
+    const vp = viewportPage();
+    if (vp != null && vp >= 0) {
+      const row = host.querySelector('.page-row[data-i="' + vp + '"]');
+      ed = row ? row.querySelector('.editable') : null;
+    }
+  }
+  if (!ed) ed = currentEditable();
+  if (!ed) { showToast('未找到可插入题注的编辑区（请先点击某一页的图片）', 'warn'); return null; }
+  const img = (imgEl && imgEl.isConnected && ed.contains(imgEl)) ? imgEl : _captionTargetImg(ed);
+  if (!img) {
+    showToast('请先选中一张图片：点击图片（会弹出图片设置窗）把光标放进图片所在段落', 'warn');
+    return null;
+  }
+  const row = ed.closest('.page-row');
+  const i = row ? Number(row.dataset.i) : 0;
+  const block = img.closest('p,div,h1,h2,h3,h4,h5,h6');
+  if (!block || block === ed || !ed.contains(block)) { showToast('未找到图片所在段落，无法插入题注', 'warn'); return null; }
+  if (mdMode) return _insertCaptionMd(ed, i, block);
+  const next = block.nextElementSibling;
+  if (next && next.classList && next.classList.contains(CAPTION_CLASS)) {
+    _focusCaption(next); // 已有题注 → 直接进入编辑，不重复插入
+    showToast('该图片已有题注，已定位到题注', 'ok');
+    return next;
+  }
+  const before = histBegin('插入题注', [i]);
+  let cap = null;
+  inDiscreteOp = true;
+  try {
+    ed.focus();
+    withScrollStable(() => {
+      cap = document.createElement('p');
+      cap.className = CAPTION_CLASS;
+      cap.appendChild(document.createElement('br'));
+      ed.insertBefore(cap, block.nextSibling);
+    });
+  } finally { inDiscreteOp = false; }
+  syncContent(ed); markDirty(i); scheduleRemeasure(i);
+  histEnd(before, '插入题注');
+  _focusCaption(cap);
+  showToast('已插入题注，输入图注文字', 'ok');
+  return cap;
+}
+// Markdown 源码模式：题注以一行 raw HTML 插入到图片所在行之后
+// （mdToHtml 对 <p 开头的行原样透传 → 切回富文本仍是同一个题注段落）。
+function _insertCaptionMd(ed, i, block) {
+  const lines = String(pageSource(i) == null ? '' : pageSource(i)).split('\n');
+  const edLines = ed.querySelectorAll(':scope > div');
+  let lineIdx = -1;
+  for (let k = 0; k < edLines.length; k++) {
+    if (edLines[k] === block || edLines[k].contains(block)) { lineIdx = k; break; }
+  }
+  const pos = lineIdx < 0 ? lines.length : lineIdx + 1;
+  const before = histBegin('插入题注', [i]);
+  inDiscreteOp = true;
+  try {
+    const next = lines.slice();
+    next.splice(pos, 0, buildCaptionHtml(''));
+    mdSourceMap.set(i, next.join('\n'));
+    ed.innerHTML = displayHtml(i);
+  } finally { inDiscreteOp = false; }
+  if (i >= 0) { markDirty(i); scheduleRemeasure(i); }
+  histEnd(before, '插入题注');
+  // 重渲染后行节点全部换了：按行号取新的题注行再聚焦
+  const capRow = ed.querySelectorAll(':scope > div')[pos] || null;
+  if (capRow) _focusCaption(capRow);
+  showToast('已插入题注（Markdown 源码模式的一行 raw HTML）', 'ok');
+  return capRow;
+}
+// 题注工具按钮（前端注入，correctmanage 侧无需改 HTML）：
+// ①工具栏「更多格式工具」面板（紧跟「插入表格」）②图片设置弹窗（紧邻「删除」）。
+// 两处都幂等 + 空守卫；按钮缺 CSS 类时静默跳过（不影响快捷键）。
+function _injectCaptionButtons() {
+  const panel = document.getElementById('morePanelFormat');
+  if (panel && !document.getElementById('captionBtn')) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'tb-btn';
+    b.id = 'captionBtn';
+    b.setAttribute('role', 'menuitem');
+    b.title = '为图片添加题注：在图片所在段落之后插入可编辑的题注段落（Ctrl+Alt+G）';
+    b.setAttribute('aria-label', '插入题注');
+    b.textContent = '插入题注';
+    b.addEventListener('mousedown', (e) => e.preventDefault()); // 同 tableBtn：不夺焦
+    b.addEventListener('click', () => { insertCaption(); });
+    const ref = document.getElementById('tableBtn');
+    if (ref && ref.parentNode === panel) ref.parentNode.insertBefore(b, ref.nextSibling);
+    else panel.appendChild(b);
+  }
+  const pop = document.getElementById('imgPopup');
+  if (pop && !pop.querySelector('.img-pop-btn[data-img-op="caption"]')) {
+    const del = pop.querySelector('.img-pop-btn[data-img-op="delete"]');
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'img-pop-btn';
+    b.dataset.imgOp = 'caption';
+    b.textContent = '题注';
+    b.title = '在图片所在段落之后插入可编辑的题注段落（Ctrl+Alt+G）';
+    if (del && del.parentNode) {
+      if (del.style && del.style.flex) b.style.flex = '1';
+      del.parentNode.insertBefore(b, del);
+    } else {
+      pop.appendChild(b);
+    }
+  }
+}
+_injectCaptionButtons();
+_injectFloatLayoutUI();  // 绕排布局两选项（下拉框 + 图片弹窗「布局」行），否则 applyImgLayoutMode 是死代码
 // Esc 关闭图片弹窗 / 表格操作条
 document.addEventListener('keydown', function (e) {
   if (e.key === 'Escape' && _imgKey) { hideImgPopup(); }
@@ -8928,6 +9482,7 @@ const SHORTCUT_ACTIONS = {
   proofread_accept: acceptErrShortcut,
   proofread_ignore: ignoreErrShortcut,
   insert_table: openTableDialog,
+  insert_caption: insertCaption,
   popup: function() {
     const sel = window.getSelection();
     if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return true;

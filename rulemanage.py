@@ -492,6 +492,11 @@ class MiniDOMParser(HTMLParser):
             tag = "em"
         # 只保留白名单标签；其余标签当作透明容器（仅保留文本内容）
         if tag not in ALLOWED_TAGS:
+            # 空元素无闭合标签（html.parser 不会为其派发 handle_endtag），
+            # 压入 __skip_ 后无法出栈 → 块内后续文本全被当透明内容丢弃。
+            # 例：<p>前文<input type=hidden>后文</p> 的「后文」消失。
+            if tag in VOID_TAGS:
+                return
             # 记录一个透明标记，用于后续 handle_data 知道在非白名单标签内
             self.stack.append(ElementNode(f"__skip_{tag}"))
             return
@@ -512,6 +517,8 @@ class MiniDOMParser(HTMLParser):
             allowed_img_attrs = {"src", "alt"}
             allowed_img_classes = {
                 "ptoe-img-full", "ptoe-img-fit", "ptoe-img-inline",
+                # 浮动绕排（2026-10 图文混合）：与 ptoe-img-inline 互斥，类挂 img 自身
+                "ptoe-img-float-left", "ptoe-img-float-right",
                 "ptoe-img-w25", "ptoe-img-w50", "ptoe-img-w75", "ptoe-img-w100",
                 "ptoe-img-left", "ptoe-img-center", "ptoe-img-right",
                 "ptoe-img-vtop", "ptoe-img-vmid", "ptoe-img-vbot",
@@ -554,15 +561,29 @@ class MiniDOMParser(HTMLParser):
             attr_dict = new_attrs
 
         # p/h1-h6 保留 class（ptoe-note/ptoe-citation/ptoe-align-*/ptoe-flush/
-        # ptoe-indent/ptoe-divider*）与段落设置 data-* 属性（缩进/间距/行距）
+        # ptoe-indent/ptoe-divider*/ptoe-caption）与段落设置 data-* 属性（缩进/间距/行距）
         if tag in BLOCK_TAGS:
             new_attrs = {}
             for k, v in attr_dict.items():
                 if k == "class" and isinstance(v, list):
                     allowed = [
                         c for c in v
-                        if c in {"ptoe-note", "ptoe-citation", "ptoe-flush", "ptoe-indent"}
+                        # 题注段落（2026-10-01）：图片块之后的独立 <p class="ptoe-caption">，
+                        # 块级样式（不是行内格式，故不入 INLINE_FORMAT_CLASSES），
+                        # 不加则每应用一次格式规则题注身份就被剥掉（与 ptoe-divider 同型丢失）
+                        if c in {"ptoe-note", "ptoe-citation", "ptoe-flush", "ptoe-indent",
+                                 "ptoe-caption"}
                         or c.startswith("ptoe-align-")
+                        # 题注样式后缀类（2026-10-01 修正）：判定口径必须与
+                        # _is_caption_block 逐字一致的**严格前缀**——基类已在上面的
+                        # 精确集合里，本行只放行「ptoe-caption + 连字符 + 后缀」。
+                        # 若用宽松 startswith("ptoe-caption")（分隔线 ptoe-divider 的
+                        # 现状即如此），ptoe-captionx 这类恰好以此前缀开头、无连字符
+                        # 分隔的无关 class 会被误判受保护；而 _is_caption_block 不保护
+                        # 它 → 两侧口径分叉，题注保护形同虚设。
+                        # 修前此处只做精确匹配，ptoe-caption-xxx 在**解析期**即被剥掉，
+                        # 使 _is_caption_block 的前缀分支成为端到端死代码。
+                        or c.startswith("ptoe-caption-")
                         # 分隔线段落（2026-09-27）：基类 + 样式后缀两个类都要留
                         or c.startswith("ptoe-divider")
                     ]
@@ -587,7 +608,15 @@ class MiniDOMParser(HTMLParser):
         el = ElementNode(tag, norm_attrs)
         self.stack[-1].children.append(el)
         el.parent = self.stack[-1]
-        self.stack.append(el)
+        # 空元素不得入栈（img/br/hr…）。
+        # 否则块内后续文本会成为其子节点，而 to_html 序列化空元素时直接丢弃
+        # children（:468）→ 图片/换行之后的所有文字凭空消失：
+        #   <p>前文<img src=..>后文</p>  →  <p>前文<img/></p>
+        # 这不是边界情况：浏览器 innerHTML 序列化对 void 元素**永不**输出自闭合
+        # 斜杠（jsdom 实测两种输入都得到 <img src="x">），而矫正界面格式规则
+        # 走的正是 ed.innerHTML，故自闭合形态永远不会被送到本解析器。
+        if tag not in VOID_TAGS:
+            self.stack.append(el)
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
@@ -1179,6 +1208,28 @@ def _is_divider_block(el: ElementNode | None) -> bool:
     return False
 
 
+def _is_caption_block(el: ElementNode | None) -> bool:
+    """块是否带 ptoe-caption class（图片题注段落，2026-10-01）。
+
+    形态 = 图片块之后的独立说明段落 <p class="ptoe-caption">图1 示例插图</p>
+    （契约见 correctmanage._CAPTION_CLASS / htmlmanage._CAPTION_CLASS），
+    与分隔线一样是**用户手动放置的版式元素**，但对标的是配图而非正文：
+    题注-图片是一对，拆开或搬走就失去意义。
+
+    判定口径与 _is_divider_block 严格一致（「精确相等 或 前缀+连字符」）：
+      ① 让将来的样式后缀（ptoe-caption-xxx）也受保护；
+      ② 不会把 ptoe-captionx 这类恰好以此前缀开头、无连字符分隔的无关 class
+         误判为题注。注意解析侧块级白名单用的是宽松 startswith
+         （handle_starttag 的 BLOCK_TAGS 分支），故本判定必须比它更严。
+    """
+    if el is None or not isinstance(el, ElementNode):
+        return False
+    for c in (el.attrs.get("class") or "").split():
+        if c == "ptoe-caption" or c.startswith("ptoe-caption-"):
+            return True
+    return False
+
+
 def apply_block_format(
     root: ElementNode,
     nodes_info: list[TextNodeInfo],
@@ -1218,7 +1269,10 @@ def apply_block_format(
     # 分隔线段落（ptoe-divider，2026-09-27）：整块就是一行字形，是用户手动插入的
     # 版式元素。任何块级格式（标题/对齐/缩进/合并）都不得作用其上——否则一条恰好
     # 命中字形行的正则会把分隔线变成标题，或把它与相邻段落 merge 掉。
-    if _is_divider_block(start_block):
+    # 题注段落（ptoe-caption，2026-10-01）同受此保护，处理方式与分隔线**完全一致**
+    # （一律跳过、返回 False、不改写不合并）：一条恰好命中「图1」这类题注文字的
+    # 正则会把题注变成 <h1>（进而进入 EPUB 目录）并让题注-配图关系失效。
+    if _is_divider_block(start_block) or _is_caption_block(start_block):
         return False
 
     # 对于 merge 操作：将选区覆盖的全部块（start_block..end_block）合并为一段
@@ -1229,9 +1283,11 @@ def apply_block_format(
         # 收集受影响的块（从 start_block 到 end_block，与下方通用收集逻辑一致）
         # 遇到分隔线即停（2026-09-27）：分隔线是独立版式元素，合并既不能吞掉它，
         # 也不能跨过它把两侧正文拼到一起（那会改变文段顺序）
+        # 题注同样「即停」（2026-10-01）：跨过题注合并会把题注留在原地而把其配图
+        # 与说明拆到不同段落（题注失去指代对象），或反过来吞掉题注使图片无说明。
         merge_blocks: list[ElementNode] = []
         cur_block = start_block
-        while cur_block and not _is_divider_block(cur_block):
+        while cur_block and not (_is_divider_block(cur_block) or _is_caption_block(cur_block)):
             merge_blocks.append(cur_block)
             if cur_block is end_block:
                 break
@@ -1261,7 +1317,9 @@ def apply_block_format(
                 sib = siblings[i]
                 if isinstance(sib, ElementNode) and sib.tag in BLOCK_TAGS:
                     # 紧邻兄弟就是分隔线 → 无可合并目标（不跨线合并）
-                    if _is_divider_block(sib):
+                    # 题注同理（2026-10-01）：紧邻题注不合并——把题注并进上一段
+                    # 会让「图片 → 题注」的对应关系断开
+                    if _is_divider_block(sib) or _is_caption_block(sib):
                         return False
                     next_block = sib
                     break
@@ -1305,7 +1363,10 @@ def apply_block_format(
         cur_block = nxt
 
     # 跨块区间里的分隔线块同样排除（start_block 已单独守卫，这里补中间块）
-    blocks = [b for b in blocks if not _is_divider_block(b)]
+    # 题注同理排除（2026-10-01）：跨块区间若只选中首尾而中间压着题注，题注不能
+    # 跟着被改写（改标签 → 变成 h1 进目录；加类 → 破坏题注版式）。
+    # 与分隔线同口径：只从受影响块列表里剔除，区间其余块照常应用。
+    blocks = [b for b in blocks if not _is_divider_block(b) and not _is_caption_block(b)]
     if not blocks:
         return False
 
