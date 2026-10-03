@@ -41,7 +41,9 @@ import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
+import correctmanage
 import htmlmanage
+import rulemanage
 from htmlmanage import (
     _CAPTION_CLASS,
     _img_declarations,
@@ -1192,6 +1194,318 @@ class TestFloatCrossFileContract(unittest.TestCase):
         self.assertIn("imgEl.classList.remove('ptoe-img-inline')", body)
         self.assertIn("IMG_FLOAT_CLASSES.forEach", body)
         self.assertIn("clampFloatSize(imgEl)", body)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# 4. 自定义图片宽度（style="width:NN%"）—— 存储/规则/产物三层
+# ---------------------------------------------------------------------------
+# 契约：自定义宽度是**行内 style**，不是新 class。刻意如此 —— 新增一个尺寸类要同步
+# 7 处注册点（sanitize 白名单 / 编辑器 CSS / class→声明映射 / 规则引擎白名单 /
+# EPUB CSS / epubedit CSS / 前端类表），漏一处就是**静默剥类**，用户看着宽度"自己
+# 变回去"且没有任何报错（本项目已因同型问题出过 bug）。
+#
+# 唯一事实源 = rulemanage.normalize_img_width_style：窄口径白名单，只认 1..100 的
+# 整数百分比 width，输出恒为规范写法 `width:42%`。sanitize（存）与规则引擎（改）
+# 两处都走它，因此「保存/载历史」与「每次应用格式规则」都不会抹掉用户设的宽度。
+
+# 已实测的规范化口径（与 rulemanage.py:241-273 的实现逐条对齐）：
+#   'width:42%'             -> 'width:42%'
+#   '  WIDTH : 42 % ; '      -> 'width:42%'   （属性名大小写不敏感、空白容忍）
+#   'width:042%'            -> 'width:42%'   （前导零归一，不是 'width:042%'）
+#   'width:42'              -> ''            （缺 % 的裸数字）
+#   'width:10%;width:42%'   -> 'width:42%'   （后者覆盖前者）
+#   'width:10%;width:42px'  -> ''            （非法者同样覆盖 → 整体清空）
+#   'color:red;width:42%'   -> 'width:42%'   （无关声明丢弃）
+_IMG_WIDTH_ACCEPTED = (
+    ("width:42%", "width:42%"),
+    ("width:1%", "width:1%"),
+    ("width:100%", "width:100%"),
+    ("  WIDTH : 42 % ; ", "width:42%"),
+    ("width:042%", "width:42%"),
+    ("color:red;width:42%;font-size:2em", "width:42%"),
+    ("width:10%;width:42%", "width:42%"),
+    ("width:42%;color:red", "width:42%"),
+)
+_IMG_WIDTH_REJECTED = (
+    "width:0%",            # 下界外
+    "width:101%",          # 上界外
+    "width:1000%",         # 4 位数字：\d{1,3} 直接不匹配
+    "width:42.5%",         # 小数
+    "width:42px",          # 像素
+    "width:42",            # 缺 %
+    "height:42%",          # 别的属性
+    "width:10%;width:42px",  # 非法者覆盖 → 清空
+    "color:red",
+    "",
+)
+
+
+class TestNormalizeImgWidthStyle(unittest.TestCase):
+    """normalize_img_width_style 的取值域 / 幂等 / 覆盖语义。"""
+
+    def test_accepted_forms_normalize(self):
+        """① 合法的整数百分比被规范成唯一写法。"""
+        for raw, want in _IMG_WIDTH_ACCEPTED:
+            with self.subTest(raw=raw):
+                self.assertEqual(rulemanage.normalize_img_width_style(raw), want)
+
+    def test_rejected_forms_become_empty(self):
+        """② 非法输入一律丢弃（绝不透传任意 style 文本）。"""
+        for raw in _IMG_WIDTH_REJECTED:
+            with self.subTest(raw=raw):
+                self.assertEqual(rulemanage.normalize_img_width_style(raw), "")
+
+    def test_idempotent(self):
+        """③ 幂等：f(f(x)) == f(x)（sanitize 与规则引擎会反复过同一串）。"""
+        for raw in [r for r, _ in _IMG_WIDTH_ACCEPTED] + list(_IMG_WIDTH_REJECTED):
+            with self.subTest(raw=raw):
+                once = rulemanage.normalize_img_width_style(raw)
+                self.assertEqual(rulemanage.normalize_img_width_style(once), once)
+
+    def test_none_and_non_str_do_not_raise(self):
+        """④ None / 非字符串输入安全（sanitize 侧传的是 attrs.get(...) or ""）。"""
+        from typing import Any, cast
+
+        for raw in (None, 42):
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    rulemanage.normalize_img_width_style(cast(Any, raw)), "")
+
+    def test_bounds_are_1_to_100(self):
+        """⑤ 取值域常量与实现一致（前端按这两个值 clamp 输入框）。"""
+        self.assertEqual(rulemanage.IMG_WIDTH_PCT_MIN, 1)
+        self.assertEqual(rulemanage.IMG_WIDTH_PCT_MAX, 100)
+
+
+class TestSanitizeImgWidth(unittest.TestCase):
+    """correctmanage.sanitize_html（存储侧）：宽度活下来，无宽度时逐字节不变。"""
+
+    def test_img_without_style_is_byte_identical(self):
+        """① 无 style 的 img 输出与 2026-10 之前逐字节相同（回归闸门）。
+
+        这是本特性最容易出事的地方：sanitize 是矫正界面内容落盘的唯一入口，
+        给它多加一个属性就会让**所有**历史 JSON 的体积与内容发生无谓变化。
+        """
+        for src, want in (
+            ('<p>x<img src="a.png" alt="tu" class="ptoe-img-w50"/>y</p>',
+             '<p>x<img src="a.png" alt="tu" class="ptoe-img-w50"/>y</p>'),
+            ('<p>x<img src="a.png" alt="tu"/>y</p>',
+             '<p>x<img src="a.png" alt="tu"/>y</p>'),
+        ):
+            with self.subTest(src=src):
+                self.assertEqual(correctmanage.sanitize_html(src), want)
+
+    def test_valid_percent_survives_roundtrip(self):
+        """② 合法宽度往返保留，属性序为 src alt style class。"""
+        out = correctmanage.sanitize_html(
+            '<p>x<img src="a.png" alt="tu" style="width:42%"/>y</p>')
+        self.assertEqual(out, '<p>x<img src="a.png" alt="tu" style="width:42%"/>y</p>')
+
+    def test_only_width_declaration_is_kept(self):
+        """③ 窄白名单：其它声明（颜色/字号）被丢掉，只留规范化的 width。"""
+        out = correctmanage.sanitize_html(
+            '<p>x<img src="a.png" style="color:red;width:42%;font-size:2em"/>y</p>')
+        self.assertIn('style="width:42%"', out)
+        for dropped in ("color", "font-size", "2em", "red"):
+            self.assertNotIn(dropped, out)
+
+    def test_invalid_width_drops_whole_style_attribute(self):
+        """④ 像素/小数宽度 → style 属性整体消失（不留 style="" 残骸）。"""
+        for bad in ("width:42px", "width:42.5%", "width:0%", "width:101%"):
+            with self.subTest(bad=bad):
+                out = correctmanage.sanitize_html(
+                    f'<p>x<img src="a.png" style="{bad}"/>y</p>')
+                self.assertNotIn("style", out)
+
+    def test_percent_and_class_coexist_inline_wins(self):
+        """⑤ 尺寸 class 与自定义宽度并存时两者都留下，行内样式优先级更高。
+
+        前端 applyImgLayoutMode 才是唯一的互斥点，这里只锁「后端不擅自删一边」。
+        """
+        out = correctmanage.sanitize_html(
+            '<p>x<img src="a.png" class="ptoe-img-w50" style="width:42%"/>y</p>')
+        self.assertIn('class="ptoe-img-w50"', out)
+        self.assertIn('style="width:42%"', out)
+
+    def test_sanitize_is_idempotent(self):
+        """⑦ sanitize(sanitize(x)) == sanitize(x)（存盘→载历史→再存盘不漂移）。"""
+        for src in ('<p>x<img src="a.png" alt="tu" style="width:42%"/>y</p>',
+                    '<p>x<img src="a.png" style="color:red;width:42%"/>y</p>',
+                    '<p>x<img src="a.png" style="width:42px"/>y</p>'):
+            with self.subTest(src=src):
+                once = correctmanage.sanitize_html(src)
+                self.assertEqual(correctmanage.sanitize_html(once), once)
+
+
+class TestRuleEngineKeepsImgWidth(unittest.TestCase):
+    """规则引擎：每应用一次格式规则都不该抹掉自定义宽度。
+
+    背景：MiniDOMParser 的 img 分支此前把 style **整条丢弃**（与 span 分支的老问题
+    同型）。矫正界面的格式规则是「解析整页 → 改 → 序列化」的全页往返，用户每点一次
+    规则就丢一次宽度，且规则照样报 success。锁死这条链路。
+    """
+
+    _WIDTH = "width:42%"
+
+    def _page(self, style: str) -> str:
+        """自定义宽度图与后文同段；段后补一段，避免整页只有一张图。"""
+        return (f'<p>段落：<img src="a.png" alt="tu" style="{style}"/>文字继续。</p>'
+                '<p>乙段</p>')
+
+    def _out(self, html: str) -> str:
+        return rulemanage.serialize_html(rulemanage.parse_html(html))
+
+    def test_width_survives_parse_serialize(self):
+        """① 解析 → 序列化往返存活。
+
+        按每个输入自身的规范形式断言（别统一按 42% 写死 —— `width:1%` 就该以
+        `width:1%` 回来，规范化只改写法不改数值）。
+        """
+        for style in ("width:42%", "width:1%", "width:100%", "WIDTH:42%"):
+            with self.subTest(style=style):
+                want = rulemanage.normalize_img_width_style(style)
+                self.assertIn('style="%s"' % want, self._out(self._page(style)))
+
+    def test_invalid_width_not_carried_into_output(self):
+        """② 非法宽度不进产物（规则引擎也不透传任意 style 文本）。"""
+        for style in ("width:42px", "width:42.5%", "width:0%", "color:red"):
+            with self.subTest(style=style):
+                out = self._out(self._page(style))
+                self.assertNotIn("width", out.split("<img")[1].split(">")[0])
+
+    def test_width_survives_inline_rule(self):
+        """③ 应用行内规则（加粗）后宽度仍在（规则不许顺手改图片版式）。"""
+        out, err = rulemanage.apply_rules(
+            self._page(self._WIDTH), [{
+                "id": "cw1", "name": "加粗", "enabled": True,
+                "conditions": [{"type": "contains", "pattern": "文字",
+                                "formats": ["bold"], "mode": "all"}],
+                "formats": [],
+            }], all_rules=True,
+        )
+        self.assertIsNone(err)
+        self.assertIn(self._WIDTH, out)
+        self.assertIn("<strong>", out)          # 规则真的生效了（非空转断言）
+        # 加粗只包住匹配到的「文字」，`继续` 留在 <strong> 之后 → 原串会被标签劈开，
+        # 断言正文须先剥标签（这坑与 _strip_ws_text 压 CJK 空格同源）。
+        self.assertIn("文字继续", re.sub(r"<[^>]+>", "", out))
+
+    def test_width_survives_block_rule(self):
+        """④ 应用块级规则（居中）后宽度仍在，且段落拿到 ptoe-align-center。"""
+        out, err = rulemanage.apply_rules(
+            self._page(self._WIDTH), [{
+                "id": "cw2", "name": "居中", "enabled": True,
+                "conditions": [{"type": "contains", "pattern": "文字",
+                                "formats": ["align_center"], "mode": "all"}],
+                "formats": [],
+            }], all_rules=True,
+        )
+        self.assertIsNone(err)
+        self.assertIn(self._WIDTH, out)
+        self.assertIn("ptoe-align-center", out)   # 块级规则真的生效了
+        self.assertIn("文字继续", out)
+
+
+class TestConvertDocumentImgCustomWidth(unittest.TestCase):
+    """convert_document → XHTML 产物：自定义宽度直达 EPUB 且产物合法。
+
+    ⚠️ 本层**不做**归一化：`_img_inline_tag` 对已带 style 的 img 原样透传
+    （`_HAS_STYLE_RE` 守卫），所以非法宽度也会原样落进 EPUB。归一化的关口在
+    **存储侧 sanitize**（TestSanitizeImgWidth），本类锁住「已合法的宽度不会被转换层
+    改掉」这条性质。
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="t_imgcw_"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        # ⚠️ 每章首尾都放正文段：整页只有一张图的章节会被 _is_img_page 判成
+        # cover.xhtml 而不产出 content 文件，「无输出」看起来就像断言失败。
+        self.pages = [
+            "<h1>第一章</h1>"
+            "<p>本章正文，用来确保章节不被判成整页图片页。</p>",
+            '<p>自定义宽度：<img src="%s" alt="自宽图" style="width:42%%"/>'
+            "文字继续。</p>" % PNG_DATA_URI,
+            '<p>双宽度：<img src="%s" alt="双宽图" class="ptoe-img-w50"'
+            ' style="width:42%%"/>文字继续。</p>' % PNG_DATA_URI,
+            '<p>收尾正文。</p>',
+        ]
+        self.structured = _build_structured(self.pages)
+        self.storage_snapshot = [p["text"] for p in self.structured["pages"]]
+        self.result = htmlmanage.HTMLConverter(
+            output_dir=str(self.tmp)
+        ).convert_document(self.structured)
+        self.assertIsNone(self.result.get("epub_error"), self.result.get("epub_error"))
+        # content_files 是相对 output_dir 的路径（'OEBPS/xxx'），不是绝对路径。
+        content_files = sorted(
+            self.tmp / p for p in (self.result.get("content_files") or [])
+        )
+        self.assertTrue(content_files, "应产出 content_*.xhtml")
+        self.content_files = content_files
+        self.content = "\n".join(
+            p.read_text(encoding="utf-8") for p in content_files
+        )
+
+    def _e2e_setup_ok(self):
+        """端到端前置：产物确实含自定义宽度（避免断言恒真空转）。"""
+        self.assertIn("width:42%", self.content)
+
+    def test_custom_width_reaches_xhtml(self):
+        """① 行内 width:42% 原样出现在产物里（未被转换层改写/丢弃）。"""
+        self._e2e_setup_ok()
+        tag = _img_tag_of(self.content, "自宽图")
+        self.assertEqual(_decls_of(_style_attr_of(tag)), {"width": "42%"})
+
+    def test_class_and_custom_width_both_reach_xhtml(self):
+        """② 与尺寸 class 并存时两者都在（data URI 已提取为 Images/ 相对路径）。"""
+        self._e2e_setup_ok()
+        tag = _img_tag_of(self.content, "双宽图")
+        self.assertIn("ptoe-img-w50", (_attr(tag, "class") or "").split())
+        self.assertEqual(_decls_of(_style_attr_of(tag))["width"], "42%")
+        self.assertTrue(re.match(r"^Images/img_\d+\.png$", _attr(tag, "src") or ""),
+                        tag)
+
+    def test_data_uri_extracted_and_no_inline_data_left(self):
+        """③ data URI 被提取到 Images/，正文里不再残留内联 base64。"""
+        self._e2e_setup_ok()
+        self.assertNotIn("data:image/png;base64", self.content)
+
+    def test_xhtml_wellformed_by_both_parsers(self):
+        """④ 产物双解析器良构（ET 用 XHTML 命名空间，html.parser 独立复核）。"""
+        from html.parser import HTMLParser
+
+        class _Counter(HTMLParser):
+            def __init__(self):
+                super().__init__(convert_charrefs=True)
+                self.imgs = 0
+                self.texts = []
+
+            def handle_starttag(self, tag, attrs):
+                if tag == "img":
+                    self.imgs += 1
+
+            def handle_data(self, data):
+                if data.strip():
+                    self.texts.append(data)
+
+        for p in self.content_files:
+            raw = p.read_text(encoding="utf-8")
+            ET.fromstring(raw)                      # XML 良构
+            c = _Counter()                          # 独立复核：真解析出了 img
+            c.feed(raw)
+            c.close()
+            self.assertEqual(c.imgs, 2, p.name)
+        self.assertIn("文字继续", self.content)
+
+    def test_storage_side_pages_untouched(self):
+        """⑤ 转换层不回写 pages 文本（存储侧仍只存 class/行内 style，不塞声明）。"""
+        self.assertEqual([p["text"] for p in self.structured["pages"]],
+                         self.storage_snapshot)
+        for text in self.storage_snapshot:
+            self.assertNotIn("max-width", text)
 
 
 if __name__ == "__main__":

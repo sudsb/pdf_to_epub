@@ -1647,11 +1647,23 @@ class _Sanitizer(HTMLParser):
                     c for c in (attrs_d.get("class") or "").split() if c in _IMG_CLASSES
                 ]
                 alt = (attrs_d.get("alt") or "插图")[:100]
-                cls_html = f' class="{" ".join(cls)}"' if cls else ""
+                cls_html = f' class="{_html.escape(" ".join(cls), quote=True)}"' if cls else ""
+                # 自定义图片宽度（2026-10）：行内 style="width:NN%" 是自定义档位的唯一
+                # 载体，不放行则保存/载历史会丢掉用户设的宽度（只保留白名单 1 条声明：
+                # 校验与规范序列化统一走 rulemanage.normalize_img_width_style ——
+                # 窄口径白名单，像素值/小数/其它声明一律丢弃，绝不透传任意 style 文本）。
+                # 与尺寸 class 互斥（前端 applyImgLayoutMode/size 分支负责），
+                # 同时存在时以行内样式为准。无合法宽度 → style_html 为空串，
+                # 输出与 2026-10 之前逐字节相同。
+                norm_w = rulemanage.normalize_img_width_style(attrs_d.get("style") or "")
+                style_html = (
+                    f' style="{_html.escape(norm_w, quote=True)}"' if norm_w else ""
+                )
                 # 同上：单元格内须写入单元格缓冲（否则图片被搬出表格）
                 ibuf, _ = self._inline_target()
                 ibuf.append(
-                    f'<img src="{_html.escape(src, quote=True)}" alt="{_html.escape(alt, quote=True)}"{cls_html}/>'
+                    f'<img src="{_html.escape(src, quote=True)}"'
+                    f' alt="{_html.escape(alt, quote=True)}"{style_html}{cls_html}/>'
                 )
         # 其余标签（a/...）丢弃，仅保留其文本内容
 
@@ -10350,6 +10362,10 @@ body.paint-mode{cursor:copy;}
 #imgPopup{position:fixed;z-index:65;display:none;flex-direction:column;gap:6px;padding:10px;background:#fff;border:1px solid #ccc;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.2);min-width:140px;}
 .img-pop-btn{background:#f5f5f5;border:1px solid #ddd;border-radius:4px;padding:3px 10px;font-size:13px;cursor:pointer;}
 .img-pop-btn:hover{background:#eef3fb;border-color:var(--accent);}
+.img-pop-btn:disabled{opacity:.5;cursor:not-allowed;background:#f5f5f5;border-color:#ddd;}
+/* 「大小」行的自定义宽度输入（2026-10）：观感对齐字符格式弹窗的 #cfSizeNum */
+#imgCustomW{width:62px;padding:3px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;font-size:13px;}
+#imgCustomW:disabled{opacity:.5;background:#f7f7f7;}
 #errOk{background:#2e8b57;color:#fff;border:none;border-radius:4px;padding:2px 10px;cursor:pointer;font-size:14px;}
 #errNo{background:#c0392b;color:#fff;border:none;border-radius:4px;padding:2px 10px;cursor:pointer;font-size:14px;}
 /* 文字纠错下拉菜单 / 文字包围 / 上标下标 / 分隔线 */
@@ -11375,6 +11391,11 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
     <button type="button" class="img-pop-btn" data-img-op="size" data-img-val="w50">50%</button>
     <button type="button" class="img-pop-btn" data-img-op="size" data-img-val="w75">75%</button>
     <button type="button" class="img-pop-btn" data-img-op="size" data-img-val="w100">100%</button>
+    <!-- 自定义宽度（2026-10）：整数百分比 1-100，写入 img 的行内 style="width:NN%"
+         （与五个固定档位互斥，见 ui/app.js 的 size / size-custom 分支） -->
+    <input type="number" id="imgCustomW" min="1" max="100" step="1" placeholder="自定义 1-100"
+           aria-label="自定义图片宽度（1-100 百分比）" title="输入 1-100 的整数百分比宽度，按回车或点「应用」生效（与五个固定档位互斥）">
+    <button type="button" class="img-pop-btn" data-img-op="size-custom" title="按输入值设置图片宽度（1-100 整数百分比）">应用</button>
   </div>
   <div id="imgPosRow" style="display:flex;flex-wrap:wrap;gap:4px;">
     <span style="width:100%;font-size:12px;color:#666;">位置</span>

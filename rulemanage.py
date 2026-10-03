@@ -238,6 +238,41 @@ def char_style_get(raw: str, prop: str) -> str:
     return ""
 
 
+# 自定义图片宽度（2026-10）：只认「整数百分比」一种写法。
+# 限定 \d{1,3} 顺带挡掉 1000% 之类的长数字（越界值本就要丢弃，双保险）。
+_IMG_WIDTH_PCT_RE = re.compile(r"^(\d{1,3})\s*%$")
+# 自定义宽度的取值域：1..100 的整数百分比
+# （绕排图另有 75% 上限，那是前端 UI 侧的约束，见 ui/app.js IMG_FLOAT_MAX_PCT）
+IMG_WIDTH_PCT_MIN = 1
+IMG_WIDTH_PCT_MAX = 100
+
+
+def normalize_img_width_style(raw: str) -> str:
+    """原始 style 串 → 规范化的图片宽度声明（无合法宽度时返回 ""）。
+
+    行为要点（与 normalize_char_style 同一范式：**窄口径白名单**，绝不整体透传
+    任意 style 文本）：
+    - 只认 width 一条属性，输出固定为 `width:42%` 这一种规范写法；
+    - 小数百分比（42.5%）、像素值（42px）、缺 % 的裸数字、非数字 → 全部丢弃；
+    - 越界（0 / 101）视为非法 → 丢弃（宽度只允许 1..100 的整数百分比）；
+    - 同一属性重复出现时后者覆盖前者（与 CSS 层叠一致），非法者同样覆盖 → 输出
+      至多一条声明；
+    - **幂等**：normalize_img_width_style(normalize_img_width_style(x)) ==
+      normalize_img_width_style(x)。
+    """
+    val = ""
+    for decl in str(raw or "").split(";"):
+        if not decl.strip():
+            continue
+        prop, sep, v = decl.partition(":")
+        if not sep or prop.strip().lower() != "width":
+            continue
+        m = _IMG_WIDTH_PCT_RE.match(v.strip())
+        n = int(m.group(1)) if m else -1
+        val = (f"width:{n}%" if IMG_WIDTH_PCT_MIN <= n <= IMG_WIDTH_PCT_MAX else "")
+    return val
+
+
 # 冲突组（照抄前端 FORMAT_OP_GROUPS / opsConflict）
 FORMAT_OP_GROUPS = {
     "block_tag": ["p", "heading1", "heading2", "heading3", "heading4", "heading5", "heading6"],
@@ -531,6 +566,15 @@ class MiniDOMParser(HTMLParser):
                     filtered = [c for c in v if c in allowed_img_classes]
                     if filtered:
                         new_attrs[k] = filtered
+                elif k == "style":
+                    # 自定义图片宽度（2026-10）：行内 style="width:NN%" 是自定义档位的
+                    # **唯一载体**（刻意不新增尺寸 class —— 新增类要同步 7 处注册点，
+                    # 漏一处就被静默剥类）。此前 style 在 img 分支整条丢弃 →
+                    # 每应用一次格式规则就会抹掉用户设的自定义宽度（同 span 分支的老问题）。
+                    # 放行口径照 span 分支的既有范式：窄白名单规范化，绝不透传任意 style。
+                    norm = normalize_img_width_style(str(v))
+                    if norm:
+                        new_attrs[k] = norm
             attr_dict = new_attrs
             # 如果没有 src，标记为丢弃
             if "src" not in attr_dict:

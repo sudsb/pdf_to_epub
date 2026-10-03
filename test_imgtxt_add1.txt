@@ -1,0 +1,5 @@
+
+class TestNormalizeImgWidthStyle(unittest.TestCase):
+    def test_valid_percent_kept(self):
+        from rulemanage import normalize_img_width_style
+        self.assertEqual(normalize_img_width_style('width:42%'), 'width:42%')

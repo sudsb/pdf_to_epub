@@ -483,7 +483,10 @@ function adoptLooseImgs(ed) {
 const IMG_MODES = ['full', 'fit', 'inline', 'float-left', 'float-right'];
 const IMG_FLOAT_CLASSES = ['ptoe-img-float-left', 'ptoe-img-float-right'];
 // 绕排宽度上限 75%：100% 宽等于独占整行，文字无路可绕（钳一档，不禁用 100% 按钮）
-const IMG_FLOAT_MAX_SIZE = 'ptoe-img-w75';
+// 档位类名与自定义行内宽度（style="width:NN%"）共用这一个上限，故由数值派生类名，
+// 两条通道不可能各自漂移（clampFloatSize 走类、clampFloatInlineWidth 走行内样式）。
+const IMG_FLOAT_MAX_PCT = 75;
+const IMG_FLOAT_MAX_SIZE = 'ptoe-img-w' + IMG_FLOAT_MAX_PCT;
 // 模式名 → <img> 上的绕排类（非绕排模式返回空串）
 function floatClassOf(mode) { return mode === 'float-left' || mode === 'float-right' ? 'ptoe-img-' + mode : ''; }
 function isFloatMode(mode) { return !!floatClassOf(mode); }
@@ -501,6 +504,22 @@ function clampFloatSize(imgEl) {
     imgEl.classList.remove('ptoe-img-w100');
     imgEl.classList.add(IMG_FLOAT_MAX_SIZE);
   }
+}
+// 同一上限的**行内宽度**通道：clampFloatSize 只看得见 ptoe-img-w* 档位类，
+// 看不见自定义档位的 style="width:NN%"（行内样式本就压过档位 class），
+// 不在这里补一次的话，切到绕排后 100% 宽的图会独占整行、文字无处可绕。
+function clampFloatInlineWidth(imgEl) {
+  if (!imgEl || !imgEl.style) return;
+  const m = /^\s*(\d+(?:\.\d+)?)\s*%\s*$/.exec(String(imgEl.style.width || ''));
+  if (!m) return;
+  const n = Math.round(parseFloat(m.group(1)));
+  if (n >= 1) imgEl.style.width = Math.min(n, IMG_FLOAT_MAX_PCT) + '%';
+}
+// 取 img 上的自定义百分比宽度（无则 0；只认整数/小数百分比写法）
+function imgInlineWidthPct(imgEl) {
+  if (!imgEl || !imgEl.style) return 0;
+  const m = /^\s*(\d+(?:\.\d+)?)\s*%\s*$/.exec(String(imgEl.style.width || ''));
+  return m ? Math.round(parseFloat(m.group(1))) : 0;
 }
 // 统一布局切换：把 imgEl 切到 mode（full/fit/inline/float-left/float-right）。
 //   图片弹窗「布局」按钮、右键「图片绕排」共用；互斥规则只此一处。
@@ -532,10 +551,11 @@ function applyImgLayoutMode(mode, imgEl, pEl, ed) {
     if (isFloatMode(val)) {
       imgEl.classList.add(floatClassOf(val));
       clampFloatSize(imgEl);
+      clampFloatInlineWidth(imgEl);
     } else {
       imgEl.classList.add('ptoe-img-inline');
     }
-    if (!_imgSizeClasses.some((c) => imgEl.classList.contains(c))) imgEl.classList.add('ptoe-img-w50');
+    if (!_imgSizeClasses.some((c) => imgEl.classList.contains(c)) && !imgInlineWidthPct(imgEl)) imgEl.classList.add('ptoe-img-w50');
   } else {
     // ---- 全画幅 / 局部：类挂 <p>，图独占一段 ----
     // 从内嵌模式（行内/绕排）切来时图与文字同段 → 必须另起一个 <p> 把图摘出去，
@@ -554,8 +574,11 @@ function applyImgLayoutMode(mode, imgEl, pEl, ed) {
     IMG_FLOAT_CLASSES.forEach((c) => imgEl.classList.remove(c));
     _imgVAlignClasses.forEach((c) => imgEl.classList.remove(c));
     if (val === 'full') {
-      // 全画幅独占整页：清除尺寸 class，保证「大小的改变不影响导出图片效果」
+      // 全画幅独占整页：清除尺寸 class **与自定义行内宽度**，保证「大小的改变不影响导出图片效果」
+      // （行内 width 会压过 ptoe-img-full 的 width:100% 与 p 的分页声明，
+      //   只清 class 的话自定义宽度仍能绕过全画幅契约）
       _imgSizeClasses.forEach((c) => imgEl.classList.remove(c));
+      imgEl.style.width = '';
     }
   }
   return val;
@@ -6960,7 +6983,97 @@ function showImgPopup(rect) {
   pop.style.left = left + 'px';
   pop.style.top = top + 'px';
   _updateImgLayoutActive();
+  _syncImgCustomW();
 }
+// 「大小」行的自定义宽度输入框同步（预填 / 上限 / 禁用态），单点出口：
+//   showImgPopup 打开时、size / layout 操作后都调它 —— 弹窗常驻不关，
+//   图片状态变了却不重算，输入框就会显示上一张图的陈旧值。
+// 全画幅（p.ptoe-img-full）禁用：弹窗已注明「大小设置不影响导出」，
+// 且 EPUB 侧 full 的 width:100% 是内容契约，行内宽度不得绕过它。
+// 绕排上限 75%（与 clampFloatSize 同一上限，由 IMG_FLOAT_MAX_PCT 派生）。
+function _syncImgCustomW() {
+  const input = document.getElementById('imgCustomW');
+  if (!input) return;
+  const pop = document.getElementById('imgPopup');
+  const btn = pop ? pop.querySelector('.img-pop-btn[data-img-op="size-custom"]') : null;
+  const imgEl = _imgKey && _imgKey.imgEl;
+  const pEl = (_imgKey && _imgKey.pEl) || (imgEl && imgEl.closest('p'));
+  const pct = imgInlineWidthPct(imgEl);
+  input.value = pct ? String(pct) : '';
+  const isFull = !!(pEl && pEl.classList && pEl.classList.contains('ptoe-img-full'));
+  const limit = (imgEl && isFloatImg(imgEl)) ? IMG_FLOAT_MAX_PCT : 100;
+  input.max = String(limit);
+  input.disabled = isFull;
+  input.title = isFull ? '全画幅图片的大小设置不影响导出，请先切换布局'
+                       : '输入 1-' + limit + ' 的整数百分比宽度，按回车或点「应用」生效';
+  if (btn) {
+    btn.disabled = isFull;
+    // 基准 tooltip 取自 HTML 属性并缓存（disabled 文案会反复改写 title，
+    // 不缓存的话离开全画幅后 tooltip 会永久停留在禁用文案上）
+    if (!btn.dataset.baseTitle) btn.dataset.baseTitle = btn.title;
+    btn.title = isFull ? '全画幅图片的大小设置不影响导出，请先切换布局'
+                       : btn.dataset.baseTitle;
+  }
+}
+// 解析输入 → 整数百分比 → 钳制 1..100；空/非数字/NaN 返回 0（= 不合法，调用方不改图）
+function _parseCustomWidth(raw) {
+  const s = String(raw == null ? '' : raw).trim().replace(/%$/, '').trim();
+  if (!s || !/^[+-]?\d+(\.\d+)?$/.test(s)) return 0;
+  const n = parseFloat(s);
+  if (!isFinite(n)) return 0;
+  return Math.max(1, Math.min(100, Math.round(n)));
+}
+// 应用自定义宽度：清掉全部尺寸档位 class（两者互斥），再写行内 style="width:NN%"。
+//   为什么用行内样式而不是新增尺寸 class：新增类要同步 7 处注册点，漏一处就被静默剥类；
+//   行内样式天然压过 .ptoe-img-w*，且 EPUB 侧 htmlmanage._img_inline_tag 对
+//   「已带 style 的 img」原样不动 → 宽度直达 EPUB（与 2026-10 图片样式内联化同动机）。
+//   导出降级：TXT/DOCX/MD 的 _html_to_export_blocks 不解析行内宽度（img 块只取
+//   src/alt/cls），这些格式按 100% 处理 —— 有意的降级，与 float 绕排一致。
+// 弹窗保持打开，便于连续微调；成功后重算输入框（回显钳制后的值）。
+function applyImgCustomWidth() {
+  const input = document.getElementById('imgCustomW');
+  if (!input || !_imgKey || !_imgKey.imgEl) return;
+  const { i, pEl, imgEl } = _imgKey;
+  const row = imgEl.closest('.page-row');
+  const ed = row ? row.querySelector('.editable') : null;
+  if (!ed) return;
+  const isFull = !!(pEl && pEl.classList && pEl.classList.contains('ptoe-img-full'));
+  if (isFull) {
+    showToast('全画幅图片的大小设置不影响导出，请先切换布局', 'warn');
+    return;
+  }
+  const pct = _parseCustomWidth(input.value);
+  if (!pct) {
+    showToast('请输入 1-100 之间的百分比宽度', 'warn');
+    input.focus();
+    return;
+  }
+  const limit = isFloatImg(imgEl) ? IMG_FLOAT_MAX_PCT : 100;
+  const applied = Math.min(pct, limit);
+  if (applied < pct) showToast('绕排图片宽度上限 ' + IMG_FLOAT_MAX_PCT + '%，已按 ' + applied + '% 应用', 'warn');
+  histRun('设置图片自定义大小', [i], function () {
+    _imgSizeClasses.forEach(function (c) { imgEl.classList.remove(c); });
+    imgEl.style.width = applied + '%';
+    syncContent(ed);
+  });
+  scheduleRemeasure(i);
+  _updateImgLayoutActive();
+  _syncImgCustomW();
+  showToast('图片宽度已设为 ' + applied + '%', 'ok');
+}
+// 输入框回车应用：全局快捷键分发只放行**裸** Enter/Escape（comboOf），
+// 默认绑定的 proofread_accept 虽有 _inField 守卫，但用户可把任意操作绑到裸 Enter，
+// 故这里既 preventDefault 又 stopPropagation，把回车彻底留在输入框内。
+(function () {
+  const input = document.getElementById('imgCustomW');
+  if (!input) return;
+  input.addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    e.stopPropagation();
+    applyImgCustomWidth();
+  });
+})();
 // 布局按钮高亮：按当前图片实际布局（全画幅/局部/行内）同步 .active 状态
 function _updateImgLayoutActive() {
   const pop = document.getElementById('imgPopup');
@@ -7488,14 +7601,22 @@ document.getElementById('imgPopup').addEventListener('click', function (e) {
   const { i, pEl, imgEl } = _imgKey;
   const ed = [...host.children].find(function (r) { return Number(r.dataset.i) === i; }).querySelector('.editable');
   if (op === 'size') {
-    // 设置图片大小：原尺寸=移除尺寸 class，其他=交换到对应 ptoe-img-w* class
+    // 设置图片大小：原尺寸=移除尺寸 class，其他=交换到对应 ptoe-img-w* class。
+    // ★额外清掉自定义行内宽度：行内 style 天然压过 .ptoe-img-w*，两者共存时
+    //   固定档位「点了没反应」，且导出时读到的仍是旧宽度 → 视为互斥，只能有一个。
     histRun('设置图片大小', [i], function () {
       _imgSizeClasses.forEach(function (c) { imgEl.classList.remove(c); });
+      imgEl.style.width = '';
       if (val !== 'original') imgEl.classList.add('ptoe-img-' + val);
       syncContent(ed);
     });
     scheduleRemeasure(i);
+    _syncImgCustomW();
     // 大小操作保持弹窗打开，便于连续调整
+  } else if (op === 'size-custom') {
+    // 自定义宽度：逻辑在 applyImgCustomWidth（取值/钳制/互斥/绕排上限都在那一处）
+    applyImgCustomWidth();
+    // 弹窗保持打开，便于连续微调
   } else if (op === 'pos') {
     // 设置图片位置：行内图片 → vertical-align（顶/中/底）；
     // 块级图片 → 交换 ptoe-img-left/center/right class（p 的 text-align）。
@@ -7532,6 +7653,7 @@ document.getElementById('imgPopup').addEventListener('click', function (e) {
     });
     scheduleRemeasure(i);
     _updateImgLayoutActive();
+    _syncImgCustomW();
     // 布局操作保持弹窗打开并同步高亮
   } else if (op === 'delete') {
     // 删除图片：行内图片只移除 <img> 本身（保留周围文字）；块级图片移除整个 <p> 包裹
