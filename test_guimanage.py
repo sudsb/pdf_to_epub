@@ -2246,6 +2246,24 @@ class TestCacheBackupHistory(GuiServerTestBase):
         self.assertEqual(status, 404)
         self.assertIn("无法定位", json.loads(raw)["error"])
 
+    def test_history_rename_button_appended_in_ops(self):
+        """DOM 回归（2026-10-09）：renderHistory 创建了 renBtn（「重命名」按钮）但
+        从未 appendChild 进 ops 单元格 → 历史列表里按钮根本不显示（用户可见 bug：
+        弹窗/后端都在，唯独行内按钮缺失）。断言 append 链中 renBtn 位于 openBtn 与
+        expBtn 之间，且操作列表头已加宽到 222px 容纳第 5 个元素。
+        """
+        html = guimanage._UI_HTML
+        create_at = html.find('var renBtn=document.createElement("button")')
+        self.assertGreater(create_at, 0, "renBtn 定义缺失")
+        chain = (
+            "ops.appendChild(openBtn);ops.appendChild(renBtn);"
+            "ops.appendChild(expBtn);ops.appendChild(saveAsSel);ops.appendChild(delBtn);"
+        )
+        chain_at = html.find(chain)
+        self.assertGreater(chain_at, 0, "append 链不含 renBtn（按钮不会渲染）")
+        self.assertLess(create_at, chain_at, "renBtn 必须先定义后 append")
+        self.assertIn('<th style="width:222px;">操作</th>', html, "操作列未加宽")
+
     def test_history_export_backup_ok(self):
         """POST /api/history/export/backup：版本打包成 ZIP 写入 data/data/ 并回传路径。
 
