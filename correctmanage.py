@@ -272,9 +272,12 @@ _IMG_CLASSES = {
     "ptoe-img-vbot",
 }
 
-# apply_markers 用：匹配清洗后的标记 span
+# apply_markers / _proofread_plain_text 用：匹配清洗后的标记 span。
+# 属性顺序无关（前端普通模式 createElement 先设 class 再设 dataset，
+# 序列化后为 <span class="ptoe-marker" data-ptoe-marker="...">；旧写法要求
+# data-ptoe-marker 紧跟在 <span 之后会漏匹配，导致标记 label 被当纠错对象）。
 _MARKER_SPAN_RE = re.compile(
-    r'<span\s+data-ptoe-marker="([^"]+)"[^>]*>(.*?)</span>',
+    r'<span\b[^>]*\bdata-ptoe-marker="([^"]+)"[^>]*>(.*?)</span>',
     flags=re.IGNORECASE | re.DOTALL,
 )
 
@@ -1238,8 +1241,9 @@ def _note_already_parenthesized(text: str) -> bool:
 
 # 令牌化：优先把「完整的标记 span 元素」作为一个令牌，其余按单个标签切分。
 # 这样块内切段时能直接拿到标记的类型与文本，不必在三个令牌（开标签/文本/闭标签）间拼凑。
+# 属性顺序无关（class 可能在 data-ptoe-marker 之前，见 _MARKER_SPAN_RE 注释）。
 _TOKEN_RE = re.compile(
-    r'(<span\s+data-ptoe-marker="[^"]*"[^>]*>.*?</span>|<[^>]+>)',
+    r'(<span\b[^>]*\bdata-ptoe-marker="[^"]*"[^>]*>.*?</span>|<[^>]+>)',
     flags=re.IGNORECASE | re.DOTALL,
 )
 
@@ -4689,6 +4693,61 @@ def _delete_history(ids: list[str], all_: bool = False) -> int:
     return deleted
 
 
+def rename_history(vid: str, new_name: str) -> dict[str, Any]:
+    """重命名历史记录条目：把 display_name 写入同一 PDF 组的所有版本文件。
+
+    返回 {"ok": True, "display_name": <该组首条显示名>, "prefix": <组前缀>}。
+    校验失败抛 ValueError（中文消息）；无法定位所属 PDF 组抛 LookupError。
+    矫正界面（correctmanage）与配置中心（guimanage）共用本函数，行为一致。
+    """
+    vid = str(vid or "").strip()
+    new_name = str(new_name or "").strip()
+    if not vid:
+        raise ValueError("缺少版本 ID")
+    if not new_name:
+        raise ValueError("新名称不能为空")
+    # 拒绝路径分隔符，避免重命名被当成路径操作
+    if "\\" in new_name or "/" in new_name or ":" in new_name:
+        raise ValueError("名称含非法字符（含 \\ / :）")
+    if len(new_name) > 100:
+        raise ValueError("名称过长（最多 100 字符）")
+    prefix = _version_prefix(vid)
+    if not prefix:
+        raise LookupError("无法定位所属 PDF 组")
+    d = _history_dir()
+    # 遍历该 PDF 组的所有版本文件（前缀匹配），仅更新/写入 display_name
+    for fp in d.glob(f"{prefix}_*.json"):
+        try:
+            data = json.loads(fp.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
+            data["display_name"] = new_name
+            import tempfile
+            import os as _os
+
+            fd, tmp = tempfile.mkstemp(dir=str(d), prefix=".rename-", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                _os.replace(tmp, str(fp))
+            except Exception:
+                try:
+                    _os.unlink(tmp)
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    first_items = _history_entries(prefix)
+    first_display = (
+        first_items[0].get("display_name", first_items[0].get("name", ""))
+        if first_items
+        else new_name
+    )
+    return {"ok": True, "display_name": first_display, "prefix": prefix}
+
+
 def export_history_backup(
     ids: list[str] | None, save_path: str | None = None
 ) -> dict[str, Any]:
@@ -7176,6 +7235,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "popup_row1": POPUP_ROW1_DEFAULT,
                     "popup_row2": POPUP_ROW2_DEFAULT,
                     "popup_rule_count": POPUP_RULE_COUNT_DEFAULT,
+                    "proofread_batch_pages": 1,
                 })
                 merged = {
                     "tip_delay": stored.get("tip_delay", defaults["tip_delay"]),
@@ -7186,6 +7246,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "popup_row1": stored.get("popup_row1", defaults["popup_row1"]),
                     "popup_row2": stored.get("popup_row2", defaults["popup_row2"]),
                     "popup_rule_count": stored.get("popup_rule_count", defaults["popup_rule_count"]),
+                    "proofread_batch_pages": stored.get("proofread_batch_pages", defaults.get("proofread_batch_pages", 1)),
                 }
                 self._send(
                     200,
@@ -7281,6 +7342,16 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     self._send(400, self._json({"ok": False, "error": "弹出菜单规则按钮数量无效（需为 0-10 的整数）"}), "application/json; charset=utf-8")
                     return
                 clean["popup_rule_count"] = v
+            if "proofread_batch_pages" in ui:
+                try:
+                    v = int(ui["proofread_batch_pages"])
+                except (TypeError, ValueError):
+                    self._send(400, self._json({"ok": False, "error": "proofread_batch_pages 必须是数字"}), "application/json; charset=utf-8")
+                    return
+                if not (1 <= v <= 50):
+                    self._send(400, self._json({"ok": False, "error": "proofread_batch_pages 超出范围（1-50）"}), "application/json; charset=utf-8")
+                    return
+                clean["proofread_batch_pages"] = v
             set_ui_settings(clean)
             self._send(200, self._json({"ok": True}), "application/json; charset=utf-8")
         except Exception as e:  # noqa: BLE001
@@ -8263,95 +8334,37 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 )
             return
         if path == "/api/history/rename":
-            # 重命名历史记录条目：更新 display_name，应用到同一 PDF 组的所有版本文件
+            # 重命名历史记录条目：调用共享 helper rename_history 写入 display_name
+            # 到同一 PDF 组的所有版本文件（guimanage 的 /api/history/rename 复用同一 helper）
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length else b"{}"
                 body = json.loads(raw.decode("utf-8"))
-                vid = str(body.get("id") or "").strip()
                 new_name = str(body.get("newName") or "").strip()
-                if not vid:
-                    self._send(
-                        400,
-                        self._json({"ok": False, "error": "缺少版本 ID"}),
-                        "application/json; charset=utf-8",
-                    )
-                    return
-                if not new_name:
-                    self._send(
-                        400,
-                        self._json({"ok": False, "error": "新名称不能为空"}),
-                        "application/json; charset=utf-8",
-                    )
-                    return
-                # 验证：拒绝包含路径分隔符的名称
-                if "\\" in new_name or "/" in new_name or ":" in new_name:
-                    self._send(
-                        400,
-                        self._json({"ok": False, "error": "名称含非法字符（含 \\ / :）"}),
-                        "application/json; charset=utf-8",
-                    )
-                    return
-                # 长度限制（最多 100 个字符，与文件名惯例一致）
-                if len(new_name) > 100:
-                    self._send(
-                        400,
-                        self._json({"ok": False, "error": "名称过长（最多 100 字符）"}),
-                        "application/json; charset=utf-8",
-                    )
-                    return
-                prefix = _version_prefix(vid)  # 由版本文件名 stem 算出的 book 前缀
-                if not prefix:
-                    self._send(
-                        404,
-                        self._json({"ok": False, "error": "无法定位所属 PDF 组"}),
-                        "application/json; charset=utf-8",
-                    )
-                    return
-                d = _history_dir()
-                # 遍历该 PDF 组的所有版本文件（前缀匹配），写入 display_name
-                # 注意用 Path.glob（返回 Path 对象）；glob.glob 返回 str 无 .read_text
-                matched = False
-                for fp in d.glob(f"{prefix}_*.json"):
-                    try:
-                        data = json.loads(fp.read_text(encoding="utf-8"))
-                        # 保留原有字段，仅更新/写入 display_name
-                        data["display_name"] = new_name
-                        # 使用原子写入：先写临时文件再 os.replace
-                        import tempfile, os as _os
-                        fd, tmp = tempfile.mkstemp(dir=str(d), prefix=".rename-", suffix=".tmp")
-                        try:
-                            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                                json.dump(data, f, ensure_ascii=False, indent=2)
-                                f.flush()
-                                os.fsync(f.fileno())
-                            _os.replace(tmp, str(fp))
-                        except Exception:
-                            try:
-                                _os.unlink(tmp)
-                            except Exception:
-                                pass
-                        matched = True
-                    except Exception:
-                        continue
-                # 更新内存中 _HISTORY_INDEX 以立即反映变更
-                # 重新计算签名使下次 _history_entries 重读
-                fps = sorted(fp for fp in d.glob("*.json") if not fp.name.endswith(".images.json"))
-                sig = "|".join(
-                    f"{fp.name}:{fp.stat().st_mtime_ns}:{fp.stat().st_size}" for fp in fps
-                )
-                # 若重命名的是当前编辑中的书（前缀一致），同步更新会话内
-                # state.display_name，使随后的保存/暂存/完成沿用它而非回退到原名
+                result = rename_history(body.get("id"), new_name)
+                # 若重命名的是当前编辑中的书（前缀一致），同步会话内的 display_name，
+                # 使随后的保存/暂存/完成沿用它而非回退到原名
                 st = self.server.state
-                if st.get("history_prefix") == prefix:
+                if st.get("history_prefix") == result.get("prefix"):
                     st["display_name"] = new_name
-                # 只要取第一个版本的显示名作为组名变更的凭证
-                first_items = _history_entries(prefix)
-                first_display = first_items[0].get("display_name", first_items[0].get("name", "")) if first_items else new_name
                 self._send(
-                    200, self._json({"ok": True, "display_name": first_display}), "application/json; charset=utf-8"
+                    200,
+                    self._json({"ok": True, "display_name": result.get("display_name")}),
+                    "application/json; charset=utf-8",
                 )
                 return
+            except ValueError as e:
+                self._send(
+                    400,
+                    self._json({"ok": False, "error": str(e)}),
+                    "application/json; charset=utf-8",
+                )
+            except LookupError as e:
+                self._send(
+                    404,
+                    self._json({"ok": False, "error": str(e)}),
+                    "application/json; charset=utf-8",
+                )
             except Exception as e:  # noqa: BLE001
                 self._send(
                     500,
@@ -9169,6 +9182,16 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     return
                 content_type, img_bytes = img
                 ocr_prompt = cfg.get("ocr_prompt") or llamamanage.OCR_PROMPT
+                # 2026-10-05：重识别走同一个 llama-server，长时间逐页重识别时宿主
+                # RAM 会持续上涨（残余的每 token 匿名内存泄漏只有重启进程才回收）。
+                # 阈值未配置时本调用零开销立即返回；参数与下方 peg-native 自动重启
+                # 的 runserver 保持一致（单页请求 ctx_size=8192 + 视觉模型）。
+                try:
+                    llamamanage.maybe_recycle_server(
+                        model_key, with_mmproj=True, ctx_size=8192
+                    )
+                except Exception as e:  # noqa: BLE001  回收失败不阻断重识别
+                    print(f"[reocr] llama-server 回收检查失败（忽略）: {e}")
                 with _proofread_engine_ctx():
                     res = llamamanage._request_image_new(
                         ocr_prompt,
@@ -9655,9 +9678,12 @@ def _open_browser(url: str) -> None:
 
     优先使用 config.json 的 browser 键指定的浏览器路径，否则用系统默认浏览器。
     browser 模式（gui_display='browser'）或 pywebview 不可用/启动失败时使用。
-    """
-    import subprocess  # noqa: PLC0415 — 仅在需要时导入
 
+    浏览器经 guimanage._spawn_detached **完全脱离**启动：常驻浏览器若继承宿主
+    stdin/stdout/stderr 控制台句柄，宿主主流程结束也退不出去（Ctrl+C 无效，
+    实测墙钟 45s vs 脱离后 2.3s）。惰性 import 避免 guimanage ← correctmanage
+    顶层循环依赖（反之 guimanage 也只在函数内 import correctmanage）。
+    """
     _br_path = ""
     try:
         from configmanage import get_config as _get_cfg
@@ -9667,7 +9693,9 @@ def _open_browser(url: str) -> None:
         pass
     try:
         if _br_path:
-            subprocess.Popen([_br_path, url])
+            from guimanage import _spawn_detached  # noqa: PLC0415
+
+            _spawn_detached([_br_path, url])
         else:
             webbrowser.open(url)
     except Exception:  # noqa: BLE001  打不开浏览器不阻断服务
@@ -10236,7 +10264,7 @@ button:disabled{opacity:.5;cursor:not-allowed;}
 select{font:inherit;padding:5px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-elev);color:var(--text);}
 
 /* U2居中，3s 自动消失 */
-#toast{position:fixed;top:60px;left:50%;transform:translateX(-50%);z-index:90;display:flex;flex-direction:column;gap:6px;align-items:center;pointer-events:none;}
+#toast{position:fixed;top:62%;left:50%;transform:translateX(-50%);z-index:90;display:flex;flex-direction:column;gap:6px;align-items:center;pointer-events:none;}
 .toast{background:#1c2733;color:#fff;font-size:13px;line-height:1.5;padding:8px 16px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.25);opacity:0;transform:translateY(-6px);transition:opacity .2s,transform .2s;max-width:70vw;}
 .toast.show{opacity:1;transform:translateY(0);}
 .toast.ok{background:#1a7f37;}
@@ -10251,6 +10279,16 @@ select{font:inherit;padding:5px 8px;border:1px solid var(--border);border-radius
 @keyframes ptoeShimmer{to{background-position:-200% 0;}}
 button.loading::after{content:'';display:inline-block;width:11px;height:11px;margin-left:8px;border:2px solid rgba(255,255,255,.45);border-top-color:#fff;border-radius:50%;animation:ptoe-spin .8s linear infinite;vertical-align:-2px;}
 @keyframes ptoe-spin{to{transform:rotate(360deg);}}
+/* U11 入场动画：菜单/弹窗出现时轻微上浮淡入；尊重系统「减少动态效果」偏好 */
+@keyframes ptoeFadeIn{from{opacity:0;transform:translateY(-4px);}to{opacity:1;transform:none;}}
+@keyframes ptoeFade{from{opacity:0;}to{opacity:1;}}
+.anim-in{animation:ptoeFadeIn .16s ease both;}
+.anim-fade{animation:ptoeFade .16s ease both;}
+#contextMenu,#popup{animation:ptoeFadeIn .16s ease both;}
+#searchModalBg,#exportModalBg,#indentModalBg,#tableModalBg,#charFormatModalBg,#finishModalBg,#historyModalBg,#helpModalBg,#formatRulesModalBg,#frRuleModalBg,#replaceRulesModalBg,#rrEditModalBg{animation:ptoeFade .16s ease both;}
+@media (prefers-reduced-motion: reduce){
+  .anim-in,.anim-fade,#contextMenu,#popup,#searchModalBg,#exportModalBg,#indentModalBg,#tableModalBg,#charFormatModalBg,#finishModalBg,#historyModalBg,#helpModalBg,#formatRulesModalBg,#frRuleModalBg,#replaceRulesModalBg,#rrEditModalBg{animation:none !important;}
+}
 /* U3：hintbar 可折叠（✕ 关闭，localStorage 记忆） */
 #hintbar{padding:6px 14px;font-size:12px;color:#5a6b7c;background:#eef3fb;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;}
 #hintbar .hint-text{flex:1;}
@@ -10315,8 +10353,8 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
 /* 全局延迟提示：悬停超过设定时间才显示（含快捷键），延迟可在「快捷键」设置中调整 */
 #tip{position:fixed;z-index:80;display:none;background:#1c2733;color:#fff;font-size:12px;line-height:1.5;padding:5px 9px;border-radius:4px;max-width:320px;pointer-events:none;}
 #tip .tip-key{color:#bcd0e5;margin-left:6px;white-space:nowrap;}
-#popup{position:fixed;z-index:60;display:none;flex-wrap:wrap;gap:4px;max-width:360px;padding:6px 8px;background:#fff;border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 18px rgba(0,0,0,.22);}
-.pop-btn{min-width:34px;height:30px;padding:0 8px;font-size:13px;border:1px solid var(--border);background:#fff;color:#1c2733;border-radius:6px;cursor:pointer;line-height:1;}
+#popup{position:fixed;z-index:60;display:none;flex-wrap:wrap;gap:3px;max-width:300px;padding:4px 6px;background:#fff;border:1px solid var(--border);border-radius:7px;box-shadow:0 4px 18px rgba(0,0,0,.22);}
+.pop-btn{min-width:28px;height:26px;padding:0 6px;font-size:12px;border:1px solid var(--border);background:#fff;color:#1c2733;border-radius:5px;cursor:pointer;line-height:1;}
 /* 右键上下文菜单（2026-08-08）：浅色主题、圆角、分组分隔线、二级菜单向右展开（右缘不足向左） */
 #contextMenu{position:fixed;z-index:80;min-width:172px;padding:5px;background:#fff;border:1px solid var(--border);border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,.22);display:flex;flex-direction:column;gap:1px;user-select:none;}
 #contextMenu[hidden]{display:none;} /* 必须显式覆盖：作者样式 #contextMenu{display:flex} 会压过 UA 的 [hidden]{display:none} */
@@ -10925,6 +10963,9 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   <button type="button" id="prMenuApply" role="menuitem">应用</button>
   <button type="button" id="prMenuClear" role="menuitem">清除</button>
   <button type="button" id="prMenuRevert" role="menuitem">回退</button>
+  <div style="border-top:1px solid #eee;margin-top:6px;"></div>
+  <button type="button" id="prMenuApplyAll" role="menuitem" title="对所有已挂载页应用纠错提示">全部应用</button>
+  <button type="button" id="prMenuClearAll" role="menuitem" title="清除所有页的纠错标注">全部清除</button>
   <div style="padding:6px 10px;border-top:1px solid #eee;margin-top:6px;">
     <label style="display:block;font-size:13px;" title="默认只执行三条规则：连续重复文字 / 连续标点 / 中文中的连续字母">启用原有规则（半角转全角/引号配对/混淆表/词典） <input type="checkbox" id="prLegacyRules"></label>
     <label style="display:block;font-size:13px;margin-top:6px;">启用 LLM 深度校对 <input type="checkbox" id="prLlmEnable"></label>
@@ -11209,6 +11250,9 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <h4 style="margin:16px 0 4px;">编辑器字号</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">调整编辑区显示字号（视图偏好，不写入保存内容）。</p>
       <label style="font-size:13px;">字号（px） <input type="number" id="editorFontSizeInput" min="10" max="28" step="1" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
+      <h4 style="margin:16px 0 4px;">纠错批处理</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">「校正 / 重识别」一次连续处理的页数：从当前页起向后处理 N 页（1-50）。应用 / 清除默认仍只作用于当前页。</p>
+      <label style="font-size:13px;">每批页数 <input type="number" id="prBatchPages" min="1" max="50" step="1" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
       <h4 style="margin:16px 0 4px;">格式规则</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">把规则应用到全部页前先弹出确认，防止误操作大范围改动。</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;">

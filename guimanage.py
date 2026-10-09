@@ -144,7 +144,7 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
 .rule-card:hover{border-color:var(--accent)}
 .rule-name{font-weight:600;min-width:80px}
 .rule-cond{flex:1;font-size:12px;color:var(--text-sec)}
-#toast{position:fixed;top:64px;left:50%;transform:translateX(-50%);z-index:999;display:flex;flex-direction:column;gap:6px;align-items:center;pointer-events:none}
+#toast{position:fixed;top:62%;left:50%;transform:translateX(-50%);z-index:999;display:flex;flex-direction:column;gap:6px;align-items:center;pointer-events:none}
 .toast-item{padding:8px 18px;border-radius:8px;font-size:13px;color:#fff;line-height:1.5;box-shadow:var(--shadow-lg);opacity:0;transform:translateY(-8px);transition:opacity .25s,transform .25s}
 .toast-item.show{opacity:1;transform:translateY(0)}
 .toast-item.t-ok{background:var(--green)}.toast-item.t-fail{background:var(--red)}.toast-item.t-warn{background:var(--yellow)}
@@ -175,6 +175,9 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
 .mops .del-btn{width:auto;padding:0 4px;font-size:14px;border:none;background:transparent;color:var(--text-dim);cursor:pointer;border-radius:4px;display:inline-flex;align-items:center;justify-content:center}
 .mops .del-btn:hover{background:var(--red-bg);color:var(--red)}
 @media(max-width:768px){.convert-grid{grid-template-columns:1fr}}
+/* 历史记录重命名弹窗 */
+#renameInput{width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;font-size:13px;color:var(--text);background:var(--card);transition:border-color .15s}
+#renameInput:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgba(47,111,237,.12)}
 </style>
 </head>
 <body>
@@ -195,6 +198,7 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
     <div class="nav-item" data-page="vllm" onclick="switchPage('vllm')"><span class="nav-icon">▶</span> vLLM 参数</div>
     <div class="nav-item" data-page="proofread" onclick="switchPage('proofread')"><span class="nav-icon">✎</span> 校对参数</div>
     <div class="nav-item" data-page="epubedit" onclick="switchPage('epubedit')"><span class="nav-icon">▤</span> EPUB 编辑</div>
+    <div class="nav-item" data-page="bookmeta" onclick="switchPage('bookmeta')"><span class="nav-icon">✒</span> 书籍信息</div>
     <div class="nav-item" data-page="shortcuts" onclick="switchPage('shortcuts')"><span class="nav-icon">⌨</span> 快捷键</div>
     <div class="nav-item" data-page="rules" onclick="switchPage('rules')"><span class="nav-icon">☰</span> 格式规则</div>
     <div class="nav-item" data-page="history" onclick="switchPage('history')"><span class="nav-icon">↺</span> 历史记录</div>
@@ -488,6 +492,40 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
         <pre id="epubeditLines" class="log-box">等待 EPUB 编辑任务...</pre>
       </div>
     </div>
+    <!-- 13. 书籍信息 -->
+    <div class="page" id="page-bookmeta">
+      <h2 class="page-title">书籍信息</h2>
+      <p class="page-desc">选择 EPUB 文件，编辑书名、作者、简介与语言，并可替换封面，保存后原地重写该 EPUB。</p>
+      <div class="card">
+        <div class="card-title"><span class="ct-icon">▤</span> EPUB 文件</div>
+        <div class="form-row">
+          <span class="form-label">EPUB 路径</span>
+          <div class="form-ctrl">
+            <div class="pick-row">
+              <input type="text" id="bookMetaPath" placeholder="选择要编辑的 EPUB 文件..." readonly>
+              <button class="btn-small" onclick="pickBookMetaEpub()">选择文件…</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="ct-icon">✎</span> 元数据</div>
+        <div class="form-row"><span class="form-label">书名</span><div class="form-ctrl"><input type="text" id="bookMetaTitle" placeholder="书名"></div></div>
+        <div class="form-row"><span class="form-label">作者</span><div class="form-ctrl"><input type="text" id="bookMetaAuthor" placeholder="作者"></div></div>
+        <div class="form-row"><span class="form-label">语言</span><div class="form-ctrl"><input type="text" id="bookMetaLang" placeholder="如 zh-CN"></div></div>
+        <div class="form-row"><span class="form-label">简介</span><div class="form-ctrl"><textarea id="bookMetaDesc" placeholder="简介" style="width:100%;min-height:90px;resize:vertical;"></textarea></div></div>
+        <div class="form-row"><span class="form-label">封面</span><div class="form-ctrl"><div class="pick-row"><img id="bookMetaCover" alt="封面预览" style="max-width:150px;max-height:210px;border:1px solid var(--border);border-radius:6px;display:none;background:#f5f5f5;"><button class="btn-small" onclick="pickBookMetaCover()">选择封面…</button><button class="btn-small" onclick="clearBookMetaCover()">移除新封面</button></div><div class="form-hint" id="bookMetaCoverHint">选择图片文件将替换原封面；不改动则保持原封面。</div></div></div>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="ct-icon">▶</span> 操作</div>
+        <div class="action-row">
+          <button class="btn-outline" id="bookMetaReloadBtn" onclick="loadBookMeta()">重新加载</button>
+          <button class="btn-start" id="bookMetaSaveBtn" onclick="saveBookMeta()">保存</button>
+          <button class="btn-outline" id="bookMetaSaveAsBtn" onclick="saveBookMetaAs()">另存为…</button>
+          <span id="bookMetaStatus" style="font-size:12px;color:var(--text-dim);"></span>
+        </div>
+      </div>
+    </div>
   </main>
 </div>
 <!-- 转换弹窗询问（OCR 断点续传等需要用户决策时显示；选择写回子进程） -->
@@ -496,6 +534,19 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
     <div style="font-weight:600;font-size:15px;margin-bottom:10px;">转换需要选择</div>
     <div id="convertPromptQuestion" style="margin-bottom:16px;color:#333;line-height:1.6;font-size:13px;"></div>
     <div id="convertPromptBtns" style="display:flex;flex-direction:column;gap:8px;"></div>
+  </div>
+</div>
+<!-- 历史记录重命名弹窗（pywebview 不支持浏览器原生输入对话框，改用应用内模态框） -->
+<div id="renameModalBg" role="dialog" aria-modal="true" aria-labelledby="renameModalTitle" style="display:none;position:fixed;inset:0;z-index:80;background:rgba(0,0,0,.4);align-items:center;justify-content:center;">
+  <div style="background:#fff;border-radius:10px;padding:22px 26px;max-width:440px;width:90%;box-shadow:0 8px 30px rgba(0,0,0,.3);">
+    <div id="renameModalTitle" style="font-weight:600;font-size:15px;margin-bottom:10px;">重命名历史记录</div>
+    <div id="renameModalPdf" style="margin-bottom:12px;color:var(--text-sec);font-size:12px;line-height:1.6;word-break:break-all;"></div>
+    <label for="renameInput" style="display:block;font-size:12px;color:var(--text-sec);margin-bottom:5px;">新标题</label>
+    <input type="text" id="renameInput" maxlength="200" autofocus aria-label="新标题" style="margin-bottom:18px;">
+    <div style="display:flex;justify-content:flex-end;gap:8px;">
+      <button class="btn-small" id="renameCancelBtn" type="button" aria-label="取消重命名" style="padding:6px 16px;font-size:13px;">取消</button>
+      <button class="btn-start" id="renameOkBtn" type="button" aria-label="确定重命名" style="padding:6px 18px;font-size:13px;">确定</button>
+    </div>
   </div>
 </div>
 <div id="toast"></div>
@@ -621,14 +672,28 @@ function clearCaches(){var scopes=[];if(document.getElementById("ccPreview").che
 function createBackup(){var params={include_history_images:document.getElementById("bkImages").checked,include_epubs:document.getElementById("bkEpubs").checked};var btn=document.getElementById("bkBtn"),out=document.getElementById("bkResult");btn.disabled=true;btn.textContent="备份中…";apiPost("/api/backup/create",params).then(function(res){btn.disabled=false;btn.textContent="立即备份";if(res&&res.ok){var mb=(res.size/1048576).toFixed(1);out.textContent="已备份 "+res.files+" 个文件："+res.path+"（"+mb+" MB）";toast("备份完成","ok")}else{var msg=res&&res.error?res.error:"备份失败";out.textContent=msg;toast(msg,"fail")}})}
 /* ===== 历史记录页 ===== */
 var historyLoaded=false;
-function renderHistory(){apiGet("/api/history").then(function(res){if(!res||!res.ok){toast("加载历史记录失败","fail");return}historyLoaded=true;var tbody=document.getElementById("historyTbody");var entries=res.entries||[];if(!entries.length){tbody.innerHTML='<tr><td colspan="6" class="empty-state">暂无历史记录</td></tr>';return}tbody.innerHTML="";entries.forEach(function(e){var tr=document.createElement("tr");var title=escH(e.display_name||e.name||(e.pdf?basename(e.pdf):"(未命名)"));var pdf=escH(e.pdf?basename(e.pdf):"");var upd=escH(e.updated||"");var pages=e.pages!=null?e.pages:"";var pr=e.last_proofread_page!=null?e.last_proofread_page:"";tr.innerHTML='<td>'+title+'</td><td style="font-size:12px;">'+pdf+'</td><td style="font-size:12px;">'+upd+'</td><td>'+pages+'</td><td>'+pr+'</td>';var ops=document.createElement("td");ops.style.cssText="white-space:nowrap;";var openBtn=document.createElement("button");openBtn.className="btn-small";openBtn.textContent="矫正";openBtn.onclick=function(){openHistoryCorrect(e)};var delBtn=document.createElement("button");delBtn.className="btn-small";delBtn.textContent="删除";delBtn.style.cssText="margin-left:6px;color:var(--red);border-color:var(--red);";delBtn.onclick=function(){deleteHistory(e)};var expBtn=document.createElement("button");expBtn.className="btn-small";expBtn.textContent="导出";expBtn.title="导出该版本为备份 ZIP（含内嵌预览图，保存到程序 data/data 目录），可在矫正界面「导入」恢复";expBtn.style.cssText="margin-left:6px;";expBtn.onclick=function(){exportHistory(e)};var saveAsSel=document.createElement("select");saveAsSel.className="btn-small";saveAsSel.style.cssText="margin-left:6px;height:26px;";saveAsSel.title="另存为：选择格式后弹窗选保存位置（TXT / MD / DOCX / EPUB）";var so0=document.createElement("option");so0.value="";so0.textContent="另存为 ▾";saveAsSel.appendChild(so0);[["txt","txt"],["md","md"],["docx","docx"],["epub","epub"]].forEach(function(f){var o=document.createElement("option");o.value=f[0];o.textContent="导出 "+f[1].toUpperCase();saveAsSel.appendChild(o)});saveAsSel.onchange=function(){var f=saveAsSel.value;saveAsSel.value="";if(f){exportHistorySaveAs(e,f)}};ops.appendChild(openBtn);ops.appendChild(expBtn);ops.appendChild(saveAsSel);ops.appendChild(delBtn);tr.appendChild(ops);tbody.appendChild(tr)})})}
+function renderHistory(){apiGet("/api/history").then(function(res){if(!res||!res.ok){toast("加载历史记录失败","fail");return}historyLoaded=true;var tbody=document.getElementById("historyTbody");var entries=res.entries||[];if(!entries.length){tbody.innerHTML='<tr><td colspan="6" class="empty-state">暂无历史记录</td></tr>';return}tbody.innerHTML="";entries.forEach(function(e){var tr=document.createElement("tr");var title=escH(e.display_name||e.name||(e.pdf?basename(e.pdf):"(未命名)"));var pdf=escH(e.pdf?basename(e.pdf):"");var upd=escH(e.updated||"");var pages=e.pages!=null?e.pages:"";var pr=e.last_proofread_page!=null?e.last_proofread_page:"";tr.innerHTML='<td>'+title+'</td><td style="font-size:12px;">'+pdf+'</td><td style="font-size:12px;">'+upd+'</td><td>'+pages+'</td><td>'+pr+'</td>';var ops=document.createElement("td");ops.style.cssText="white-space:nowrap;";var openBtn=document.createElement("button");openBtn.className="btn-small";openBtn.textContent="矫正";openBtn.onclick=function(){openHistoryCorrect(e)};var renBtn=document.createElement("button");renBtn.className="btn-small";renBtn.textContent="重命名";renBtn.style.cssText="margin-left:6px;";renBtn.onclick=function(){renameHistory(e)};var delBtn=document.createElement("button");delBtn.className="btn-small";delBtn.textContent="删除";delBtn.style.cssText="margin-left:6px;color:var(--red);border-color:var(--red);";delBtn.onclick=function(){deleteHistory(e)};var expBtn=document.createElement("button");expBtn.className="btn-small";expBtn.textContent="导出";expBtn.title="导出该版本为备份 ZIP（含内嵌预览图，保存到程序 data/data 目录），可在矫正界面「导入」恢复";expBtn.style.cssText="margin-left:6px;";expBtn.onclick=function(){exportHistory(e)};var saveAsSel=document.createElement("select");saveAsSel.className="btn-small";saveAsSel.style.cssText="margin-left:6px;height:26px;";saveAsSel.title="另存为：选择格式后弹窗选保存位置（TXT / MD / DOCX / EPUB）";var so0=document.createElement("option");so0.value="";so0.textContent="另存为 ▾";saveAsSel.appendChild(so0);[["txt","txt"],["md","md"],["docx","docx"],["epub","epub"]].forEach(function(f){var o=document.createElement("option");o.value=f[0];o.textContent="导出 "+f[1].toUpperCase();saveAsSel.appendChild(o)});saveAsSel.onchange=function(){var f=saveAsSel.value;saveAsSel.value="";if(f){exportHistorySaveAs(e,f)}};ops.appendChild(openBtn);ops.appendChild(expBtn);ops.appendChild(saveAsSel);ops.appendChild(delBtn);tr.appendChild(ops);tbody.appendChild(tr)})})}
 function openHistoryCorrect(e){apiPost("/api/correct/start",{pdf:e.pdf||null,history_id:e.id}).then(function(res){if(res&&res.ok){toast("矫正已启动","ok")}else{var msg=res&&res.error?res.error:"启动失败";toast(msg,"fail")}})}
 function exportHistory(e){apiPost("/api/history/export/backup",{ids:[e.id||""]}).then(function(res){if(res&&res.ok){toast("已导出备份："+(res.path||""),"ok")}else{toast((res&&res.error)||"导出失败","fail")}})}
 function exportHistorySaveAs(e,fmt){var extMap={txt:".txt",md:".md",docx:".docx",epub:".epub"};var ftMap={txt:[["文本文件","*.txt"],["所有文件","*.*"]],md:[["Markdown 文件","*.md"],["所有文件","*.*"]],docx:[["Word 文档","*.docx"],["所有文件","*.*"]],epub:[["EPUB 电子书","*.epub"],["所有文件","*.*"]]};function _p2(n){return(n<10?"0":"")+n}var d=new Date();var stamp=""+d.getFullYear()+_p2(d.getMonth()+1)+_p2(d.getDate())+_p2(d.getHours())+_p2(d.getMinutes())+_p2(d.getSeconds());var t=(e.display_name||e.name||(e.pdf?basename(e.pdf):"历史")||"历史").replace(/\.[^.]+$/,"");var def=t+"_"+stamp+(extMap[fmt]||".txt");apiPost("/api/pick",{kind:"save",title:"导出为 "+(fmt||"").toUpperCase(),default:def,ext:extMap[fmt]||".txt",filetypes:ftMap[fmt]||[["所有文件","*.*"]]}).then(function(r){if(!r)return;if(r.cancelled){toast("已取消保存","warn");return}if(r.error){toast(r.error,"fail");return}var path=r.path;apiPost("/api/history/export/file",{id:e.id||"",format:fmt,save_path:path}).then(function(res){if(res&&res.ok){toast("已导出："+(res.path||""),"ok")}else{toast((res&&res.error)||"导出失败","fail")}})})}
 function deleteHistory(e){if(!confirm("确定删除历史记录「"+(e.display_name||e.name||e.id)+"」？"))return;apiPost("/api/history/delete",{id:e.id}).then(function(res){if(res&&res.ok){toast("已删除","ok");renderHistory()}else{toast((res&&res.error)||"删除失败","fail")}})}
+/* 历史记录重命名：应用内模态框（pywebview 不支持浏览器原生输入对话框） */
+var _renameTarget=null;
+function renameHistory(e){_renameTarget=e||null;var cur=(e&&(e.display_name||e.name||(e.pdf?basename(e.pdf):"")))||"";var pdfEl=document.getElementById("renameModalPdf");if(pdfEl)pdfEl.textContent="当前 PDF："+(e&&e.pdf?basename(e.pdf):(cur||"(未命名)"));var inp=document.getElementById("renameInput");if(inp)inp.value=cur;var bg=document.getElementById("renameModalBg");if(!bg)return;bg.style.display="flex";if(inp){inp.focus();inp.select()}}
+function closeRenameModal(){var bg=document.getElementById("renameModalBg");if(bg)bg.style.display="none";_renameTarget=null}
+function submitRename(){if(_renameTarget===null)return;var btn=document.getElementById("renameOkBtn");if(btn&&btn.disabled)return;var inp=document.getElementById("renameInput");var nn=inp?inp.value.trim():"";if(!nn){toast("名称不能为空","warn");if(inp)inp.focus();return}if(btn)btn.disabled=true;var e=_renameTarget;apiPost("/api/history/rename",{id:e.id,newName:nn}).then(function(res){if(btn)btn.disabled=false;if(res&&res.ok){toast("标题已更新","ok");closeRenameModal();renderHistory()}else{toast((res&&res.error)||"重命名失败","fail")}})}
+var bookMetaCoverPath=null;
+function pickBookMetaEpub(){apiPost("/api/pick",{kind:"file",filter:"epub",title:"选择 EPUB 文件"}).then(function(res){if(!res)return;if(res&&res.ok&&!res.cancelled&&res.path){document.getElementById("bookMetaPath").value=res.path;loadBookMeta()}else if(res&&res.cancelled){toast("已取消选择","warn")}else if(res&&res.error){toast("选择失败: "+res.error,"fail")}})}
+function loadBookMeta(){var p=document.getElementById("bookMetaPath").value;if(!p){toast("请先选择 EPUB 文件","warn");return}var st=document.getElementById("bookMetaStatus");if(st)st.textContent="读取中…";apiPost("/api/epub/meta/read",{path:p}).then(function(res){if(res&&res.ok){document.getElementById("bookMetaTitle").value=res.title||"";document.getElementById("bookMetaAuthor").value=res.author||"";document.getElementById("bookMetaLang").value=res.language||"";document.getElementById("bookMetaDesc").value=res.description||"";var img=document.getElementById("bookMetaCover");if(img){if(res.cover_data_uri){img.src=res.cover_data_uri;img.style.display="block"}else{img.removeAttribute("src");img.style.display="none"}}clearBookMetaCover();if(st)st.textContent="已读取"}else{if(st)st.textContent="";toast((res&&res.error)||"读取失败","fail")}})}
+function pickBookMetaCover(){apiPost("/api/pick",{kind:"file",filter:"image",title:"选择封面图片"}).then(function(res){if(!res)return;if(res&&res.ok&&!res.cancelled&&res.path){bookMetaCoverPath=res.path;var h=document.getElementById("bookMetaCoverHint");if(h)h.textContent="保存时将替换为新封面："+res.path}else if(res&&res.cancelled){toast("已取消选择","warn")}else if(res&&res.error){toast("选择失败: "+res.error,"fail")}})}
+function clearBookMetaCover(){bookMetaCoverPath=null;var h=document.getElementById("bookMetaCoverHint");if(h)h.textContent="选择图片文件将替换原封面；不改动则保持原封面。"}
+function saveBookMeta(){doSaveBookMeta(null)}
+function doSaveBookMeta(outPath){var p=document.getElementById("bookMetaPath").value;if(!p){toast("请先选择 EPUB 文件","warn");return}var body={path:p,title:document.getElementById("bookMetaTitle").value,author:document.getElementById("bookMetaAuthor").value,language:document.getElementById("bookMetaLang").value,description:document.getElementById("bookMetaDesc").value};if(bookMetaCoverPath)body.cover_path=bookMetaCoverPath;if(outPath)body.out_path=outPath;var st=document.getElementById("bookMetaStatus");if(st)st.textContent="保存中…";apiPost("/api/epub/meta/save",body).then(function(res){if(res&&res.ok){if(outPath){if(st)st.textContent="已另存为";toast("已另存为："+(res.path||outPath),"ok");document.getElementById("bookMetaPath").value=res.path||outPath;loadBookMeta()}else{if(st)st.textContent="已保存";toast("已保存书籍信息","ok");clearBookMetaCover()}}else{if(st)st.textContent="";toast((res&&res.error)||"保存失败","fail")}})}
+function saveBookMetaAs(){var p=document.getElementById("bookMetaPath").value;if(!p){toast("请先选择 EPUB 文件","warn");return}var name=(p.split(/[\\/]/).pop()||"book.epub");var def=name.replace(/\.[^.]*$/,"")+".epub";var dir=p.replace(/[\\/][^\\/]*$/,"");apiPost("/api/pick",{kind:"save",title:"另存 EPUB 为",default:def,initialdir:dir,ext:".epub",filetypes:[["EPUB 电子书","*.epub"],["所有文件","*.*"]]}).then(function(res){if(!res)return;if(res.cancelled){toast("已取消","warn");return}if(res.error){toast("选择失败: "+res.error,"fail");return}doSaveBookMeta(res.path)})}
 setInterval(function(){fetch("/api/ping").catch(function(){})},30000);
 window.addEventListener("pagehide",function(){stopPollConvert();stopPollCorrect();stopPollMerge();stopPollEpubEdit();navigator.sendBeacon("/api/bye")});
 window.addEventListener("pageshow",function(){fetch("/api/ping").catch(function(){})});
+(function(){var bg=document.getElementById("renameModalBg");if(!bg)return;bg.addEventListener("mousedown",function(ev){if(ev.target===bg)closeRenameModal()});var ok=document.getElementById("renameOkBtn");if(ok)ok.addEventListener("click",submitRename);var cancel=document.getElementById("renameCancelBtn");if(cancel)cancel.addEventListener("click",closeRenameModal);document.addEventListener("keydown",function(ev){var m=document.getElementById("renameModalBg");if(!m||m.style.display==="none")return;if(ev.key==="Escape"){ev.preventDefault();closeRenameModal()}else if(ev.key==="Enter"){ev.preventDefault();submitRename()}})})();
 fetchConfig().then(function(){fetchStatus()});
 </script>
 </body>
@@ -1265,6 +1330,7 @@ def _pick_path(
                 ftypes = {
                     "pdf": [("PDF 文件", "*.pdf"), ("所有文件", "*.*")],
                     "epub": [("EPUB 文件", "*.epub"), ("所有文件", "*.*")],
+                    "image": [("图片文件", "*.png;*.jpg;*.jpeg;*.gif;*.webp"), ("所有文件", "*.*")],
                 }.get(filt or "")
                 path = filedialog.askopenfilenames(
                     title=title or "选择文件",
@@ -1274,6 +1340,16 @@ def _pick_path(
                 path = filedialog.askopenfilename(
                     title=title or "选择 PDF 文件",
                     filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")],
+                )
+            elif filt == "epub":
+                path = filedialog.askopenfilename(
+                    title=title or "选择 EPUB 文件",
+                    filetypes=[("EPUB 文件", "*.epub"), ("所有文件", "*.*")],
+                )
+            elif filt == "image":
+                path = filedialog.askopenfilename(
+                    title=title or "选择图片文件",
+                    filetypes=[("图片文件", "*.png;*.jpg;*.jpeg;*.gif;*.webp"), ("所有文件", "*.*")],
                 )
             else:
                 path = filedialog.askopenfilename(title=title or "选择文件")
@@ -1680,8 +1756,8 @@ class _GuiHandler(BaseHTTPRequestHandler):
             self._send(400, self._json({"ok": False, "error": "multiple 必须是布尔值"}))
             return
         filt = body.get("filter")
-        if filt is not None and filt not in ("pdf", "epub"):
-            self._send(400, self._json({"ok": False, "error": "filter 仅支持 pdf / epub"}))
+        if filt is not None and filt not in ("pdf", "epub", "image"):
+            self._send(400, self._json({"ok": False, "error": "filter 仅支持 pdf / epub / image"}))
             return
         save_ext = body.get("ext") if kind == "save" else None
         if save_ext is not None and not isinstance(save_ext, str):
@@ -2606,6 +2682,104 @@ class _GuiHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send(500, self._json({"ok": False, "error": str(e)}))
 
+    def _api_history_rename(self, body) -> None:
+        """POST /api/history/rename：重命名历史条目（复用 correctmanage.rename_history）。
+
+        body {id, newName}；校验失败 400、无法定位组 404、其他 500（中文错误）。
+        """
+        if not isinstance(body, dict):
+            self._send(400, self._json({"ok": False, "error": "无效的 JSON"}))
+            return
+        hid = body.get("id")
+        if not isinstance(hid, str) or not hid:
+            self._send(400, self._json({"ok": False, "error": "缺少 id"}))
+            return
+        new_name = body.get("newName")
+        if not isinstance(new_name, str):
+            self._send(400, self._json({"ok": False, "error": "newName 必须是字符串"}))
+            return
+        try:
+            import correctmanage
+            result = correctmanage.rename_history(hid, new_name)
+            self._send(
+                200,
+                self._json({"ok": True, "display_name": result.get("display_name")}),
+            )
+        except ValueError as e:
+            self._send(400, self._json({"ok": False, "error": str(e)}))
+        except LookupError as e:
+            self._send(404, self._json({"ok": False, "error": str(e)}))
+        except Exception as e:
+            self._send(500, self._json({"ok": False, "error": str(e)}))
+
+    # -- 工具：EPUB 书籍信息编辑 --
+
+    def _api_epub_meta_read(self, body) -> None:
+        """POST /api/epub/meta/read：读取 EPUB 元数据（书名/作者/简介/语言/封面）。"""
+        if not isinstance(body, dict):
+            self._send(400, self._json({"ok": False, "error": "无效的 JSON"}))
+            return
+        path = body.get("path")
+        if not isinstance(path, str) or not path:
+            self._send(400, self._json({"ok": False, "error": "缺少 path"}))
+            return
+        try:
+            import epubmetamanage
+            info = epubmetamanage.read_epub_metadata(path)
+            self._send(200, self._json(info))
+        except FileNotFoundError as e:
+            self._send(404, self._json({"ok": False, "error": str(e)}))
+        except Exception as e:
+            self._send(500, self._json({"ok": False, "error": str(e)}))
+
+    def _api_epub_meta_save(self, body) -> None:
+        """POST /api/epub/meta/save：保存 EPUB 元数据（可替换封面）；传 out_path 时另存为新文件，否则原地重写。"""
+        if not isinstance(body, dict):
+            self._send(400, self._json({"ok": False, "error": "无效的 JSON"}))
+            return
+        path = body.get("path")
+        if not isinstance(path, str) or not path:
+            self._send(400, self._json({"ok": False, "error": "缺少 path"}))
+            return
+        out_path = body.get("out_path")
+        if out_path is not None and (not isinstance(out_path, str) or not out_path):
+            self._send(400, self._json({"ok": False, "error": "out_path 必须是字符串"}))
+            return
+        if out_path and not os.path.isdir(os.path.dirname(os.path.abspath(out_path)) or "."):
+            self._send(400, self._json({"ok": False, "error": "目标目录不存在"}))
+            return
+        cover_path = body.get("cover_path")
+        cover_bytes = None
+        cover_ext = None
+        if cover_path:
+            if not isinstance(cover_path, str) or not os.path.isfile(cover_path):
+                self._send(400, self._json({"ok": False, "error": "封面文件不存在"}))
+                return
+            try:
+                with open(cover_path, "rb") as fh:
+                    cover_bytes = fh.read()
+                cover_ext = os.path.splitext(cover_path)[1]
+            except Exception as e:
+                self._send(500, self._json({"ok": False, "error": str(e)}))
+                return
+        try:
+            import epubmetamanage
+            result = epubmetamanage.save_epub_metadata(
+                path,
+                title=body.get("title"),
+                author=body.get("author"),
+                description=body.get("description"),
+                language=body.get("language"),
+                cover_bytes=cover_bytes,
+                cover_ext=cover_ext,
+                out_path=out_path,
+            )
+            self._send(200, self._json({"ok": True, "path": result.get("path")}))
+        except FileNotFoundError as e:
+            self._send(404, self._json({"ok": False, "error": str(e)}))
+        except Exception as e:
+            self._send(500, self._json({"ok": False, "error": str(e)}))
+
     # -- 工具：多 EPUB 合并 --
 
     def _api_tools_merge_start(self, body) -> None:
@@ -2769,6 +2943,15 @@ class _GuiHandler(BaseHTTPRequestHandler):
         if path == "/api/history/delete":
             self._api_history_delete(body)
             return
+        if path == "/api/history/rename":
+            self._api_history_rename(body)
+            return
+        if path == "/api/epub/meta/read":
+            self._api_epub_meta_read(body)
+            return
+        if path == "/api/epub/meta/save":
+            self._api_epub_meta_save(body)
+            return
         if path == "/api/tools/merge/start":
             self._api_tools_merge_start(body)
             return
@@ -2840,11 +3023,51 @@ def _open_display(url: str, title: str) -> tuple[str, object | None]:
     return "owner", _win
 
 
+def _spawn_detached(cmd: list[str]) -> subprocess.Popen:
+    """以「完全脱离」方式启动子进程（拉起浏览器），返回 Popen 对象。
+
+    **为什么必须完全脱离**（2026-10-05 实测）：
+    浏览器是常驻进程、不会自己退出。若用裸 `subprocess.Popen` 启动，它会继承宿主的
+    stdin/stdout/stderr **控制台句柄**；宿主主流程早已结束（实测 `PYTHON_MAIN_DONE`
+    2.2s 已打印），但解释器仍要等这些继承来的句柄全部关闭才肯退出 —— 对外表现就是
+    「按 Ctrl+C 关不掉配置界面」。已逐层排除 `_serve_loop`/`server.shutdown()` 顺序/
+    `_drain_dialog_queue`/`except KeyboardInterrupt`/`signal.signal`/心跳轮询，均正常。
+
+    实测对照（用会 sleep 的常驻子进程模拟浏览器，测父进程墙钟退出时间）：
+      - 完全继承 stdio（修复前）                    → 45.1s，Ctrl+C 无效
+      - 仅 stdout/stderr=DEVNULL（stdin 仍继承）   → 2.1s
+      - 完全脱离（本函数）                          → 2.3s
+
+    故 stdin/stdout/stderr 三者全部 DEVNULL + `close_fds=True`，Windows 再加
+    `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`（不给子进程附加控制台，宿主退出后
+    浏览器继续运行，Ctrl+C 也不会误传给浏览器）。
+
+    注意两点：
+    1. `DETACHED_PROCESS` 与 `CREATE_NEW_CONSOLE` 互斥，混用 Windows 直接报错；
+    2. 这两个常量只在 Windows 的 subprocess 上存在，故一律 `getattr` 安全取值，
+       非 Windows 平台退化为 `close_fds=True` + DEVNULL，代码保持可移植可导入。
+
+    失败时**抛出异常**（不吞异常）：由各调用点 `_open_browser` 既有的
+    try/except 兜底，保证原有 webbrowser 回退语义逐字不变。
+    """
+    kwargs: dict[str, object] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    _flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    if _flags:
+        kwargs["creationflags"] = _flags
+    return subprocess.Popen(cmd, **kwargs)
+
+
 def _open_browser(url: str) -> None:
     """打开外部浏览器访问配置界面。
 
     优先使用 config.json 的 browser 键指定的浏览器路径，否则用系统默认浏览器。
     browser 模式（gui_display='browser'）或 pywebview 不可用/启动失败时使用。
+    浏览器经 `_spawn_detached` 完全脱离启动，避免常驻浏览器拖住宿主导致 Ctrl+C 无效。
     """
     try:
         from configmanage import get_config as _get_cfg
@@ -2854,7 +3077,7 @@ def _open_browser(url: str) -> None:
         _br_path = ""
     try:
         if _br_path:
-            subprocess.Popen([_br_path, url])
+            _spawn_detached([_br_path, url])
         else:
             webbrowser.open(url)
     except Exception:  # noqa: BLE001  打不开浏览器不阻断服务

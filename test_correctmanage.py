@@ -8,17 +8,21 @@ Covers:
   structuring and HTML conversion, EPUB still produced
 """
 
+import inspect
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import configmanage
 import correctmanage
+import guimanage
 import htmlmanage
 import mian
 import pdfmanage
@@ -2870,9 +2874,11 @@ class TestApplyMarkersIndentAttrs(unittest.TestCase):
     无标记路径（structured['pages'] 直传）本就正常，本类锁定标记路径。
     """
 
-    # 标记 span 的 data-ptoe-marker 必须是第一个属性（_MARKER_SPAN_RE 要求），
-    # 且与 sanitize_html 的输出属性顺序一致
+    # 标记 span 属性顺序无关（_MARKER_SPAN_RE 已属性顺序无关）；sanitize_html
+    # 输出为 data-ptoe-marker 在前，但真实编辑器普通模式可能 class 在前。
     FULL = '<span data-ptoe-marker="full" class="ptoe-marker">全文</span>'
+    # 真实编辑器普通模式序列化后的属性顺序（class 在前）
+    FULL_CLASS_FIRST = '<span class="ptoe-marker" data-ptoe-marker="full">全文</span>'
 
     def _arts(self, *page_texts):
         return apply_markers(
@@ -2890,6 +2896,15 @@ class TestApplyMarkersIndentAttrs(unittest.TestCase):
     def test_first_line_indent_kept(self):
         out = self._run(f"<p>{self.FULL}</p><p data-ind=\"first\" data-indv=\"2\">甲</p>")
         self.assertIn('<p data-ind="first" data-indv="2">甲</p>', out)
+
+    def test_class_first_marker_recognized(self):
+        """class 在 data-ptoe-marker 之前的真实序列化顺序，标记语义仍须生效
+        （整 span 剥离，不把「全文」label 当段内文本泄漏）。"""
+        out = self._run(
+            f'<p>{self.FULL_CLASS_FIRST}</p><p data-ind="first" data-indv="2">甲</p>'
+        )
+        self.assertIn('<p data-ind="first" data-indv="2">甲</p>', out)
+        self.assertNotIn("全文", out)
 
     def test_hanging_indent_kept(self):
         out = self._run(f"<p>{self.FULL}</p><p data-ind=\"hang\" data-indv=\"2\">甲</p>")
@@ -7708,6 +7723,33 @@ class TestProofreadPlainText(unittest.TestCase):
         self.assertIn("B", result)
         self.assertNotIn("label", result)
 
+    def test_class_first_marker_stripped(self):
+        # 真实编辑器（普通模式 createElement 先设 class 再设 dataset）序列化为
+        # <span class="ptoe-marker" data-ptoe-marker="...">，属性顺序与旧写法相反；
+        # 正则必须属性顺序无关，否则标记 label 会被当纠错对象。
+        html = '<p>正文<span class="ptoe-marker" data-ptoe-marker="full">全文</span>继续</p>'
+        result = _proofread_plain_text(html)
+        self.assertIn("正文", result)
+        self.assertIn("继续", result)
+        self.assertNotIn("全文", result)
+        self.assertNotIn("ptoe-marker", result)
+
+    def test_class_first_marker_with_extra_attrs(self):
+        html = ('<p>前<span class="ptoe-marker foo" data-ptoe-marker="join" '
+                'title="x">段落</span>后</p>')
+        result = _proofread_plain_text(html)
+        self.assertIn("前", result)
+        self.assertIn("后", result)
+        self.assertNotIn("段落", result)
+
+    def test_class_first_multiple_markers(self):
+        html = ('<p>A<span class="ptoe-marker" data-ptoe-marker="full">全文</span>B'
+                '<span class="ptoe-marker" data-ptoe-marker="page">换页</span>C</p>')
+        result = _proofread_plain_text(html)
+        self.assertIn("ABC", result.replace(" ", ""))
+        self.assertNotIn("全文", result)
+        self.assertNotIn("换页", result)
+
 
 class TestParseLlmSuggestions(unittest.TestCase):
     """_parse_llm_suggestions 响应中间层：模型返回的 JSON 建议解析与归一校验。
@@ -8860,6 +8902,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "popup_row1": ["bold", "p"],
                     "popup_row2": ["note"],
                     "popup_rule_count": 3,
+                    "proofread_batch_pages": 1,
                 },
             )
         finally:
@@ -8885,6 +8928,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "popup_row1": ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"],
                     "popup_row2": ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"],
                     "popup_rule_count": 5,
+                    "proofread_batch_pages": 1,
                 },
             )
         finally:
@@ -9084,6 +9128,62 @@ class TestUiSettingsEndpoint(unittest.TestCase):
             ).json()
             self.assertTrue(res["ok"])
             self.assertEqual(calls, [{"rule_all_pages_confirm": False}])
+        finally:
+            self._stop(server)
+
+    def test_post_proofread_batch_pages_persists(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"proofread_batch_pages": 7}}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(calls, [{"proofread_batch_pages": 7}])
+        finally:
+            self._stop(server)
+
+    def test_post_proofread_batch_pages_bad_type_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"proofread_batch_pages": "abc"}}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("数字", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+    def test_post_proofread_batch_pages_out_of_range_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"proofread_batch_pages": 51}}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("范围", res["error"])
+            self.assertEqual(calls, [])
         finally:
             self._stop(server)
 
@@ -9976,6 +10076,7 @@ class TestSetUiSettingsConfig(unittest.TestCase):
                 "popup_row1": ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"],
                 "popup_row2": ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"],
                 "popup_rule_count": 5,
+                "proofread_batch_pages": 1,
             },
         )
 
@@ -14482,6 +14583,104 @@ class TestExportCaption(unittest.TestCase):
         self.assertTrue(_is_caption_block({"caption": True, "attrs": ""}))
         # 无 attrs 键不得抛异常
         self.assertFalse(_is_caption_block({}))
+
+
+class TestOpenBrowserDetached(unittest.TestCase):
+    """_open_browser 必须经 guimanage._spawn_detached「完全脱离」启动浏览器。
+
+    根因（2026-10-05 实测）：常驻浏览器继承宿主 stdin/stdout/stderr 控制台句柄，
+    宿主主流程结束后解释器仍等句柄关闭才退出 → Ctrl+C 关不掉界面
+    （完全继承 45.1s / 完全脱离 2.3s）。
+    """
+
+    def setUp(self):
+        self._orig_get_config = configmanage.get_config
+        self._orig_open_browser = correctmanage._open_browser
+        self._orig_webbrowser_open = correctmanage.webbrowser.open
+
+    def tearDown(self):
+        configmanage.get_config = self._orig_get_config
+        correctmanage._open_browser = self._orig_open_browser
+        correctmanage.webbrowser.open = self._orig_webbrowser_open
+
+    @staticmethod
+    def _expected_flags():
+        return getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+    def test_open_browser_uses_devnull_and_close_fds(self):
+        """stdin/stdout/stderr 全部 DEVNULL + close_fds=True（不得为 None=继承）。"""
+        configmanage.get_config = lambda show_dialogs=True: {"browser": "D:/min/min.exe"}
+        with mock.patch.object(subprocess, "Popen") as popen:
+            correctmanage._open_browser("http://127.0.0.1:9765/")
+        popen.assert_called_once()
+        self.assertEqual(popen.call_args[0][0], ["D:/min/min.exe", "http://127.0.0.1:9765/"])
+        kwargs = popen.call_args[1]
+        for key in ("stdin", "stdout", "stderr"):
+            self.assertIs(kwargs[key], subprocess.DEVNULL)
+            self.assertIsNot(kwargs[key], None)
+        self.assertIs(kwargs["close_fds"], True)
+
+    def test_open_browser_creationflags_exact(self):
+        """Windows 下 creationflags 精确等于 DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP。"""
+        configmanage.get_config = lambda show_dialogs=True: {"browser": "D:/min/min.exe"}
+        with mock.patch.object(subprocess, "Popen") as popen:
+            correctmanage._open_browser("http://127.0.0.1:9765/")
+        flags = popen.call_args[1].get("creationflags", 0)
+        self.assertEqual(flags, self._expected_flags())
+        if sys.platform == "win32":
+            self.assertTrue(flags & getattr(subprocess, "DETACHED_PROCESS", 0))
+            self.assertTrue(flags & getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+
+    def test_open_browser_no_create_new_console(self):
+        """禁止混用 CREATE_NEW_CONSOLE（与 DETACHED_PROCESS 互斥）。"""
+        configmanage.get_config = lambda show_dialogs=True: {"browser": "D:/min/min.exe"}
+        with mock.patch.object(subprocess, "Popen") as popen:
+            correctmanage._open_browser("http://127.0.0.1:9765/")
+        flags = popen.call_args[1].get("creationflags", 0)
+        self.assertFalse(flags & getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+        self.assertNotEqual(flags, getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+
+    def test_open_browser_delegates_to_shared_helper(self):
+        """源码级守卫：必须惰性 import guimanage._spawn_detached，不得自己内联 Popen。"""
+        src = inspect.getsource(correctmanage._open_browser)
+        self.assertIn("from guimanage import _spawn_detached", src)
+        self.assertNotIn("subprocess.Popen", src)
+        self.assertNotIn("import subprocess", src)
+
+    def test_open_browser_empty_path_uses_webbrowser(self):
+        """browser 键为空 → webbrowser.open，不起子进程。"""
+        configmanage.get_config = lambda show_dialogs=True: {"browser": ""}
+        opened = []
+        correctmanage.webbrowser.open = lambda u: opened.append(u)
+        with mock.patch.object(subprocess, "Popen") as popen:
+            correctmanage._open_browser("http://127.0.0.1:9765/")
+        popen.assert_not_called()
+        self.assertEqual(opened, ["http://127.0.0.1:9765/"])
+
+    def test_open_browser_falls_back_to_webbrowser_on_failure(self):
+        """浏览器路径无效 → 保持原有语义：回退 webbrowser.open。"""
+        configmanage.get_config = lambda show_dialogs=True: {"browser": "D:/不存在/min.exe"}
+        opened = []
+        correctmanage.webbrowser.open = lambda u: opened.append(u)
+        with mock.patch.object(subprocess, "Popen", side_effect=OSError("no such file")):
+            correctmanage._open_browser("http://127.0.0.1:9765/")
+        self.assertEqual(opened, ["http://127.0.0.1:9765/"])
+
+    def test_open_browser_returns_immediately_with_sleeping_child(self):
+        """行为级：常驻「假浏览器」不得拖住调用方返回。"""
+        proc = None
+        t0 = time.time()
+        try:
+            proc = guimanage._spawn_detached([sys.executable, "-c", "import time; time.sleep(30)"])
+            self.assertIsNotNone(proc)
+            self.assertLess(time.time() - t0, 5.0)
+        finally:
+            if proc is not None:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except Exception:  # noqa: BLE001  收尾失败不影响断言
+                    pass
 
 
 if __name__ == "__main__":

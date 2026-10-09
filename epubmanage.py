@@ -97,6 +97,10 @@ class ResourceMapper:
         self.oebps_root = oebps_root
         self.source_to_epub_path: Dict[str, str] = {}
         self.counter: Dict[str, int] = {}
+        # 已占用的 epub 相对路径集合：等价于 source_to_epub_path.values()，
+        # 但成员测试 O(1)。原实现 `key in ...values()` 每次 map_file 都线性
+        # 扫描全部已映射文件（O(N²)）——图片/章节多的书（上千文件）里是热点。
+        self._used_epub_paths: set = set()
 
     @staticmethod
     def sanitize_filename(name: str) -> str:
@@ -118,18 +122,24 @@ class ResourceMapper:
         }.get(category, 'Misc')
         key = os.path.join(folder, safe)
         # avoid collisions
-        if key in self.source_to_epub_path.values():
+        if key in self._used_epub_paths:
             # append numeric suffix
             base, ext = os.path.splitext(safe)
             i = self.counter.get(key, 1)
             while True:
                 candidate = os.path.join(folder, f"{base}_{i}{ext}")
-                if candidate not in self.source_to_epub_path.values():
+                if candidate not in self._used_epub_paths:
                     key = candidate
                     self.counter[key] = i + 1
                     break
                 i += 1
+        # 覆盖同一 original_path 时，旧映射从占用集合移除（与 dict 赋值后
+        # values() 不再含旧 key 的语义一致）。
+        old = self.source_to_epub_path.get(original_path)
+        if old is not None and old != key:
+            self._used_epub_paths.discard(old)
         self.source_to_epub_path[original_path] = key
+        self._used_epub_paths.add(key)
         return key
 
     def get_manifest_items(self) -> List[Tuple[str, str]]:
@@ -342,25 +352,29 @@ class EPUBPacker:
         # requested spine hrefs (e.g. 'content_1.xhtml') to their manifest item ids
         href_to_id = {href: f'item{i+1}' for i, (href, _m) in enumerate(manifest_items)}
 
+        # O(1) 反查表：原实现每个 spine 项都线性扫描 href_to_id（O(N²)，
+        # 1600 章书实测 2.5M 次 os.path.basename 占 ~8s）→ 预建 basename 索引。
+        # setdefault 保留「迭代序首个匹配」语义，与原线性扫描结果逐字节一致。
+        basename_to_id: Dict[str, str] = {}
+        for hid, iid in href_to_id.items():
+            basename_to_id.setdefault(os.path.basename(hid), iid)
+
         def _resolve_id(href: str) -> Optional[str]:
-            base = os.path.basename(href)
-            for hid in href_to_id:
-                if os.path.basename(hid) == base:
-                    return href_to_id[hid]
-            return None
+            return basename_to_id.get(os.path.basename(href))
 
         opf_content = self.generate_content_opf(metadata, manifest_items, [_resolve_id(r) or r for r in spine_order])
         # NCX 目录：EPUB2/EPUB3 均生成，给旧阅读器做目录兜底
         # toc.ncx lives at OEBPS/ root; its srcs must point at the mapped paths
+        # O(1) 反查表（同上）：原实现对每个 toc 项线性扫描 manifest_sources（O(N²)）
+        basename_to_mapped: Dict[str, str] = {}
+        for _s, e in manifest_sources:
+            basename_to_mapped.setdefault(os.path.basename(e), e.replace('\\', '/'))
         mapped_toc = []
         for it in toc_items:
             href = it.get('href', '')
             file_part, _, frag = href.partition('#')
             base = os.path.basename(file_part)
-            mapped = next(
-                (e.replace('\\', '/') for _s, e in manifest_sources if os.path.basename(e) == base),
-                file_part,
-            )
+            mapped = basename_to_mapped.get(base, file_part)
             mapped_toc.append({'title': it.get('title'), 'href': mapped + (f'#{frag}' if frag else ''), 'level': it.get('level')})
         ncx_content = self.generate_toc_ncx(metadata, mapped_toc)
 

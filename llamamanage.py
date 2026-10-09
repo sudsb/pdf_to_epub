@@ -449,6 +449,57 @@ def _handle_stale_instance(model_name: str) -> bool:
     return False
 
 
+def _cfg_int(raw, *, name: str, default: int, minv: int, maxv: int) -> int:
+    """配置整数解析（llama_server_args 通用）：返回 default 或合法整数值。
+
+    语义：
+    - 键缺失 / None / 空串（含纯空格）→ default（键"未配置"）；
+    - 非整数（如 "abc"）→ 打印中文警告并返回 default（**不中断启动**）；
+    - 越界 → 打印中文警告并返回 default。
+    刻意不用 `raw or default` 这种写法：int 0 与字符串 "0" 都是合法且有意义的
+    配置值（0 = 禁用），而 `sargs.get(k) or ''` 会把 int 0 判成假值 → 契约静默
+    失效（本项目已在 flash_attn 上踩过同样的坑，见 runserver 内的归一处理）。
+    这里先归一为字符串再判空，"0" 与 0 一律按"已配置"处理。
+    """
+    txt = "" if raw is None else str(raw).strip()
+    if txt == "":
+        return default
+    try:
+        val = int(txt)
+    except (TypeError, ValueError):
+        print(f"llama_server_args.{name} 非法值 {txt!r}（非整数），按 {default} 处理")
+        return default
+    if not (minv <= val <= maxv):
+        print(
+            f"llama_server_args.{name} {val} 超出允许范围（{minv}-{maxv}），"
+            f"按 {default} 处理"
+        )
+        return default
+    return val
+
+
+def _parse_recycle_args(args: dict) -> tuple:
+    """从 llama_server_args 解析 (recycle_every, recycle_rss_mb)。
+
+    两个阈值都是「0 = 不启用」：非法值按未启用处理并打印中文警告（见 _cfg_int）。
+    """
+    every = _cfg_int(
+        (args or {}).get("recycle_every"),
+        name="recycle_every",
+        default=0,
+        minv=0,
+        maxv=1000000,
+    )
+    rss_mb = _cfg_int(
+        (args or {}).get("recycle_rss_mb"),
+        name="recycle_rss_mb",
+        default=0,
+        minv=0,
+        maxv=1 << 20,
+    )
+    return every, rss_mb
+
+
 # 使用 curl http://127.0.0.1:8080/health 检测服务器是否加载完成
 # 加载失败或者未加载完成时
 #   {"error":{"message":"Loading model","type":"unavailable_error","code":503}}
@@ -509,6 +560,7 @@ def runserver(
         #   - 低于配置 → 判定为残留进程，自动重启采用当前配置（不再静默降级）；
         #   - /slots 探测失败 → 提示可能是旧服务，仍截断时建议停止重试。
         _record_server_ctx()
+        _reset_recycle_count()  # 服务可用（复用/自动重启后）：回收计数归零
         try:
             _cfg_ctx = (get_config(show_dialogs=False).get("llama_server_args") or {}).get("ctx_size") or 0
             _sc = int(ctx_size) if ctx_size is not None else int(_cfg_ctx)
@@ -621,6 +673,48 @@ def runserver(
                 print(f"llama_server_args.ctx_size {cz} out of range (256-65536), ignoring")
     except Exception as e:
         print(f"Invalid llama_server_args.ctx_size: {e}")
+
+    # --ctx-checkpoints / --cache-ram（2026-10-05）：掐断 llama-server 宿主 RAM 的
+    # 两处无谓占用——OCR 是「一页一 prompt、页页都不同」的场景，两者都只有代价、
+    # 没有收益：
+    #   --ctx-checkpoints N（llama.cpp 默认 32）：为每个 slot 在生成期间把 KV 状态
+    #     快照进宿主 RAM，只服务投机解码（draft 模型）失败后的恢复。我们没有 draft
+    #     模型，且 OCR 请求全是 COMPLETION 任务、全部命中该路径 → 实测默认 32 时
+    #     每请求约 +150MB 宿主 RAM；置 0 后约 +0.5MB（约 300 倍改善）。
+    #   --cache-ram N（默认 8192 MiB，0=禁用 / -1=不限）：配合默认开启的
+    #     --cache-idle-slots，每次新任务把空闲 slot 的完整状态序列化进宿主 RAM。
+    #     prompt 每页不同 → 前缀缓存永不命中，只填满上限并常驻；置 0 会让
+    #     --cache-idle-slots 自动禁用。代价是失去共享前缀复用，而前缀只有约 30
+    #     token 系统提示 vs 每页 3100-3200 图片 token，prefill 影响 <1%。
+    # 缺省一律按 0（禁用）拼装；不同 llama.cpp 版本可能没有这两个 flag，按
+    # _server_supports_arg 探测后静默跳过，绝不因缺 flag 中断启动。
+    # 注意用完整长名而非 -ctxcp / -cram 短别名：短名拼错会静默失效且难以排查。
+    # 人工排障（参数是否被服务端接受的确认串，任一出现即已生效）：
+    #   "context checkpoints disabled"
+    #   "prompt cache is disabled - use --cache-ram N to enable it"
+    #   "--cache-idle-slots requires --cache-ram, disabling"
+    for _name, _flag, _minv, _maxv in (
+        ("ctx_checkpoints", "--ctx-checkpoints", 0, 1024),
+        ("cache_ram", "--cache-ram", -1, 1048576),
+    ):
+        # 默认 0（禁用）：缺失键与显式 0 同义；非法/越界值按 0 兜底而非"不加参数"，
+        # 否则会退回 llama.cpp 内置默认（32 / 8192MiB）——那正是要修的泄漏。
+        _val = _cfg_int(sargs.get(_name), name=_name, default=0, minv=_minv, maxv=_maxv)
+        if _server_supports_arg(exe, _flag):
+            args += [_flag, str(_val)]
+            print(f"Using {_name} from config: {_val}")
+        else:
+            print(f"llama-server 构建不支持 {_flag} 启动参数，已跳过")
+
+    # 主动回收提示（2026-10-05）：上面两个 flag 只掐掉「每请求」的两处占用，残余
+    # 的每 token 匿名内存泄漏（上游 issue #25740/#25953）只有进程退出才回收，长书
+    # 转换期间宿主 RAM 仍会持续上涨 → 提供按页数/私有内存阈值重启服务的选项。
+    if all(v <= 0 for v in _parse_recycle_args(sargs)):
+        print(
+            "提示：长书转换/校正时 llama-server 宿主内存会持续上涨（残余泄漏只有"
+            "重启进程才回收）。需要自动回收时可设 llama_server_args.recycle_every"
+            "=每多少页重启一次（如 50），或 recycle_rss_mb=私有内存上限MiB（如 6000）"
+        )
 
     # Additional numeric startup parameters supported via config.json llama_server_args:
     # - max_tokens: integer (defaults to 8192) -> also controls per-request max_tokens used by HTTP calls
@@ -751,6 +845,7 @@ def runserver(
             if response.status_code == 200:
                 print("Server loaded successfully")
                 _record_server_ctx()  # 记录真实 n_ctx，供截断警告正确分流
+                _reset_recycle_count()  # 新进程：宿主 RAM 回到基线，回收计数归零
                 return True
             # 503（Loading model）等非 200：服务未就绪，稍候重试。
             # 不 sleep 会忙轮询打满正在加载模型的进程，拖慢启动（2026-08-08）。
@@ -909,6 +1004,7 @@ def stopserver():
     global _server_process
     global _SERVER_CTX
     _SERVER_CTX = None  # 服务停止后旧 n_ctx 探测值不再有效
+    _reset_recycle_count()  # 服务已停：回收计数归零（下次启动从 0 开始数）
 
     if _active_engine() == "vllm":
         m = _vllm_module()
@@ -937,6 +1033,304 @@ def stopserver():
     else:
         print("No server process is running")
     return True
+
+
+# ---- 进程回收（recycle）：矫正/转换过程中 llama-server 宿主 RAM 持续上涨 ----
+# 2026-10-05：llama.cpp 存在与启动参数无关的**残余泄漏**——生成过程中匿名内存按
+# token 缓慢增长（上游 issue #25740/#25953 实测残留约 0.47MB/token）。这些内存是
+# 匿名内存，只有进程退出才回收，故长书（数百页、数十分钟）批处理期间宿主 RAM 会
+# 一路上涨。--ctx-checkpoints 0 / --cache-ram 0 只能掐掉「每请求」的 KV 快照与
+# 空闲 slot 缓存（合计约 150MB/请求），残余部分只能靠重启进程回收——本节提供
+# 按页数 / 按私有内存阈值主动回收的能力。
+#
+# 阈值配置（config.json → llama_server_args，默认关闭）：
+#   recycle_every  : 每处理 N 个请求回收一次（0=不启用）；
+#   recycle_rss_mb : 私有内存上限（MiB，0=不启用），达到即回收。
+# 任一命中即触发；两者都为 0 时 maybe_recycle_server 立即返回（零开销，可安全
+# 在每个请求前调用）。
+#
+# 为什么默认关闭（recycle_every=0）：回收要 stopserver + runserver，即模型重载
+# 10-30s。绝大多数任务只有几页，默认开启等于每本书都白等一次；且回收瞬间会断开
+# 在途请求（有单页失败重试成本）。故默认 0，用户在长书/内存紧张时按需开启
+# （runserver 启动时会打印该提示）。
+_RECYCLE_LOCK = threading.RLock()
+# 可重入（RLock 而非 Lock）：锁内会调 stopserver/runserver，二者结束时又回调
+# _reset_recycle_count → 普通 Lock 会自死锁。
+_RECYCLE_COUNT = 0  # 自上次（重）启动以来处理的请求数
+_RECYCLE_SETTINGS_CACHE: tuple | None = None  # (monotonic, recycle_every, recycle_rss_mb)
+_RECYCLE_SETTINGS_TTL = 5.0  # 秒：逐页调用不必每次读 config.json（同 _ENGINE_CACHE）
+_SERVER_PID_CACHE: tuple = (0.0, None)  # (monotonic, pid)：按端口查到的 pid 缓存
+_SERVER_PID_TTL = 30.0  # 秒：避免每页都拉起一次 netstat
+
+
+def _reset_recycle_count() -> None:
+    """回收计数归零：服务刚启动/停止时调用（宿主 RAM 已回到基线）。"""
+    global _RECYCLE_COUNT
+    with _RECYCLE_LOCK:
+        _RECYCLE_COUNT = 0
+
+
+def _process_private_bytes(pid) -> int | None:
+    """读进程私有提交内存（Private Bytes，字节）；不支持/失败返回 None。
+
+    **必须用 Private Bytes 而不是 Working Set**：GGUF 权重是 mmap 文件映射，
+    Working Set 会把已映射的模型页算进去（可达数 GB），用它判断阈值会立刻误触发
+    回收；Private Usage 只统计匿名提交内存，正是随生成 token 增长的那部分。
+    纯标准库实现（ctypes + psapi.GetProcessMemoryInfo），不引入 psutil 等新依赖；
+    非 Windows、拿不到句柄或调用失败一律返回 None——调用方按「读不到就不按内存
+    阈值回收」处理，绝不因探测失败中断识别。
+    """
+    if not pid or os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _PMC_EX(ctypes.Structure):
+            """PROCESS_MEMORY_COUNTERS_EX：末项 PrivateUsage 才是私有提交内存。"""
+
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+                ("PrivateUsage", ctypes.c_size_t),
+            ]
+
+        cpmc = _PMC_EX()
+        cpmc.cb = ctypes.sizeof(_PMC_EX)
+        kernel32 = ctypes.windll.kernel32
+        # 指针宽度下不显式声明 restype/argtypes 会把 HANDLE 截断成 32 位 int，
+        # 导致后续调用拿着残缺句柄（CloseHandle 失败、读取到垃圾）。
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        try:
+            get_info = ctypes.windll.psapi.GetProcessMemoryInfo
+        except Exception:  # 老系统无 psapi → 用 kernel32 的 K32* 同名导出
+            get_info = getattr(kernel32, "K32GetProcessMemoryInfo", None)
+        if get_info is None:
+            return None
+        get_info.restype = wintypes.BOOL
+        get_info.argtypes = (wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD)
+        # PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ
+        handle = kernel32.OpenProcess(0x1000 | 0x0010, False, int(pid))
+        if not handle:
+            return None
+        try:
+            if not get_info(handle, ctypes.byref(cpmc), cpmc.cb):
+                return None
+        finally:
+            kernel32.CloseHandle(handle)
+        val = int(cpmc.PrivateUsage)
+        return val if val > 0 else None
+    except Exception:
+        return None
+
+
+def _listener_pids(port) -> set:
+    """监听指定 TCP 端口的 PID 集合（netstat 解析，失败返回空集）。
+
+    与 _kill_port_owner / _kill_stale_llama_on_port 用同一套解析，仅做读取，
+    用于在本进程没有 llama-server 句柄时按端口定位服务进程。
+    """
+    import subprocess as sp
+
+    port = str(port)
+    try:
+        out = sp.check_output(
+            ["netstat", "-ano", "-p", "tcp"],
+            text=True,
+            errors="replace",
+            timeout=10,
+        )
+    except Exception:
+        return set()
+    pids = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if (
+            len(parts) >= 5
+            and parts[1].rsplit(":", 1)[-1] == port
+            and parts[3].upper() == "LISTENING"
+        ):
+            pids.add(parts[4])
+    return pids
+
+
+def _server_pid():
+    """当前 llama-server 的 PID；定位不到返回 None。
+
+    优先用本进程句柄（runserver 启动的实例，OCR 流程与矫正界面 /api/llm_start
+    都属于这种）；句柄不可用时按配置端口查监听者（仅当映像名是 llama-server），
+    结果缓存 _SERVER_PID_TTL 秒，避免逐页调用时反复拉起 netstat。
+    """
+    global _SERVER_PID_CACHE
+    proc = _server_process
+    if proc is not None and proc.poll() is None:
+        try:
+            return int(proc.pid)
+        except Exception:
+            pass
+    ts, cached_pid = _SERVER_PID_CACHE
+    now = time.monotonic()
+    if cached_pid and now - ts < _SERVER_PID_TTL:
+        return cached_pid
+    pid = None
+    for p in _listener_pids(_server_port()):
+        if _pid_image_name(p).startswith("llama-server"):
+            pid = int(p)
+            break
+    _SERVER_PID_CACHE = (now, pid)
+    return pid
+
+
+def _server_private_mb():
+    """llama-server 私有内存（MiB）；读不到返回 None（含义：本次不按内存判断）。"""
+    pid = _server_pid()
+    if not pid:
+        return None
+    n = _process_private_bytes(pid)
+    if not n:
+        return None
+    return n / (1024.0 * 1024.0)
+
+
+def _recycle_settings():
+    """(recycle_every, recycle_rss_mb) 解析结果，带短 TTL 缓存。
+
+    读配置失败（文件缺失/损坏等）静默按「未启用」处理：回收是可选项，探测故障
+    不应影响识别；非空但非整数/越界的值打印中文警告并按未启用处理。缓存 5 秒，
+    批内高频调用不会每页读 config.json（与 _ENGINE_CACHE 同一策略）。
+    """
+    global _RECYCLE_SETTINGS_CACHE
+    cached = _RECYCLE_SETTINGS_CACHE
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < _RECYCLE_SETTINGS_TTL:
+        return cached[1], cached[2]
+    every = rss_mb = 0
+    try:
+        args = get_config(show_dialogs=False).get("llama_server_args") or {}
+        every, rss_mb = _parse_recycle_args(args)
+    except Exception:
+        every = rss_mb = 0
+    _RECYCLE_SETTINGS_CACHE = (now, every, rss_mb)
+    return every, rss_mb
+
+
+def _recycle_server_process(
+    model_key: str,
+    *,
+    with_mmproj: bool = True,
+    ctx_size: int | None = None,
+    parallel: int | None = None,
+) -> bool:
+    """stopserver → runserver → _probe_server 复核，返回服务是否恢复就绪。
+
+    复用既有生命周期路径（runserver 内部的 _probe_server / _handle_stale_instance /
+    _kill_stale_llama_on_port / _record_server_ctx），不自建一套进程管理。
+    ctx_size / parallel 传 None 表示「与初次启动一致」（沿用配置值）。
+    回收后**必须重新 probe 确认就绪**：runserver 只等到 /health 200，而模型 id
+    尚未确认时第一个请求可能打到别的服务上。
+    """
+    stopserver()
+    ok = runserver(
+        model_key,
+        with_mmproj=with_mmproj,
+        parallel=parallel,
+        ctx_size=ctx_size,
+    )
+    if not ok:
+        print("[recycle] 重启 llama-server 失败：本次请求将失败，请检查模型与服务状态")
+        return False
+    try:
+        _llama_cfg, _models_cfg, model_cfg, _sel = _reload_config()
+        model_name = (
+            model_cfg.get(model_key, {}).get("name", model_key)
+            if isinstance(model_cfg, dict)
+            else model_key
+        )
+    except Exception:
+        model_name = model_key
+    state = _probe_server(model_name)
+    if state == "match":
+        print("[recycle] llama-server 已重启并确认就绪")
+        return True
+    print(f"[recycle] 重启后探测状态为 {state}（非 match），未能确认服务就绪")
+    return False
+
+
+def maybe_recycle_server(
+    model_key: str = "HY",
+    *,
+    with_mmproj: bool = True,
+    ctx_size: int | None = None,
+    parallel: int | None = None,
+    settings: tuple | None = None,
+    force: bool = False,
+) -> bool:
+    """按阈值主动回收 llama-server 进程；返回本次是否真的发生了回收。
+
+    触发条件（任一命中，阈值配置见本节开头注释 / config.json）：
+      recycle_every  : 自上次启动以来处理的请求数达到 N；
+      recycle_rss_mb : 私有内存（Private Bytes）达到上限 MiB。
+    两个阈值都没配时立即返回 False（不读配置、不加锁），因此可以在每个请求前
+    无条件调用。
+
+    回收动作：stopserver() → runserver()（内部已轮询 /health 至 200）→
+    _probe_server() 复核模型 id，确认就绪后才返回，避免下一个请求打到还在初始化
+    的服务上。
+
+    线程安全：判定与回收全程在 _RECYCLE_LOCK 内串行——batch_infer 是多线程，
+    不能让几个 worker 同时重启服务。其余 worker 阻塞等待后复用同一次回收的结果
+    （计数已重置），不会重复回收。代价：回收期间（模型重载 10-30s）在途请求会被
+    服务端断开，由 _request_image_new 的单页失败捕获兜底（batch_infer 语义：单页
+    失败不中断整批），故回收点放在请求**之前**以缩小失败窗口。
+
+    Args:
+        settings: 可选的 (recycle_every, recycle_rss_mb)，由调用方（如 batch_infer
+            在批次开始时）解析一次后逐页传入，避免逐页读 config.json。
+        force: True 时无视阈值强制回收一次（手工触发/测试用）。
+    仅对 engine=llama 生效：vLLM / Paddle 引擎的服务进程不由本模块管理。
+    """
+    global _RECYCLE_COUNT
+    if _active_engine() != "llama":
+        return False
+    if settings is None:
+        settings = _recycle_settings()
+    every, rss_mb = settings
+    if not force and every <= 0 and rss_mb <= 0:
+        return False
+    with _RECYCLE_LOCK:
+        _RECYCLE_COUNT += 1
+        n = _RECYCLE_COUNT
+        reason = ""
+        if force:
+            reason = "force=True"
+        elif every > 0 and n >= every:
+            reason = f"已达 recycle_every={every}（本次为第 {n} 个请求）"
+        if not reason and rss_mb > 0:
+            # 读不到私有内存（无句柄/非 Windows/探测失败）→ 本次不按内存阈值回收
+            mb = _server_private_mb()
+            if mb is not None and mb >= rss_mb:
+                reason = f"私有内存 {mb:.0f}MB ≥ recycle_rss_mb={rss_mb}"
+        if not reason:
+            return False
+        print(f"[recycle] 触发 llama-server 进程回收：{reason}")
+        _RECYCLE_COUNT = 0
+        return _recycle_server_process(
+            model_key,
+            with_mmproj=with_mmproj,
+            ctx_size=ctx_size,
+            parallel=parallel,
+        )
 
 
 def request(
@@ -1067,6 +1461,14 @@ def _batch_infer_impl(
     def infer_one(img, prompt):
         t0 = time.perf_counter()
         try:
+            # 回收检查放在请求**之前**（2026-10-05）：llama-server 存在与 flag 无关的
+            # 每 token 匿名内存泄漏，长书转换时宿主 RAM 会持续上涨；命中阈值就在这里
+            # stopserver→runserver→probe 确认就绪。阈值未配置时本调用零开销立即返回。
+            # 回收本身抛异常不影响识别（逐页失败语义由 _request_image_new 兜底）。
+            try:
+                maybe_recycle_server(model_key, settings=recycle_settings)
+            except Exception as e:  # noqa: BLE001
+                print(f"[batch_infer] llama-server 回收检查失败（忽略）: {e}")
             r = _request_image_new(
                 prompt,
                 img,
@@ -1110,6 +1512,10 @@ def _batch_infer_impl(
         msg = f"config resolution failed: {e}"
         print(f"[batch_infer] {msg}")
         return [{"img": img, "result": None, "error": msg} for img in images]
+    # 回收阈值同样在批次开始解析一次：逐页调 maybe_recycle_server 时传入 settings，
+    # 避免每页读 config.json（与 model_name 同思路；_recycle_settings 自带异常兜底，
+    # 读失败即按未启用处理，不会让整批返回错误）。
+    recycle_settings = _recycle_settings()
     # prompts 可为单值/同长序列
     if isinstance(prompts, str):
         prompts = [prompts] * len(images)

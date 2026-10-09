@@ -199,6 +199,28 @@ DEFAULT_CONFIG = {
         # （finish_reason=length 误报为触顶 max_tokens）。默认 16384 兼顾
         # 显存与生成余量（2026-09-01 引入，2026-09-07 由 8192 调大）。
         "ctx_size": "16384",
+        # ctx_checkpoints（--ctx-checkpoints，默认 32）：llama.cpp 为每个 slot 在
+        # 生成期间做宿主 RAM 里的 KV 快照，仅用于投机解码（draft 模型）失败后的
+        # 状态恢复。PToEA 没有 draft 模型，且 OCR 请求全是 COMPLETION 任务、全部
+        # 命中该路径 → 纯浪费：实测默认 32 时每请求约 +150MB 宿主 RAM，置 0 后
+        # 约 +0.5MB（约 300 倍改善）。故默认禁用（2026-10-05 引入）。
+        "ctx_checkpoints": "0",
+        # cache_ram（--cache-ram，默认 8192 MiB；0=禁用 / -1=不限）：配合默认开启的
+        # --cache-idle-slots，每次新任务把所有空闲 slot 的完整状态序列化进宿主 RAM。
+        # 我们每页 prompt 都不同（不同页图）→ 前缀缓存永不命中，只填满上限并常驻。
+        # 置 0 会让 --cache-idle-slots 自动禁用；代价是失去共享前缀复用，而前缀
+        # 只有约 30 token 系统提示 vs 每页 3100-3200 图片 token，prefill 影响 <1%
+        # （2026-10-05 引入）。
+        "cache_ram": "0",
+        # recycle_every：主动回收 llama-server 的「每 N 页」阈值（0=不启用）。
+        # 残余的「每生成 token 泄漏」（llama.cpp 上游 issue #25740/#25953 残留约
+        # 0.47MB/token）是匿名内存，只有进程退出才回收，长书批处理仍会持续涨，
+        # 故提供按页数回收。默认 0（关闭）：模型重载要 10-30s，贸然默认开启会明显
+        # 拖慢短书用户，需要时按需开启（见 llamamanage.maybe_recycle_server）。
+        "recycle_every": "0",
+        # recycle_rss_mb：私有内存（Private Bytes）上限（MiB，0=不启用），达到即
+        # 回收。与 recycle_every 任一命中即触发；两个都为 0 时不做任何回收检查。
+        "recycle_rss_mb": "0",
     },
     # 推理引擎选择：'llama'（llama.cpp，默认）| 'vllm'（vLLM-Omni）| 'paddle'（PaddleOCR 本地推理）
     "engine": "llama",
@@ -317,6 +339,8 @@ DEFAULT_CONFIG = {
         "popup_row1": POPUP_ROW1_DEFAULT,
         "popup_row2": POPUP_ROW2_DEFAULT,
         "popup_rule_count": POPUP_RULE_COUNT_DEFAULT,
+        # 每批「校正/重识别」处理的页数（1-50，默认 1）：设为 N 时从当前页起连续处理 N 页
+        "proofread_batch_pages": 1,
     },
     # 图片预处理（2026-08，OpenCV）：PDF 分割图片时启用，提高 OCR 识别率。
     # enabled 开关；gray 灰度 / denoise 中值去噪 / sharpen 锐化 / binarize 自适应二值化；
@@ -854,6 +878,13 @@ def set_ui_settings(ui: dict) -> dict:
             clean["popup_rule_count"] = v
         else:
             clean["popup_rule_count"] = POPUP_RULE_COUNT_DEFAULT
+    if "proofread_batch_pages" in ui:
+        # 每批校正/重识别页数：1-50 的整数，非数值回退 1（与既有数值键 clamp 写法一致）
+        try:
+            v = int(ui["proofread_batch_pages"])
+        except (TypeError, ValueError):
+            v = 1
+        clean["proofread_batch_pages"] = max(1, min(50, v))
     with _CFG_LOCK:
         try:
             if os.path.exists(_CONFIG_PATH):

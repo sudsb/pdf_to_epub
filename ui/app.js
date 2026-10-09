@@ -73,10 +73,11 @@ const DEFAULTS = {
 };
 // 鼠标中键手势（与键盘快捷键同一套操作体系）：手势是稀缺资源，默认只绑定对齐三件套。
 const MOUSE_GESTURES = [
-  ['Middle+Up','中键上滑'], ['Middle+Down','中键下滑'],
+  ['Middle+Click','中键单击'], ['Middle+Up','中键上滑'], ['Middle+Down','中键下滑'],
   ['Middle+Left','中键左滑'], ['Middle+Right','中键右滑'],
 ];
-const MOUSE_DEFAULTS = { align_center:'Middle+Up', align_left:'Middle+Left', align_right:'Middle+Right' };
+// 中键单击默认执行「加粗」：轻点即给光标/选区套一个最常用的行内格式（用户可在设置中改绑）。
+const MOUSE_DEFAULTS = { bold:'Middle+Click', align_center:'Middle+Up', align_left:'Middle+Left', align_right:'Middle+Right' };
 let mouseBindings = loadMouseBindings();
 let mouseCapturingOp = null;   // 正在等待中键滑动绑定的操作（null = 未捕获）
 let pages = [];
@@ -107,6 +108,8 @@ let _loadDoneTimer = null;
 function tipDelay() { return uiv('tip_delay', 600); }
 // 纠错悬停弹出延迟（毫秒）：悬停校正文本超过该时间自动弹出采纳/忽略菜单；0 = 悬停即弹（设置-界面可调）
 function errHoverDelay() { return uiv('err_hover_delay', 1500); }
+// 每批「校正 / 重识别」处理页数（1-50，默认 1；服务端持久化 config.json ui_settings）
+function proofreadBatchCount() { return Math.max(1, Math.min(50, uiv('proofread_batch_pages', 1))); }
 
 // 设置「界面」页偏好：服务端持久化到 config.json（/api/ui_settings）。
 // correct_pages 每运行随机端口 → localStorage 按 origin 隔离每次失效，
@@ -116,7 +119,7 @@ const POPUP_ELIGIBLE_OPS = ['bold','italic','underline','strike','highlight','ch
 const UI_SETTINGS_DEFAULTS = { tip_delay: 600, err_hover_delay: 1500, editor_font_size: 14, img_mode: '', rule_all_pages_confirm: true,
   popup_row1: ['bold','italic','heading','p','note','citation','paint','remove'],
   popup_row2: ['align_left','align_center','align_right','centerbold','merge','sup','sub'],
-  popup_rule_count: 5 };
+  popup_rule_count: 5, proofread_batch_pages: 1 };
 let uiSettings = null; // 服务端加载前为 null → 读 localStorage 兜底；加载后为完整对象
 function uiv(key, def) {
   if (uiSettings && key in uiSettings && uiSettings[key] !== undefined && uiSettings[key] !== null) return uiSettings[key];
@@ -149,6 +152,8 @@ async function loadUiSettingsFromServer() {
       document.getElementById('errHoverDelayInput').value = uiSettings.err_hover_delay;
       const rac = document.getElementById('ruleAllPagesConfirm');
       if (rac) rac.checked = !!uiSettings.rule_all_pages_confirm;
+      const pb = document.getElementById('prBatchPages');
+      if (pb) pb.value = uiSettings.proofread_batch_pages;
       if (document.getElementById('popupRow1List')) initPopupSettings(); // 弹出菜单编辑器同步
     }
   } catch (e) { console.warn('loadUiSettingsFromServer failed: ' + e.message); }
@@ -163,6 +168,7 @@ function saveUIMirror() {
     localStorage.setItem('ptoe_popup_row1', JSON.stringify(uiSettings.popup_row1 || UI_SETTINGS_DEFAULTS.popup_row1));
     localStorage.setItem('ptoe_popup_row2', JSON.stringify(uiSettings.popup_row2 || UI_SETTINGS_DEFAULTS.popup_row2));
     localStorage.setItem('ptoe_popup_rule_count', String(uiSettings.popup_rule_count != null ? uiSettings.popup_rule_count : UI_SETTINGS_DEFAULTS.popup_rule_count));
+    localStorage.setItem('ptoe_proofread_batch_pages', String(uiSettings.proofread_batch_pages != null ? uiSettings.proofread_batch_pages : UI_SETTINGS_DEFAULTS.proofread_batch_pages));
   } catch (e) {}
 }
 function saveUiSettings() {
@@ -3324,8 +3330,10 @@ function insertMarker(op) {
   let block = node && node.closest ? node.closest('p,div,h1,h2,h3,h4,h5,h6') : null;
   if (!block || !ed.contains(block)) block = ed;
   const span = document.createElement('span');
-  span.className = 'ptoe-marker';
+  // 先设 dataset 再设 class：保证序列化后 data-ptoe-marker 在 class 之前，
+  // 与服务端 _MARKER_SPAN_RE / 标记解析口径一致（属性顺序无关的旧版也能兼容）。
   span.dataset.ptoeMarker = type;
+  span.className = 'ptoe-marker';
   span.textContent = label;
   histRun('标记', [i], function () {
     if (range && block.contains(range.endContainer)) {
@@ -5579,6 +5587,8 @@ function showPopup(range) {
   left = Math.max(8, Math.min(left, window.innerWidth - r.width - 8));
   let top = rect.top - r.height - 8;   // 选中文字正上方，不遮盖选中内容
   if (top < 8) top = rect.bottom + 8;  // 上方空间不足 → 移到下方
+  // 下方空间也不足（贴近视口底部）时，钳制到视口内，避免菜单被裁掉/超出屏幕。
+  top = Math.max(8, Math.min(top, window.innerHeight - r.height - 8));
   popup.style.left = left + 'px';
   popup.style.top = top + 'px';
 }
@@ -6417,8 +6427,9 @@ document.addEventListener('mouseup', (e) => {
   const g0 = _midGesture; _midGesture = null;
   e.preventDefault();               // 是编辑区内的中键手势 → 消费掉
   const g = _midGestureDir(e.clientX - g0.x, e.clientY - g0.y);
-  if (!g) return;
-  const op = mouseReverseBindings()[g];
+  // 无滑动方向 = 中键单击：执行绑定的 'Middle+Click' 操作（默认加粗），
+  // 与滑动共用同一套「选区/集合优先，否则按按下点定位」的分发逻辑。
+  const op = g ? mouseReverseBindings()[g] : mouseReverseBindings()['Middle+Click'];
   if (!op) return;
   // 集合激活或存在非折叠选区 → 保留它们，操作直接作用于集合/选区（不再 collapse 到指针处）。
   // 修复：中键手势曾无条件 _focusMidTarget 折叠选区，多段 range 选择的格式只落到单块。
@@ -6602,50 +6613,87 @@ let proofreadLlmEnabled = false; // LLM 深度校对开关（服务端持久化 
 let proofreadLlmModel = '';      // 深度校对模型 key（'' = 跟随 selected_model）
 let proofreadLegacyRules = false; // 原有规则开关（默认关：校正只跑三条新规则；服务端持久化）
 
+// 批量范围：从 start 起连续 n 页的索引数组（n=proofreadBatchCount()，上限 pages.length）
+function _batchRange(start, n) {
+  const end = Math.min(pages.length, start + n);
+  const out = [];
+  for (let k = start; k < end; k++) out.push(k);
+  return out;
+}
+// 取某页用于纠错/重识别的干净 HTML。已挂载行返回 live DOM 的编辑区（与旧单页行为一致，
+// 并先清旧标注、保留已忽略集）；未挂载行走页模型（contentMap 优先，回退 pages[k].text），
+// 干净 HTML 写回模型供后续挂载复用。
+function _proofreadSourceAtIndex(k) {
+  const row = host.children ? [...host.children].find(function (r) { return Number(r.dataset.i) === k; }) : null;
+  const ed = row ? row.querySelector('.editable') : null;
+  if (ed) {
+    if (proofreadErrors[k]) clearProofread(k, true);
+    return { html: ed.innerHTML, ed: ed };
+  }
+  const clean = stripProofreadMarkup(contentMap.has(k) ? contentMap.get(k) : pages[k].text);
+  contentMap.set(k, clean);
+  return { html: clean, ed: null };
+}
+// 应用某页纠错结果：过滤已忽略 → 存状态 → 已挂载行即时渲染；返回有效条目数。
+function _applyProofreadResult(k, errors) {
+  let errs = Array.isArray(errors) ? errors : [];
+  if (proofreadDismissed[k]) {
+    errs = errs.filter(function (e) { return !proofreadDismissed[k].has(e.start + ':' + e.wrong); });
+  }
+  proofreadErrors[k] = errs;
+  const row = host.children ? [...host.children].find(function (r) { return Number(r.dataset.i) === k; }) : null;
+  if (row && row.querySelector('.editable')) { renderProofread(k); scheduleRemeasure(k); }
+  return errs.length;
+}
+
 // 纠错当前编辑行：调 /api/proofread → 叠加标注（不入 undo）
+// 批处理：从当前页起连续校正 proofreadBatchCount() 页（默认 1）。
 async function runProofread() {
   const ed = currentEditable();
   if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
   const row = ed.closest('.page-row');
   if (!row) return;
-  const i = Number(row.dataset.i);
-  // 先清旧标注（clearProofread 会连带清掉旧快照/忽略集），再取本轮校正前快照——
-  // 顺序不可颠倒：clearProofread 内 delete proofreadOriginal[i]（2026-08-09 清除 bug 修复）。
-  // 快照取清理后的 HTML（不含 .ptoe-err/.ptoe-fix），「回退」恢复得到干净原文。
-  if (proofreadErrors[i]) clearProofread(i, true);
-  proofreadOriginal[i] = ed.innerHTML;
-  try {
-    const res = await fetchJSON('/api/proofread', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        html: ed.innerHTML,
-        // 可选 LLM 增强：读自内存变量（服务端 /api/proofread_settings 持久化）
-        use_llm: proofreadLlmEnabled,
-        llm_model: proofreadLlmModel,
-      }),
-    });
-    if (!res.ok) { showToast('纠错失败: ' + (res.error || '未知错误'), 'fail'); return; }
-    let errors = res.errors || [];
-    if (res.llm_error) showToast('深度校对失败: ' + res.llm_error, 'warn');
-    // 过滤已忽略的条目
-    if (proofreadDismissed[i]) {
-      errors = errors.filter(function (e) { return !proofreadDismissed[i].has(e.start + ':' + e.wrong); });
+  const start = Number(row.dataset.i);
+  const indices = _batchRange(start, proofreadBatchCount());
+  let total = 0, pagesDone = 0, llmErr = false;
+  let lastDoneIdx = start; // 最后真正处理成功的页索引（多页批处理时「校正至」应指向末页而非首页）
+  for (const k of indices) {
+    // 先清旧标注（clearProofread 会连带清掉旧快照/忽略集），再取本轮校正前快照——
+    // 顺序不可颠倒：clearProofread 内 delete proofreadOriginal[k]（2026-08-09 清除 bug 修复）。
+    // 快照取清理后的 HTML（不含 .ptoe-err/.ptoe-fix），「回退」恢复得到干净原文。
+    const src = _proofreadSourceAtIndex(k);
+    proofreadOriginal[k] = src.html;
+    try {
+      const res = await fetchJSON('/api/proofread', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          html: src.html,
+          // 可选 LLM 增强：读自内存变量（服务端 /api/proofread_settings 持久化）
+          use_llm: proofreadLlmEnabled,
+          llm_model: proofreadLlmModel,
+        }),
+      });
+      if (!res.ok) { showToast('第 ' + pages[k].page + ' 页纠错失败: ' + (res.error || '未知错误'), 'fail'); continue; }
+      if (res.llm_error) llmErr = true;
+      total += _applyProofreadResult(k, res.errors);
+      pagesDone++;
+      lastDoneIdx = k;
+    } catch (e) {
+      showToast('第 ' + pages[k].page + ' 页纠错失败: ' + e.message, 'fail');
     }
-    proofreadErrors[i] = errors;
-    lastProofreadPage = pages[i].page;
-    updatePagePos();
-    if (errors.length) {
-      renderProofread(i);
-      scheduleRemeasure(i);
-      setStatus('找到 ' + errors.length + ' 处疑似错误');
-      showToast('找到 ' + errors.length + ' 处疑似错误', 'ok');
-    } else {
-      setStatus('未发现明显错误');
-      showToast('未发现明显错误', 'ok');
-    }
-  } catch (e) {
-    showToast('纠错失败: ' + e.message, 'fail');
+  }
+  if (llmErr) showToast('部分页深度校对失败', 'warn');
+  lastProofreadPage = pages[lastDoneIdx].page;
+  updatePagePos();
+  if (total) {
+    const msg = (pagesDone > 1 ? '已校正 ' + pagesDone + ' 页，' : '') + '找到 ' + total + ' 处疑似错误';
+    setStatus('找到 ' + total + ' 处疑似错误');
+    showToast(msg, 'ok');
+  } else {
+    const msg = pagesDone > 1 ? ('已校正 ' + pagesDone + ' 页，未发现明显错误') : '未发现明显错误';
+    setStatus('未发现明显错误');
+    showToast(msg, 'ok');
   }
 }
 
@@ -7174,7 +7222,7 @@ function proofreadCorrect() {
   runProofread();
 }
 
-// 子项2 重识别：对当前页重新 OCR，差异以纠错标注叠加显示
+// 子项2 重识别：对当前页（起连续 proofreadBatchCount() 页）重新 OCR，差异以纠错标注叠加显示
 let _reocrBusy = false; // 防并发：上一次请求未完成前忽略再次点击
 async function runReocr() {
   closeProofreadMenu();
@@ -7183,46 +7231,60 @@ async function runReocr() {
   if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
   const row = ed.closest('.page-row');
   if (!row) return;
-  const i = Number(row.dataset.i);
-  const page = pages[i].page;
+  const start = Number(row.dataset.i);
+  const indices = _batchRange(start, proofreadBatchCount());
   const model = proofreadLlmModel || '';
   const btn = document.getElementById('prMenuReocr');
   if (btn) btn.disabled = true;
   _reocrBusy = true;
+  let pagesDone = 0, totalDiff = 0, emptyFill = false;
+  const firstPage = pages[start].page;
+  let lastDoneIdx = start; // 最后真正处理成功的页索引（多页批处理时「校正至」应指向末页而非首页）
   try {
-    const res = await fetchJSON('/api/reocr', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ page: page, model: model, html: ed.innerHTML }),
-    });
-    if (!res.ok) { showToast('重识别失败: ' + (res.error || '未知错误'), 'fail'); return; }
-    proofreadOriginal[i] = ed.innerHTML;
-    proofreadErrors[i] = Array.isArray(res.diff) ? res.diff : [];
-    lastProofreadPage = pages[i].page;
+    for (const k of indices) {
+      const src = _proofreadSourceAtIndex(k);
+      proofreadOriginal[k] = src.html;
+      try {
+        const res = await fetchJSON('/api/reocr', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ page: pages[k].page, model: model, html: src.html }),
+        });
+        if (!res.ok) { showToast('第 ' + pages[k].page + ' 页重识别失败: ' + (res.error || '未知错误'), 'fail'); continue; }
+        const diff = Array.isArray(res.diff) ? res.diff : [];
+        // 空白页填充：wrong 为空的条目表示插入到空白页
+        if (diff.some(function (e) { return !e.wrong && e.start === 0 && e.end === 0; })) emptyFill = true;
+        totalDiff += _applyProofreadResult(k, diff);
+        pagesDone++;
+        lastDoneIdx = k;
+      } catch (e) {
+        // 网络层失败（TypeError/NetworkError）= 本地矫正服务已不可达（进程退出/端口关闭），
+        // 给出可行动的中文提示而非原始错误
+        if (e instanceof TypeError || /NetworkError|Failed to fetch/i.test(e.message || '')) {
+          showToast('与服务器的连接已断开，请重启矫正界面', 'fail');
+          break;
+        }
+        showToast('第 ' + pages[k].page + ' 页重识别失败: ' + e.message, 'fail');
+      }
+    }
+    lastProofreadPage = pages[lastDoneIdx].page;
     updatePagePos();
-    if (proofreadErrors[i].length) {
-      renderProofread(i);
-      scheduleRemeasure(i);
-      // 空白页填充：wrong 为空的条目表示插入到空白页
-      const isEmptyFill = proofreadErrors[i].some(function (e) { return !e.wrong && e.start === 0 && e.end === 0; });
-      if (isEmptyFill) {
-        setStatus('第 ' + page + ' 页为空白页，检测到可填充内容，点击绿色建议插入');
-        showToast('第 ' + page + ' 页为空白页，检测到可填充内容，点击绿色建议插入', 'ok');
+    if (pagesDone > 1) {
+      const msg = emptyFill
+        ? ('已重识别 ' + pagesDone + ' 页，检测到可填充的空白页内容')
+        : ('已重识别 ' + pagesDone + ' 页，标注 ' + totalDiff + ' 处差异');
+      setStatus(msg); showToast(msg, 'ok');
+    } else if (totalDiff || emptyFill) {
+      if (emptyFill) {
+        setStatus('第 ' + firstPage + ' 页为空白页，检测到可填充内容，点击绿色建议插入');
+        showToast('第 ' + firstPage + ' 页为空白页，检测到可填充内容，点击绿色建议插入', 'ok');
       } else {
-        setStatus('第 ' + page + ' 页重识别完成，标注 ' + proofreadErrors[i].length + ' 处差异');
-        showToast('第 ' + page + ' 页重识别完成，标注 ' + proofreadErrors[i].length + ' 处差异', 'ok');
+        setStatus('第 ' + firstPage + ' 页重识别完成，标注 ' + totalDiff + ' 处差异');
+        showToast('第 ' + firstPage + ' 页重识别完成，标注 ' + totalDiff + ' 处差异', 'ok');
       }
     } else {
-      setStatus('第 ' + page + ' 页重识别完成，未发现差异');
-      showToast('第 ' + page + ' 页重识别完成，未发现差异', 'ok');
-    }
-  } catch (e) {
-    // 网络层失败（TypeError/NetworkError）= 本地矫正服务已不可达（进程退出/端口关闭），
-    // 给出可行动的中文提示而非原始错误
-    if (e instanceof TypeError || /NetworkError|Failed to fetch/i.test(e.message || '')) {
-      showToast('与服务器的连接已断开，请重启矫正界面', 'fail');
-    } else {
-      showToast('重识别失败: ' + e.message, 'fail');
+      setStatus('第 ' + firstPage + ' 页重识别完成，未发现差异');
+      showToast('第 ' + firstPage + ' 页重识别完成，未发现差异', 'ok');
     }
   } finally {
     _reocrBusy = false;
@@ -7252,7 +7314,84 @@ function _candText(c) {
   return (c && typeof c === 'object' && 'text' in c) ? c.text : c;
 }
 
-// 子项2 应用：把当前页所有有候选的提示替换为 candidates[0]；无候选（增字）=删除 wrong（支持跨多文本节点）
+// 对单页执行「应用」：有候选的替换为 candidates[0]，无候选删除 wrong（支持跨多文本节点）。
+// 需该页已挂载（否则返回 null）。返回 {applied, skippedOverlap, skippedMissing, skippedTotal}。
+// 从 proofreadApplyCurrent 抽出：单页「应用」、「全部应用」共用同一算法。
+function _applyProofreadPage(i) {
+  const row = host.children ? [...host.children].find(function (r) { return Number(r.dataset.i) === i; }) : null;
+  const ed = row ? row.querySelector('.editable') : null;
+  if (!ed) return null;
+  const errors = proofreadErrors[i];
+  if (!errors || !errors.length) return { applied: 0, skippedOverlap: 0, skippedMissing: 0, skippedTotal: 0 };
+  const st = { applied: 0, skippedOverlap: 0, skippedMissing: 0, skippedTotal: 0 };
+  const acceptItems = []; // 收集批量 accept 反馈
+  const appliedShifts = []; // {start, delta} 用于 rebase 剩余标注
+  const appliedRanges = []; // 已应用原始区间：跳过与其重叠的条目
+  // 倒序处理，避免 DOM 修改影响后续 data-err-i 索引
+  for (let idx = errors.length - 1; idx >= 0; idx--) {
+    const err = errors[idx];
+    if (err._gone) continue; // F5: 已标记消失的条目跳过
+    // 与已应用区间重叠：直接跳过（两条建议改同一段文字时只应用一条，
+    // 否则重叠删除/替换会产生交错重复的文字错乱——2026-08 修复）
+    if (appliedRanges.some(function (r) { return err.start < r.end && r.start < err.end; })) { st.skippedOverlap++; continue; }
+    const sEls = ed.querySelectorAll('.ptoe-err[data-err-i="' + idx + '"]');
+    if (!sEls.length) { st.skippedMissing++; continue; } // 标注 span 缺失（如已被编辑移除）如实计数
+    // 标注段文本拼接（供 delta 计算）；2026-09-21 改为与应用锚定标注 span 本身
+    // （与手动 ✓ 一致）——DOM 文本与 err.wrong 不一致（reocr/繁简转换/$ 清理后
+    // 漂移）不再整条跳过
+    let segText = '';
+    sEls.forEach(function (s) { segText += s.textContent; });
+    const fixEl = ed.querySelector('.ptoe-fix[data-err-i="' + idx + '"]');
+    if (fixEl) fixEl.parentNode.removeChild(fixEl);
+    const delta = (err.candidates && err.candidates.length ? String(_candText(err.candidates[0])).length : 0) - (segText ? segText.length : (err.wrong ? err.wrong.length : 0));
+    if (err.candidates && err.candidates.length) {
+      // 有候选：首段替换为 candidates[0]，其余段删除
+      sEls[0].parentNode.replaceChild(document.createTextNode(_candText(err.candidates[0])), sEls[0]);
+      for (let p = 1; p < sEls.length; p++) sEls[p].parentNode.removeChild(sEls[p]);
+      acceptItems.push({ wrong: segText || err.wrong, fixed: _candText(err.candidates[0]) }); // 收集反馈
+    } else {
+      // 无候选（增字）：全部段删除
+      for (const s of sEls) s.parentNode.removeChild(s);
+    }
+    appliedShifts.push({ start: err.start, delta: delta });
+    appliedRanges.push({ start: err.start, end: err.end });
+    errors.splice(idx, 1);
+    st.applied++;
+  }
+  // rebase 剩余标注——用原始坐标判定，end 用新 start+wrong 长度
+  for (const e of errors) {
+    if (e._gone) continue;
+    let d = 0;
+    for (const as of appliedShifts) {
+      if (e.start >= as.start) d += as.delta;
+    }
+    const origLen = e.end - e.start;
+    e.start = e.start + d;
+    e.end = e.start + origLen;
+  }
+  syncContent(ed); // 页面文本同步入 pages[i].text
+  renderProofread(i); // 重建剩余标注（避免手动 reindex 导致 fix 索引漂移）
+  proofreadFeedbackAcceptBatch(acceptItems); // 批量反馈：应用全部
+  st.skippedTotal = st.skippedOverlap + st.skippedMissing;
+  return st;
+}
+// 应用结果的统一提示（单页 / 全部应用共用）
+function _reportApplyResult(st) {
+  const skippedTotal = st.skippedTotal || 0;
+  if (st.applied > 0) {
+    const msg = '已应用 ' + st.applied + ' 处纠错提示' + (skippedTotal ? '，跳过 ' + skippedTotal + ' 处（重叠或标注缺失）' : '');
+    showToast(msg, 'ok');
+    setStatus(msg);
+  } else if (skippedTotal > 0) {
+    showToast('有 ' + skippedTotal + ' 处提示无法应用（重叠或标注缺失）', 'warn');
+    setStatus('有 ' + skippedTotal + ' 处提示无法应用');
+  } else {
+    showToast('当前页没有可应用的纠错提示', 'warn');
+    setStatus('当前页没有可应用的纠错提示');
+  }
+}
+
+// 子项2 应用：把当前页所有有候选的提示替换为 candidates[0]；无候选（增字）=删除 wrong
 function proofreadApplyCurrent() {
   closeProofreadMenu();
   const ed = ctxTargetEditable(); // 右键菜单目标页优先（与光标位置解耦）
@@ -7262,75 +7401,76 @@ function proofreadApplyCurrent() {
   const i = Number(row.dataset.i);
   const errors = proofreadErrors[i];
   if (!errors || !errors.length) { showToast('当前页没有可应用的纠错提示', 'warn'); setStatus('当前页没有可应用的纠错提示'); return; }
+  let st = null;
   // D6: 改文本主体包进 histRun（入撤销栈）
-  histRun('应用纠错', [i], function () {
-    let applied = 0;
-    let skippedOverlap = 0, skippedMissing = 0; // 2026-09-21：统计未应用原因（重叠/标注缺失），toast 如实反馈
-    const acceptItems = []; // 收集批量 accept 反馈
-    const appliedShifts = []; // 收集 {start, delta, origStart} 用于 rebase 剩余标注
-    const appliedRanges = []; // 已应用原始区间：跳过与其重叠的条目
-    // 倒序处理，避免 DOM 修改影响后续 data-err-i 索引
-    for (let idx = errors.length - 1; idx >= 0; idx--) {
-      const err = errors[idx];
-      if (err._gone) continue; // F5: 已标记消失的条目跳过
-      // 与已应用区间重叠：直接跳过（两条建议改同一段文字时只应用一条，
-      // 否则重叠删除/替换会产生交错重复的文字错乱——2026-08 修复）
-      if (appliedRanges.some(function (r) { return err.start < r.end && r.start < err.end; })) { skippedOverlap++; continue; }
-      const sEls = ed.querySelectorAll('.ptoe-err[data-err-i="' + idx + '"]');
-      if (!sEls.length) { skippedMissing++; continue; } // 标注 span 缺失（如已被编辑移除）如实计数
-      // 标注段文本拼接（供 delta 计算）；2026-09-21 改为与应用锚定标注 span 本身
-      // （与手动 ✓ 一致）——DOM 文本与 err.wrong 不一致（reocr/繁简转换/$ 清理后
-      // 漂移）不再整条跳过
-      let segText = '';
-      sEls.forEach(function (s) { segText += s.textContent; });
-      const fixEl = ed.querySelector('.ptoe-fix[data-err-i="' + idx + '"]');
-      if (fixEl) fixEl.parentNode.removeChild(fixEl);
-      const delta = (err.candidates && err.candidates.length ? String(_candText(err.candidates[0])).length : 0) - (segText ? segText.length : (err.wrong ? err.wrong.length : 0));
-      if (err.candidates && err.candidates.length) {
-        // 有候选：首段替换为 candidates[0]，其余段删除
-        sEls[0].parentNode.replaceChild(document.createTextNode(_candText(err.candidates[0])), sEls[0]);
-        for (let p = 1; p < sEls.length; p++) sEls[p].parentNode.removeChild(sEls[p]);
-        acceptItems.push({ wrong: segText || err.wrong, fixed: _candText(err.candidates[0]) }); // 收集反馈
-      } else {
-        // 无候选（增字）：全部段删除
-        for (const s of sEls) s.parentNode.removeChild(s);
-      }
-      // D8: 收集原始坐标用于 rebase
-      appliedShifts.push({ start: err.start, delta: delta });
-      appliedRanges.push({ start: err.start, end: err.end });
-      errors.splice(idx, 1);
-      applied++;
-    }
-    // D8: rebase 剩余标注——用原始坐标判定，end 用新 start+wrong 长度
-    for (const e of errors) {
-      if (e._gone) continue;
-      let d = 0;
-      for (const as of appliedShifts) {
-        if (e.start >= as.start) d += as.delta;
-      }
-      const origLen = e.end - e.start;
-      e.start = e.start + d;
-      e.end = e.start + origLen;
-    }
-    syncContent(ed); // 页面文本同步入 pages[i].text
-    // 重建剩余标注（避免手动 reindex 导致 fix 索引漂移）
-    renderProofread(i);
-    // 批量反馈：应用全部
-    proofreadFeedbackAcceptBatch(acceptItems);
-    const skippedTotal = skippedOverlap + skippedMissing;
-    if (applied > 0) {
-      const msg = '已应用 ' + applied + ' 处纠错提示' + (skippedTotal ? '，跳过 ' + skippedTotal + ' 处（重叠或标注缺失）' : '');
-      showToast(msg, 'ok');
-      setStatus(msg);
-    } else if (skippedTotal > 0) {
-      showToast('有 ' + skippedTotal + ' 处提示无法应用（重叠或标注缺失）', 'warn');
-      setStatus('有 ' + skippedTotal + ' 处提示无法应用');
-    } else {
-      showToast('当前页没有可应用的纠错提示', 'warn');
-      setStatus('当前页没有可应用的纠错提示');
+  histRun('应用纠错', [i], function () { st = _applyProofreadPage(i); });
+  scheduleRemeasure(i);
+  if (st) _reportApplyResult(st);
+}
+
+// 全部应用：对所有「已挂载且有纠错提示」的页执行应用（未挂载页需滚动到可见后再应用）；
+// 整批作为一次撤销步骤。
+function proofreadApplyAll() {
+  closeProofreadMenu();
+  const targets = [];
+  let unattached = 0;
+  for (let k = 0; k < pages.length; k++) {
+    const errs = proofreadErrors[k];
+    if (!errs || !errs.some(function (e) { return !e._gone; })) continue;
+    const row = host.children ? [...host.children].find(function (r) { return Number(r.dataset.i) === k; }) : null;
+    if (row && row.querySelector('.editable')) targets.push(k); else unattached++;
+  }
+  if (!targets.length) {
+    const msg = unattached ? ('有 ' + unattached + ' 页纠错提示未在可见区域，请滚动到对应页后再试') : '没有可应用的纠错提示';
+    showToast(msg, 'warn'); setStatus(msg); return;
+  }
+  let applied = 0, skipped = 0;
+  histRun('全部应用纠错', targets, function () {
+    for (const k of targets) {
+      const st = _applyProofreadPage(k);
+      if (!st) continue;
+      applied += st.applied; skipped += st.skippedTotal || 0;
     }
   });
-  scheduleRemeasure(i);
+  for (const k of targets) scheduleRemeasure(k);
+  let msg = '已应用 ' + applied + ' 处纠错提示' + (skipped ? '，跳过 ' + skipped + ' 处' : '');
+  if (unattached) msg += '；另有 ' + unattached + ' 页未在可见区域';
+  showToast(msg, 'ok'); setStatus(msg);
+}
+
+// 全部清除：清除所有页的纠错标注（删除线+候选字），已应用文字保留不动；
+// 未挂载页一并清理模型 HTML，避免挂载后标注复现。
+function proofreadClearAll() {
+  closeProofreadMenu();
+  let n = 0;
+  for (let k = 0; k < pages.length; k++) {
+    const errs = proofreadErrors[k];
+    if ((!errs || !errs.length) && !proofreadOriginal[k]) continue;
+    const row = host.children ? [...host.children].find(function (r) { return Number(r.dataset.i) === k; }) : null;
+    const ed = row ? row.querySelector('.editable') : null;
+    if (ed) {
+      if (ed.querySelector('.ptoe-err, .ptoe-fix')) { clearProofread(k); scheduleRemeasure(k); }
+      else {
+        proofreadErrors[k] = [];
+        delete proofreadOriginal[k];
+        delete proofreadDismissed[k];
+        delete _prTextBefore[k];
+        syncContent(ed);
+      }
+    } else {
+      proofreadErrors[k] = [];
+      delete proofreadOriginal[k];
+      delete proofreadDismissed[k];
+      delete _prTextBefore[k];
+      const base = contentMap.has(k) ? contentMap.get(k) : pages[k].text;
+      contentMap.set(k, stripProofreadMarkup(base));
+    }
+    n++;
+  }
+  hideErrPopup();
+  updatePrCount();
+  if (n) { showToast('已清除 ' + n + ' 页纠错标注', 'ok'); setStatus('已清除 ' + n + ' 页纠错标注'); }
+  else { showToast('没有可清除的纠错标注', 'warn'); setStatus('没有可清除的纠错标注'); }
 }
 
 // 子项4 回退：彻底恢复当前页校正前的原始文本（已应用的修改一并撤回）
@@ -9212,6 +9352,8 @@ function openSettings() {
   document.getElementById('errHoverDelayInput').value = errHoverDelay();
   loadFontSettings();
   document.getElementById('editorFontSizeInput').value = parseInt(document.documentElement.style.getPropertyValue('--editor-font-size') || '14', 10);
+  const pbIn = document.getElementById('prBatchPages');
+  if (pbIn) pbIn.value = proofreadBatchCount();
   const rac = document.getElementById('ruleAllPagesConfirm');
   if (rac) rac.checked = !!uiBool('rule_all_pages_confirm', true);
   document.getElementById('modalBg').style.display = 'flex';
@@ -9552,6 +9694,7 @@ function undoHistory() {
   if (redoStack.length > UNDO_LIMIT) redoStack.shift();
   histUpdateButtons();
   setStatus('已撤回：' + entry.label);
+  showToast('已撤回：' + entry.label, 'ok');
   return true;
 }
 function redoHistory() {
@@ -9562,6 +9705,7 @@ function redoHistory() {
   if (undoStack.length > UNDO_LIMIT) undoStack.shift();
   histUpdateButtons();
   setStatus('已前进：' + entry.label);
+  showToast('已前进：' + entry.label, 'ok');
   return true;
 }
 function histUpdateButtons() {
@@ -9882,6 +10026,8 @@ document.getElementById('prMenuReocr').addEventListener('click', runReocr);
 document.getElementById('prMenuApply').addEventListener('click', proofreadApplyCurrent);
 document.getElementById('prMenuClear').addEventListener('click', proofreadClearCurrent);
 document.getElementById('prMenuRevert').addEventListener('click', proofreadRevertCurrent);
+document.getElementById('prMenuApplyAll').addEventListener('click', proofreadApplyAll);
+document.getElementById('prMenuClearAll').addEventListener('click', proofreadClearAll);
 document.getElementById('searchOpenBtn').addEventListener('click', openSearchModal);
 document.getElementById('searchBtn').addEventListener('click', searchPages);
 document.getElementById('searchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') searchPages(); });
@@ -10122,6 +10268,8 @@ document.getElementById('resetUiSettingsBtn').addEventListener('click', () => {
   document.getElementById('tipDelayInput').value = uiSettings.tip_delay;
   document.getElementById('errHoverDelayInput').value = uiSettings.err_hover_delay;
   document.getElementById('editorFontSizeInput').value = uiSettings.editor_font_size;
+  const pbIn2 = document.getElementById('prBatchPages');
+  if (pbIn2) pbIn2.value = uiSettings.proofread_batch_pages;
   const rac = document.getElementById('ruleAllPagesConfirm');
   if (rac) rac.checked = true;
   applyFontSize(uiSettings.editor_font_size);
@@ -10206,6 +10354,14 @@ document.getElementById('tipDelayInput').addEventListener('change', (e) => {
 // 格式规则应用到全部页前需确认（2026-09-13 新增；服务端持久化 config.json ui_settings）
 document.getElementById('ruleAllPagesConfirm').addEventListener('change', (e) => {
   if (uiSettings) { uiSettings.rule_all_pages_confirm = e.target.checked; saveUiSettings(); }
+});
+// 纠错批处理页数（1-50；服务端持久化 config.json ui_settings）
+const _prBatchInput = document.getElementById('prBatchPages');
+if (_prBatchInput) _prBatchInput.addEventListener('change', (e) => {
+  const v = parseInt(e.target.value, 10);
+  const n = isFinite(v) ? Math.max(1, Math.min(50, v)) : 1;
+  e.target.value = n;
+  if (uiSettings) { uiSettings.proofread_batch_pages = n; saveUiSettings(); }
 });
 // 暂存/保存/完成并转换/快捷键设置（2026-08-07 修复：四个绑定曾整块丢失 → 按钮点击无响应）
 document.getElementById('saveBtn').addEventListener('click', save);
@@ -10459,6 +10615,7 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
    loadBindingsFromServer();   // 服务端快捷键设置（异步覆盖，失败静默回退 localStorage/DEFAULTS）
    loadMouseBindingsFromServer(); // 服务端鼠标手势设置（同因：随机端口下 localStorage 每运行失效）
    loadUiSettingsFromServer(); // 服务端界面设置（异步覆盖，失败静默回退 localStorage/DEFAULTS）
+   loadFontSettings(); // 服务端字体/引用斜体设置：启动即应用（否则需打开一次设置才生效）
   mdMode = loadBool('ptoe_md_mode');
   if (mdMode) {
     for (let i = 0; i < pages.length; i++) mdSourceMap.set(i, htmlToMd(pages[i].text));

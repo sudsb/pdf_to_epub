@@ -633,7 +633,12 @@ class _EpubEditHandler(BaseHTTPRequestHandler):
 # --------------------------------------------------------------------------
 
 def _open_browser(url: str) -> None:
-    """打开外部浏览器；优先使用 config.json browser 键指定的浏览器路径。"""
+    """打开外部浏览器；优先使用 config.json browser 键指定的浏览器路径。
+
+    浏览器经 guimanage._spawn_detached **完全脱离**启动：常驻浏览器若继承宿主
+    stdin/stdout/stderr 控制台句柄，宿主主流程结束也退不出去（Ctrl+C 无效，
+    实测墙钟 45s vs 脱离后 2.3s）。惰性 import 保持模块边界与可移植性。
+    """
     _br_path = ""
     try:
         from configmanage import get_config
@@ -643,9 +648,9 @@ def _open_browser(url: str) -> None:
         pass
     try:
         if _br_path:
-            import subprocess
+            from guimanage import _spawn_detached  # noqa: PLC0415
 
-            subprocess.Popen([_br_path, url])
+            _spawn_detached([_br_path, url])
         else:
             webbrowser.open(url)
     except Exception:

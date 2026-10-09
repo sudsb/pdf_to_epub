@@ -7,10 +7,12 @@ _browser_gone 判定，以及 mian.py 的 gui 子命令与终端菜单第 8 项�
 测试期间 monkeypatch configmanage._CONFIG_PATH 到临时文件（严禁写真实 config.json）。
 """
 
+import inspect
 import json
 import os
 import queue
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -22,6 +24,7 @@ from pathlib import Path as _Path
 from unittest import mock
 
 import configmanage
+import epubmetamanage
 import guimanage
 import mian
 
@@ -549,15 +552,148 @@ class TestBrowserGoneGuard(GuiServerTestBase):
         self.assertIsNone(stale)
 
 
+class TestOpenBrowserDetached(unittest.TestCase):
+    """_open_browser / _spawn_detached：浏览器必须「完全脱离」启动。
+
+    根因（2026-10-05 实测）：浏览器是常驻进程，裸 subprocess.Popen 会让它继承宿主
+    stdin/stdout/stderr 控制台句柄，宿主主流程结束后解释器仍等这些句柄关闭才退出
+    → 「按 Ctrl+C 关不掉配置界面」。对照：完全继承 45.1s / 仅 DEVNULL(out,err) 2.1s /
+    完全脱离 2.3s。
+    """
+
+    def setUp(self):
+        self._orig_get_config = configmanage.get_config
+        # 防止其它测试类（如 TestOpenDisplay）把 _open_browser 换成 lambda 后泄漏到本类
+        self._orig_open_browser = guimanage._open_browser
+        self._orig_webbrowser_open = guimanage.webbrowser.open
+
+    def tearDown(self):
+        configmanage.get_config = self._orig_get_config
+        guimanage._open_browser = self._orig_open_browser
+        guimanage.webbrowser.open = self._orig_webbrowser_open
+
+    @staticmethod
+    def _expected_flags():
+        return getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+    def test_spawn_detached_uses_devnull_and_close_fds(self):
+        """_spawn_detached：stdin/stdout/stderr 全部 DEVNULL + close_fds=True。"""
+        with mock.patch.object(subprocess, "Popen") as popen:
+            guimanage._spawn_detached(["D:/min/min.exe", "http://127.0.0.1:1/"])
+        popen.assert_called_once()
+        argv = popen.call_args[0][0]
+        kwargs = popen.call_args[1]
+        self.assertEqual(argv, ["D:/min/min.exe", "http://127.0.0.1:1/"])
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
+        self.assertIs(kwargs["close_fds"], True)
+        # 不得回退成继承（None = 继承宿主句柄，正是本 bug 的根因）
+        for key in ("stdin", "stdout", "stderr"):
+            self.assertIsNot(kwargs[key], None)
+
+    def test_spawn_detached_creationflags_exact(self):
+        """Windows 下 creationflags 精确等于 DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP。"""
+        with mock.patch.object(subprocess, "Popen") as popen:
+            guimanage._spawn_detached(["br", "u"])
+        flags = popen.call_args[1].get("creationflags", 0)
+        self.assertEqual(flags, self._expected_flags())
+        if sys.platform == "win32":
+            # 两常量必须都置位（缺一即退化为不脱离）
+            self.assertTrue(flags & getattr(subprocess, "DETACHED_PROCESS", 0))
+            self.assertTrue(flags & getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+
+    def test_spawn_detached_no_create_new_console(self):
+        """禁止混用 CREATE_NEW_CONSOLE（与 DETACHED_PROCESS 互斥，Windows 直接报错）。"""
+        with mock.patch.object(subprocess, "Popen") as popen:
+            guimanage._spawn_detached(["br", "u"])
+        flags = popen.call_args[1].get("creationflags", 0)
+        self.assertFalse(flags & getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+        self.assertNotEqual(flags, getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+
+    def test_spawn_detached_source_never_mixes_console_flags(self):
+        """源码级守卫：不得同时出现 DETACHED_PROCESS 与 CREATE_NEW_CONSOLE 字面量。"""
+        src = inspect.getsource(guimanage._spawn_detached)
+        self.assertIn("DETACHED_PROCESS", src)
+        self.assertNotIn("CREATE_NEW_CONSOLE", src.split("注意两点")[0])
+
+    def test_open_browser_spawns_detached_browser(self):
+        """_open_browser 走 _spawn_detached：argv=[浏览器路径, url] + 脱离参数。"""
+
+        def fake_get_config(show_dialogs=True):
+            return {"browser": "D:/min/min.exe"}
+
+        configmanage.get_config = fake_get_config
+        with mock.patch.object(subprocess, "Popen") as popen:
+            guimanage._open_browser("http://127.0.0.1:8765/")
+        popen.assert_called_once()
+        self.assertEqual(popen.call_args[0][0], ["D:/min/min.exe", "http://127.0.0.1:8765/"])
+        kwargs = popen.call_args[1]
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
+        self.assertIs(kwargs["close_fds"], True)
+        self.assertEqual(kwargs.get("creationflags", 0), self._expected_flags())
+
+    def test_open_browser_empty_path_uses_webbrowser(self):
+        """browser 键为空 → 走 webbrowser.open，不起子进程。"""
+        configmanage.get_config = lambda show_dialogs=True: {"browser": ""}
+        opened = []
+        guimanage.webbrowser.open = lambda u: opened.append(u)
+        with mock.patch.object(subprocess, "Popen") as popen:
+            guimanage._open_browser("http://127.0.0.1:8765/")
+        popen.assert_not_called()
+        self.assertEqual(opened, ["http://127.0.0.1:8765/"])
+
+    def test_open_browser_swallows_spawn_failure(self):
+        """浏览器路径无效（Popen 抛错）→ 不阻断服务，保持原有吞异常语义。"""
+        configmanage.get_config = lambda show_dialogs=True: {"browser": "D:/不存在/min.exe"}
+        with mock.patch.object(subprocess, "Popen", side_effect=OSError("no such file")):
+            guimanage._open_browser("http://127.0.0.1:8765/")  # 不抛异常即通过
+
+    def test_open_browser_returns_immediately_with_sleeping_child(self):
+        """行为级：常驻「假浏览器」（sleep 子进程）不得拖住调用方返回。"""
+        proc = None
+        t0 = time.time()
+        try:
+            proc = guimanage._spawn_detached([sys.executable, "-c", "import time; time.sleep(30)"])
+            elapsed = time.time() - t0
+            self.assertIsNotNone(proc)
+            self.assertLess(elapsed, 5.0, "起常驻子进程后调用方应立即返回")
+        finally:
+            if proc is not None:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except Exception:  # noqa: BLE001  收尾失败不影响断言
+                    pass
+
+    def test_open_display_browser_mode_uses_detached(self):
+        """端到端：_open_display('browser') 拉起的浏览器也必须完全脱离。"""
+        configmanage.get_config = lambda show_dialogs=True: {
+            "gui_display": "browser",
+            "browser": "D:/min/min.exe",
+        }
+        with mock.patch.object(subprocess, "Popen") as popen:
+            role, win = guimanage._open_display("http://127.0.0.1:8765", "ptoe")
+        self.assertEqual(role, "browser")
+        self.assertIsNone(win)
+        self.assertEqual(popen.call_args[1].get("creationflags", 0), self._expected_flags())
+        self.assertIs(popen.call_args[1]["stderr"], subprocess.DEVNULL)
+
+
 class TestOpenDisplay(unittest.TestCase):
     """_open_display 助手函数测试（monkeypatch configmanage.get_config + webview/webbrowser）。"""
 
     def setUp(self):
         self._orig_get_config = configmanage.get_config
+        self._orig_open_browser = guimanage._open_browser
         self._orig_modules = dict(sys.modules)
 
     def tearDown(self):
         configmanage.get_config = self._orig_get_config
+        # 还原 _open_browser：否则本类替换的 lambda 会泄漏给后续测试类
+        guimanage._open_browser = self._orig_open_browser
         sys.modules.clear()
         sys.modules.update(self._orig_modules)
 
@@ -2062,6 +2198,54 @@ class TestCacheBackupHistory(GuiServerTestBase):
         self.assertEqual(status, 400)
         self.assertIn("缺少 id", json.loads(raw)["error"])
 
+    def test_history_rename_ok(self):
+        """POST /api/history/rename 透传 correctmanage.rename_history(id, newName)。"""
+        import correctmanage
+
+        with mock.patch.object(
+            correctmanage, "rename_history", return_value={"ok": True, "display_name": "新名"}
+        ) as rh:
+            status, raw = self._post("/api/history/rename", {"id": "abc", "newName": "新名"})
+        self.assertEqual(status, 200, raw)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["display_name"], "新名")
+        rh.assert_called_once_with("abc", "新名")
+
+    def test_history_rename_missing_id_400(self):
+        """缺 id → 400。"""
+        status, raw = self._post("/api/history/rename", {"id": "", "newName": "x"})
+        self.assertEqual(status, 400)
+        self.assertIn("缺少 id", json.loads(raw)["error"])
+
+    def test_history_rename_bad_type_400(self):
+        """newName 非字符串 → 400。"""
+        status, raw = self._post("/api/history/rename", {"id": "abc", "newName": 123})
+        self.assertEqual(status, 400)
+        self.assertIn("newName", json.loads(raw)["error"])
+
+    def test_history_rename_value_error_400(self):
+        """rename_history 抛 ValueError → 400（透传中文消息，不触 500）。"""
+        import correctmanage
+
+        with mock.patch.object(
+            correctmanage, "rename_history", side_effect=ValueError("名称含非法字符（含 \\ / :）")
+        ):
+            status, raw = self._post("/api/history/rename", {"id": "abc", "newName": "a/b"})
+        self.assertEqual(status, 400)
+        self.assertIn("非法字符", json.loads(raw)["error"])
+
+    def test_history_rename_lookup_error_404(self):
+        """rename_history 抛 LookupError → 404。"""
+        import correctmanage
+
+        with mock.patch.object(
+            correctmanage, "rename_history", side_effect=LookupError("无法定位所属 PDF 组")
+        ):
+            status, raw = self._post("/api/history/rename", {"id": "abc", "newName": "新名"})
+        self.assertEqual(status, 404)
+        self.assertIn("无法定位", json.loads(raw)["error"])
+
     def test_history_export_backup_ok(self):
         """POST /api/history/export/backup：版本打包成 ZIP 写入 data/data/ 并回传路径。
 
@@ -2228,6 +2412,145 @@ class TestCacheBackupHistory(GuiServerTestBase):
             )
         self.assertEqual(status, 400)
         self.assertIn("没有可导出", json.loads(raw)["error"])
+
+
+class TestEpubMetaEndpoints(GuiServerTestBase):
+    """EPUB 书籍信息端点（/api/epub/meta/read|save）。"""
+
+    def test_read_ok(self):
+        """POST /api/epub/meta/read 透传 epubmetamanage.read_epub_metadata。"""
+        info = {"ok": True, "path": "/x.epub", "title": "书", "author": "作者",
+                "description": "简介", "language": "zh-CN", "cover_data_uri": "data:image/png;base64,AA"}
+        with mock.patch.object(epubmetamanage, "read_epub_metadata", return_value=info) as rd:
+            status, raw = self._post("/api/epub/meta/read", {"path": "/x.epub"})
+        self.assertEqual(status, 200, raw)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["title"], "书")
+        rd.assert_called_once_with("/x.epub")
+
+    def test_read_non_dict_400(self):
+        status, raw = self._post("/api/epub/meta/read", ["x"])
+        self.assertEqual(status, 400)
+        self.assertIn("无效的 JSON", json.loads(raw)["error"])
+
+    def test_read_missing_path_400(self):
+        status, raw = self._post("/api/epub/meta/read", {"path": ""})
+        self.assertEqual(status, 400)
+        self.assertIn("缺少 path", json.loads(raw)["error"])
+
+    def test_read_not_found_404(self):
+        with mock.patch.object(
+            epubmetamanage, "read_epub_metadata", side_effect=FileNotFoundError("文件不存在")
+        ):
+            status, raw = self._post("/api/epub/meta/read", {"path": "/no.epub"})
+        self.assertEqual(status, 404)
+        self.assertIn("不存在", json.loads(raw)["error"])
+
+    def test_read_error_500(self):
+        with mock.patch.object(
+            epubmetamanage, "read_epub_metadata", side_effect=Exception("boom")
+        ):
+            status, raw = self._post("/api/epub/meta/read", {"path": "/x.epub"})
+        self.assertEqual(status, 500)
+        self.assertIn("boom", json.loads(raw)["error"])
+
+    def test_save_ok(self):
+        """POST /api/epub/meta/save 透传字段；无 cover_path 时 cover_bytes=None。"""
+        with mock.patch.object(
+            epubmetamanage, "save_epub_metadata", return_value={"ok": True, "path": "/x.epub"}
+        ) as sv:
+            status, raw = self._post(
+                "/api/epub/meta/save",
+                {"path": "/x.epub", "title": "书", "author": "作者",
+                 "description": "简介", "language": "zh-CN"},
+            )
+        self.assertEqual(status, 200, raw)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["path"], "/x.epub")
+        sv.assert_called_once_with(
+            "/x.epub", title="书", author="作者", description="简介",
+            language="zh-CN", cover_bytes=None, cover_ext=None, out_path=None,
+        )
+
+    def test_save_with_out_path(self):
+        """传 out_path → 透传给 save_epub_metadata，响应 path 为另存目标。"""
+        dest = os.path.join(tempfile.gettempdir(), "副本.epub")
+        with mock.patch.object(
+            epubmetamanage, "save_epub_metadata", return_value={"ok": True, "path": dest}
+        ) as sv:
+            status, raw = self._post(
+                "/api/epub/meta/save", {"path": "/x.epub", "out_path": dest, "title": "书"}
+            )
+        self.assertEqual(status, 200, raw)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["path"], dest)
+        self.assertEqual(sv.call_args.kwargs["out_path"], dest)
+
+    def test_save_out_path_non_string_400(self):
+        status, raw = self._post("/api/epub/meta/save", {"path": "/x.epub", "out_path": 123})
+        self.assertEqual(status, 400)
+        self.assertIn("out_path", json.loads(raw)["error"])
+
+    def test_save_out_path_missing_dir_400(self):
+        missing = os.path.join(tempfile.gettempdir(), "ptoe_no_such_dir_9f3", "y.epub")
+        status, raw = self._post("/api/epub/meta/save", {"path": "/x.epub", "out_path": missing})
+        self.assertEqual(status, 400)
+        self.assertIn("目标目录不存在", json.loads(raw)["error"])
+
+    def test_save_with_cover_file(self):
+        """cover_path 存在 → 读取字节并传 cover_bytes / cover_ext。"""
+        fd, cover = tempfile.mkstemp(prefix="test_cover_", suffix=".png")
+        os.close(fd)
+        with open(cover, "wb") as fh:
+            fh.write(b"\x89PNG\r\n\x1a\nDATA")
+        self.addCleanup(os.unlink, cover)
+        with mock.patch.object(
+            epubmetamanage, "save_epub_metadata", return_value={"ok": True, "path": "/x.epub"}
+        ) as sv:
+            status, raw = self._post(
+                "/api/epub/meta/save", {"path": "/x.epub", "title": "书", "cover_path": cover}
+            )
+        self.assertEqual(status, 200, raw)
+        args, kwargs = sv.call_args
+        self.assertEqual(args, ("/x.epub",))
+        self.assertEqual(kwargs["cover_bytes"], b"\x89PNG\r\n\x1a\nDATA")
+        self.assertEqual(kwargs["cover_ext"], ".png")
+
+    def test_save_non_dict_400(self):
+        status, raw = self._post("/api/epub/meta/save", ["x"])
+        self.assertEqual(status, 400)
+        self.assertIn("无效的 JSON", json.loads(raw)["error"])
+
+    def test_save_missing_path_400(self):
+        status, raw = self._post("/api/epub/meta/save", {"path": ""})
+        self.assertEqual(status, 400)
+        self.assertIn("缺少 path", json.loads(raw)["error"])
+
+    def test_save_cover_missing_400(self):
+        status, raw = self._post(
+            "/api/epub/meta/save", {"path": "/x.epub", "cover_path": "/no/cover.png"}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("封面文件不存在", json.loads(raw)["error"])
+
+    def test_save_not_found_404(self):
+        with mock.patch.object(
+            epubmetamanage, "save_epub_metadata", side_effect=FileNotFoundError("文件不存在")
+        ):
+            status, raw = self._post("/api/epub/meta/save", {"path": "/no.epub"})
+        self.assertEqual(status, 404)
+        self.assertIn("不存在", json.loads(raw)["error"])
+
+    def test_save_error_500(self):
+        with mock.patch.object(
+            epubmetamanage, "save_epub_metadata", side_effect=Exception("boom")
+        ):
+            status, raw = self._post("/api/epub/meta/save", {"path": "/x.epub"})
+        self.assertEqual(status, 500)
+        self.assertIn("boom", json.loads(raw)["error"])
 
 
 if __name__ == "__main__":

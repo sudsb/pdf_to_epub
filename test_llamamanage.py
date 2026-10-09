@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 import llamamanage as llm
+import configmanage
 
 
 class _FakeResp:
@@ -1206,3 +1207,557 @@ class TestTruncationWarningBudgetMessage(unittest.TestCase):
         )
         self.assertIn("调大 max_tokens 无效", w)
         self.assertIn("调大 ctx_size", w)
+
+
+# =============================================================================
+# 2026-10-05：矫正/转换过程中 llama-server 宿主 RAM 持续上涨
+#   任务 A：--ctx-checkpoints 0 / --cache-ram 0（掐掉每请求的 KV 快照与空闲 slot 缓存）
+#   任务 B：recycle_* 阈值 + maybe_recycle_server（残余泄漏只有重启进程才回收）
+# =============================================================================
+
+
+class _RunServerHarness:
+    """runserver 执行夹具：mock 掉子进程/探测/引擎探测，返回 (ok, args, printed)。
+
+    与既有测试（TestPerfTuning._run_server / TestFlashAttnIntegerOff._run_capture）
+    同风格：可控制 _server_supports_arg（flag 支持性）并捕获中文输出。
+    """
+
+    @staticmethod
+    def run(sargs, supports=True):
+        fake_proc = mock.Mock()
+        fake_proc.poll.return_value = None
+        fake_resp = mock.Mock(status_code=200)
+        cfg = {"llama_server_args": dict(sargs)}
+        orig_proc = llm._server_process
+        llm._server_process = None
+        printed = []
+        _orig_print = builtins.print
+        try:
+            builtins.print = lambda *a, **kw: printed.append(" ".join(str(x) for x in a))
+            with mock.patch.object(llm, "_reload_config",
+                                   return_value=("exe", "mdir", {"HY": {"name": "HY.gguf"}}, "HY")), \
+                 mock.patch.object(llm, "get_config", return_value=cfg), \
+                 mock.patch.object(llm, "_probe_server", return_value="none"), \
+                 mock.patch.object(llm, "_detect_gpu", return_value=("", "")), \
+                 mock.patch.object(llm, "_server_supports_arg", return_value=supports), \
+                 mock.patch.object(llm.os.path, "exists", return_value=True), \
+                 mock.patch.object(llm.subprocess, "Popen", return_value=fake_proc) as popen_mock, \
+                 mock.patch.object(llm._SESSION, "get", return_value=fake_resp):
+                ok = llm.runserver("HY")
+            args = popen_mock.call_args[0][0]
+        finally:
+            builtins.print = _orig_print
+            llm._server_process = orig_proc
+        return ok, args, printed
+
+
+class TestHostRamStartupFlags(unittest.TestCase):
+    """--ctx-checkpoints / --cache-ram：默认禁用，且不同构建/非法值都不阻断启动。"""
+
+    @staticmethod
+    def _val(args, flag):
+        """取 flag 后的值；flag 不存在返回 None。"""
+        return args[args.index(flag) + 1] if flag in args else None
+
+    def test_defaults_in_default_config(self):
+        # 默认即"禁用"：0/0 是修复的落点，若默认值被改成 llama.cpp 内置默认
+        # （32 / 8192）就会静默退回每请求 ~150MB 的 KV 快照占用
+        sargs = configmanage.DEFAULT_CONFIG["llama_server_args"]
+        self.assertEqual(sargs["ctx_checkpoints"], "0")
+        self.assertEqual(sargs["cache_ram"], "0")
+
+    def test_flags_appended_with_zero_when_supported(self):
+        ok, args, _ = _RunServerHarness.run({"ctx_checkpoints": "0", "cache_ram": "0"})
+        self.assertTrue(ok)
+        self.assertEqual(self._val(args, "--ctx-checkpoints"), "0")
+        self.assertEqual(self._val(args, "--cache-ram"), "0")
+
+    def test_flags_default_to_zero_when_keys_absent(self):
+        # 旧版 config.json 无这两个键（validate_and_patch_config 未跑过的场景）：
+        # 仍按 0（禁用）拼装，而不是退回 llama.cpp 内置默认
+        ok, args, _ = _RunServerHarness.run({"ctx_size": "16384"})
+        self.assertTrue(ok)
+        self.assertEqual(self._val(args, "--ctx-checkpoints"), "0")
+        self.assertEqual(self._val(args, "--cache-ram"), "0")
+
+    def test_int_zero_treated_as_configured_not_missing(self):
+        # 防回归（对应 flash_attn 的 `str(x or '')` 老坑）：整数 0 是"已配置为 0"，
+        # 不能被判成未配置。set_llama_server_arg 写入的就是整数。
+        ok, args, _ = _RunServerHarness.run({"ctx_checkpoints": 0, "cache_ram": 0})
+        self.assertTrue(ok)
+        self.assertEqual(self._val(args, "--ctx-checkpoints"), "0")
+        self.assertEqual(self._val(args, "--cache-ram"), "0")
+
+    def test_skipped_when_build_unsupported(self):
+        # 老构建没有这两个 flag：静默跳过，绝不因未知参数让进程启动即退出
+        ok, args, printed = _RunServerHarness.run(
+            {"ctx_checkpoints": "0", "cache_ram": "0"}, supports=False
+        )
+        self.assertTrue(ok)
+        self.assertNotIn("--ctx-checkpoints", args)
+        self.assertNotIn("--cache-ram", args)
+        self.assertTrue(any("不支持 --ctx-checkpoints" in p for p in printed))
+        self.assertTrue(any("不支持 --cache-ram" in p for p in printed))
+
+    def test_invalid_values_warn_and_fall_back_to_zero(self):
+        # 非整数 / 越界 → 中文警告 + 按 0 兜底（不退回 llama.cpp 默认），启动不中断
+        ok, args, printed = _RunServerHarness.run(
+            {"ctx_checkpoints": "abc", "cache_ram": "-5"}
+        )
+        self.assertTrue(ok, "非法值不得中断启动")
+        self.assertEqual(self._val(args, "--ctx-checkpoints"), "0")
+        self.assertEqual(self._val(args, "--cache-ram"), "0")
+        self.assertTrue(any("非法值" in p and "ctx_checkpoints" in p for p in printed))
+        self.assertTrue(any("超出允许范围" in p and "cache_ram" in p for p in printed))
+
+    def test_cache_ram_accepts_minus_one_and_positive(self):
+        # -1=不限、>0 为 MiB 上限：都应原样透传
+        _, args, _ = _RunServerHarness.run({"cache_ram": "-1"})
+        self.assertEqual(self._val(args, "--cache-ram"), "-1")
+        _, args, _ = _RunServerHarness.run({"cache_ram": "2048"})
+        self.assertEqual(self._val(args, "--cache-ram"), "2048")
+
+    def test_cache_ram_minus_two_out_of_range(self):
+        # <-1 无意义 → 警告 + 0
+        ok, args, printed = _RunServerHarness.run({"cache_ram": "-2"})
+        self.assertTrue(ok)
+        self.assertEqual(self._val(args, "--cache-ram"), "0")
+        self.assertTrue(any("超出允许范围" in p for p in printed))
+
+    def test_ctx_checkpoints_positive_passthrough(self):
+        # 用户显式开启快照（如换投机解码模型）时值应原样透传
+        _, args, _ = _RunServerHarness.run({"ctx_checkpoints": "8"})
+        self.assertEqual(self._val(args, "--ctx-checkpoints"), "8")
+
+    def test_full_long_flag_names_only(self):
+        # 短别名（-ctxcp / -cram）拼错会静默失效且难排查 → 只用完整长名
+        _, args, _ = _RunServerHarness.run({"ctx_checkpoints": "0", "cache_ram": "0"})
+        self.assertNotIn("-ctxcp", args)
+        self.assertNotIn("-cram", args)
+        self.assertIn("--ctx-checkpoints", args)
+        self.assertIn("--cache-ram", args)
+
+    def test_hint_printed_only_when_recycle_disabled(self):
+        # 两个阈值都关时提示可用（可发现性）；开启后不再提示
+        _, _, printed = _RunServerHarness.run({})
+        self.assertTrue(any("recycle_every" in p for p in printed))
+        _, _, printed = _RunServerHarness.run({"recycle_every": "50"})
+        self.assertFalse(any("recycle_every" in p for p in printed))
+
+
+class TestCfgIntHelper(unittest.TestCase):
+    """_cfg_int：配置整数解析（'0'/0 都是已配置；非法/越界有中文警告）。"""
+
+    def test_missing_returns_default(self):
+        self.assertEqual(llm._cfg_int(None, name="x", default=7, minv=0, maxv=10), 7)
+        self.assertEqual(llm._cfg_int("", name="x", default=7, minv=0, maxv=10), 7)
+        self.assertEqual(llm._cfg_int("  ", name="x", default=7, minv=0, maxv=10), 7)
+
+    def test_zero_string_and_int_are_configured(self):
+        self.assertEqual(llm._cfg_int("0", name="x", default=9, minv=0, maxv=10), 0)
+        self.assertEqual(llm._cfg_int(0, name="x", default=9, minv=0, maxv=10), 0)
+
+    def test_invalid_and_out_of_range_fall_back_with_warning(self):
+        printed = []
+        _orig = builtins.print
+        try:
+            builtins.print = lambda *a, **kw: printed.append(" ".join(str(x) for x in a))
+            self.assertEqual(llm._cfg_int("abc", name="x", default=0, minv=0, maxv=10), 0)
+            self.assertEqual(llm._cfg_int(-1, name="x", default=0, minv=0, maxv=10), 0)
+            self.assertEqual(llm._cfg_int("11", name="x", default=0, minv=0, maxv=10), 0)
+        finally:
+            builtins.print = _orig
+        self.assertEqual(len(printed), 3)
+        self.assertTrue(all("llama_server_args.x" in p for p in printed))
+
+    def test_negative_allowed_when_range_permits(self):
+        self.assertEqual(llm._cfg_int("-1", name="x", default=0, minv=-1, maxv=10), -1)
+
+
+class TestRecycleSettingsParsing(unittest.TestCase):
+    """_recycle_settings / _parse_recycle_args：阈值解析 + TTL 缓存 + 失败兜底。"""
+
+    def setUp(self):
+        self._cache = llm._RECYCLE_SETTINGS_CACHE
+        llm._RECYCLE_SETTINGS_CACHE = None
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        llm._RECYCLE_SETTINGS_CACHE = self._cache
+
+    def test_reads_config(self):
+        with mock.patch.object(llm, "get_config", return_value={
+            "llama_server_args": {"recycle_every": "40", "recycle_rss_mb": "6000"}
+        }):
+            self.assertEqual(llm._recycle_settings(), (40, 6000))
+
+    def test_defaults_disabled(self):
+        with mock.patch.object(llm, "get_config", return_value={"llama_server_args": {}}):
+            self.assertEqual(llm._recycle_settings(), (0, 0))
+
+    def test_config_read_failure_disables_silently(self):
+        # 可选优化：读配置失败不得影响识别（静默按未启用）
+        with mock.patch.object(llm, "get_config", side_effect=OSError("boom")):
+            self.assertEqual(llm._recycle_settings(), (0, 0))
+
+    def test_invalid_values_disable_with_warning(self):
+        printed = []
+        _orig = builtins.print
+        try:
+            builtins.print = lambda *a, **kw: printed.append(" ".join(str(x) for x in a))
+            with mock.patch.object(llm, "get_config", return_value={
+                "llama_server_args": {"recycle_every": "abc", "recycle_rss_mb": "-3"}
+            }):
+                self.assertEqual(llm._recycle_settings(), (0, 0))
+        finally:
+            builtins.print = _orig
+        self.assertTrue(any("recycle_every" in p for p in printed))
+        self.assertTrue(any("recycle_rss_mb" in p for p in printed))
+
+    def test_ttl_cache_avoids_rereading_config(self):
+        cfg = {"llama_server_args": {"recycle_every": "7", "recycle_rss_mb": "0"}}
+        with mock.patch.object(llm, "get_config", return_value=cfg) as gc:
+            self.assertEqual(llm._recycle_settings(), (7, 0))
+            llm._RECYCLE_SETTINGS_CACHE = (llm.time.monotonic(), 7, 0)
+            self.assertEqual(llm._recycle_settings(), (7, 0))
+        self.assertEqual(gc.call_count, 1, "TTL 内不应重复读 config.json")
+
+    def test_default_config_recycle_keys_are_disabled(self):
+        sargs = configmanage.DEFAULT_CONFIG["llama_server_args"]
+        self.assertEqual(sargs["recycle_every"], "0")
+        self.assertEqual(sargs["recycle_rss_mb"], "0")
+        self.assertEqual(llm._parse_recycle_args(sargs), (0, 0))
+
+
+class TestProcessPrivateBytes(unittest.TestCase):
+    """RSS 读取：必须用 Private Bytes（匿名提交内存），且失败静默返回 None。"""
+
+    @staticmethod
+    def _num(value):
+        """int|None / float|None → 数值（None → -1）：给 assertGreater/Less/Equal 收敛类型。"""
+        return -1 if value is None else value
+
+    def test_missing_pid_returns_none(self):
+        self.assertIsNone(llm._process_private_bytes(None))
+        self.assertIsNone(llm._process_private_bytes(0))
+
+    def test_unknown_pid_returns_none(self):
+        # 不存在的 PID → OpenProcess 失败 → None（调用方按"读不到"处理）
+        self.assertIsNone(llm._process_private_bytes(0x7FFFFFF0))
+
+    def test_self_process_returns_plausible_bytes(self):
+        import os
+
+        n = self._num(llm._process_private_bytes(os.getpid()))
+        if os.name != "nt":
+            self.assertEqual(n, -1, "非 Windows 无 Private Usage，退回 None")
+        else:
+            self.assertGreater(n, 0)
+            self.assertLess(n, 1 << 40, "单进程私有字节不应达 TB 级（句柄截断会爆表）")
+
+    def test_server_private_mb_uses_handle_pid(self):
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        proc.pid = 4242
+        orig = llm._server_process
+        llm._server_process = proc
+        try:
+            with mock.patch.object(llm, "_process_private_bytes", return_value=6 * 1024 * 1024) as pmb:
+                self.assertEqual(self._num(llm._server_private_mb()), 6.0)
+            pmb.assert_called_once_with(4242)
+        finally:
+            llm._server_process = orig
+
+    def test_server_private_mb_none_when_unreadable(self):
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        proc.pid = 4242
+        orig = llm._server_process
+        llm._server_process = proc
+        try:
+            with mock.patch.object(llm, "_process_private_bytes", return_value=None):
+                self.assertIsNone(llm._server_private_mb())
+        finally:
+            llm._server_process = orig
+
+    def test_server_pid_falls_back_to_port_lookup(self):
+        # 本进程无句柄（外部启动的实例）→ 按配置端口找 llama-server 监听者
+        orig_proc = llm._server_process
+        orig_cache = llm._SERVER_PID_CACHE
+        llm._server_process = None
+        llm._SERVER_PID_CACHE = (0.0, None)
+        try:
+            with mock.patch.object(llm, "_listener_pids", return_value={"777", "888"}) as lp, \
+                 mock.patch.object(llm, "_pid_image_name", side_effect=lambda p: "llama-server.exe" if p == "888" else "chrome.exe"):
+                self.assertEqual(llm._server_pid(), 888)
+            lp.assert_called_once()
+            # 结果缓存：第二次不再拉起 netstat
+            with mock.patch.object(llm, "_listener_pids", side_effect=AssertionError("不该再查")):
+                self.assertEqual(llm._server_pid(), 888)
+        finally:
+            llm._server_process = orig_proc
+            llm._SERVER_PID_CACHE = orig_cache
+
+    def test_listener_pids_parses_netstat(self):
+        out = (
+            "  Proto  Local Address          Foreign Address        State           PID\n"
+            "  TCP    127.0.0.1:8080         0.0.0.0:0              LISTENING       1234\n"
+            "  TCP    127.0.0.1:8080         127.0.0.1:5555         ESTABLISHED     1234\n"
+            "  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       999\n"
+        )
+        with mock.patch.object(llm.subprocess, "check_output", return_value=out):
+            self.assertEqual(llm._listener_pids("8080"), {"1234"})
+
+    def test_listener_pids_empty_on_failure(self):
+        with mock.patch.object(llm.subprocess, "check_output", side_effect=OSError("no netstat")):
+            self.assertEqual(llm._listener_pids("8080"), set())
+
+
+class TestMaybeRecycleServer(unittest.TestCase):
+    """maybe_recycle_server：阈值触发、stop→run→probe 顺序、并发只回收一次。"""
+
+    def setUp(self):
+        self._count = llm._RECYCLE_COUNT
+        self._cache = llm._RECYCLE_SETTINGS_CACHE
+        llm._RECYCLE_COUNT = 0
+        llm._RECYCLE_SETTINGS_CACHE = None
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        llm._RECYCLE_COUNT = self._count
+        llm._RECYCLE_SETTINGS_CACHE = self._cache
+
+    def _ctx(self, *, runserver_ok=True, probe="match", private_mb=None, sleep=0.0):
+        """返回 (ExitStack, calls)：stack 供 with 使用，calls 记录 stop/run/probe 次序。"""
+        import contextlib
+        import time as _time
+
+        calls = []
+
+        def fake_stop():
+            calls.append("stop")
+
+        def fake_run(model_key="HY", **kw):
+            calls.append("run")
+            if sleep:
+                _time.sleep(sleep)
+            return runserver_ok
+
+        def fake_probe(model_name):
+            calls.append(("probe", model_name))
+            return probe
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(llm, "_active_engine", return_value="llama"))
+        stack.enter_context(mock.patch.object(llm, "stopserver", side_effect=fake_stop))
+        stack.enter_context(mock.patch.object(llm, "runserver", side_effect=fake_run))
+        stack.enter_context(mock.patch.object(llm, "_probe_server", side_effect=fake_probe))
+        stack.enter_context(mock.patch.object(
+            llm, "_reload_config",
+            return_value=("exe", "mdir", {"HY": {"name": "HY.gguf"}}, "HY")))
+        stack.enter_context(mock.patch.object(llm, "_server_private_mb", return_value=private_mb))
+        return stack, calls
+
+    def test_disabled_returns_false_without_touching_server(self):
+        stack, calls = self._ctx()
+        with stack:
+            self.assertFalse(llm.maybe_recycle_server("HY", settings=(0, 0)))
+        self.assertEqual(calls, [], "未配置阈值时不得 stop/run/probe")
+
+    def test_recycle_every_triggers_on_nth_request(self):
+        stack, calls = self._ctx()
+        with stack:
+            got = [llm.maybe_recycle_server("HY", settings=(3, 0)) for _ in range(5)]
+        self.assertEqual(got, [False, False, True, False, False], "第 3 个请求触发一次")
+        self.assertEqual(calls, ["stop", "run", ("probe", "HY.gguf")])
+
+    def test_recycle_does_stop_then_run_then_probe(self):
+        # 顺序契约：stop → run → probe（不 probe 会把下一个请求打到未就绪服务）
+        stack, calls = self._ctx()
+        with stack:
+            self.assertTrue(llm.maybe_recycle_server("HY", settings=(1, 0)))
+        self.assertEqual(calls[0], "stop")
+        self.assertEqual(calls[1], "run")
+        self.assertEqual(calls[2][0], "probe")
+
+    def test_counter_resets_after_recycle(self):
+        # recycle_every=2：第 2 个请求回收并把计数清零 → 第 3 个不应再次触发
+        # （若不清零，第 3 个请求计数为 3 >= 2 会再回收一次）
+        stack, calls = self._ctx()
+        with stack:
+            got = [llm.maybe_recycle_server("HY", settings=(2, 0)) for _ in range(3)]
+        self.assertEqual(got, [False, True, False])
+        self.assertEqual(calls.count("stop"), 1, "回收后计数归零，2 个请求内不再回收")
+
+    def test_rss_threshold_triggers_only_above_limit(self):
+        stack, calls = self._ctx(private_mb=6001.0)
+        with stack:
+            self.assertTrue(llm.maybe_recycle_server("HY", settings=(0, 6000)))
+        self.assertEqual(calls.count("stop"), 1)
+
+        stack, calls = self._ctx(private_mb=5999.0)
+        with stack:
+            self.assertFalse(llm.maybe_recycle_server("HY", settings=(0, 6000)))
+        self.assertEqual(calls, [])
+
+    def test_unreadable_memory_does_not_recycle(self):
+        # 读不到私有内存（无句柄/非 Windows）→ 不误回收
+        stack, calls = self._ctx(private_mb=None)
+        with stack:
+            self.assertFalse(llm.maybe_recycle_server("HY", settings=(0, 100)))
+        self.assertEqual(calls, [])
+
+    def test_failed_restart_returns_false(self):
+        stack, calls = self._ctx(runserver_ok=False)
+        with stack:
+            self.assertFalse(llm.maybe_recycle_server("HY", settings=(1, 0)))
+        self.assertEqual(calls, ["stop", "run"], "启动失败后不再 probe")
+
+    def test_probe_mismatch_reports_failure(self):
+        stack, calls = self._ctx(probe="mismatch")
+        with stack:
+            self.assertFalse(llm.maybe_recycle_server("HY", settings=(1, 0)))
+        self.assertEqual(calls[-1], ("probe", "HY.gguf"))
+
+    def test_non_llama_engine_never_recycles(self):
+        stack, calls = self._ctx()
+        with stack:
+            with mock.patch.object(llm, "_active_engine", return_value="vllm"):
+                self.assertFalse(llm.maybe_recycle_server("HY", settings=(1, 0), force=True))
+        self.assertEqual(calls, [])
+
+    def test_force_recycles_even_when_disabled(self):
+        stack, calls = self._ctx()
+        with stack:
+            self.assertTrue(llm.maybe_recycle_server("HY", settings=(0, 0), force=True))
+        self.assertEqual(calls.count("stop"), 1)
+
+    def test_settings_read_from_config_when_not_passed(self):
+        stack, calls = self._ctx()
+        cfg = {"llama_server_args": {"recycle_every": "1", "recycle_rss_mb": "0"}}
+        with stack, mock.patch.object(llm, "get_config", return_value=cfg):
+            self.assertTrue(llm.maybe_recycle_server("HY"))
+        self.assertEqual(calls.count("stop"), 1)
+
+    def test_concurrent_workers_recycle_once_per_window(self):
+        # 8 个 worker 并发 + recycle_every=3 → 恰好 2 次回收（3/6），
+        # 且第二个 worker 不会与第一个并行重启服务（锁内串行）
+        import threading
+        import time as _time
+
+        stack, calls = self._ctx(sleep=0.02)
+        barrier = threading.Barrier(8)
+        with stack:
+            results = []
+
+            def worker():
+                barrier.wait()
+                results.append(llm.maybe_recycle_server("HY", settings=(3, 0)))
+
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+        self.assertEqual(len(results), 8, "所有 worker 都应完成")
+        self.assertEqual(calls.count("stop"), 2, f"应恰好 2 次回收，实际 {calls.count('stop')}")
+        self.assertEqual(calls.count("run"), 2)
+        self.assertEqual(sum(1 for r in results if r), 2)
+
+    def test_runserver_receives_ctx_size_and_mmproj(self):
+        # 回收必须用与初次启动一致的启动参数（矫正界面传 8192 + 图像模型）
+        import contextlib
+
+        seen = {}
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(llm, "_active_engine", return_value="llama"))
+        stack.enter_context(mock.patch.object(llm, "stopserver"))
+        stack.enter_context(mock.patch.object(llm, "runserver", side_effect=lambda k, **kw: seen.update(kw) or True))
+        stack.enter_context(mock.patch.object(llm, "_probe_server", return_value="match"))
+        stack.enter_context(mock.patch.object(
+            llm, "_reload_config",
+            return_value=("exe", "mdir", {"HY": {"name": "HY.gguf"}}, "HY")))
+        with stack:
+            self.assertTrue(llm.maybe_recycle_server(
+                "HY", with_mmproj=False, ctx_size=8192, settings=(1, 0)))
+        self.assertEqual(seen.get("ctx_size"), 8192)
+        self.assertIs(seen.get("with_mmproj"), False)
+
+
+class TestRecycleCountersReset(unittest.TestCase):
+    """服务启停时回收计数归零（RAM 已回基线）。"""
+
+    def setUp(self):
+        self._count = llm._RECYCLE_COUNT
+        llm._RECYCLE_COUNT = 5
+        self.addCleanup(lambda: setattr(llm, "_RECYCLE_COUNT", self._count))
+
+    def test_stopserver_resets_count(self):
+        orig_proc = llm._server_process
+        llm._server_process = None
+        try:
+            with mock.patch.object(llm, "_kill_port_owner", return_value=False), \
+                 mock.patch.object(llm, "_server_port", return_value="8080"):
+                llm.stopserver()
+        finally:
+            llm._server_process = orig_proc
+        self.assertEqual(llm._RECYCLE_COUNT, 0)
+
+    def test_runserver_success_resets_count(self):
+        _ok, _args, _printed = _RunServerHarness.run({})
+        self.assertEqual(llm._RECYCLE_COUNT, 0, "新进程启动成功应把回收计数归零")
+
+
+class TestBatchInferRecycleHook(unittest.TestCase):
+    """batch_infer：每页请求前调用 maybe_recycle_server，传入批次级 settings。"""
+
+    def setUp(self):
+        self._cache = llm._RECYCLE_SETTINGS_CACHE
+        llm._RECYCLE_SETTINGS_CACHE = None
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        llm._RECYCLE_SETTINGS_CACHE = self._cache
+
+    @staticmethod
+    def _fake_request(prompt, img, model_key, thinking=False, img_is_base64=False,
+                      timeout=llm.REQUEST_TIMEOUT, model_name=None):
+        return {"img": img, "result": "ok", "error": None}
+
+    def test_hook_called_once_per_page_with_batch_settings(self):
+        images = [f"/tmp/f{i}.png" for i in range(4)]
+        cfg = {"llama_server_args": {"recycle_every": "2", "recycle_rss_mb": "0"}}
+        with mock.patch.object(llm, "_reload_config",
+                               return_value=("exe", "mdir", {"HY": {"name": "HY.gguf"}}, "HY")), \
+             mock.patch.object(llm, "get_config", return_value=cfg), \
+             mock.patch.object(llm, "_request_image_new", side_effect=self._fake_request), \
+             mock.patch.object(llm, "maybe_recycle_server") as rec:
+            out = llm.batch_infer(images, ["p"] * 4, model_key="HY", max_workers=2)
+        self.assertEqual(len(out), 4)
+        self.assertEqual(rec.call_count, 4, "每页请求前各检查一次")
+        for c in rec.call_args_list:
+            self.assertEqual(c.args, ("HY",))
+            self.assertEqual(c.kwargs.get("settings"), (2, 0), "阈值应批次级解析一次传入")
+
+    def test_recycle_error_does_not_abort_batch(self):
+        # 回收检查本身抛异常不得影响识别（逐页失败语义由 _request_image_new 兜底）
+        images = [f"/tmp/f{i}.png" for i in range(3)]
+        with mock.patch.object(llm, "_reload_config",
+                               return_value=("exe", "mdir", {"HY": {"name": "HY.gguf"}}, "HY")), \
+             mock.patch.object(llm, "get_config", return_value={"llama_server_args": {}}), \
+             mock.patch.object(llm, "_request_image_new", side_effect=self._fake_request), \
+             mock.patch.object(llm, "maybe_recycle_server", side_effect=RuntimeError("boom")):
+            out = llm.batch_infer(images, ["p"] * 3, model_key="HY", max_workers=2)
+        self.assertEqual(len(out), 3)
+        self.assertTrue(all(r["error"] is None for r in out))
+
+    def test_no_recycle_when_settings_disabled(self):
+        images = [f"/tmp/f{i}.png" for i in range(3)]
+        with mock.patch.object(llm, "_reload_config",
+                               return_value=("exe", "mdir", {"HY": {"name": "HY.gguf"}}, "HY")), \
+             mock.patch.object(llm, "get_config", return_value={"llama_server_args": {}}), \
+             mock.patch.object(llm, "_request_image_new", side_effect=self._fake_request), \
+             mock.patch.object(llm, "_recycle_server_process") as srv:
+            llm.batch_infer(images, ["p"] * 3, model_key="HY", max_workers=1)
+        srv.assert_not_called()
