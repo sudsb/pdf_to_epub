@@ -319,7 +319,8 @@
       "sup",
       "sub"
     ],
-    "proofread_batch_pages": 1
+    "proofread_batch_pages": 1,
+    "undo_depth": 100
   },
   "proofread_engine": "llama",
   "mouse_shortcuts": {},

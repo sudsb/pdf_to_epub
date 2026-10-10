@@ -8903,6 +8903,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "popup_row2": ["note"],
                     "popup_rule_count": 3,
                     "proofread_batch_pages": 1,
+                    "undo_depth": 100,
                 },
             )
         finally:
@@ -8916,7 +8917,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
         try:
             res = requests.get(base + "/api/ui_settings").json()
             self.assertTrue(res["ok"])
-            # All eight keys present with default values
+            # All nine keys present with default values
             self.assertEqual(
                 res["ui_settings"],
                 {
@@ -8929,6 +8930,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "popup_row2": ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"],
                     "popup_rule_count": 5,
                     "proofread_batch_pages": 1,
+                    "undo_depth": 100,
                 },
             )
         finally:
@@ -9183,6 +9185,43 @@ class TestUiSettingsEndpoint(unittest.TestCase):
             ).json()
             self.assertFalse(res["ok"])
             self.assertIn("范围", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+    def test_post_undo_depth_persists(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"undo_depth": 200}}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(calls, [{"undo_depth": 200}])
+        finally:
+            self._stop(server)
+
+    def test_post_undo_depth_invalid_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"undo_depth": 123}}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("无效", res["error"])
             self.assertEqual(calls, [])
         finally:
             self._stop(server)
@@ -10077,8 +10116,16 @@ class TestSetUiSettingsConfig(unittest.TestCase):
                 "popup_row2": ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"],
                 "popup_rule_count": 5,
                 "proofread_batch_pages": 1,
+                "undo_depth": 100,
             },
         )
+
+    def test_undo_depth_defensive_fallback(self):
+        # 非法档位 → 回退默认 100；合法档位保留
+        cfg = self.cm.set_ui_settings({"undo_depth": 999})
+        self.assertEqual(cfg["ui_settings"]["undo_depth"], 100)
+        cfg2 = self.cm.set_ui_settings({"undo_depth": 200})
+        self.assertEqual(cfg2["ui_settings"]["undo_depth"], 200)
 
     def test_popup_defensive_fallback(self):
         # 结构性非法（非列表 / 含非法项 / 越界数值 / 布尔）→ 回退默认

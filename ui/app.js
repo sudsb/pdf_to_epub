@@ -110,6 +110,12 @@ function tipDelay() { return uiv('tip_delay', 600); }
 function errHoverDelay() { return uiv('err_hover_delay', 1500); }
 // 每批「校正 / 重识别」处理页数（1-50，默认 1；服务端持久化 config.json ui_settings）
 function proofreadBatchCount() { return Math.max(1, Math.min(50, uiv('proofread_batch_pages', 1))); }
+// 撤销/回退历史步数档位（50/100/200/500，默认 100；服务端持久化 config.json ui_settings）
+const UNDO_DEPTH_CHOICES = [50, 100, 200, 500];
+function undoLimit() {
+  const v = parseInt(uiv('undo_depth', 100), 10);
+  return UNDO_DEPTH_CHOICES.indexOf(v) >= 0 ? v : 100;
+}
 
 // 设置「界面」页偏好：服务端持久化到 config.json（/api/ui_settings）。
 // correct_pages 每运行随机端口 → localStorage 按 origin 隔离每次失效，
@@ -119,7 +125,7 @@ const POPUP_ELIGIBLE_OPS = ['bold','italic','underline','strike','highlight','ch
 const UI_SETTINGS_DEFAULTS = { tip_delay: 600, err_hover_delay: 1500, editor_font_size: 14, img_mode: '', rule_all_pages_confirm: true,
   popup_row1: ['bold','italic','heading','p','note','citation','paint','remove'],
   popup_row2: ['align_left','align_center','align_right','centerbold','merge','sup','sub'],
-  popup_rule_count: 5, proofread_batch_pages: 1 };
+  popup_rule_count: 5, proofread_batch_pages: 1, undo_depth: 100 };
 let uiSettings = null; // 服务端加载前为 null → 读 localStorage 兜底；加载后为完整对象
 function uiv(key, def) {
   if (uiSettings && key in uiSettings && uiSettings[key] !== undefined && uiSettings[key] !== null) return uiSettings[key];
@@ -154,6 +160,8 @@ async function loadUiSettingsFromServer() {
       if (rac) rac.checked = !!uiSettings.rule_all_pages_confirm;
       const pb = document.getElementById('prBatchPages');
       if (pb) pb.value = uiSettings.proofread_batch_pages;
+      const ud = document.getElementById('undoDepthInput');
+      if (ud) ud.value = String(undoLimit());
       if (document.getElementById('popupRow1List')) initPopupSettings(); // 弹出菜单编辑器同步
     }
   } catch (e) { console.warn('loadUiSettingsFromServer failed: ' + e.message); }
@@ -169,6 +177,7 @@ function saveUIMirror() {
     localStorage.setItem('ptoe_popup_row2', JSON.stringify(uiSettings.popup_row2 || UI_SETTINGS_DEFAULTS.popup_row2));
     localStorage.setItem('ptoe_popup_rule_count', String(uiSettings.popup_rule_count != null ? uiSettings.popup_rule_count : UI_SETTINGS_DEFAULTS.popup_rule_count));
     localStorage.setItem('ptoe_proofread_batch_pages', String(uiSettings.proofread_batch_pages != null ? uiSettings.proofread_batch_pages : UI_SETTINGS_DEFAULTS.proofread_batch_pages));
+    localStorage.setItem('ptoe_undo_depth', String(uiSettings.undo_depth != null ? uiSettings.undo_depth : UI_SETTINGS_DEFAULTS.undo_depth));
   } catch (e) {}
 }
 function saveUiSettings() {
@@ -1039,6 +1048,7 @@ function updatePrBadge() {
     }
   }
   numEl.textContent = String(total);
+  _updateAllPageErrBadges();
 }
 function jumpToPageIndex(idx) {
   if (idx < 0 || idx >= pages.length) return;
@@ -1105,7 +1115,7 @@ function pageRow(p, i) {
   row.className = 'page-row';
   row.dataset.i = i;
   row.innerHTML =
-    '<div class="page-head">第 ' + p.page + ' 页</div>' +
+    '<div class="page-head">第 ' + p.page + ' 页<span class="page-err-badge" data-err-badge="' + i + '" hidden></span></div>' +
     '<div class="img-panel"><span class="badge">预览</span>' +
     '<button type="button" class="img-insert" title="插入图片到右侧文字光标处（居中；显示模式见工具栏「图片」）">图</button>' +
     '<button type="button" class="img-crop" title="裁剪左侧图片后插入到右侧文字光标处">裁</button>' +
@@ -1114,6 +1124,7 @@ function pageRow(p, i) {
   const ed = row.querySelector('.editable');
   ed.innerHTML = displayHtml(i);
   _reapplyProofread(i);
+  _updatePageErrBadge(i);
   ed.addEventListener('input', (ev) => { syncContent(ed); markDirty(i); scheduleRemeasure(i); histTouchInput(i); histScheduleIdle(); const composing = window.isComposing || (ev && (ev.isComposing || ev.inputType === 'insertCompositionText')); if (composing) { _proofreadAutoDismiss(ed, i, true); _prRenderPending[i] = true; } else { _proofreadAutoDismiss(ed, i); } });
   // 撤销/重做操作起点：beforeinput（现代浏览器，含 IME/粘贴/拖放/键盘）为主，
   // keydown（可打印键/退格/删除/回车）与 compositionstart/paste 作兼容兜底；
@@ -6602,7 +6613,7 @@ document.addEventListener('mousedown', (e) => {
 });
 
 // ---------- 文字纠错（proofread） ----------
-// 视图层叠加标注（仿搜索高亮机制），不进 undo 快照；服务端 proofread_page 检测错误。
+// 视图层叠加标注（仿搜索高亮机制）；校正/重识别/清除标注 现在入撤销栈（仅当页有实际变化时产生条目）；服务端 proofread_page 检测错误。
 let proofreadErrors = {};   // pageIndex → errors 数组
 let proofreadDismissed = {}; // pageIndex → Set('start:wrong')
 let proofreadOriginal = {};  // pageIndex → 校正前的 innerHTML 快照（用于回退）
@@ -6646,7 +6657,7 @@ function _applyProofreadResult(k, errors) {
   return errs.length;
 }
 
-// 纠错当前编辑行：调 /api/proofread → 叠加标注（不入 undo）
+// 纠错当前编辑行：调 /api/proofread → 叠加标注（校正结果入撤销栈）
 // 批处理：从当前页起连续校正 proofreadBatchCount() 页（默认 1）。
 async function runProofread() {
   const ed = currentEditable();
@@ -6655,6 +6666,10 @@ async function runProofread() {
   if (!row) return;
   const start = Number(row.dataset.i);
   const indices = _batchRange(start, proofreadBatchCount());
+  // 标注操作入撤销栈：校正前快照（内容 + 错误标注）；仅实际有变化的页会产生撤销条目
+  const errBefore = new Map();
+  for (const k of indices) errBefore.set(k, _copyErrors(k));
+  const before = histBegin('校正', indices);
   let total = 0, pagesDone = 0, llmErr = false;
   let lastDoneIdx = start; // 最后真正处理成功的页索引（多页批处理时「校正至」应指向末页而非首页）
   for (const k of indices) {
@@ -6683,6 +6698,7 @@ async function runProofread() {
       showToast('第 ' + pages[k].page + ' 页纠错失败: ' + e.message, 'fail');
     }
   }
+  histEnd(before, '校正', errBefore);
   if (llmErr) showToast('部分页深度校对失败', 'warn');
   lastProofreadPage = pages[lastDoneIdx].page;
   updatePagePos();
@@ -6805,6 +6821,7 @@ function renderProofread(i) {
   // C: 重建后同步基准文本（供 _proofreadAutoDismiss delta-rebase 使用）
   _prTextBefore[i] = _plainNoAnno(ed);
   updatePrCount();
+  _updatePageErrBadge(i);
   // P2: 恢复光标（按保存的字符偏移定位文本节点）
   if (savedSelOffset >= 0) {
     try {
@@ -6852,6 +6869,7 @@ function clearProofread(i, keepDismissed) {
   }
   ed.normalize();
   proofreadErrors[i] = [];
+  _updatePageErrBadge(i);
   delete proofreadOriginal[i];
   if (!keepDismissed) delete proofreadDismissed[i];
   delete _prTextBefore[i];
@@ -6895,6 +6913,27 @@ function _reapplyProofread(i) {
   if (proofreadErrors[i] && proofreadErrors[i].length) {
     renderProofread(i);
   }
+}
+// 每页纠错角标：本页未处理（未采纳/未忽略）的纠错数量；页面懒挂载时按需刷新
+function _pageErrCount(i) {
+  const errs = proofreadErrors[i];
+  if (!errs || !errs.length) return 0;
+  let n = 0;
+  for (const e of errs) { if (!e._gone) n++; }
+  return n;
+}
+function _updatePageErrBadge(i) {
+  const row = host.querySelector('.page-row[data-i="' + i + '"]');
+  if (!row) return;
+  const badge = row.querySelector('.page-err-badge');
+  if (!badge) return;
+  const n = _pageErrCount(i);
+  if (n > 0) { badge.textContent = '待纠错 ' + n; badge.hidden = false; badge.title = '本页有 ' + n + ' 处待纠错'; }
+  else { badge.textContent = ''; badge.hidden = true; badge.title = ''; }
+}
+function _updateAllPageErrBadges() {
+  if (!host.children) return;
+  for (const row of host.children) _updatePageErrBadge(Number(row.dataset.i));
 }
 
 // 取去除标注后的纯文本（用于重锚定偏移）
@@ -7233,6 +7272,10 @@ async function runReocr() {
   if (!row) return;
   const start = Number(row.dataset.i);
   const indices = _batchRange(start, proofreadBatchCount());
+  // 标注操作入撤销栈：重识别前快照（内容 + 错误标注）；仅实际有变化的页会产生撤销条目
+  const errBefore = new Map();
+  for (const k of indices) errBefore.set(k, _copyErrors(k));
+  const before = histBegin('重识别', indices);
   const model = proofreadLlmModel || '';
   const btn = document.getElementById('prMenuReocr');
   if (btn) btn.disabled = true;
@@ -7267,6 +7310,7 @@ async function runReocr() {
         showToast('第 ' + pages[k].page + ' 页重识别失败: ' + e.message, 'fail');
       }
     }
+    histEnd(before, '重识别', errBefore);
     lastProofreadPage = pages[lastDoneIdx].page;
     updatePagePos();
     if (pagesDone > 1) {
@@ -7301,7 +7345,8 @@ function proofreadClearCurrent() {
   if (!row) return;
   const i = Number(row.dataset.i);
   if (!ed.querySelector('.ptoe-err, .ptoe-fix')) { showToast('当前页没有纠错标注', 'warn'); setStatus('当前页没有纠错标注'); return; }
-  clearProofread(i);
+  // D6-style: 标注更动也入撤销栈
+  histRun('清除纠错标注', [i], function () { clearProofread(i); });
   hideErrPopup();
   scheduleRemeasure(i);
   showToast('已清除当前页纠错标注', 'ok');
@@ -7442,33 +7487,43 @@ function proofreadApplyAll() {
 // 未挂载页一并清理模型 HTML，避免挂载后标注复现。
 function proofreadClearAll() {
   closeProofreadMenu();
-  let n = 0;
+  const affected = [];
   for (let k = 0; k < pages.length; k++) {
     const errs = proofreadErrors[k];
     if ((!errs || !errs.length) && !proofreadOriginal[k]) continue;
-    const row = host.children ? [...host.children].find(function (r) { return Number(r.dataset.i) === k; }) : null;
-    const ed = row ? row.querySelector('.editable') : null;
-    if (ed) {
-      if (ed.querySelector('.ptoe-err, .ptoe-fix')) { clearProofread(k); scheduleRemeasure(k); }
-      else {
+    affected.push(k);
+  }
+  const n = histRun('全部清除纠错标注', affected, function () {
+    let n = 0;
+    for (let k = 0; k < pages.length; k++) {
+      const errs = proofreadErrors[k];
+      if ((!errs || !errs.length) && !proofreadOriginal[k]) continue;
+      const row = host.children ? [...host.children].find(function (r) { return Number(r.dataset.i) === k; }) : null;
+      const ed = row ? row.querySelector('.editable') : null;
+      if (ed) {
+        if (ed.querySelector('.ptoe-err, .ptoe-fix')) { clearProofread(k); scheduleRemeasure(k); }
+        else {
+          proofreadErrors[k] = [];
+          delete proofreadOriginal[k];
+          delete proofreadDismissed[k];
+          delete _prTextBefore[k];
+          syncContent(ed);
+        }
+      } else {
         proofreadErrors[k] = [];
         delete proofreadOriginal[k];
         delete proofreadDismissed[k];
         delete _prTextBefore[k];
-        syncContent(ed);
+        const base = contentMap.has(k) ? contentMap.get(k) : pages[k].text;
+        contentMap.set(k, stripProofreadMarkup(base));
       }
-    } else {
-      proofreadErrors[k] = [];
-      delete proofreadOriginal[k];
-      delete proofreadDismissed[k];
-      delete _prTextBefore[k];
-      const base = contentMap.has(k) ? contentMap.get(k) : pages[k].text;
-      contentMap.set(k, stripProofreadMarkup(base));
+      n++;
     }
-    n++;
-  }
+    return n;
+  });
   hideErrPopup();
   updatePrCount();
+  _updateAllPageErrBadges();
   if (n) { showToast('已清除 ' + n + ' 页纠错标注', 'ok'); setStatus('已清除 ' + n + ' 页纠错标注'); }
   else { showToast('没有可清除的纠错标注', 'warn'); setStatus('没有可清除的纠错标注'); }
 }
@@ -7490,6 +7545,7 @@ function proofreadRevertCurrent() {
     if (proofreadDismissed[i]) proofreadDismissed[i] = new Set();
     delete proofreadOriginal[i];
   });
+  _updatePageErrBadge(i);
   scheduleRemeasure(i);
   hideErrPopup();
   showToast('已回退当前页的纠错操作', 'ok');
@@ -9354,6 +9410,8 @@ function openSettings() {
   document.getElementById('editorFontSizeInput').value = parseInt(document.documentElement.style.getPropertyValue('--editor-font-size') || '14', 10);
   const pbIn = document.getElementById('prBatchPages');
   if (pbIn) pbIn.value = proofreadBatchCount();
+  const udIn = document.getElementById('undoDepthInput');
+  if (udIn) udIn.value = String(undoLimit());
   const rac = document.getElementById('ruleAllPagesConfirm');
   if (rac) rac.checked = !!uiBool('rule_all_pages_confirm', true);
   document.getElementById('modalBg').style.display = 'flex';
@@ -9542,10 +9600,9 @@ function markedParse(md) {
 // ---------- 撤销 / 重做 ----------
 // 快照粒度为「操作」：一次连续输入（间隔 < UNDO_IDLE_MS）算一次操作；
 // 格式按钮/标记/对齐/搜索替换/智能清理/繁简转换/插入图片等离散操作各算一次。
-// undoStack/redoStack 各保留最近 UNDO_LIMIT（10）步，超出丢最旧；新操作清空重做。
+// undoStack/redoStack 各保留最近 undoLimit() 步（默认 100，可配置 50/100/200/500），超出丢最旧；新操作清空重做。
 // 快照只记录「源」（pageSource，即当前模式对应的 map 或回退到初始 text），
 // 且 histEnd 只保留实际变化的页，避免全页操作把整本书复制 10 份。
-const UNDO_LIMIT = 10;
 const UNDO_IDLE_MS = 800; // 两次输入间隔超过此值 → 视为新操作起点
 let undoStack = [];   // [{before: Map(i→源), after: Map(i→源), label}]
 let redoStack = [];
@@ -9559,7 +9616,7 @@ function histPush(before, after, errBefore, errAfter, label) {
   if (errBefore && errBefore.size) entry.errBefore = errBefore;
   if (errAfter && errAfter.size) entry.errAfter = errAfter;
   undoStack.push(entry);
-  if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+  if (undoStack.length > undoLimit()) undoStack.shift();
   redoStack.length = 0; // 新操作使重做历史失效
   histUpdateButtons();
 }
@@ -9637,9 +9694,14 @@ function histEnd(before, label, errBefore) {
   const errAfter = new Map();
   for (const [i, src] of before) {
     const now = pageSource(i);
-    if (now !== src) {
-      after.set(i, now);
-      if (errBefore && errBefore.has(i)) errAfter.set(i, _copyErrors(i));
+    let errChanged = false, errNow;
+    if (errBefore && errBefore.has(i)) {
+      errNow = _copyErrors(i);
+      errChanged = JSON.stringify(errBefore.get(i)) !== JSON.stringify(errNow);
+    }
+    if (now !== src || errChanged) {
+      after.set(i, now);          // 内容未变但标注变了（校正/清除等）→ after 仍含该页，恢复对称
+      if (errChanged) errAfter.set(i, errNow);
     } else {
       before.delete(i);
     }
@@ -9683,6 +9745,8 @@ function restoreHistorySnapshot(snap, errSnap) {
       const s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
     }
   }
+  // 撤销/重做后刷新总数角标（标注随快照恢复，计数可能变化）
+  updatePrBadge();
 }
 function undoHistory() {
   histCommitInput(); // 先落栈进行中的输入操作，才能撤到它
@@ -9691,7 +9755,7 @@ function undoHistory() {
   // D5: 兼容旧格式（无 errBefore 字段）——undefined errSnap → 只清空该页现有标注
   restoreHistorySnapshot(entry.before, entry.errBefore);
   redoStack.push(entry);
-  if (redoStack.length > UNDO_LIMIT) redoStack.shift();
+  if (redoStack.length > undoLimit()) redoStack.shift();
   histUpdateButtons();
   setStatus('已撤回：' + entry.label);
   showToast('已撤回：' + entry.label, 'ok');
@@ -9702,7 +9766,7 @@ function redoHistory() {
   if (!entry) { setStatus('没有可前进的操作'); return false; }
   restoreHistorySnapshot(entry.after, entry.errAfter);
   undoStack.push(entry);
-  if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+  if (undoStack.length > undoLimit()) undoStack.shift();
   histUpdateButtons();
   setStatus('已前进：' + entry.label);
   showToast('已前进：' + entry.label, 'ok');
@@ -10270,6 +10334,8 @@ document.getElementById('resetUiSettingsBtn').addEventListener('click', () => {
   document.getElementById('editorFontSizeInput').value = uiSettings.editor_font_size;
   const pbIn2 = document.getElementById('prBatchPages');
   if (pbIn2) pbIn2.value = uiSettings.proofread_batch_pages;
+  const udIn2 = document.getElementById('undoDepthInput');
+  if (udIn2) udIn2.value = String(UI_SETTINGS_DEFAULTS.undo_depth);
   const rac = document.getElementById('ruleAllPagesConfirm');
   if (rac) rac.checked = true;
   applyFontSize(uiSettings.editor_font_size);
@@ -10362,6 +10428,17 @@ if (_prBatchInput) _prBatchInput.addEventListener('change', (e) => {
   const n = isFinite(v) ? Math.max(1, Math.min(50, v)) : 1;
   e.target.value = n;
   if (uiSettings) { uiSettings.proofread_batch_pages = n; saveUiSettings(); }
+});
+// 撤销/回退历史步数（50/100/200/500；服务端持久化 config.json ui_settings）
+const _undoDepthInput = document.getElementById('undoDepthInput');
+if (_undoDepthInput) _undoDepthInput.addEventListener('change', (e) => {
+  const v = parseInt(e.target.value, 10);
+  const n = UNDO_DEPTH_CHOICES.indexOf(v) >= 0 ? v : 100;
+  e.target.value = String(n);
+  if (uiSettings) { uiSettings.undo_depth = n; saveUiSettings(); }
+  while (undoStack.length > n) undoStack.shift();
+  while (redoStack.length > n) redoStack.shift();
+  histUpdateButtons();
 });
 // 暂存/保存/完成并转换/快捷键设置（2026-08-07 修复：四个绑定曾整块丢失 → 按钮点击无响应）
 document.getElementById('saveBtn').addEventListener('click', save);

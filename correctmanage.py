@@ -7219,6 +7219,8 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 POPUP_RULE_COUNT_DEFAULT,
                 POPUP_RULE_COUNT_MIN,
                 POPUP_RULE_COUNT_MAX,
+                UNDO_DEPTH_DEFAULT,
+                UNDO_DEPTH_CHOICES,
             )
 
             if self.command == "GET":
@@ -7236,6 +7238,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "popup_row2": POPUP_ROW2_DEFAULT,
                     "popup_rule_count": POPUP_RULE_COUNT_DEFAULT,
                     "proofread_batch_pages": 1,
+                    "undo_depth": UNDO_DEPTH_DEFAULT,
                 })
                 merged = {
                     "tip_delay": stored.get("tip_delay", defaults["tip_delay"]),
@@ -7247,6 +7250,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "popup_row2": stored.get("popup_row2", defaults["popup_row2"]),
                     "popup_rule_count": stored.get("popup_rule_count", defaults["popup_rule_count"]),
                     "proofread_batch_pages": stored.get("proofread_batch_pages", defaults.get("proofread_batch_pages", 1)),
+                    "undo_depth": stored.get("undo_depth", defaults.get("undo_depth", UNDO_DEPTH_DEFAULT)),
                 }
                 self._send(
                     200,
@@ -7352,6 +7356,12 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     self._send(400, self._json({"ok": False, "error": "proofread_batch_pages 超出范围（1-50）"}), "application/json; charset=utf-8")
                     return
                 clean["proofread_batch_pages"] = v
+            if "undo_depth" in ui:
+                v = ui["undo_depth"]
+                if not (isinstance(v, int) and not isinstance(v, bool) and v in UNDO_DEPTH_CHOICES):
+                    self._send(400, self._json({"ok": False, "error": "undo_depth 取值无效（需为 50/100/200/500）"}), "application/json; charset=utf-8")
+                    return
+                clean["undo_depth"] = v
             set_ui_settings(clean)
             self._send(200, self._json({"ok": True}), "application/json; charset=utf-8")
         except Exception as e:  # noqa: BLE001
@@ -10220,6 +10230,8 @@ body{margin:0;font-family:"Microsoft YaHei",system-ui,sans-serif;background:var(
 #errBadge:hover{background:rgba(224,32,32,.18);border-color:rgba(224,32,32,.45);transform:scale(1.05);}
 #errBadge:active{transform:scale(0.97);}
 #errBadgeNum{font-variant-numeric:tabular-nums;}
+.page-err-badge{display:inline-block;margin-left:8px;padding:0 6px;border-radius:9px;font-size:11px;font-weight:700;line-height:17px;color:#fff;background:#E02020;vertical-align:middle;}
+.page-err-badge[hidden]{display:none;}
 
 /* 保存 / 完成并转换 强视觉区分 */
 #toolbar #saveBtn{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600;padding:0 14px;}
@@ -11253,6 +11265,16 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <h4 style="margin:16px 0 4px;">纠错批处理</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">「校正 / 重识别」一次连续处理的页数：从当前页起向后处理 N 页（1-50）。应用 / 清除默认仍只作用于当前页。</p>
       <label style="font-size:13px;">每批页数 <input type="number" id="prBatchPages" min="1" max="50" step="1" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
+      <h4 style="margin:16px 0 4px;">撤销 / 回退</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">撤销（Ctrl+Z）/ 前进（Ctrl+Y）保留的历史步数；步数越多占用内存越大。</p>
+      <label style="font-size:13px;">历史步数
+        <select id="undoDepthInput" style="padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+          <option value="50">50 步</option>
+          <option value="100">100 步</option>
+          <option value="200">200 步</option>
+          <option value="500">500 步</option>
+        </select>
+      </label>
       <h4 style="margin:16px 0 4px;">格式规则</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">把规则应用到全部页前先弹出确认，防止误操作大范围改动。</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;">

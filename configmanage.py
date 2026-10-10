@@ -110,6 +110,9 @@ POPUP_ROW2_DEFAULT = ["align_left", "align_center", "align_right", "centerbold",
 POPUP_RULE_COUNT_DEFAULT = 5
 POPUP_RULE_COUNT_MIN = 0
 POPUP_RULE_COUNT_MAX = 10
+# 撤销/回退历史步数档位（矫正界面 ui_settings.undo_depth；2026-10）
+UNDO_DEPTH_DEFAULT = 100
+UNDO_DEPTH_CHOICES = (50, 100, 200, 500)
 
 DEFAULT_CONFIG = {
     "llama_server": "E:/xox/Tools/llama-c/llama-server.exe",
@@ -341,6 +344,8 @@ DEFAULT_CONFIG = {
         "popup_rule_count": POPUP_RULE_COUNT_DEFAULT,
         # 每批「校正/重识别」处理的页数（1-50，默认 1）：设为 N 时从当前页起连续处理 N 页
         "proofread_batch_pages": 1,
+        # 撤销/回退（Ctrl+Z / Ctrl+Y）保留的历史步数：50/100/200/500（默认 100）
+        "undo_depth": UNDO_DEPTH_DEFAULT,
     },
     # 图片预处理（2026-08，OpenCV）：PDF 分割图片时启用，提高 OCR 识别率。
     # enabled 开关；gray 灰度 / denoise 中值去噪 / sharpen 锐化 / binarize 自适应二值化；
@@ -885,6 +890,12 @@ def set_ui_settings(ui: dict) -> dict:
         except (TypeError, ValueError):
             v = 1
         clean["proofread_batch_pages"] = max(1, min(50, v))
+    if "undo_depth" in ui:
+        try:
+            v = int(ui["undo_depth"])
+        except (TypeError, ValueError):
+            v = UNDO_DEPTH_DEFAULT
+        clean["undo_depth"] = v if v in UNDO_DEPTH_CHOICES else UNDO_DEPTH_DEFAULT
     with _CFG_LOCK:
         try:
             if os.path.exists(_CONFIG_PATH):
