@@ -731,7 +731,13 @@ def pdf_to_epub(
         t_batch = time.perf_counter()
         if use_paddle:
             # PaddleOCR 本地识别：无提示词/服务进程，接口形状与 llamamanage.batch_infer 一致
-            import paddleocrmanage as _paddle
+            try:
+                import paddleocrmanage as _paddle
+            except ImportError:
+                # 可选依赖缺失：给出友好提示并返回干净失败（不抛原始 traceback）
+                msg = "PaddleOCR 未安装或不可用：请安装可选依赖或改用其他引擎"
+                print(msg, file=sys.stderr)
+                return {"ok": False, "message": msg, "epub_error": msg}
 
             results = _paddle.batch_infer(
                 todo_images,
@@ -762,19 +768,25 @@ def pdf_to_epub(
                 )
             else:
                 q = ImageQueue(store_in_memory=False)
-                items = [q.add(p, encode=False) for p in todo_images]
-                # Pre-encode concurrently to temp files/in-memory to reduce per-worker I/O
-                q.preload_all(max_workers=eff_workers or 4)
-                results = batch_infer(
-                    items,
-                    [prompt] * len(items),
-                    model_key=model_key,
-                    max_workers=eff_workers,
-                    thinking=thinking,
-                    timeout=timeout,
-                    on_progress=_on_progress,
-                    on_result=_on_ocr_result,
-                )
+                try:
+                    items = [q.add(p, encode=False) for p in todo_images]
+                    # Pre-encode concurrently to temp files/in-memory to reduce per-worker I/O
+                    q.preload_all(max_workers=eff_workers or 4)
+                    results = batch_infer(
+                        items,
+                        [prompt] * len(items),
+                        model_key=model_key,
+                        max_workers=eff_workers,
+                        thinking=thinking,
+                        timeout=timeout,
+                        on_progress=_on_progress,
+                        on_result=_on_ocr_result,
+                    )
+                finally:
+                    # 释放 ImageQueue 持有的临时 .b64 文件，避免泄漏
+                    _clear = getattr(q, "clear", None)
+                    if callable(_clear):
+                        _clear(free_files=True)
 
         timings["ocr"] = time.perf_counter() - t_batch
     else:
@@ -1238,7 +1250,7 @@ def _menu_epubedit() -> None:
 
 def _menu_config() -> None:
     """菜单项 4：查看/修改配置（engine / llama_server / models_dir / selected_model / browser / gui_display / window_maximized / tabs_position）。"""
-    from configmanage import get_config, update_config
+    from configmanage import find_canonical_model_key, get_config, update_config
 
     cfg = get_config()
     for k in ("engine", "llama_server", "models_dir", "selected_model", "browser", "gui_display", "window_maximized", "tabs_position"):
@@ -1266,11 +1278,17 @@ def _menu_config() -> None:
     if not value:
         print("已跳过（未输入新值）。")
         return
-    if key == "selected_model" and value not in cfg.get("model_choices", {}):
-        print(
-            f"错误：未知模型键 {value}；可用：{', '.join(cfg.get('model_choices', {}).keys())}"
+    if key == "selected_model":
+        # 规范化（去空白 + 大小写不敏感）后再校验/写入，避免因大小写或空白被误判为未知键
+        canonical, _matches = find_canonical_model_key(
+            cfg.get("model_choices", {}), value.strip()
         )
-        return
+        if canonical is None:
+            print(
+                f"错误：未知模型键 {value}；可用：{', '.join(cfg.get('model_choices', {}).keys())}"
+            )
+            return
+        value = canonical
     if key == "engine" and value not in ("llama", "vllm"):
         print("错误：engine 仅支持 llama / vllm")
         return
@@ -1293,7 +1311,7 @@ def _menu_config() -> None:
 
 def _menu_model() -> None:
     """菜单项 5：模型管理（列出并切换默认模型）。"""
-    from configmanage import get_config, update_config
+    from configmanage import find_canonical_model_key, get_config, update_config
 
     cfg = get_config()
     choices = cfg.get("model_choices", {})
@@ -1305,9 +1323,12 @@ def _menu_model() -> None:
     if not key:
         print("已跳过。")
         return
-    if key not in choices:
+    # 规范化（去空白 + 大小写不敏感）后再校验/写入
+    canonical, _matches = find_canonical_model_key(choices, key.strip())
+    if canonical is None:
         print(f"错误：未知模型键 {key}")
         return
+    key = canonical
     update_config("selected_model", key)
     print(f"selected_model 已切换为 {key}")
     _pause()
@@ -1801,6 +1822,7 @@ def main(argv: list[str] | None = None) -> int:
         """Return canonical key from choices by case-insensitive match.
 
         Rules:
+        - `key` is stripped of surrounding whitespace before matching.
         - If `key` exactly exists in choices -> return it.
         - Else look for case-insensitive matches (k.lower() == key.lower()).
           - If exactly one match -> return that canonical key.
@@ -1808,6 +1830,9 @@ def main(argv: list[str] | None = None) -> int:
         - If no match -> return None.
         """
         if not isinstance(choices, dict) or not isinstance(key, str) or not key:
+            return None
+        key = key.strip()
+        if not key:
             return None
         if key in choices:
             return key
@@ -1873,9 +1898,11 @@ def main(argv: list[str] | None = None) -> int:
             mmproj = getattr(args, "mmproj", None)
             force = getattr(args, "force", False)
             choices = dict(cfg.get("model_choices", {}))
-            if not isinstance(key, str) or not key:
+            if not isinstance(key, str) or not key.strip():
                 print(f"Error: invalid model key: {key}", file=sys.stderr)
                 return 1
+            # 规范化：先去除首尾空白再做大小写不敏感重复检查
+            key = key.strip()
             matches = [
                 k for k in choices if isinstance(k, str) and k.lower() == key.lower()
             ]
@@ -1998,12 +2025,19 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 1
-            if key == "selected_model" and value not in cfg.get("model_choices", {}):
-                print(
-                    f"Error: 未知的 model key: {value}（可用: {', '.join(cfg.get('model_choices', {}).keys())}）",
-                    file=sys.stderr,
+            if key == "selected_model":
+                # 规范化（去空白 + 大小写不敏感）后写入 canonical key
+                canonical = _find_model_key(
+                    cfg.get("model_choices", {}),
+                    value if isinstance(value, str) else "",
                 )
-                return 1
+                if canonical is None:
+                    print(
+                        f"Error: 未知的 model key: {value}（可用: {', '.join(cfg.get('model_choices', {}).keys())}）",
+                        file=sys.stderr,
+                    )
+                    return 1
+                value = canonical
             if key == "engine" and value not in ("llama", "vllm"):
                 print("Error: engine 仅支持 llama / vllm", file=sys.stderr)
                 return 1

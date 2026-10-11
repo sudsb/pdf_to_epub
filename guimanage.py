@@ -60,8 +60,10 @@ _UI_HTML = r"""
 <style>
 :root{--accent:#2f6fed;--accent-light:#eef3fb;--accent-hover:#2256c2;--border:#d8dee6;--bg:#f4f6f9;--card:#fff;--text:#1c2733;--text-sec:#5a6b7c;--text-dim:#8a97a6;--green:#1a7f37;--green-bg:#e6f4ea;--red:#c0392b;--red-bg:#fdecea;--yellow:#b8860b;--yellow-bg:#fef8e1;--radius:8px;--radius-sm:5px;--shadow:0 1px 3px rgba(0,0,0,.08);--shadow-lg:0 4px 20px rgba(0,0,0,.12);--sidebar-w:220px;--header-h:54px}
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body[data-no-anim="1"] *,body[data-no-anim="1"] *::before,body[data-no-anim="1"] *::after{animation:none !important;transition:none !important;}
 html{height:100%}
-body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-serif;font-size:14px;color:var(--text);background:var(--bg);line-height:1.6;overflow:hidden}
+body{height:100%;font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;text-rendering:optimizeLegibility;font-size:14px;color:var(--text);background:var(--bg);line-height:1.6;overflow:hidden}
+#saveBtn,.btn-outline,.btn-small,.btn-add,.btn-start,.btn-stop-convert,.engine-switch button,.del-btn,.menu-toggle{transition:transform .08s ease}
 .header{position:fixed;top:0;left:0;right:0;height:var(--header-h);display:flex;align-items:center;gap:14px;padding:0 20px;background:var(--card);border-bottom:1px solid var(--border);z-index:50}
 .header .logo{font-size:16px;font-weight:700;color:var(--accent);white-space:nowrap}
 .header .logo span{color:var(--text);font-weight:400;margin-left:6px;font-size:13px}
@@ -96,7 +98,8 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
 .page.active{display:block}
 .page-title{font-size:20px;font-weight:700;margin-bottom:6px}
 .page-desc{font-size:13px;color:var(--text-sec);margin-bottom:20px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:18px 20px;margin-bottom:16px;box-shadow:var(--shadow)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:18px 20px;margin-bottom:16px;box-shadow:var(--shadow);transition:transform .15s ease,box-shadow .15s ease}
+.card:hover{transform:translateY(-1px);box-shadow:var(--shadow-lg)}
 .card-title{font-size:14px;font-weight:600;margin-bottom:12px;display:flex;align-items:center;gap:8px}
 .card-title .ct-icon{color:var(--accent)}
 .form-row{display:flex;align-items:center;gap:10px;margin-bottom:12px}
@@ -125,6 +128,8 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
 .dyn-table th{text-align:left;font-weight:600;font-size:12px;color:var(--text-dim);padding:6px 8px;border-bottom:2px solid var(--border)}
 .dyn-table td{padding:5px 6px;border-bottom:1px solid #eef0f3;vertical-align:middle}
 .dyn-table tr:hover td{background:#fafbfc}
+.dyn-table tbody tr{transition:transform .12s ease}
+.dyn-table tbody tr:hover{transform:translateY(-1px)}
 .dyn-table input[type="text"]{width:100%;padding:4px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;font-size:12px}
 .dyn-table input[type="text"]:focus{outline:none;border-color:var(--accent)}
 .dyn-table .del-cell{width:36px;text-align:center}
@@ -140,12 +145,12 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
 .pr-grid .form-row{margin-bottom:0}
 .pr-grid .form-label{width:110px}
 .pr-grid .form-ctrl input[type="checkbox"]{width:16px;height:16px;accent-color:var(--accent)}
-.rule-card{padding:10px 14px;border:1px solid var(--border);border-radius:var(--radius-sm);margin-bottom:8px;display:flex;align-items:center;gap:10px;background:var(--card)}
-.rule-card:hover{border-color:var(--accent)}
+.rule-card{padding:10px 14px;border:1px solid var(--border);border-radius:var(--radius-sm);margin-bottom:8px;display:flex;align-items:center;gap:10px;background:var(--card);transition:transform .15s ease,box-shadow .15s ease,border-color .15s ease}
+.rule-card:hover{border-color:var(--accent);transform:translateY(-1px);box-shadow:var(--shadow)}
 .rule-name{font-weight:600;min-width:80px}
 .rule-cond{flex:1;font-size:12px;color:var(--text-sec)}
 #toast{position:fixed;top:62%;left:50%;transform:translateX(-50%);z-index:999;display:flex;flex-direction:column;gap:6px;align-items:center;pointer-events:none}
-.toast-item{padding:8px 18px;border-radius:8px;font-size:13px;color:#fff;line-height:1.5;box-shadow:var(--shadow-lg);opacity:0;transform:translateY(-8px);transition:opacity .25s,transform .25s}
+.toast-item{padding:8px 18px;border-radius:8px;font-size:13px;color:#fff;line-height:1.5;box-shadow:var(--shadow-lg);opacity:0;transform:translateY(-8px);transition:opacity .25s,transform .25s,background .25s ease,color .25s ease}
 .toast-item.show{opacity:1;transform:translateY(0)}
 .toast-item.t-ok{background:var(--green)}.toast-item.t-fail{background:var(--red)}.toast-item.t-warn{background:var(--yellow)}
 .empty-state{text-align:center;padding:24px;color:var(--text-dim);font-size:13px}
@@ -178,6 +183,12 @@ body{height:100%;font-family:"Microsoft YaHei",system-ui,-apple-system,sans-seri
 /* 历史记录重命名弹窗 */
 #renameInput{width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;font-size:13px;color:var(--text);background:var(--card);transition:border-color .15s}
 #renameInput:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgba(47,111,237,.12)}
+/* 按压反馈：统一微暗 + 微缩（纯 CSS） */
+#saveBtn:active,.btn-outline:active,.btn-small:active,.btn-add:active,.btn-start:active,.btn-stop-convert:active,.engine-switch button:active,.del-btn:active,.menu-toggle:active{transform:scale(.97);filter:brightness(.95)}
+/* 尊重系统「减少动态效果」偏好：关闭本页新增动效 */
+@media (prefers-reduced-motion: reduce){
+  #saveBtn,.btn-outline,.btn-small,.btn-add,.btn-start,.btn-stop-convert,.engine-switch button,.del-btn,.menu-toggle,.card,.rule-card,.dyn-table tbody tr,.toast-item{transition:none !important;transform:none !important}
+}
 </style>
 </head>
 <body>
@@ -577,7 +588,7 @@ function addArg(tid){var tbody=document.getElementById(tid),empty=tbody.querySel
 function renderProofread(){var pr=cfg.proofread||{},grid=document.getElementById("proofreadGrid");grid.innerHTML="";[{k:"similarity_min",l:"相似度阈值",s:0.01},{k:"score_min",l:"最低评分",s:0.01},{k:"max_cand_cache",l:"候选缓存上限",s:100},{k:"max_replacement_combinations",l:"替换组合上限",s:1},{k:"auto_fix_score",l:"自动修正阈值",s:0.01}].forEach(function(f){var d=document.createElement("div");d.className="form-row";d.innerHTML='<span class="form-label">'+f.l+'</span><div class="form-ctrl"><input type="number" data-pr="'+f.k+'" value="'+(pr[f.k]!=null?pr[f.k]:"")+'" step="'+f.s+'"></div>';grid.appendChild(d)});document.getElementById("prEnableLlm").checked=!!pr.enable_llm;document.getElementById("prLegacyRules").checked=!!pr.enable_legacy_rules;document.getElementById("prLlmTimeout").value=pr.llm_timeout!=null?pr.llm_timeout:"";var sel=document.getElementById("prLlmModel");sel.innerHTML='<option value="">（自动使用当前模型）</option>';models.forEach(function(m){var o=document.createElement("option");o.value=m.key;o.textContent=m.key+" - "+m.name;sel.appendChild(o)});sel.value=pr.llm_model||""}
 function renderShortcuts(){renderArgs("shortcuts",cfg.shortcuts)}
 function renderRules(){var list=document.getElementById("rulesList"),rules=cfg.format_rules||[];if(!rules.length){list.innerHTML='<div class="empty-state">暂无格式规则</div>';return}list.innerHTML="";rules.forEach(function(r,idx){var card=document.createElement("div");card.className="rule-card";var ct="";if(r.conditions&&r.conditions.length){ct=r.conditions.map(function(c){var p=[];if(c.pattern)p.push(c.type==="regex"?"正则「"+c.pattern+"」":"包含「"+c.pattern+"」");else p.push("无条件");p.push("作用域: "+(c.scope==="page"?"当前页":c.scope==="paragraph"?"段落":"选中"));if(c.formats&&c.formats.length)p.push("\u2192 "+c.formats.join(", "));return p.join(" | ")}).join("；")}else if(r.condition){ct=r.condition.pattern?(r.condition.type||"contains")+"「"+r.condition.pattern+"」":"无条件"}var btn=document.createElement("button");btn.className="btn-small";btn.textContent="删除";btn.title="删除规则";btn.onclick=function(){if(confirm("确定删除此格式规则？")){cfg.format_rules.splice(idx,1);renderRules();toast("已删除格式规则","ok")}};card.innerHTML='<span class="rule-name">'+escH(r.name||"未命名")+'</span><span class="rule-cond">'+escH(ct||"无条件")+'</span>';card.appendChild(btn);list.appendChild(card)})}
-function collectConfig(){cfg.llama_server=document.getElementById("cfgLlamaServer").value.trim();cfg.models_dir=document.getElementById("cfgModelsDir").value.trim();cfg.browser=document.getElementById("cfgBrowser").value.trim();cfg.gui_display=document.getElementById("cfgGuiDisplay").value;cfg.ocr_prompt=document.getElementById("cfgOcrPrompt").value;cfg.selected_model=document.getElementById("cfgSelectedModel").value;var er=document.querySelector('input[name="cfgEngine"]:checked');if(er)cfg.engine=er.value;var per=document.querySelector('input[name="cfgProofreadEngine"]:checked');if(per)cfg.proofread_engine=per.value;var nm={};document.getElementById("modelTbody").querySelectorAll("tr").forEach(function(tr){var ins=tr.querySelectorAll("input");if(ins.length<2)return;var key=ins[0].value.trim();if(key){var m={name:ins[1].value.trim(),mmproj:ins.length>=3?ins[2].value.trim():""};var w=ins.length>=4?parseInt(ins[3].value,10):0;if(!isNaN(w)&&w>=1&&w<=64)m.workers=w;nm[key]=m}});cfg.model_choices=nm;cfg.llama_server_args=collectKVT("llamaArgs");cfg.vllm_server_args=collectKVT("vllmArgs");cfg.vllm_server=document.getElementById("cfgVllmServer").value.trim();var pr={};document.querySelectorAll("[data-pr]").forEach(function(el){var k=el.dataset.pr,v=el.value.trim();if(el.type==="number"&&v!=="")pr[k]=parseFloat(v);else pr[k]=v});pr.enable_llm=document.getElementById("prEnableLlm").checked;pr.enable_legacy_rules=document.getElementById("prLegacyRules").checked;var lm=document.getElementById("prLlmModel").value;if(lm)pr.llm_model=lm;var lt=document.getElementById("prLlmTimeout").value.trim();if(lt!=="")pr.llm_timeout=parseFloat(lt);cfg.proofread=pr;cfg.shortcuts=collectKVT("shortcuts")}
+function collectConfig(){cfg.llama_server=document.getElementById("cfgLlamaServer").value.trim();cfg.models_dir=document.getElementById("cfgModelsDir").value.trim();cfg.browser=document.getElementById("cfgBrowser").value.trim();cfg.gui_display=document.getElementById("cfgGuiDisplay").value;cfg.ocr_prompt=document.getElementById("cfgOcrPrompt").value;cfg.selected_model=document.getElementById("cfgSelectedModel").value.trim();var er=document.querySelector('input[name="cfgEngine"]:checked');if(er)cfg.engine=er.value;var per=document.querySelector('input[name="cfgProofreadEngine"]:checked');if(per)cfg.proofread_engine=per.value;var nm={};document.getElementById("modelTbody").querySelectorAll("tr").forEach(function(tr){var ins=tr.querySelectorAll("input");if(ins.length<2)return;var key=ins[0].value.trim();if(key){var m={name:ins[1].value.trim(),mmproj:ins.length>=3?ins[2].value.trim():""};var w=ins.length>=4?parseInt(ins[3].value,10):0;if(!isNaN(w)&&w>=1&&w<=64)m.workers=w;nm[key]=m}});cfg.model_choices=nm;cfg.llama_server_args=collectKVT("llamaArgs");cfg.vllm_server_args=collectKVT("vllmArgs");cfg.vllm_server=document.getElementById("cfgVllmServer").value.trim();var pr={};document.querySelectorAll("[data-pr]").forEach(function(el){var k=el.dataset.pr,v=el.value.trim();if(el.type==="number"&&v!=="")pr[k]=parseFloat(v);else pr[k]=v});pr.enable_llm=document.getElementById("prEnableLlm").checked;pr.enable_legacy_rules=document.getElementById("prLegacyRules").checked;var lm=document.getElementById("prLlmModel").value;if(lm)pr.llm_model=lm;var lt=document.getElementById("prLlmTimeout").value.trim();if(lt!=="")pr.llm_timeout=parseFloat(lt);cfg.proofread=pr;cfg.shortcuts=collectKVT("shortcuts")}
 function collectKVT(tid){var r={};document.getElementById(tid).querySelectorAll("tr").forEach(function(tr){var ins=tr.querySelectorAll("input");if(ins.length<2)return;var k=ins[0].value.trim(),v=ins[1].value;if(k)r[k]=v});return r}
 function collectExtraConfig(){
   try{
@@ -1690,16 +1701,20 @@ class _GuiHandler(BaseHTTPRequestHandler):
             self._send(400, self._json({"ok": False, "error": "无效的 JSON"}))
             return
         model = body.get("model")
-        if not isinstance(model, str) or not model:
+        if not isinstance(model, str) or not model.strip():
             self._send(400, self._json({"ok": False, "error": "缺少模型参数"}))
             return
         try:
             import configmanage
 
             cfg = configmanage.get_config(show_dialogs=False)
-            if model not in (cfg.get("model_choices") or {}):
-                self._send(400, self._json({"ok": False, "error": f"未知模型：{model}"}))
+            choices = cfg.get("model_choices") or {}
+            canonical, matches = configmanage.find_canonical_model_key(choices, model)
+            if canonical is None:
+                err = "模型名不明确：" + ", ".join(matches) if matches else f"未知模型：{model}"
+                self._send(400, self._json({"ok": False, "error": err}))
                 return
+            model = canonical
         except Exception as e:
             self._send(500, self._json({"ok": False, "error": str(e)}))
             return
@@ -1827,8 +1842,20 @@ class _GuiHandler(BaseHTTPRequestHandler):
             self._send(400, self._json({"ok": False, "error": "dpi 仅支持 0-4"}))
             return
         model = body.get("model") or cfg.get("selected_model")
-        if model not in (cfg.get("model_choices") or {}):
-            self._send(400, self._json({"ok": False, "error": f"未知模型：{model}"}))
+        try:
+            import configmanage
+
+            choices = cfg.get("model_choices") or {}
+            canonical, matches = configmanage.find_canonical_model_key(
+                choices, model if isinstance(model, str) else ""
+            )
+            if canonical is None:
+                err = "模型名不明确：" + ", ".join(matches) if matches else f"未知模型：{model}"
+                self._send(400, self._json({"ok": False, "error": err}))
+                return
+            model = canonical
+        except Exception as e:
+            self._send(500, self._json({"ok": False, "error": str(e)}))
             return
         engine = body.get("engine") or ""
         if engine not in ("", "llama", "vllm", "paddle"):

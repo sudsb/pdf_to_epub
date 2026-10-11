@@ -297,7 +297,10 @@ def _render_page_range(args: tuple) -> list[dict]:
     prep 为归一化预处理配置（None=不预处理，走 pix.save 原路径）。
     """
     pdf_path, start, end, out_dir, dpi, fmt, mat_scale, prep = args
-    import fitz  # 每个子进程延迟导入
+    try:
+        import fitz  # 每个子进程延迟导入
+    except Exception as exc:  # pragma: no cover - runtime dependency
+        raise RuntimeError("PyMuPDF is required (pip install PyMuPDF)") from exc
 
     results: list[dict] = []
     try:

@@ -6404,6 +6404,12 @@ document.addEventListener('mousedown', (e) => {
     _midCapture = { x: e.clientX, y: e.clientY, ed: null };
     return;
   }
+  // 设置弹窗打开时全页面拦截中键：否则编辑区外会触发浏览器默认中键自动滚动
+  const _mb = document.getElementById('modalBg');
+  if (_mb && getComputedStyle(_mb).display !== 'none') {
+    e.preventDefault();
+    return;
+  }
   const ed = e.target && e.target.closest ? e.target.closest('.editable') : null;
   if (!ed) return;                  // 编辑区外不干预
   e.preventDefault();               // 阻止 Windows 中键自动滚动
@@ -6425,8 +6431,9 @@ document.addEventListener('mouseup', (e) => {
     const c = _midCapture; _midCapture = null;
     e.preventDefault();
     const g = _midGestureDir(e.clientX - c.x, e.clientY - c.y);
-    if (g && mouseCapturingOp) {
-      mouseBindings[mouseCapturingOp] = g;
+    if (mouseCapturingOp) {
+      // 无滑动方向 = 中键单击 → 绑定 'Middle+Click'（此前 g 为空导致中键单击永远无法绑定）
+      mouseBindings[mouseCapturingOp] = g || 'Middle+Click';
       saveMouseBindings();
       mouseCapturingOp = null;
       renderMouseShortcutTable();

@@ -6,7 +6,11 @@
 <style>
 /* ============ 基础重置 ============ */
 *, *::before, *::after { box-sizing: border-box; }
-html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; background: #fff; color: #1f2937; }
+body[data-no-anim="1"] *, body[data-no-anim="1"] *::before, body[data-no-anim="1"] *::after { animation: none !important; transition: none !important; }
+html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; text-rendering: optimizeLegibility; background: #fff; color: #1f2937; }
+/* 按压反馈：通用按钮微缩 + 微暗（纯 CSS；.tab / #posToggle 有更具体的规则） */
+button { transition: transform 120ms ease; }
+button:active { transform: scale(0.97); filter: brightness(0.96); }
 
 /* ============ 布局容器 ============ */
 #host { display: flex; flex-direction: column; height: 100vh; width: 100vw; }
@@ -42,12 +46,13 @@ html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family:
   overflow: hidden;
   text-overflow: ellipsis;
   cursor: pointer;
-  transition: background 120ms ease, color 120ms ease;
+  transition: background 120ms ease, color 120ms ease, transform 120ms ease, box-shadow 120ms ease;
 }
 .tab:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
 .tab[data-active="true"] { background: #2563eb; color: #fff; }
 .tab[data-active="false"] { background: #e5e7eb; color: #374151; }
-.tab[data-active="false"]:hover { background: #d1d5db; }
+.tab[data-active="false"]:hover { background: #d1d5db; transform: translateY(-1px); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12); }
+.tab:active { transform: scale(0.97); filter: brightness(0.96); }
 
 /* 标签标题（保证省略号只作用于标题，关闭按钮常驻可见） */
 .tab-label {
@@ -93,7 +98,7 @@ html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family:
   border: 1px solid #d1d5db;
   border-radius: 6px;
   cursor: pointer;
-  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease, transform 120ms ease;
 }
 #posToggle:hover { background: #e5e7eb; color: #1f2937; border-color: #9ca3af; }
 #posToggle:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
@@ -137,6 +142,10 @@ html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family:
   pointer-events: none;
 }
 #loading.hidden { display: none; }
+/* 尊重系统「减少动态效果」偏好：关闭本页新增过渡/变换 */
+@media (prefers-reduced-motion: reduce) {
+  button, .tab, #posToggle { transition: none !important; transform: none !important; }
+}
 </style>
 </head>
 <body>

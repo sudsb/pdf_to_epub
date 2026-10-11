@@ -8837,6 +8837,21 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     or cfg.get("selected_model")
                     or ""
                 )
+                # 规范化模型键（去空白 + 大小写不敏感）后再校验，避免因大小写或空白被误判为未注册
+                _ambiguous_msg = None
+                if isinstance(model_choices, dict):
+                    from configmanage import find_canonical_model_key
+
+                    canonical, _matches = find_canonical_model_key(
+                        model_choices, model_key.strip()
+                    )
+                    if canonical is not None:
+                        model_key = canonical
+                    elif _matches:
+                        _ambiguous_msg = (
+                            f"模型 '{model_key}' 存在多个大小写不敏感匹配 "
+                            f"{_matches}，请使用精确键名或移除重复项"
+                        )
                 if (
                     not isinstance(model_choices, dict)
                     or model_key not in model_choices
@@ -8846,7 +8861,8 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                         self._json(
                             {
                                 "ok": False,
-                                "error": (
+                                "error": _ambiguous_msg
+                                or (
                                     f"模型 '{model_key}' 未在配置中注册"
                                     f"（可用: {', '.join(sorted(model_choices)) if isinstance(model_choices, dict) else '无'}）"
                                 ),
@@ -9009,11 +9025,26 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     model_key = str(
                         llm_model or default_model or cfg.get("selected_model") or ""
                     )
+                    # 规范化模型键（去空白 + 大小写不敏感）后再校验，避免因大小写或空白被误判为未注册
+                    _ambiguous_msg = None
+                    if isinstance(model_choices, dict):
+                        from configmanage import find_canonical_model_key
+
+                        canonical, _matches = find_canonical_model_key(
+                            model_choices, model_key.strip()
+                        )
+                        if canonical is not None:
+                            model_key = canonical
+                        elif _matches:
+                            _ambiguous_msg = (
+                                f"模型 '{model_key}' 存在多个大小写不敏感匹配 "
+                                f"{_matches}，请使用精确键名或移除重复项"
+                            )
                     if (
                         not isinstance(model_choices, dict)
                         or model_key not in model_choices
                     ):
-                        llm_error = (
+                        llm_error = _ambiguous_msg or (
                             f"模型 '{model_key}' 未在配置中注册"
                             f"（可用: {', '.join(sorted(model_choices)) if isinstance(model_choices, dict) else '无'}）"
                         )
@@ -9085,6 +9116,21 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     or cfg.get("selected_model")
                     or ""
                 )
+                # 规范化模型键（去空白 + 大小写不敏感）后再校验，避免因大小写或空白被误判为未注册
+                _ambiguous_msg = None
+                if isinstance(model_choices, dict):
+                    from configmanage import find_canonical_model_key
+
+                    canonical, _matches = find_canonical_model_key(
+                        model_choices, model_key.strip()
+                    )
+                    if canonical is not None:
+                        model_key = canonical
+                    elif _matches:
+                        _ambiguous_msg = (
+                            f"模型 '{model_key}' 存在多个大小写不敏感匹配 "
+                            f"{_matches}，请使用精确键名或移除重复项"
+                        )
                 if (
                     not isinstance(model_choices, dict)
                     or model_key not in model_choices
@@ -9094,7 +9140,8 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                         self._json(
                             {
                                 "ok": False,
-                                "error": (
+                                "error": _ambiguous_msg
+                                or (
                                     f"模型 '{model_key}' 未在配置中注册"
                                     f"（可用: {', '.join(sorted(model_choices)) if isinstance(model_choices, dict) else '无'}）"
                                 ),
@@ -10092,7 +10139,8 @@ _UI_HTML = r"""<!doctype html>
   --shadow-sm:0 1px 2px rgba(0,0,0,.25);--shadow-md:0 4px 12px rgba(0,0,0,.35);
 }
 *{box-sizing:border-box}
-body{margin:0;font-family:"Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--text);}
+body[data-no-anim="1"] *,body[data-no-anim="1"] *::before,body[data-no-anim="1"] *::after{animation:none !important;transition:none !important;}
+body{margin:0;font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;text-rendering:optimizeLegibility;background:var(--bg);color:var(--text);}
 #toolbar{
   position:sticky;top:0;z-index:20;
   display:flex;align-items:center;gap:4px;
@@ -10179,6 +10227,11 @@ body{margin:0;font-family:"Microsoft YaHei",system-ui,sans-serif;background:var(
 #toolbar .tb-btn:active{background:var(--bg-active);transform:scale(.98);}
 #toolbar .tb-btn:focus-visible{outline:none;box-shadow:var(--focus-ring);}
 #toolbar .tb-btn:disabled{opacity:.5;cursor:not-allowed;}
+/* 按压反馈：统一微暗 + 微缩，并叠加 CSS-only 水波脉动（不依赖 JS 点击坐标） */
+#toolbar .ic-btn,#toolbar .tb-btn{position:relative;overflow:hidden;}
+#toolbar .ic-btn::after,#toolbar .tb-btn:not(.loading)::after{content:'';position:absolute;left:50%;top:50%;width:10px;height:10px;margin:-5px 0 0 -5px;border-radius:50%;background:currentColor;opacity:0;pointer-events:none;transform:scale(0);}
+@keyframes ptoeRipple{from{opacity:.25;transform:scale(0);}to{opacity:0;transform:scale(7);}}
+#toolbar .ic-btn:active::after,#toolbar .tb-btn:not(.loading):active::after{animation:ptoeRipple .25s ease-out;}
 #toolbar .tb-btn.primary{
   background:var(--accent);border-color:var(--accent);color:#fff;
 }
@@ -10267,17 +10320,19 @@ body{margin:0;font-family:"Microsoft YaHei",system-ui,sans-serif;background:var(
 }
 
 /* Global button styles (outside toolbar) */
-button{font:inherit;padding:5px 11px;border:1px solid var(--border);border-radius:4px;background:var(--bg-elev);color:var(--text);cursor:pointer;}
+button{font:inherit;padding:5px 11px;border:1px solid var(--border);border-radius:4px;background:var(--bg-elev);color:var(--text);cursor:pointer;transition:background var(--transition),border-color var(--transition),color var(--transition),transform .05s ease;}
 button:hover{border-color:var(--accent);color:var(--accent);}
+button:active{background:var(--bg-active);border-color:var(--border-strong);transform:scale(.97);}
 button.active{border-color:var(--accent);background:var(--accent-soft);color:var(--accent);}
 button.primary{background:var(--accent);color:#fff;border-color:var(--accent);}
 button.primary:hover{background:var(--accent-hover);color:#fff;}
+button.primary:active{background:var(--accent-hover);border-color:var(--accent-hover);}
 button:disabled{opacity:.5;cursor:not-allowed;}
 select{font:inherit;padding:5px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-elev);color:var(--text);}
 
 /* U2居中，3s 自动消失 */
 #toast{position:fixed;top:62%;left:50%;transform:translateX(-50%);z-index:90;display:flex;flex-direction:column;gap:6px;align-items:center;pointer-events:none;}
-.toast{background:#1c2733;color:#fff;font-size:13px;line-height:1.5;padding:8px 16px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.25);opacity:0;transform:translateY(-6px);transition:opacity .2s,transform .2s;max-width:70vw;}
+.toast{background:#1c2733;color:#fff;font-size:13px;line-height:1.5;padding:8px 16px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.25);opacity:0;transform:translateY(-6px);transition:opacity .2s,transform .2s,background .2s ease,color .2s ease;max-width:70vw;}
 .toast.show{opacity:1;transform:translateY(0);}
 .toast.ok{background:#1a7f37;}
 .toast.fail{background:#c0392b;}
@@ -10300,6 +10355,8 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
 #searchModalBg,#exportModalBg,#indentModalBg,#tableModalBg,#charFormatModalBg,#finishModalBg,#historyModalBg,#helpModalBg,#formatRulesModalBg,#frRuleModalBg,#replaceRulesModalBg,#rrEditModalBg{animation:ptoeFade .16s ease both;}
 @media (prefers-reduced-motion: reduce){
   .anim-in,.anim-fade,#contextMenu,#popup,#searchModalBg,#exportModalBg,#indentModalBg,#tableModalBg,#charFormatModalBg,#finishModalBg,#historyModalBg,#helpModalBg,#formatRulesModalBg,#frRuleModalBg,#replaceRulesModalBg,#rrEditModalBg{animation:none !important;}
+  button,#errBadge,.page-row,.toast{transition:none !important;transform:none !important;}
+  #toolbar .ic-btn::after,#toolbar .tb-btn:not(.loading)::after{animation:none !important;content:none !important;}
 }
 /* U3：hintbar 可折叠（✕ 关闭，localStorage 记忆） */
 #hintbar{padding:6px 14px;font-size:12px;color:#5a6b7c;background:#eef3fb;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;}
@@ -10312,7 +10369,8 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
    下发各页原始宽高，前端预计算 heights[]，未挂载行前缀和也精确 → 跳转瞬时定位）。
    每页用各自真实宽高比，个别异常大小页面只影响自身行高，不干扰其他页。
    文字窗内容超出图片高度时在行内滚动（height:0+min-height:100% 不参与撑行）。 */
-.page-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:stretch;background:#fff;border:1px solid var(--border);border-radius:8px;padding:12px;}
+.page-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:stretch;background:#fff;border:1px solid var(--border);border-radius:8px;padding:12px;transition:transform var(--transition),box-shadow var(--transition);}
+.page-row:hover{transform:translateY(-1px);box-shadow:var(--shadow-md);}
 .page-head{grid-column:1 / -1;font-size:12px;color:#5a6b7c;border-bottom:1px dashed var(--border);padding-bottom:6px;}
 .img-panel{position:relative;min-width:0;overflow:hidden;background:#fff;border:1px solid var(--border);border-radius:4px;padding:4px;}
 .img-panel img{width:100%;height:auto;display:block;background:#fff;cursor:zoom-in;}

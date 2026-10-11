@@ -481,6 +481,8 @@ def find_canonical_model_key(choices: dict, key: str):
     """
     if not isinstance(choices, dict) or not isinstance(key, str) or not key.strip():
         return None, []
+    # 去除首尾空白后再匹配，避免 " ULQ4 " 之类因空格无法规范化
+    key = key.strip()
     # exact match wins
     if key in choices:
         return key, [key]
