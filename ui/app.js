@@ -6641,7 +6641,14 @@ function _proofreadSourceAtIndex(k) {
     if (proofreadErrors[k]) clearProofread(k, true);
     return { html: ed.innerHTML, ed: ed };
   }
-  const clean = stripProofreadMarkup(contentMap.has(k) ? contentMap.get(k) : pages[k].text);
+  // 2026-10-10 修复多页批处理「第二页起错位」：未挂载页的纠错基准必须与 displayHtml(k)
+  // 渲染出的编辑区文本一致。displayHtml 会经 _ensureBlockNewlines() 在每个块开标签后
+  // 插入换行符（作为文本节点、计入字符偏移），而 contentMap/pages[k].text 存的是未插
+  // 换行的原始串。挂载页（走上面的 ed 分支）用 ed.innerHTML 已含换行；未挂载页若按
+  // 未插换行的串计算偏移，滚动挂载后再经 displayHtml 插换行 → 第 2 页起偏移整体错位。
+  // _ensureBlockNewlines 幂等：已在 contentMap 同步过（含换行）的串不会被重复插入。
+  const rawBase = contentMap.has(k) ? contentMap.get(k) : pages[k].text;
+  const clean = stripProofreadMarkup(_ensureBlockNewlines(rawBase));
   contentMap.set(k, clean);
   return { html: clean, ed: null };
 }
@@ -6722,6 +6729,11 @@ function renderProofread(i) {
   if (!ed) return;
   const errors = proofreadErrors[i] || [];
   if (!errors.length) return;
+  // 纠错条目按 start 升序原地排序（保持 data-err-i 与数组下标一致）。
+  // 若数组乱序（服务端 LLM 追加建议未排序 / 载入的历史条目），倒序遍历时
+  // 已包裹的 .ptoe-err 会被 walker 拒绝，导致左侧条目被截断，Σ标注段长度
+  // 与 err.wrong 不等，应用纠错时其后标注会按错误长度平移——2026-10-10 修复
+  errors.sort(function (a, b) { return (a.start || 0) - (b.start || 0); });
   // P2: 保存光标（相对 ed 文本偏移，排除 .ptoe-fix/.ptoe-marker 的展示文本）——重建后恢复，防 IME 光标跳段首
   let savedSelOffset = -1;
   try {
@@ -7683,8 +7695,12 @@ document.getElementById('errOk').addEventListener('click', function () {
     // 删 fixEl（若存在，只在首段）
     const fixEl2 = ed.querySelector('.ptoe-fix[data-err-i="' + k + '"]');
     if (fixEl2) fixEl2.parentNode.removeChild(fixEl2);
-    // 计算 delta：整条 wrong 被替换为 candidates[0]（或删除）
-    const delta = (err.candidates && err.candidates.length ? String(_candText(err.candidates[0])).length : 0) - (err.wrong ? err.wrong.length : 0);
+    // 计算 delta：以实际被移除的标注段文本为准（与 _applyProofreadPage 的 segText 口径一致）。
+    // 不能用 err.wrong.length：跨文本节点/块边界（_ensureBlockNewlines 插入的 \n
+    // 文本节点）或偏移已漂移时二者不等长，否则其后的标注会按错误长度平移——2026-10-10 修复
+    let segText = '';
+    sEls.forEach(function (s) { segText += s.textContent; });
+    const delta = (err.candidates && err.candidates.length ? String(_candText(err.candidates[0])).length : 0) - (segText ? segText.length : (err.wrong ? err.wrong.length : 0));
     if (err.candidates && err.candidates.length) {
       // 有候选：首段替换为 candidates[0]，其余段删除
       sEls[0].parentNode.replaceChild(document.createTextNode(_candText(err.candidates[0])), sEls[0]);
@@ -9222,6 +9238,12 @@ function _mergeSelectedBlocks(ed) {
       sel.removeAllRanges();
       sel.addRange(r2);
     } catch (e) {}
+    // 2026-10-10 修复合并段落后「错误/修正建议位置错误」：合并是直接改写 innerHTML
+    // 的离散操作，不派发 input 事件，因而绕过输入路径的 _proofreadAutoDismiss() delta-
+    // rebase —— proofreadErrors[i] 的字符偏移仍按合并前文本计算，且被并入块的
+    // .ptoe-err/.ptoe-fix 标注 span 会随 innerHTML 拼接漂移到错误位置。此处复用输入
+    // 路径同一套逻辑（对合并前后纯文本做 diff）重锚偏移并重绘标注。
+    if (row && proofreadErrors[i] && proofreadErrors[i].length) _proofreadAutoDismiss(ed, i);
   });
 }
 
