@@ -7237,7 +7237,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "popup_row1": POPUP_ROW1_DEFAULT,
                     "popup_row2": POPUP_ROW2_DEFAULT,
                     "popup_rule_count": POPUP_RULE_COUNT_DEFAULT,
-                    "proofread_batch_pages": 1,
+                    "proofread_batch_pages": 0,
                     "undo_depth": UNDO_DEPTH_DEFAULT,
                 })
                 merged = {
@@ -7249,7 +7249,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "popup_row1": stored.get("popup_row1", defaults["popup_row1"]),
                     "popup_row2": stored.get("popup_row2", defaults["popup_row2"]),
                     "popup_rule_count": stored.get("popup_rule_count", defaults["popup_rule_count"]),
-                    "proofread_batch_pages": stored.get("proofread_batch_pages", defaults.get("proofread_batch_pages", 1)),
+                    "proofread_batch_pages": stored.get("proofread_batch_pages", defaults.get("proofread_batch_pages", 0)),
                     "undo_depth": stored.get("undo_depth", defaults.get("undo_depth", UNDO_DEPTH_DEFAULT)),
                 }
                 self._send(
@@ -7352,8 +7352,8 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 except (TypeError, ValueError):
                     self._send(400, self._json({"ok": False, "error": "proofread_batch_pages 必须是数字"}), "application/json; charset=utf-8")
                     return
-                if not (1 <= v <= 50):
-                    self._send(400, self._json({"ok": False, "error": "proofread_batch_pages 超出范围（1-50）"}), "application/json; charset=utf-8")
+                if not (0 <= v <= 50):
+                    self._send(400, self._json({"ok": False, "error": "proofread_batch_pages 超出范围（0-50，0=全部页）"}), "application/json; charset=utf-8")
                     return
                 clean["proofread_batch_pages"] = v
             if "undo_depth" in ui:
@@ -11321,8 +11321,8 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">调整编辑区显示字号（视图偏好，不写入保存内容）。</p>
       <label style="font-size:13px;">字号（px） <input type="number" id="editorFontSizeInput" min="10" max="28" step="1" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
       <h4 style="margin:16px 0 4px;">纠错批处理</h4>
-      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">「校正 / 重识别」一次连续处理的页数：从当前页起向后处理 N 页（1-50）。应用 / 清除默认仍只作用于当前页。</p>
-      <label style="font-size:13px;">每批页数 <input type="number" id="prBatchPages" min="1" max="50" step="1" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">「校正 / 重识别」一次处理的页数：0 = 全部页（整本书，默认；校正后整本书的错误标注全部显示）；1-50 = 从当前页起向后处理 N 页。应用 / 清除默认仍只作用于当前页。重识别每页需模型推理，整本书耗时长，建议先设小批数。</p>
+      <label style="font-size:13px;">每批页数（0=全部） <input type="number" id="prBatchPages" min="0" max="50" step="1" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
       <h4 style="margin:16px 0 4px;">撤销 / 回退</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">撤销（Ctrl+Z）/ 前进（Ctrl+Y）保留的历史步数；步数越多占用内存越大。</p>
       <label style="font-size:13px;">历史步数

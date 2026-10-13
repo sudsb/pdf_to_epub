@@ -12,9 +12,11 @@ const OPS = [
   ['marker_full','全文标记'], ['marker_note','注释标记'], ['marker_join','段落标记'],
   ['marker_page','换页标记'],
   ['flush','顶格'], ['indent','缩进'],
-  // 新增内联格式（2026-09）
-  ['underline','下划线'], ['strike','删除线'], ['charbox','字符边框'],
+  // 新增内联格式（2026-09）；underdot 与 strip_ws 为选中菜单新增功能（2026-10）
+  ['underline','下划线'], ['underdot','下加点'], ['strike','删除线'], ['charbox','字符边框'],
   ['shade','底纹'], ['highlight','突显'], ['sup','上标'], ['sub','下标'],
+  ['charformat','字符格式'],
+  ['strip_ws','去空'],
   // 工具操作（无需 currentEditable，直接调用）
   ['search','搜索'], ['clean','智能清理'], ['convert_t2s','繁→简'], ['convert_s2t','简→繁'],
   ['toggle_md','Markdown模式'], ['undo','撤销'], ['redo','重做'], ['history','历史记录'],
@@ -25,14 +27,21 @@ const OPS = [
   ['proofread_accept', '采纳纠错'], ['proofread_ignore', '忽略纠错'],
   ['insert_table', '插入表格'], ['insert_caption', '插入题注'],
 ];
+// 选中菜单按钮字形：必须是简体中文、两两互不重复（单一事实源）。
+// 历史问题：bold/italic 曾显示英文 B/I，且候选池里的 underline/indent 等无字形时
+// 会回退成英文 op 名（见 _makePopBtn 的 `OP_ICON[op] || op`）。此处为候选池
+// POPUP_ELIGIBLE_OPS 的每个操作（paint 见 _makePaintBtn，特例）都补齐唯一汉字。
 const OP_ICON = {
-  bold:'<span class="ic-b">B</span>', italic:'<span class="ic-i">I</span>',
+  bold:'<span class="ic-b">粗</span>', italic:'<span class="ic-i">斜</span>',
   heading:'<span class="ic-h">标</span>', p:'<span class="ic-p">正</span>',
   remove:'<span class="ic-t">清</span>', note:'注', citation:'引',
   align_left:'左', align_center:'中', align_right:'右',
   centerbold:'中粗', merge:'合',
   marker_full:'篇', marker_note:'释', marker_join:'段', marker_page:'页',
-  sup:'上标', sub:'下标'
+  // 候选池其余操作字形（2026-10 补齐，全部单字且互不重复）
+  underline:'线', underdot:'点', strike:'删', highlight:'突', charbox:'框', shade:'底',
+  flush:'顶', indent:'缩', strip_ws:'空',
+  sup:'上', sub:'下', charformat:'格'
 };
 const OP_TIP = {
   bold:'粗体', italic:'斜体', heading:'标题（循环 H1→H6→正文）', p:'正文',
@@ -48,8 +57,9 @@ const OP_TIP = {
   insert_caption: '插入题注（为选中的图片在其后插入可编辑的题注段落）',
   strip_ws: '去空（去除段落内全部空白，保留换行）',
   // 新增内联格式提示
-  underline:'下划线', strike:'删除线', charbox:'字符边框',
+  underline:'下划线', underdot:'下加点', strike:'删除线', charbox:'字符边框',
   shade:'底纹', highlight:'突显', sup:'上标', sub:'下标',
+  charformat:'字符格式（为选中文字设置字体 / 字号 / 颜色）',
 };
 const DEFAULTS = {
   bold:'Ctrl+B', italic:'Ctrl+I', heading:'Ctrl+1', p:'Ctrl+0',
@@ -59,7 +69,8 @@ const DEFAULTS = {
   marker_full:'Ctrl+Shift+F', marker_note:'Ctrl+Shift+M', marker_join:'Ctrl+Shift+J',
   marker_page:'Ctrl+Shift+P',
   // 新增内联格式默认快捷键（空 = 未绑定，用户可在设置中自行绑定，避免冲突浏览器键）
-  underline:'', strike:'', charbox:'', shade:'', highlight:'', sup:'', sub:'',
+  underline:'', underdot:'', strike:'', charbox:'', shade:'', highlight:'', sup:'', sub:'',
+  charformat:'', strip_ws:'',
   // 工具操作默认快捷键
   search:'Ctrl+F', clean:'Ctrl+Shift+C', convert_t2s:'Ctrl+Shift+T', convert_s2t:'Ctrl+Shift+Y',
   toggle_md:'Ctrl+Shift+D', undo:'Ctrl+Z', redo:'Ctrl+Y', history:'Ctrl+H',
@@ -108,8 +119,13 @@ let _loadDoneTimer = null;
 function tipDelay() { return uiv('tip_delay', 600); }
 // 纠错悬停弹出延迟（毫秒）：悬停校正文本超过该时间自动弹出采纳/忽略菜单；0 = 悬停即弹（设置-界面可调）
 function errHoverDelay() { return uiv('err_hover_delay', 1500); }
-// 每批「校正 / 重识别」处理页数（1-50，默认 1；服务端持久化 config.json ui_settings）
-function proofreadBatchCount() { return Math.max(1, Math.min(50, uiv('proofread_batch_pages', 1))); }
+// 每批「校正 / 重识别」处理页数（0 = 全部页/整本书，默认 0；1-50 = 从当前页起连续处理 N 页；
+// 服务端持久化 config.json ui_settings）——2026-10：默认校正后整本书的错误标注全部显示
+function proofreadBatchCount() {
+  const v = parseInt(uiv('proofread_batch_pages', 0), 10);
+  if (isFinite(v) && v <= 0) return 0; // 0 = 整本书全部页
+  return Math.max(1, Math.min(50, isFinite(v) ? v : 1));
+}
 // 撤销/回退历史步数档位（50/100/200/500，默认 100；服务端持久化 config.json ui_settings）
 const UNDO_DEPTH_CHOICES = [50, 100, 200, 500];
 function undoLimit() {
@@ -121,11 +137,11 @@ function undoLimit() {
 // correct_pages 每运行随机端口 → localStorage 按 origin 隔离每次失效，
 // 故以内存 uiSettings 为准、服务端为准，localStorage 仅作加载前的同步兜底。
 // 弹出菜单可选操作池（与后端 correctmanage.POPUP_ELIGIBLE_OPS 保持一致；paint = 格式刷，不在 OPS 数组中）
-const POPUP_ELIGIBLE_OPS = ['bold','italic','underline','strike','highlight','charbox','shade','sup','sub','heading','p','remove','note','citation','align_left','align_center','align_right','centerbold','flush','indent','merge','marker_full','marker_note','marker_join','marker_page','paint'];
+const POPUP_ELIGIBLE_OPS = ['bold','italic','underline','underdot','strike','highlight','charbox','shade','sup','sub','heading','p','remove','note','citation','align_left','align_center','align_right','centerbold','flush','indent','strip_ws','merge','marker_full','marker_note','marker_join','marker_page','charformat','paint'];
 const UI_SETTINGS_DEFAULTS = { tip_delay: 600, err_hover_delay: 1500, editor_font_size: 14, img_mode: '', rule_all_pages_confirm: true,
   popup_row1: ['bold','italic','heading','p','note','citation','paint','remove'],
   popup_row2: ['align_left','align_center','align_right','centerbold','merge','sup','sub'],
-  popup_rule_count: 5, proofread_batch_pages: 1, undo_depth: 100 };
+  popup_rule_count: 5, proofread_batch_pages: 0, undo_depth: 100 };
 let uiSettings = null; // 服务端加载前为 null → 读 localStorage 兜底；加载后为完整对象
 function uiv(key, def) {
   if (uiSettings && key in uiSettings && uiSettings[key] !== undefined && uiSettings[key] !== null) return uiSettings[key];
@@ -3207,7 +3223,11 @@ function captureFormatFromSelection() {
   fmt.inlineClasses = Array.from(inlineSet);
   return fmt;
 }
-function applyOp(op) { const ed = currentEditable(); if (!ed) return;
+function applyOp(op) {
+   // 字符格式（2026-10）：打开「字体 / 字号 / 颜色」弹窗。不依赖 currentEditable ——
+   // 弹窗内部自行判定目标编辑区，故候选池按钮与快捷键都走这一入口。
+   if (op === 'charformat') { openCharFormatDialog(); return; }
+   const ed = currentEditable(); if (!ed) return;
    // 新增内联格式（2026-09）：下划线、删除线、字符边框、底纹、突显、上标、下标
    if (INLINE_CLASSES.includes('ptoe-' + op)) {
      applyInlineClass(ed, 'ptoe-' + op, {toggle:true});
@@ -5450,7 +5470,8 @@ document.getElementById('historyImportFile').addEventListener('change', onHistor
 function _makePopBtn(op) {
   const b = document.createElement('button');
   b.type = 'button'; b.className = 'pop-btn'; b.dataset.op = op;
-  b.innerHTML = OP_ICON[op] || op;
+  // 字形缺失时回退中文标签首字（而非英文 op 名），确保菜单永无英文按钮
+  b.innerHTML = OP_ICON[op] || esc(popupOpIcon(op));
   b.setAttribute('aria-label', OP_TIP[op] || op);
   b.addEventListener('mouseenter', scheduleTip);
   b.addEventListener('mouseleave', hideTip);
@@ -6631,8 +6652,13 @@ let proofreadLlmEnabled = false; // LLM 深度校对开关（服务端持久化 
 let proofreadLlmModel = '';      // 深度校对模型 key（'' = 跟随 selected_model）
 let proofreadLegacyRules = false; // 原有规则开关（默认关：校正只跑三条新规则；服务端持久化）
 
-// 批量范围：从 start 起连续 n 页的索引数组（n=proofreadBatchCount()，上限 pages.length）
+// 批量范围：n>0 时从 start 起连续 n 页；n<=0（0 = 全部）时返回整本书全部页索引数组
 function _batchRange(start, n) {
+  if (n <= 0) { // 0 = 校正/重识别整本书：从首页到末页
+    const out = [];
+    for (let k = 0; k < pages.length; k++) out.push(k);
+    return out;
+  }
   const end = Math.min(pages.length, start + n);
   const out = [];
   for (let k = start; k < end; k++) out.push(k);
@@ -6672,7 +6698,7 @@ function _applyProofreadResult(k, errors) {
 }
 
 // 纠错当前编辑行：调 /api/proofread → 叠加标注（校正结果入撤销栈）
-// 批处理：从当前页起连续校正 proofreadBatchCount() 页（默认 1）。
+// 批处理：proofreadBatchCount() 页（0 = 整本书全部页，默认）
 async function runProofread() {
   const ed = currentEditable();
   if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
@@ -6680,6 +6706,8 @@ async function runProofread() {
   if (!row) return;
   const start = Number(row.dataset.i);
   const indices = _batchRange(start, proofreadBatchCount());
+  // 0 = 全部页：整本书所有页一起校正，先给状态反馈（多页批处理耗时较长）
+  if (indices.length > 1) setStatus('正在校正 ' + indices.length + ' 页…');
   // 标注操作入撤销栈：校正前快照（内容 + 错误标注）；仅实际有变化的页会产生撤销条目
   const errBefore = new Map();
   for (const k of indices) errBefore.set(k, _copyErrors(k));
@@ -7280,7 +7308,7 @@ function proofreadCorrect() {
   runProofread();
 }
 
-// 子项2 重识别：对当前页（起连续 proofreadBatchCount() 页）重新 OCR，差异以纠错标注叠加显示
+// 子项2 重识别：对当前页（起连续 proofreadBatchCount() 页；0 = 整本书全部页）重新 OCR，差异以纠错标注叠加显示
 let _reocrBusy = false; // 防并发：上一次请求未完成前忽略再次点击
 async function runReocr() {
   closeProofreadMenu();
@@ -7290,7 +7318,13 @@ async function runReocr() {
   const row = ed.closest('.page-row');
   if (!row) return;
   const start = Number(row.dataset.i);
-  const indices = _batchRange(start, proofreadBatchCount());
+  const batch = proofreadBatchCount();
+  const indices = _batchRange(start, batch);
+  // 0 = 全部页：重识别每页都要走模型 OCR，整本书耗时长——先确认再执行（2026-10）
+  if (batch <= 0 && indices.length > 1 && !confirm(
+    '重识别将处理整本书全部页（共 ' + indices.length + ' 页），每页均需模型重新识别，耗时可能很长。是否继续？'
+  )) { return; }
+  if (indices.length > 1) setStatus('正在重识别 ' + indices.length + ' 页…');
   // 标注操作入撤销栈：重识别前快照（内容 + 错误标注）；仅实际有变化的页会产生撤销条目
   const errBefore = new Map();
   for (const k of indices) errBefore.set(k, _copyErrors(k));
@@ -10450,11 +10484,11 @@ document.getElementById('tipDelayInput').addEventListener('change', (e) => {
 document.getElementById('ruleAllPagesConfirm').addEventListener('change', (e) => {
   if (uiSettings) { uiSettings.rule_all_pages_confirm = e.target.checked; saveUiSettings(); }
 });
-// 纠错批处理页数（1-50；服务端持久化 config.json ui_settings）
+// 纠错批处理页数（0 = 全部页/整本书；1-50；服务端持久化 config.json ui_settings）
 const _prBatchInput = document.getElementById('prBatchPages');
 if (_prBatchInput) _prBatchInput.addEventListener('change', (e) => {
   const v = parseInt(e.target.value, 10);
-  const n = isFinite(v) ? Math.max(1, Math.min(50, v)) : 1;
+  const n = isFinite(v) ? Math.max(0, Math.min(50, v)) : 0;
   e.target.value = n;
   if (uiSettings) { uiSettings.proofread_batch_pages = n; saveUiSettings(); }
 });

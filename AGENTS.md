@@ -2,116 +2,77 @@
 
 ## Project Overview
 
-- Purpose: CLI tool (ptoe) to convert PDFs → images → OCR → structured XHTML → EPUB. Includes optional browser-based manual correction UI and a lightweight web config GUI.
-- Entrypoint: `mian.py` (subcommands: `epub`, `correct`, `resume`, `model`, `config`, `gui`, `stop`).
-- Target: Windows-first packaging (single-file PyInstaller exe); inference adapters support local and remote engines (llama.cpp, vLLM-Omni, PaddleOCR adapter).
+PToEA is a Windows-first CLI tool (plus optional local GUI) for converting PDF files to EPUB via OCR, model-based correction, and browser-based manual annotation. Core features: PDF-to-image splitting, OCR (llama.cpp and vLLM-Omni backends, PaddleOCR optional), robust EPUB output, interruption resume, and self-contained PyInstaller packs. Designed for portability and easy deployment (minimal deps, atomic writes, lazy imports, regular smoke testing). Key asset: flexible text normalization and correction pipeline, with both automated and manual flows.
 
 ## Architecture & Data Flow
 
-- High-level pipeline (canonical):
-  - mian.py → pdfmanage.split_pdf_to_images() → llamamanage/vllmmanage.batch_infer() → stringmanage.clean_and_structure_text() → htmlmanage.HTMLConverter → epubmanage.EPUBPacker
-  - Optional manual correction: correctmanage.correct_pages() (ThreadingHTTPServer) → apply_markers() → repackage
-  - Web config UI: guimanage.py serves small web endpoints for runtime configuration.
-- Engine adapters share the same API shape (llamamanage.py ↔ vllmmanage.py). Paddle OCR lives in paddleocrmanage.py (optional heavy dependency).
-- Outputs and state:
-  - Per-PDF files under `data/` (images, correction_history, final .epub)
-  - Dictionaries under `dicts/` (jieba, shapes, homophones)
-  - Embedded UI JS/HTML kept in the server files and extracted by helper scripts when needed.
+- **Core pipeline**: `pdfmanage.py` splits PDF→images, `paddleocrmanage.py`/`llamamanage.py`/`vllmmanage.py` run OCR (engine selected via config/CLI), output is normalized (`stringmanage.py`), structured, and XHMTL-wrapped for EPUB creation (`epubmanage.py`).
+- **Manual correction path**: Served via `guimanage.py`, using embedded UI (`ui/app.js`, `ui/epubedit.html`/`.js`). Users can proof, re-token, and export corrections interactively; supports undo/history.
+- **Config/session/dependency management**: `configmanage.py` ensures atomic config writes, session mutices, guarded lazy import of heavy/optional deps (`zhconv`, `requests`, etc.).
+- **Locking**: `_CFG_LOCK`, per-session mutex, and explicit module global guards for concurrency safety—order: config, session, PDF/image, model engine, HTML.
+- **Batch/parallel hotspots**: Batch inference (`llamamanage.py`), PDF-to-image bulk ops, and EPUB post-processing are lock-coordinated and performance-sensitive.
+- **Frozen EXE**: Paths, config, and runtime tests handle 8.3/long-form mismatches and minimize frozen build bugs.
 
-## Key Directories and files (paths)
+## Key Directories
 
-- Top-level Python modules: `mian.py`, `pdfmanage.py`, `llamamanage.py`, `vllmmanage.py`, `configmanage.py`, `stringmanage.py`, `htmlmanage.py`, `epubmanage.py`, `correctmanage.py`, `guimanage.py`, `dictionarymanage.py`, `rulemanage.py`, `proofreadmanage.py`, `paddleocrmanage.py`.
-- Data and assets: `data/`, `dicts/`, `ui/` (embedded UI assets when present).
-- Build / packaging: `pack.ps1`, `ptoe.spec`, `build/`, `dist/`.
-- Developer scripts: `check_js.py`, `extract_js.py`, `_extract_js.py`, `scripts/test_proofread_perf.py`.
+- Project Root: all primary modules, tests, `config.json` for persistent state.
+- `ui/`: JS/HTML embedded frontend for correction GUI and EPUB editing.
 
-## Development Commands (examples)
+## Development Commands
 
-- Convert PDF to EPUB (basic):
-  - python mian.py epub <file.pdf> --dpi 2 --model <MODEL_KEY> --workers 4 --title "Book Title"
-- Launch correction UI for a PDF:
-  - python mian.py correct <file.pdf>
-- Start config GUI:
-  - python mian.py gui
-- Stop a running engine/server:
-  - python mian.py stop --engine llama
-- Unit tests (stdlib unittest):
-  - python -m unittest discover -v
-  - python -m unittest test_stringmanage
-- Fast smoke tests after edits:
-  - python -m unittest test_stringmanage
-  - python -m unittest test_pdfmanage
-  - python -m unittest test_llamamanage
-  - python -m unittest test_vllmmanage
-- Embedded-UI JS validation (after editing correctmanage.py):
-  - python check_js.py
-  - python extract_js.py && node --check extracted_ui.js
-- Packaging (Windows):
-  - powershell -ExecutionPolicy Bypass -File .\0pack.ps1  # builds onedir PyInstaller package (dist\ptoe\)
-  - 0pack.bat  # 双击启动器：显式 -ExecutionPolicy Bypass 调 0pack.ps1，失败时窗口保持打开（本机 .ps1 关联缺失/被文本编辑器接管，双击 .ps1 不会走打包流程）
+- **Dependency sync**: `uv sync`
+- **Run CLI**: `uv run python mian.py [args]`
+- **Set config**: `uv run python mian.py config set KEY VALUE`
+- **Tests**: `python test_stringmanage.py`, `python test_pdfmanage.py`, `python test_llamamanage.py` (smoke: always run after changes)
+- **Browser/GUI**: `uv run python mian.py gui`
+- **Package to exe**: `powershell -ExecutionPolicy Bypass -File .\0pack.ps1 [-NoPaddle][-OneFile]`
+- **Lint UI JS**: `node --check ui/app.js`; also `python check_js.py` for embedded/extracted JS
 
-(Repository uses `uv run ...` wrappers in developer scripts; plain `python` commands work too.)
+## Code Conventions & Common Patterns
 
-## Code Conventions & Common Patterns — what to follow as an assistant
+- **Formatting**: No enforced linter; PEP8 and single-module patterns, avoid sprawling helpers.
+- **Naming**: Module scope is flat, one responsibility/module; test files `test_*.py` mirror module names at root.
+- **Error Handling**: Prefer explicit try/except with concise fallback. Never silence.
+- **Globals/Locks**: Only `_CFG_LOCK`, `_SESSION`, and `_server_process` global. Lock ordering must be preserved (config → session → engine/image), see in-source comments for hack doors.
+- **Async/Concurrency**: Multi-thread only in batch image/OCR/engine. No asyncio/event-loop—thread or process only.
+- **Lazy/Optional Deps**: All heavy deps (`zhconv`, `requests`, PaddleOCR, opencv) are lazy-imported (try/except fallback, Dummy for missing); code still imports if missing, always test with and without deps installed.
+- **State/DI**: No IoC framework; state passed explicitly or via config/session, not via DI.
+- **Atomicity & Safety**: Config and output writes use in-project atomic helpers (`configmanage._atomic_write_json`).
+- **Dangerous Paths**: File ops manipulate both image and epub in a single run—tmp/partial files cleaned after finish. Be careful: overwrites are explicit, not autosafe.
+- **Test Isolation**: Most tests monkeypatch config/params; no cross-test shared state (except manual override for session).
 
-- Flat script layout. Keep heavy imports lazy: import fitz/PyMuPDF, cv2, requests, zhconv, paddleocr, jieba inside functions to avoid expensive top-level imports.
-- Atomic persistent writes: use the provided helper `configmanage._atomic_write_json(path, obj)` (tempfile + os.replace). Hold `configmanage._CFG_LOCK` when reading/writing config.
-- Preserve module-global state and names. Common globals to not rename silently: `configmanage._CFG_LOCK`, `configmanage._CONFIG_PATH`, `configmanage._atomic_write_json`, `llamamanage._SESSION`, `llamamanage._server_process` (server lifecycle cache), `llamamanage._ARG_HELP_CACHE`, `llamamanage._BATCH_ENGINE`/`_ENGINE_CACHE`, `correctmanage._PREVIEW_WARM_STARTED`, `correctmanage._PREVIEW_WARMED_KEYS`. Use LSP-aware rename for cross-file symbol changes.
-- Concurrency model:
-  - ThreadPoolExecutor for batch inference and I/O parallelism (llamamanage.batch_infer).
-  - ProcessPoolExecutor used for heavy rendering/preview warming in pdfmanage/correctmanage where present.
-  - ThreadingHTTPServer for GUI/correction UIs (guimanage.py and correctmanage.py).
-  - Protect shared mutable state with threading.Lock / RLock; lock order matters (config lock vs other locks).
-- Network client reuse: a shared requests.Session with mounted HTTPAdapter+Retry is used (llamamanage._SESSION). Preserve this pattern to keep connection reuse and retry semantics.
-- EPUB rules: internal EPUB paths must use forward slashes ('/'); htmlmanage/epubmanage enforce this. Do not os.path.join EPUB internal paths.
-- Format-rule engine: rulemanage implements a small DOM-like parser for rule application (conditions: contains/prefix/suffix/regex; modes: first/all). Tests exist — prefer using that engine rather than re-implementing client-side rule logic.
-- Marker system: content markers use data attributes (e.g., data-ptoe-marker). When refactoring HTML conversion or marker application, update apply_markers() callsites.
-- Frozen exe support: access bundled assets via sys._MEIPASS when reading pyproject/embedded assets. Packaging scripts expect these assets to be present.
+## Important Files
 
-## Important files (what you'll open/edit often)
+- **Entrypoint**: `mian.py` (CLI), `guimanage.py` (server/GUI)
+- **Key modules**: `configmanage.py`, `pdfmanage.py`, `llamamanage.py`, `correctmanage.py`, `epubmanage.py`, `stringmanage.py`, `vllmmanage.py`, `paddleocrmanage.py`
+- **Frontend**: `ui/app.js`, `ui/epubedit.html`, `ui/tabhost.html`, `ui/epubedit.js`
+- **Config**: `config.json` (auto-managed but can be edited for advanced setup)
+- **Pack, build scripts**: `0pack.ps1`, `0pack.bat`, `0_copy_ptoe_to_pte.ps1`
+- **Tests**: `test_*.py` (all at repo root)
+- **Docs**: `README.md`, `USAGE.md` (Chinese quickstart), `pyproject.toml` (dependencies/tooling)
 
-- mian.py — CLI orchestration and subcommand wiring.
-- configmanage.py — get_config(), validate_and_patch_config(), `_atomic_write_json()`, DEFAULT_CONFIG. Preserve `_CFG_LOCK` semantics.
-- llamamanage.py — engine lifecycle, `_SESSION`, batch_infer(), server probe/start/stop helpers (probe uses `--help`).
-- vllmmanage.py — vLLM adapter; keep API parity with llamamanage.
-- pdfmanage.py — PDF→image splitting and preprocess, rendering helpers.
-- stringmanage.py — text cleaning and structure heuristics (bbox→HTML, heading detection, brackets).
-- htmlmanage.py / epubmanage.py — HTML→XHTML conversion and EPUB packaging (OPF/nav generation).
-- correctmanage.py — browser correction server, preview warming, apply_markers(), embedded UI script.
-- guimanage.py — config GUI endpoints and small management UI.
-- rulemanage.py — server-side format-rule engine; tests: `test_rulemanage.py`.
-- scripts: `check_js.py`, `extract_js.py`, `_extract_js.py`, `scripts/test_proofread_perf.py` (benchmarks).
-- pack.ps1, ptoe.spec, pyproject.toml — packaging metadata and packaging script.
+## Runtime/Tooling Preferences
 
-## Runtime / Tooling Preferences
+- **Interpreter**: Python ≥3.11, Windows required (tested only on Win10/11)
+- **Dep manager**: [uv](https://docs.astral.sh/uv/) (`uv sync`, not pip)
+- **Build**: PyInstaller (via PowerShell), optional PaddleOCR support (default packs exclude for space)
+- **UI**: Node.js (or Bun) only needed for JS lint/validation
+- **Test**: stdlib unittest only; no pytest/coverage/lint by default
+- **Embedded UI**: JS/HTML in `ui/`, extracted/checked via `python extract_js.py` + `node --check`
 
-- Python >= 3.11 recommended.
-- Windows-first packaging via PyInstaller (0pack.ps1). The released form is a self-contained directory (dist\ptoe\), no UPX.
-- Node required only for static JS syntax checks (`node --check`).
-- Tests primarily use the stdlib `unittest`; `pytest` is required only for `test_config_llama.py`.
-- Avoid adding new heavy runtime dependencies; prefer optional imports guarded by try/except and conservative fallbacks.
+## Testing & QA
 
-## Testing & QA — verification checklist for edits
-
-- Unit tests: `python -m unittest discover -v` (full run). Use targeted tests for fast feedback: `test_stringmanage`, `test_pdfmanage`, `test_llamamanage`, `test_vllmmanage`.
-- After editing embedded UI in `correctmanage.py`:
-  - Run `python check_js.py` (repo helper)
-  - Extract JS: `python extract_js.py` (or `_extract_js.py` depending on area)
-  - Syntax check: `node --check extracted_ui.js`
-- After edits touching config behavior: run tests including `test_config_llama.py` (requires pytest) and verify `configmanage._atomic_write_json` still used by code paths that persist config.
-- After server lifecycle or engine argument changes: verify server probe/start/stop flows and `mian.py stop` path.
-- Packaging: if you change bundled assets (dicts/, pyproject.toml, ui files), run `powershell -ExecutionPolicy Bypass -File .\pack.ps1` and smoke the exe.
-
-## Quick editing safety rules (short)
-
-- Re-ground before edits: run the small smoke tests that exercise the module you change.
-- Use lazy-import pattern already present; do not move heavy imports to module top-level.
-- For cross-file symbol renames, use LSP `rename` to update callsites — do not sed/regex replace.
-- Preserve `_SESSION`, `_CFG_LOCK`, `_server_process` semantics and lock order.
-- If you change embedded UI, run check_js + node check before committing.
+- **Framework**: stdlib `unittest` across 20+ `test_*.py` in project root
+- **How to run**:
+  - Individual: `python test_xxx.py`
+  - Minimal smoke (always run after changes):
+    - `python test_stringmanage.py`
+    - `python test_pdfmanage.py`
+    - `python test_llamamanage.py`
+  - UI/JS: `node --check ui/app.js`, `python check_js.py`
+- **Quality**: No type/lint/coverage gate—manual smoke tests are required
+- **Patterns**: Use atomic write helpers, lock ordering, and guarded lazy imports for all tests
+- **Pitfalls**: Be watchful of 8.3/long-path mismatches (especially in frozen exe), session/config race bugs, global state, and missed dependency mocks in test runs
 
 ---
-
-Paths and commands in this file were synthesized from repository source and developer scripts (see: `mian.py`, `configmanage.py`, `llamamanage.py`, `correctmanage.py`, `check_js.py`, `extract_js.py`, `pack.ps1`, `pyproject.toml`).
-
-If you want, I will also: (a) add a one-line per-file quick reference table, or (b) produce a short `DEV_CHECKLIST.md` with the smoke-test commands and exact test set to run after edits. Which should I write next? (Recommended: 0)
+_See [README.md](README.md), [USAGE.md](USAGE.md), and comments in `0pack.ps1` for deeper specifics. Update this guideline if major architecture or conventions change._

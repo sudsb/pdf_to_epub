@@ -538,6 +538,49 @@ function run() {
     doc.getElementById('cfModeSel').checked = true;
   }
 
+  console.log('\n== 9b. 弹出菜单新增候选功能（下加点 / 底纹 / 字符格式）==');
+  {
+    // 下加点：候选池 op 'underdot'，经 applyOp 走 INLINE_CLASSES 通用开关路径
+    const AP = X('applyOp');
+    const b = blockOf(0, 0);
+    b.innerHTML = '甲乙丙丁戊己';
+    const txt = b.textContent;                 // 可能带块间换行前缀，用真实文本切片断言
+    selectIn(b, 0, 3);
+    try { AP('underdot'); } catch (e) { A(false, "applyOp('underdot') 抛错: " + e.message); }
+    let sp = b.querySelector('span.ptoe-underdot');
+    A(!!sp, '下加点：选区被包 ptoe-underdot');
+    EQ(sp && sp.textContent, txt.slice(0, 3), '下加点：只覆盖选中文字');
+    // 二次点击应解包（toggle 关闭）
+    selectIn(b, 0, 3);
+    try { AP('underdot'); } catch (e) { A(false, "applyOp('underdot') 二次 抛错: " + e.message); }
+    A(b.querySelector('span.ptoe-underdot') === null, '下加点：再次点击可撤销');
+  }
+  {
+    // 底纹：候选池 op 'shade'，同样走 INLINE_CLASSES 通用开关路径
+    const AP = X('applyOp');
+    const b = blockOf(0, 0);
+    b.innerHTML = '甲乙丙丁戊己';
+    const txt = b.textContent;
+    selectIn(b, 2, 5);
+    try { AP('shade'); } catch (e) { A(false, "applyOp('shade') 抛错: " + e.message); }
+    const sp = b.querySelector('span.ptoe-shade');
+    A(!!sp, '底纹：选区被包 ptoe-shade');
+    EQ(sp && sp.textContent, txt.slice(2, 5), '底纹：只覆盖选中文字');
+  }
+  {
+    // 字符格式：候选池 op 'charformat'，applyOp 必须打开字号/字体/颜色弹窗
+    const AP = X('applyOp');
+    const b = blockOf(0, 0);
+    b.innerHTML = '甲乙';
+    selectIn(b, 0, 1);
+    const bg = doc.getElementById('charFormatModalBg');
+    if (bg) bg.style.display = 'none';
+    try { AP('charformat'); } catch (e) { A(false, "applyOp('charformat') 抛错: " + e.message); }
+    EQ(bg && bg.style.display, 'flex', '字符格式：applyOp 打开字号/颜色弹窗');
+    X('closeCharFormatDialog')();
+    EQ(bg && bg.style.display, 'none', '字符格式：关闭后弹窗隐藏');
+  }
+
   console.log('\n== 9. 插入分隔线 ==');
   {
     const IDC = X('insertDividerAtCaret');

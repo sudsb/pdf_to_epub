@@ -8902,7 +8902,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "popup_row1": ["bold", "p"],
                     "popup_row2": ["note"],
                     "popup_rule_count": 3,
-                    "proofread_batch_pages": 1,
+                    "proofread_batch_pages": 0,
                     "undo_depth": 100,
                 },
             )
@@ -8929,7 +8929,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "popup_row1": ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"],
                     "popup_row2": ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"],
                     "popup_rule_count": 5,
-                    "proofread_batch_pages": 1,
+                    "proofread_batch_pages": 0,
                     "undo_depth": 100,
                 },
             )
@@ -9148,6 +9148,25 @@ class TestUiSettingsEndpoint(unittest.TestCase):
             ).json()
             self.assertTrue(res["ok"])
             self.assertEqual(calls, [{"proofread_batch_pages": 7}])
+        finally:
+            self._stop(server)
+
+    def test_post_proofread_batch_pages_zero_means_all(self):
+        # 0 = 全部页/整本书（2026-10：默认校正后整本书错误标注全部显示）
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"proofread_batch_pages": 0}}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(calls, [{"proofread_batch_pages": 0}])
         finally:
             self._stop(server)
 
@@ -10115,7 +10134,7 @@ class TestSetUiSettingsConfig(unittest.TestCase):
                 "popup_row1": ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"],
                 "popup_row2": ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"],
                 "popup_rule_count": 5,
-                "proofread_batch_pages": 1,
+                "proofread_batch_pages": 0,
                 "undo_depth": 100,
             },
         )

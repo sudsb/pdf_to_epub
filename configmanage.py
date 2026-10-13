@@ -98,11 +98,12 @@ def _atomic_write_json(path: str, obj: dict) -> None:
         raise
 # 弹出菜单（选中文字快捷菜单）可配置按钮候选池：(ui/app.js POPUP_ELIGIBLE_OPS 需与此保持同步)
 POPUP_ELIGIBLE_OPS = [
-    "bold", "italic", "underline", "strike", "highlight", "charbox", "shade",
+    "bold", "italic", "underline", "underdot", "strike", "highlight", "charbox", "shade",
     "sup", "sub", "heading", "p", "remove", "note", "citation",
     "align_left", "align_center", "align_right", "centerbold",
-    "flush", "indent", "merge",
+    "flush", "indent", "strip_ws", "merge",
     "marker_full", "marker_note", "marker_join", "marker_page",
+    "charformat",  # 字符格式（打开字体/字号/颜色弹窗；有 OPS 中文标签与 OP_ICON 字形）
     "paint",  # 格式刷（特殊按钮，非 OPS 项）
 ]
 POPUP_ROW1_DEFAULT = ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"]
@@ -342,8 +343,8 @@ DEFAULT_CONFIG = {
         "popup_row1": POPUP_ROW1_DEFAULT,
         "popup_row2": POPUP_ROW2_DEFAULT,
         "popup_rule_count": POPUP_RULE_COUNT_DEFAULT,
-        # 每批「校正/重识别」处理的页数（1-50，默认 1）：设为 N 时从当前页起连续处理 N 页
-        "proofread_batch_pages": 1,
+        # 每批「校正/重识别」处理的页数（0-50，默认 0 = 全部页/整本书）：设为 N 时从当前页起连续处理 N 页
+        "proofread_batch_pages": 0,
         # 撤销/回退（Ctrl+Z / Ctrl+Y）保留的历史步数：50/100/200/500（默认 100）
         "undo_depth": UNDO_DEPTH_DEFAULT,
     },
@@ -886,12 +887,12 @@ def set_ui_settings(ui: dict) -> dict:
         else:
             clean["popup_rule_count"] = POPUP_RULE_COUNT_DEFAULT
     if "proofread_batch_pages" in ui:
-        # 每批校正/重识别页数：1-50 的整数，非数值回退 1（与既有数值键 clamp 写法一致）
+        # 每批校正/重识别页数：0-50 的整数（0 = 全部页/整本书），非数值回退 0（与既有数值键 clamp 写法一致）
         try:
             v = int(ui["proofread_batch_pages"])
         except (TypeError, ValueError):
-            v = 1
-        clean["proofread_batch_pages"] = max(1, min(50, v))
+            v = 0
+        clean["proofread_batch_pages"] = max(0, min(50, v))
     if "undo_depth" in ui:
         try:
             v = int(ui["undo_depth"])

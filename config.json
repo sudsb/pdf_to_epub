@@ -287,7 +287,7 @@
     "binarize": false,
     "workers": 8
   },
-  "citationItalicEnabled": true,
+  "citationItalicEnabled": false,
   "exclude_pages": [],
   "browser": "D:/min/min.exe",
   "gui_display": "pywebview",
@@ -317,9 +317,10 @@
       "centerbold",
       "merge",
       "sup",
-      "sub"
+      "underdot",
+      "highlight"
     ],
-    "proofread_batch_pages": 1,
+    "proofread_batch_pages": 0,
     "undo_depth": 100
   },
   "proofread_engine": "llama",

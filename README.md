@@ -482,6 +482,10 @@ uv run python -c "from llamamanage import stopserver; stopserver()"
 - **OCR prompt**: Appends `"\n按原文原格式输出"` unless `--thinking` enabled
 - **Thinking mode**: Qwen3 hidden CoT slows OCR ~7x; default off
 
+## 更新日志
+
+近期变更见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## License
 
 MIT (or specify your license)
