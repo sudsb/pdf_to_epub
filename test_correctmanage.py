@@ -8896,6 +8896,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                 {
                     "tip_delay": 500,
                     "err_hover_delay": 1000,
+                    "brush_merge_delay": 800,
                     "editor_font_size": 16,
                     "img_mode": "full",
                     "rule_all_pages_confirm": True,
@@ -8904,6 +8905,9 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "popup_rule_count": 3,
                     "proofread_batch_pages": 0,
                     "undo_depth": 100,
+                    "show_line_numbers": False,
+                    "line_num_size": "large",
+                    "text_justify": True,
                 },
             )
         finally:
@@ -8923,6 +8927,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                 {
                     "tip_delay": 600,
                     "err_hover_delay": 1500,
+                    "brush_merge_delay": 800,
                     "editor_font_size": 14,
                     "img_mode": "",
                     "rule_all_pages_confirm": True,
@@ -8931,6 +8936,9 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "popup_rule_count": 5,
                     "proofread_batch_pages": 0,
                     "undo_depth": 100,
+                    "show_line_numbers": False,
+                    "line_num_size": "large",
+                    "text_justify": True,
                 },
             )
         finally:
@@ -8946,6 +8954,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
             self.assertTrue(res["ok"])
             self.assertEqual(res["ui_settings"]["tip_delay"], 800)
             self.assertEqual(res["ui_settings"]["err_hover_delay"], 1500)
+            self.assertEqual(res["ui_settings"]["brush_merge_delay"], 800)
             self.assertEqual(res["ui_settings"]["editor_font_size"], 14)
             self.assertEqual(res["ui_settings"]["img_mode"], "")
             self.assertEqual(res["ui_settings"]["rule_all_pages_confirm"], True)
@@ -9042,6 +9051,62 @@ class TestUiSettingsEndpoint(unittest.TestCase):
         finally:
             self._stop(server)
 
+    def test_post_brush_merge_delay_persists(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"brush_merge_delay": 1200}}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(calls, [{"brush_merge_delay": 1200}])
+        finally:
+            self._stop(server)
+
+    def test_post_brush_merge_delay_out_of_range_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"brush_merge_delay": 99999}}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("范围", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+    def test_post_brush_merge_delay_bad_type_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"brush_merge_delay": "abc"}}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("数字", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
     def test_post_editor_font_size_out_of_range_400(self):
         import json as _json
 
@@ -9133,7 +9198,116 @@ class TestUiSettingsEndpoint(unittest.TestCase):
         finally:
             self._stop(server)
 
-    def test_post_proofread_batch_pages_persists(self):
+    def test_post_show_line_numbers_persists(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"show_line_numbers": True}}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(calls, [{"show_line_numbers": True}])
+        finally:
+            self._stop(server)
+
+    def test_post_show_line_numbers_bad_type_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"show_line_numbers": "yes"}}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("布尔", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+    def test_post_line_num_size_persists(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"line_num_size": "small"}}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(calls, [{"line_num_size": "small"}])
+        finally:
+            self._stop(server)
+
+    def test_post_line_num_size_invalid_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"line_num_size": "huge"}}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("line_num_size", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+    def test_post_text_justify_persists(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"text_justify": False}}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(calls, [{"text_justify": False}])
+        finally:
+            self._stop(server)
+
+    def test_post_text_justify_bad_type_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"text_justify": "yes"}}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("布尔", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
         import json as _json
 
         import requests
@@ -10101,6 +10275,14 @@ class TestSetUiSettingsConfig(unittest.TestCase):
         cfg = self.cm.set_ui_settings({"err_hover_delay": 20000})
         self.assertEqual(cfg["ui_settings"]["err_hover_delay"], 10000)
 
+    def test_clamp_brush_merge_delay(self):
+        cfg = self.cm.set_ui_settings({"brush_merge_delay": -100})
+        self.assertEqual(cfg["ui_settings"]["brush_merge_delay"], 0)
+        cfg = self.cm.set_ui_settings({"brush_merge_delay": 99999})
+        self.assertEqual(cfg["ui_settings"]["brush_merge_delay"], 5000)
+        cfg = self.cm.set_ui_settings({"brush_merge_delay": 1200})
+        self.assertEqual(cfg["ui_settings"]["brush_merge_delay"], 1200)
+
     def test_clamp_editor_font_size(self):
         cfg = self.cm.set_ui_settings({"editor_font_size": 5})
         self.assertEqual(cfg["ui_settings"]["editor_font_size"], 10)
@@ -10128,6 +10310,7 @@ class TestSetUiSettingsConfig(unittest.TestCase):
             {
                 "tip_delay": 600,
                 "err_hover_delay": 1500,
+                "brush_merge_delay": 800,
                 "editor_font_size": 14,
                 "img_mode": "",
                 "rule_all_pages_confirm": True,
@@ -10136,6 +10319,9 @@ class TestSetUiSettingsConfig(unittest.TestCase):
                 "popup_rule_count": 5,
                 "proofread_batch_pages": 0,
                 "undo_depth": 100,
+                "show_line_numbers": False,
+                "line_num_size": "large",
+                "text_justify": True,
             },
         )
 
@@ -10145,6 +10331,20 @@ class TestSetUiSettingsConfig(unittest.TestCase):
         self.assertEqual(cfg["ui_settings"]["undo_depth"], 100)
         cfg2 = self.cm.set_ui_settings({"undo_depth": 200})
         self.assertEqual(cfg2["ui_settings"]["undo_depth"], 200)
+
+    def test_line_num_size_defensive_fallback(self):
+        # 非法尺寸 → 回退默认 large；合法尺寸保留
+        cfg = self.cm.set_ui_settings({"line_num_size": "huge"})
+        self.assertEqual(cfg["ui_settings"]["line_num_size"], "large")
+        cfg2 = self.cm.set_ui_settings({"line_num_size": "small"})
+        self.assertEqual(cfg2["ui_settings"]["line_num_size"], "small")
+
+    def test_text_justify_defensive_fallback(self):
+        # 非 bool → 回退 False（与 show_line_numbers 同构：仅 True 才为真）
+        cfg = self.cm.set_ui_settings({"text_justify": "yes"})
+        self.assertEqual(cfg["ui_settings"]["text_justify"], False)
+        cfg2 = self.cm.set_ui_settings({"text_justify": True})
+        self.assertEqual(cfg2["ui_settings"]["text_justify"], True)
 
     def test_popup_defensive_fallback(self):
         # 结构性非法（非列表 / 含非法项 / 越界数值 / 布尔）→ 回退默认

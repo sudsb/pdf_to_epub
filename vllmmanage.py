@@ -32,8 +32,10 @@ import requests
 from configmanage import get_config
 from llamamanage import (
     _SESSION,
+    _batch_schedule_settings,
     _kill_port_owner,
     _model_id_matches,
+    _plan_ocr_waves,
     _resolve_workers,
     _sniff_image_mime,
     _truncation_warning,
@@ -458,11 +460,14 @@ request_image = _request_image_new
 
 def batch_infer(images, prompts, model_key: str = "HY", max_workers: Optional[int] = None,
                 thinking: bool = False, timeout: int = REQUEST_TIMEOUT, on_progress=None,
-                on_result=None):
+                on_result=None, batch_size: Optional[int] = None,
+                group_by_size: Optional[bool] = None):
     """批量图片 OCR（与 llamamanage.batch_infer 同构，调用本模块的 _request_image_new）。
 
     max_workers=None 时取模型推荐并发（model_choices.<key>.workers，缺省 3）；
     base_url/model_name 批次开始解析一次，批内每页请求不再读配置。
+    batch_size/group_by_size：按波提交（None=读 config.json ocr_batch_size/
+    ocr_group_by_size），同 llamamanage.batch_infer。
     """
     def infer_one(img, prompt):
         t0 = time.perf_counter()
@@ -510,26 +515,43 @@ def batch_infer(images, prompts, model_key: str = "HY", max_workers: Optional[in
         prompts = prompts * len(images)
     assert len(images) == len(prompts), "images/prompts 必须等长"
 
+    # 批处理调度：显式按波提交（同 llamamanage，避免框架一次性合并整本书请求）。
+    if batch_size is None or group_by_size is None:
+        _cfg_bs, _cfg_gb = _batch_schedule_settings()
+        if batch_size is None:
+            batch_size = _cfg_bs
+        if group_by_size is None:
+            group_by_size = _cfg_gb
+    wave_size = max_workers if (max_workers and max_workers > 0) else 1
+    try:
+        _bs = int(batch_size)
+    except (TypeError, ValueError):
+        _bs = 0
+    if _bs > 0:
+        wave_size = min(wave_size, _bs)
+    waves = _plan_ocr_waves(images, wave_size, bool(group_by_size))
+
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     results = []
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        fut_map = {pool.submit(infer_one, img, prompts[i]): i for i, img in enumerate(images)}
+    with ThreadPoolExecutor(max_workers=wave_size) as pool:
         done = 0
         total = len(images)
-        for fut in as_completed(fut_map):
-            idx = fut_map[fut]
-            try:
-                res = fut.result()
-            except Exception as e:
-                print(f"[batch_infer] Batch image failed: {e}")
-                res = {"img": images[idx], "result": None, "error": str(e)}
-            results.append(res)
-            done += 1
-            if on_progress is not None:
-                on_progress(done, total)
-            if on_result is not None:
-                on_result(res)
+        for wave in waves:
+            fut_map = {pool.submit(infer_one, images[i], prompts[i]): i for i in wave}
+            for fut in as_completed(fut_map):
+                idx = fut_map[fut]
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    print(f"[batch_infer] Batch image failed: {e}")
+                    res = {"img": images[idx], "result": None, "error": str(e)}
+                results.append(res)
+                done += 1
+                if on_progress is not None:
+                    on_progress(done, total)
+                if on_result is not None:
+                    on_result(res)
 
     # 批次结束后统一清理 ImageItem 缓存（避免逐页 clear 导致重复读盘/编码）
     for img in images:

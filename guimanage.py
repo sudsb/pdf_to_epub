@@ -397,7 +397,7 @@ body{height:100%;font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",
       <div class="card">
         <div class="card-title"><span class="ct-icon">⚙</span> 转换参数</div>
         <div class="convert-grid">
-          <div class="form-row"><span class="form-label">DPI</span><div class="form-ctrl"><select id="cvtDpi"><option value="0" selected>0 = 100</option><option value="1">1 = 150</option><option value="2">2 = 200</option><option value="3">3 = 300</option><option value="4">4 = 600</option></select></div></div>
+          <div class="form-row"><span class="form-label">DPI</span><div class="form-ctrl"><input type="number" id="cvtDpi" value="100" min="36" max="1200" step="1"><div class="form-hint">原始 DPI 36-1200，留空用配置默认</div></div></div>
           <div class="form-row"><span class="form-label">模型</span><div class="form-ctrl"><select id="cvtModel" onchange="onCvtModelChange()"></select></div></div>
           <div class="form-row"><span class="form-label">引擎</span><div class="form-ctrl"><select id="cvtEngine"><option value="">跟随配置</option><option value="llama">llama.cpp</option><option value="vllm">vLLM-Omni</option><option value="paddle">PaddleOCR</option></select></div></div>
           <div class="form-row"><span class="form-label">并发数</span><div class="form-ctrl"><input type="number" id="cvtWorkers" value="5" min="1" max="16"></div></div>
@@ -625,12 +625,12 @@ function pickFile(inputId){apiPost("/api/pick",{kind:"file",title:"选择文件"
 function pickDir(inputId){apiPost("/api/pick",{kind:"dir",title:"选择目录"}).then(function(res){if(res&&res.ok&&!res.cancelled&&res.path){document.getElementById(inputId).value=res.path;toast("已选择目录","ok")}else if(res&&res.cancelled){toast("已取消选择","warn")}})}
 /* ===== 转换页 ===== */
 var convertPollTimer=null;
-function renderConvert(){document.getElementById("cvtExclude").value=(cfg.exclude_pages||[]).join(",")||"";var sel=document.getElementById("cvtModel");sel.innerHTML="";models.forEach(function(m){var o=document.createElement("option");o.value=m.key;o.textContent=m.key+" - "+m.name;sel.appendChild(o)});sel.value=cfg.selected_model||"";applyModelWorkers();var pdf=document.getElementById("cvtPdf");if(pdf.value){var hint=document.getElementById("cvtPdfHint");if(!pdf.value.toLowerCase().endsWith(".pdf")){hint.textContent="\u26a0 \u6587\u4ef6\u540e\u7f00\u4e0d\u662f .pdf";hint.style.color="var(--red)"}else{hint.textContent="";hint.style.color=""}}}
+function renderConvert(){var _dEl=document.getElementById("cvtDpi");if(_dEl&&cfg.dpi!==undefined&&cfg.dpi!==null&&cfg.dpi!=="")_dEl.value=cfg.dpi;document.getElementById("cvtExclude").value=(cfg.exclude_pages||[]).join(",")||"";var sel=document.getElementById("cvtModel");sel.innerHTML="";models.forEach(function(m){var o=document.createElement("option");o.value=m.key;o.textContent=m.key+" - "+m.name;sel.appendChild(o)});sel.value=cfg.selected_model||"";applyModelWorkers();var pdf=document.getElementById("cvtPdf");if(pdf.value){var hint=document.getElementById("cvtPdfHint");if(!pdf.value.toLowerCase().endsWith(".pdf")){hint.textContent="\u26a0 \u6587\u4ef6\u540e\u7f00\u4e0d\u662f .pdf";hint.style.color="var(--red)"}else{hint.textContent="";hint.style.color=""}}}
 function applyModelWorkers(){var sel=document.getElementById("cvtModel"),wEl=document.getElementById("cvtWorkers");if(!sel||!wEl)return;var key=sel.value,info=(cfg.model_choices||{})[key]||{},w=parseInt(info.workers,10);if(!isNaN(w)&&w>=1&&w<=64)wEl.value=w}
 function onCvtModelChange(){applyModelWorkers()}
 function pickPdf(){apiPost("/api/pick",{kind:"file",filter:"pdf",title:"\u9009\u62e9 PDF \u6587\u4ef6"}).then(function(res){if(res&&res.ok&&!res.cancelled&&res.path){document.getElementById("cvtPdf").value=res.path;var hint=document.getElementById("cvtPdfHint");if(!res.path.toLowerCase().endsWith(".pdf")){hint.textContent="\u26a0 \u6587\u4ef6\u540e\u7f00\u4e0d\u662f .pdf";hint.style.color="var(--red)"}else{hint.textContent=""}}else if(res&&res.cancelled){toast("\u5df2\u53d6\u6d88\u9009\u62e9","warn")}})}
 function pickOutDir(){apiPost("/api/pick",{kind:"dir",title:"\u9009\u62e9\u8f93\u51fa\u76ee\u5f55"}).then(function(res){if(res&&res.ok&&!res.cancelled&&res.path){document.getElementById("cvtOutDir").value=res.path;toast("\u5df2\u9009\u62e9\u76ee\u5f55","ok")}else if(res&&res.cancelled){toast("\u5df2\u53d6\u6d88\u9009\u62e9","warn")}})}
-function collectConvertParams(){var pdf=document.getElementById("cvtPdf").value.trim();if(!pdf)return{error:"\u8bf7\u5148\u9009\u62e9 PDF \u6587\u4ef6"};if(!pdf.toLowerCase().endsWith(".pdf"))return{error:"\u6587\u4ef6\u540e\u7f00\u4e0d\u662f .pdf\uff0c\u8bf7\u9009\u62e9\u6b63\u786e\u7684 PDF"};var engine=document.getElementById("cvtEngine").value;var workers=parseInt(document.getElementById("cvtWorkers").value,10);var timeout=parseInt(document.getElementById("cvtTimeout").value,10);if(isNaN(workers)||workers<1){var _k=document.getElementById("cvtModel").value,_m=(cfg.model_choices||{})[_k]||{},_w=parseInt(_m.workers,10);workers=isNaN(_w)||_w<1?3:_w}if(isNaN(timeout)||timeout<30)timeout=600;return{pdf:pdf,dpi:parseInt(document.getElementById("cvtDpi").value,10),model:document.getElementById("cvtModel").value,engine:engine,workers:workers,timeout:timeout,thinking:document.getElementById("cvtThinking").checked,title:document.getElementById("cvtTitle").value.trim(),author:document.getElementById("cvtAuthor").value.trim(),lang:document.getElementById("cvtLang").value.trim()||"zh-CN",out_dir:document.getElementById("cvtOutDir").value.trim(),epub_path:"",exclude:document.getElementById("cvtExclude").value.trim()}}
+function collectConvertParams(){var pdf=document.getElementById("cvtPdf").value.trim();if(!pdf)return{error:"\u8bf7\u5148\u9009\u62e9 PDF \u6587\u4ef6"};if(!pdf.toLowerCase().endsWith(".pdf"))return{error:"\u6587\u4ef6\u540e\u7f00\u4e0d\u662f .pdf\uff0c\u8bf7\u9009\u62e9\u6b63\u786e\u7684 PDF"};var engine=document.getElementById("cvtEngine").value;var workers=parseInt(document.getElementById("cvtWorkers").value,10);var timeout=parseInt(document.getElementById("cvtTimeout").value,10);if(isNaN(workers)||workers<1){var _k=document.getElementById("cvtModel").value,_m=(cfg.model_choices||{})[_k]||{},_w=parseInt(_m.workers,10);workers=isNaN(_w)||_w<1?3:_w}if(isNaN(timeout)||timeout<30)timeout=600;var _dpiVal=parseInt(document.getElementById("cvtDpi").value,10);return{pdf:pdf,dpi:isNaN(_dpiVal)?null:_dpiVal,model:document.getElementById("cvtModel").value,engine:engine,workers:workers,timeout:timeout,thinking:document.getElementById("cvtThinking").checked,title:document.getElementById("cvtTitle").value.trim(),author:document.getElementById("cvtAuthor").value.trim(),lang:document.getElementById("cvtLang").value.trim()||"zh-CN",out_dir:document.getElementById("cvtOutDir").value.trim(),epub_path:"",exclude:document.getElementById("cvtExclude").value.trim()}}
 function setConvertBusy(busy){var start=document.getElementById("cvtStartBtn"),stop=document.getElementById("cvtStopBtn");if(busy){start.disabled=true;start.classList.add("running");start.textContent="\u8f6c\u6362\u4e2d\u2026";stop.style.display="";stop.disabled=false}else{start.disabled=false;start.classList.remove("running");start.textContent="\u5f00\u59cb\u8f6c\u6362";stop.style.display="none";stop.disabled=true}}
 function startConvert(){var params=collectConvertParams();if(params.error){toast(params.error,"warn");return}setConvertBusy(true);var log=document.getElementById("convertLog");log.textContent="";addLog("\u542f\u52a8\u8f6c\u6362: "+params.pdf,"log-info");apiPost("/api/convert/start",params).then(function(res){if(res&&res.ok){toast("\u8f6c\u6362\u5df2\u542f\u52a8","ok");addLog("\u8f6c\u6362\u5df2\u542f\u52a8","log-ok");startPollConvert()}else{var msg=res&&res.error?res.error:"\u542f\u52a8\u5931\u8d25";toast(msg,"fail");addLog("\u542f\u52a8\u5931\u8d25: "+msg,"log-err");setConvertBusy(false)}})}
 function startPollConvert(){if(convertPollTimer)clearInterval(convertPollTimer);convertPollTimer=setInterval(pollConvertStatus,500)}
@@ -728,6 +728,15 @@ _CORRECT_MAX_LINES = 2000
 
 # 矫正子进程日志中矫正界面地址的正则（页面加载后打印 `http://127.0.0.1:端口/`）
 _CORRECT_URL_RE = re.compile(r"http://127\.0\.0\.1:(\d+)/")
+
+# 子进程「可能是错误」的日志行：命中即同时打到控制台。
+# 矫正子进程 stdout 被 GUI 收进界面日志面板后用户控制台什么都看不到，出错
+# 行若只存在于面板里，界面静默退出时就查不到原因。故意放宽松（多类关键词），
+# 误报只是多几行控制台输出，漏报才是致命的。
+_CORRECT_ERR_RE = re.compile(
+    r"traceback|error|exception|错误|异常|失败|无法|放弃|退出码|"
+    r"fatal|crash|中断|core dumped"
+)
 
 # 转换子进程的弹窗询问协议标记（与 mian.py _PROMPT_MARKER 同值）：子进程在
 # 需要用户决策（OCR 断点续传选择）时打印 `__PTOE_PROMPT__ <json>` 单行，
@@ -1105,6 +1114,15 @@ def _correct_monitor(inst: dict, proc) -> None:
         inst.setdefault("lines", []).append(line)
         if len(inst["lines"]) > _CORRECT_MAX_LINES:
             del inst["lines"][: len(inst["lines"]) - _CORRECT_MAX_LINES]
+        # 矫正子进程的 stdout 被 GUI 收进界面日志面板，用户控制台什么都看不到。
+        # 出错行（Traceback/Error/异常/失败）必须同时在控制台留一份，否则
+        # 界面「静默退出」时无线索可查（历史故障：长时间使用矫正界面后无任何
+        # 异常提示就结束了）。
+        if _CORRECT_ERR_RE.search(line):
+            try:
+                print(f"[矫正实例{inst.get('id', '')}] {line}")
+            except Exception:  # noqa: BLE001  控制台异常不能影响监控线程
+                pass
 
     try:
         while True:
@@ -1132,6 +1150,9 @@ def _correct_monitor(inst: dict, proc) -> None:
         inst["running"] = False
         inst["finalized"] = True
         inst["exit_code"] = rc
+        # 非 0 退出同样是「静默结束」的一种，控制台必须留痕
+        if rc:
+            print(f"[矫正实例{inst.get('id', '')}] 子进程已退出，退出码 {rc}（界面若无异常提示请把此行回报）")
     except Exception:  # noqa: BLE001  监控线程异常不崩溃服务
         inst["running"] = False
         inst["finalized"] = True
@@ -1838,8 +1859,17 @@ class _GuiHandler(BaseHTTPRequestHandler):
             self._send(400, self._json({"ok": False, "error": f"文件不存在：{pdf}"}))
             return
         dpi = body.get("dpi")
-        if dpi is not None and (type(dpi) is not int or not 0 <= dpi <= 4):
-            self._send(400, self._json({"ok": False, "error": "dpi 仅支持 0-4"}))
+        # 兼容两种写法：档位 0-4（100/150/200/300/600，旧版下拉框）或原始 DPI
+        # 36-1200；mian.resolve_dpi 会做同样的归一，这里先行校验给出明确报错。
+        if dpi is not None and (
+            type(dpi) is not int or not (0 <= dpi <= 4 or 36 <= dpi <= 1200)
+        ):
+            self._send(
+                400,
+                self._json(
+                    {"ok": False, "error": "dpi 仅支持档位 0-4 或原始数值 36-1200"}
+                ),
+            )
             return
         model = body.get("model") or cfg.get("selected_model")
         try:
@@ -3111,6 +3141,74 @@ def _open_browser(url: str) -> None:
         pass
 
 
+def _run_server_forever(server) -> None:
+    """serve_forever 的安全包装：线程死掉时必须在控制台留痕并自愈。
+
+    背景（用户返修单：长时间使用矫正界面后配置中心白屏、本地链接断开，
+    但程序进程还在、矫正界面正常）：serve_forever 线程一旦因未捕获异常退出，
+    HTTP 端口就拒绝连接，配置中心标签页刷新即白屏；而主线程还压在
+    _serve_loop 里，进程看起来「还在运行」，控制台却很可能只看到启动时那句
+    Ctrl+C 提示，没有其他线索。这里把异常打全 + 由 _serve_loop 负责重启
+    serve_forever，让白屏可自愈、可定位。
+    """
+    try:
+        server.serve_forever()
+    except Exception as exc:  # noqa: BLE001  必须能看到，绝不静默
+        import traceback  # noqa: PLC0415
+
+        traceback.print_exc()
+        print(f"配置中心 HTTP 服务异常退出：{exc!r}（界面可能白屏，正在尝试重启服务）")
+
+
+def _ensure_http_server(state: dict) -> None:
+    """若 HTTP serve 线程已死，重启一个（_serve_loop 每轮检查）。
+
+    限流：同一秒内最多重启一次，避免 serve_forever 反复抛异常时刷屏。
+    """
+    server = state.get("http_server")
+    if server is None:
+        return
+    thread = state.get("http_thread")
+    if thread is not None and thread.is_alive():
+        return
+    now = time.monotonic()
+    last = state.get("http_restart_at", None)
+    if last is not None and now - last < 1.0:
+        return
+    state["http_restart_at"] = now
+    print("配置中心 HTTP 服务线程已停止，正在重启（界面应可重新连接）")
+    new_thread = threading.Thread(
+        target=_run_server_forever, args=(server,), daemon=True
+    )
+    new_thread.start()
+    state["http_thread"] = new_thread
+
+
+def _any_job_running(state: dict) -> bool:
+    """当前是否有「长任务」在跑（转换 / 矫正 / EPUB 编辑 / 合并）。
+
+    长任务运行中视为用户仍在干活：此时浏览器的 pagehide 信标（/api/bye）
+    极可能是后台标签页被浏览器挂起/回收/内存压力丢弃，而非用户真的关闭
+    服务。用本函数把「服务自动退出」抑制掉，避免长矫正会话被静默杀掉
+    （症状：长时间使用矫正界面后配置中心白屏、矫正进程无异常退出）。
+    """
+    cv = state.get("convert") or {}
+    with cv.get("lock", threading.Lock()):
+        if cv.get("running"):
+            return True
+    for _inst in _correct_instances(state):
+        if _inst.get("running"):
+            return True
+    for _inst in _epubedit_instances(state):
+        if _inst.get("running"):
+            return True
+    mg = state.get("merge") or {}
+    with mg.get("lock", threading.Lock()):
+        if mg.get("running"):
+            return True
+    return False
+
+
 def _serve_loop(
     state: dict,
     idle_timeout: int,
@@ -3132,15 +3230,49 @@ def _serve_loop(
     """
     stale_since: float | None = None
     _last_probe = 0.0
+    _logged_noquit = False
+    _saved_beat: float | None = None
+    _saved_gone_at = object()
     while not state["finished"].is_set():
         time.sleep(0.5)
         _drain_dialog_queue(state)
+        # 看护 HTTP serve 线程：死了就重启，绝不让配置中心停在白屏
+        try:
+            _ensure_http_server(state)
+        except Exception:  # noqa: BLE001  看护失败不能拖死监视循环
+            pass
         if watch_gone:
             gone, stale_since = _browser_gone(
                 state, idle_timeout=idle_timeout, stale_since=stale_since
             )
+            if gone and _any_job_running(state):
+                # 长任务进行中 + 浏览器信标/心跳判定「已关闭」：不退出。
+                # 只保留 finished（Ctrl+C / 显式关闭）这一条真实退出通道。
+                # 浏览器（Thorium/Chrome）在内存吃紧时会把后台标签页挂起/回收，
+                # 页面拿不到心跳、也可能补发 pagehide，这是误判而非用户关服务。
+                if not _logged_noquit:
+                    print("浏览器界面已断开（可能被挂起/回收），但矫正/转换任务仍在运行，服务保持后台运行")
+                    _logged_noquit = True
+                stale_since = None
+                # 暂存原始心跳/信标时刻并清空，让 gone 判定重新计时（不立即退出）
+                if _saved_beat is None:
+                    _saved_beat = state.get("last_beat", 0.0)
+                    _saved_gone_at = state.get("gone_at")
+                state["gone_at"] = None
+                with state.get("beat_lock", threading.Lock()):
+                    state["last_beat"] = time.monotonic()
+                continue
+            if _saved_beat is not None:
+                # 任务已结束：恢复原始时刻，关闭倒计时按真实事件时间继续走
+                state["gone_at"] = _saved_gone_at
+                with state.get("beat_lock", threading.Lock()):
+                    state["last_beat"] = _saved_beat
+                _saved_beat = None
+                _saved_gone_at = object()
+            _logged_noquit = False
             if gone:
                 state["finished"].set()
+                print("浏览器界面已关闭超过空闲时间，配置中心自动退出")
                 break
         # guest 模式：定期探测会话是否仍有效（owner 存活且自身标签在列表中）
         if tab_key is not None:
@@ -3219,8 +3351,11 @@ def gui_serve(
     server = ThreadingHTTPServer((host, port), _GuiHandler)
     server.daemon_threads = True
     server.state = state
-    serve_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    serve_thread = threading.Thread(target=_run_server_forever, args=(server,), daemon=True)
     serve_thread.start()
+    # 供 _serve_loop 看护：serve 线程死掉时自动重启，避免「白屏无异常」
+    state["http_server"] = server
+    state["http_thread"] = serve_thread
     url = f"http://{server.server_address[0]}:{server.server_address[1]}/"
     print(f"配置界面已启动: {url}（Ctrl+C 退出）")
     _win = None
@@ -3304,7 +3439,11 @@ def gui_serve(
             except Exception:  # noqa: BLE001  管道可能已关闭，忽略
                 pass
             cv["prompt"] = None
-        # 兜底：矫正子进程仍在运行时强制终止（多实例全部遍历）
+        # 兜底：矫正子进程仍在运行时强制终止（多实例全部遍历）。
+        # 注意：正常路径下 _serve_loop 已在长任务运行时抑制自动退出，走不到
+        # 这里；能走到说明是 Ctrl+C / 显式关闭，此时必须把「杀了哪些实例」
+        # 打到控制台——静默强杀会让用户以为界面「异常结束」且查不到原因。
+        _killed = []
         for _inst in _correct_instances(state):
             proc = _inst.get("proc")
             if _inst.get("running") and proc is not None and proc.poll() is None:
@@ -3314,6 +3453,9 @@ def gui_serve(
                     pass
                 _inst["running"] = False
                 _inst["finalized"] = True
+                _killed.append(_inst.get("url") or _inst.get("id") or "?")
+        if _killed:
+            print("配置中心已退出，强杀仍在运行的矫正实例: " + ", ".join(str(k) for k in _killed))
         # 兜底：合并任务仍在运行时请求停止（引擎自行检查 stop_event）
         mg = state["merge"]
         with mg["lock"]:

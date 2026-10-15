@@ -114,6 +114,10 @@ POPUP_RULE_COUNT_MAX = 10
 # 撤销/回退历史步数档位（矫正界面 ui_settings.undo_depth；2026-10）
 UNDO_DEPTH_DEFAULT = 100
 UNDO_DEPTH_CHOICES = (50, 100, 200, 500)
+# 文字页面行号栏尺寸档位（矫正界面 ui_settings.line_num_size；2026-10）：
+# 控制行号字号与左侧留白/数字-正文间距。默认大（large）。
+LINE_NUM_SIZE_DEFAULT = "large"
+LINE_NUM_SIZE_CHOICES = ("small", "medium", "large")
 
 DEFAULT_CONFIG = {
     "llama_server": "E:/xox/Tools/llama-c/llama-server.exe",
@@ -190,9 +194,10 @@ DEFAULT_CONFIG = {
         # max_tokens 保留：请求级 MAX_TOKENS 上限（OCR 单页输出远小于此值）。
         # ngram_size/window_size 已移除：纯启动参数，部分 llama-server 构建不支持
         # （如 llama13 会因 --ngram-size/--window-size 直接退出），且对 OCR 无增益。
-        # flash_attn 可选："0"/false 禁用、空/缺省自动、非 0（如 "1"/"on"）强制开启
-        # GPU 下的 Flash Attention（新构建默认 auto：CUDA 支持时自动启用；
-        # 老构建自动附加裸 --flash-attn）。
+        # flash_attn：GPU（CUDA/Vulkan）下强制开启 Flash Attention（视觉页含数千
+        # 图像 token，长上下文解码收益最大）。缺省（无此键/空）= 检测到 GPU 即按
+        # 构建语法传 --flash-attn on / 裸 --flash-attn；"0"/false/no/off 禁用；
+        # "auto" 保留构建默认（CUDA 支持时自动启用、不支持时安全回退）。
         "max_tokens": "8192",   # per-request max token cap (also passed to llama-server via --max-tokens)
         # ctx_size：显式限定服务端上下文 n_ctx（--ctx-size）。llama.cpp 缺省
         # "-c 0 = 从模型加载"，GLM-OCR 等视觉模型原生上下文可达数万 token，
@@ -225,6 +230,24 @@ DEFAULT_CONFIG = {
         # recycle_rss_mb：私有内存（Private Bytes）上限（MiB，0=不启用），达到即
         # 回收。与 recycle_every 任一命中即触发；两个都为 0 时不做任何回收检查。
         "recycle_rss_mb": "0",
+        # batch_size（--batch-size，默认 2048）：逻辑批大小（单次前向最多处理的
+        # token 数）。并行受限（--parallel 1）时吞吐 ≈ 单请求用时，视觉 OCR 每页图
+        # ≈3100-3200 token，小于此值会把一次前向拆成多次、明显拖慢 prefill。0/缺失
+        # = 用 llama.cpp 内置默认；需要时可显式调大（如 4096）让整页一次算完
+        # （2026-10-14）。
+        "batch_size": "0",
+        # ubatch_size（--ubatch-size，默认 512）：物理 micro-batch，越小峰值显存
+        # 越低、前向次数越多。8GB 显存吃紧可下调（256/128）换稳定，宽裕可上调加速
+        # prefill。不得大于 batch_size（超出会被截断）。0/缺失=用内置默认
+        # （2026-10-14）。
+        "ubatch_size": "0",
+        # cache_reuse（--cache-reuse，默认 0=禁用）：以 KV shifting 复用缓存的最小
+        # 块大小。每页图片不同、公共前缀仅约 30 token 系统提示（vs 每页 3100+ 图片
+        # token），命中收益 <1%，故默认关闭；多页共享较长前置文本时可设为如 64
+        # （2026-10-14）。
+        # 注意：--aggregate / -bs/--buffer-size / -bks/--block-size / --slot-linger-ms
+        # 并非 llama.cpp 参数（llama13 构建 --help 无），配置了也会被探测逻辑跳过。
+        "cache_reuse": "0",
     },
     # 推理引擎选择：'llama'（llama.cpp，默认）| 'vllm'（vLLM-Omni）| 'paddle'（PaddleOCR 本地推理）
     "engine": "llama",
@@ -245,6 +268,9 @@ DEFAULT_CONFIG = {
         "port": "8000",
         "omni": "1",
         "trust_remote_code": "1",
+        # kv_cache_dtype（--kv-cache-dtype）：KV 缓存量化，fp8 可显著降低显存占用
+        # 并提升长上下文吞吐（vLLM 官方推荐 fp8）。留空 = 不传，走 vLLM 默认 auto。
+        "kv_cache_dtype": "fp8",
         "served_model_name": "",
         "max_model_len": "",
         "gpu_memory_utilization": "",
@@ -335,6 +361,9 @@ DEFAULT_CONFIG = {
     "ui_settings": {
         "tip_delay": 600,
         "err_hover_delay": 1500,
+        # 增强格式刷「合并段落」自动合并延迟（毫秒，0-5000）：拖选多段停稳超过该时间才合并，
+        # 防止拖选途中瞬时覆盖 ≥2 段误合并。默认 800。仅视图/交互行为，不影响保存内容。
+        "brush_merge_delay": 800,
         "editor_font_size": 14,
         "img_mode": "",
         # 格式规则应用到全部页前是否弹确认（bool，默认 true；非 bool 输入归一为 true）
@@ -347,6 +376,14 @@ DEFAULT_CONFIG = {
         "proofread_batch_pages": 0,
         # 撤销/回退（Ctrl+Z / Ctrl+Y）保留的历史步数：50/100/200/500（默认 100）
         "undo_depth": UNDO_DEPTH_DEFAULT,
+        # 文字页面行号显示（2026-10）：虚拟列表各页文字块左侧显示行号（每页从 1 起），
+        # 供命令行按行号寻址（如 :7,10merge）。纯视图层，不写入保存内容/导出。默认关。
+        "show_line_numbers": False,
+        # 行号栏尺寸（2026-10）：small/medium/large，控制行号字号与左侧留白。默认 large（大）。
+        "line_num_size": LINE_NUM_SIZE_DEFAULT,
+        # 正文两端对齐/分散对齐（2026-10）：bool，默认 true，矫正页正文段落左右边缘对齐更美观。
+        # 仅视图样式，不影响保存内容/导出。关闭后按浏览器默认（左对齐）。
+        "text_justify": True,
     },
     # 图片预处理（2026-08，OpenCV）：PDF 分割图片时启用，提高 OCR 识别率。
     # enabled 开关；gray 灰度 / denoise 中值去噪 / sharpen 锐化 / binarize 自适应二值化；
@@ -363,6 +400,19 @@ DEFAULT_CONFIG = {
     # 从 config.json 读取时由 parse_exclude_spec 处理字符串/列表兼容；
     # CLI --exclude 优先于配置文件。
     "exclude_pages": [],
+    # 转换默认 DPI（2026-10）：持久化的原始分辨率数值（非档位），默认 100。
+    # CLI --dpi 仍接受档位 0-4（100/150/200/300/600）或该范围内的原始数值；
+    # 未显式指定时回退到此键。GUI 转换页开始转换时把所选 DPI 写回此键。
+    "dpi": 100,
+    # OCR 批处理调度（2026-10）：
+    # ocr_batch_size：每波提交的请求数上限（0=自动=并发数 max_workers）；设为 1
+    #   即完全串行调度（显存紧张/长书稳定优先时使用）。防止一次性把整本书的
+    #   请求全部排队（框架自动合并时按最大尺寸 padding，浪费视觉 token）。
+    # ocr_group_by_size：True（默认）时按图片像素尺寸分组，同尺寸图片同波提交，
+    #   减少服务端批内 padding；False 保持原始页序调度。均为显式控制项，不会
+    #   因缺省而被框架自行合并多图请求。
+    "ocr_batch_size": 0,
+    "ocr_group_by_size": True,
     # 自定义浏览器可执行文件路径（空字符串=使用系统默认浏览器）。
     # 如 "C:/Program Files/Google/Chrome/Application/chrome.exe"。
     # 矫正界面和配置中心启动时使用此浏览器打开。
@@ -839,6 +889,12 @@ def set_ui_settings(ui: dict) -> dict:
         except (TypeError, ValueError):
             v = 1500
         clean["err_hover_delay"] = max(0, min(10000, v))
+    if "brush_merge_delay" in ui:
+        try:
+            v = int(ui["brush_merge_delay"])
+        except (TypeError, ValueError):
+            v = 800
+        clean["brush_merge_delay"] = max(0, min(5000, v))
     if "editor_font_size" in ui:
         try:
             v = int(ui["editor_font_size"])
@@ -899,6 +955,18 @@ def set_ui_settings(ui: dict) -> dict:
         except (TypeError, ValueError):
             v = UNDO_DEPTH_DEFAULT
         clean["undo_depth"] = v if v in UNDO_DEPTH_CHOICES else UNDO_DEPTH_DEFAULT
+    if "show_line_numbers" in ui:
+        # 行号显示开关（bool）：非 bool 输入回退 False，与 rule_all_pages_confirm 同构
+        v = ui["show_line_numbers"]
+        clean["show_line_numbers"] = True if v is True else False
+    if "line_num_size" in ui:
+        # 行号栏尺寸：仅接受 small/medium/large，非法值回退默认 large
+        v = str(ui["line_num_size"])
+        clean["line_num_size"] = v if v in LINE_NUM_SIZE_CHOICES else LINE_NUM_SIZE_DEFAULT
+    if "text_justify" in ui:
+        # 正文两端对齐开关（bool）：非 bool 输入回退 True（默认开启），与 show_line_numbers 同构
+        v = ui["text_justify"]
+        clean["text_justify"] = True if v is True else False
     with _CFG_LOCK:
         try:
             if os.path.exists(_CONFIG_PATH):

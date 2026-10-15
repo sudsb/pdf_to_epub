@@ -207,6 +207,147 @@ def default_workers(model_key: str) -> int:
         return 3
 
 
+# 批处理调度设置缓存（ocr_batch_size / ocr_group_by_size），短 TTL 防整批每页读盘
+_BATCH_SCHEDULE_CACHE: tuple | None = None  # (monotonic, batch_size, group_by_size)
+_BATCH_SCHEDULE_TTL = 5.0  # 秒：与 _RECYCLE_SETTINGS_TTL / _ENGINE_CACHE 同策略
+
+
+def _batch_schedule_settings() -> tuple[int, bool]:
+    """解析 (batch_size, group_by_size)，带短 TTL 缓存。
+
+    batch_size<=0 视为「自动」（=并发数 max_workers）；group_by_size 缺省 True。
+    读配置失败静默回退 (0, True)：调度是可选项，探测故障不应影响识别。
+    """
+    global _BATCH_SCHEDULE_CACHE
+    cached = _BATCH_SCHEDULE_CACHE
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < _BATCH_SCHEDULE_TTL:
+        return cached[1], cached[2]
+    batch_size = 0
+    group_by_size = True
+    try:
+        cfg = get_config(show_dialogs=False)
+        try:
+            batch_size = int(cfg.get("ocr_batch_size") or 0)
+        except (TypeError, ValueError):
+            batch_size = 0
+        gb = cfg.get("ocr_group_by_size")
+        if gb is None:
+            group_by_size = True
+        elif isinstance(gb, bool):
+            group_by_size = gb
+        elif isinstance(gb, (int, float)):
+            group_by_size = bool(gb)
+        else:
+            group_by_size = str(gb).strip().lower() not in (
+                "0", "false", "no", "off", "",
+            )
+    except Exception:
+        batch_size, group_by_size = 0, True
+    if batch_size < 0:
+        batch_size = 0
+    _BATCH_SCHEDULE_CACHE = (now, batch_size, group_by_size)
+    return batch_size, group_by_size
+
+
+def _image_pixel_size(img) -> tuple[int, int] | None:
+    """尽力廉价地取图片像素尺寸 (w, h)，用于按尺寸分组调度。
+
+    支持：自带 width/height（或 size）属性的对象、ImageItem（经 .path 读 PNG）、
+    以及 PNG/JPEG 文件路径字符串。只读文件头部少量字节、不解码整图；无法判定时
+    返回 None（分组时排到最后，不阻塞调度）。
+    """
+    # 1) 对象自带尺寸属性（PIL Image 等）
+    w = getattr(img, "width", None)
+    h = getattr(img, "height", None)
+    if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
+        return (w, h)
+    size = getattr(img, "size", None)
+    if isinstance(size, (tuple, list)) and len(size) == 2:
+        try:
+            sw, sh = int(size[0]), int(size[1])
+            if sw > 0 and sh > 0:
+                return (sw, sh)
+        except (TypeError, ValueError):
+            pass
+    # 2) 路径（ImageItem.path 或路径字符串 / PathLike）
+    path = getattr(img, "path", None)
+    if path is None and isinstance(img, (str, os.PathLike)):
+        path = img
+    if path is None:
+        return None
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+            if head[:8] == b"\x89PNG\r\n\x1a\n" and len(head) >= 24:
+                w = int.from_bytes(head[16:20], "big")
+                h = int.from_bytes(head[20:24], "big")
+                if w and h:
+                    return (w, h)
+            if head[:2] == b"\xff\xd8":  # JPEG：扫描 SOF 段取高/宽
+                f.seek(2)
+                while True:
+                    b = f.read(1)
+                    if not b:
+                        break
+                    if b != b"\xff":
+                        continue
+                    marker = f.read(1)
+                    while marker == b"\xff":
+                        marker = f.read(1)
+                    if not marker:
+                        break
+                    m = marker[0]
+                    if m == 0x01 or 0xD0 <= m <= 0xD8:
+                        continue
+                    ln = f.read(2)
+                    if len(ln) < 2:
+                        break
+                    seg_len = int.from_bytes(ln, "big")
+                    if m in (
+                        0xC0, 0xC1, 0xC2, 0xC3, 0xC5,
+                        0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+                    ):
+                        sof = f.read(5)
+                        if len(sof) < 5:
+                            break
+                        h = int.from_bytes(sof[1:3], "big")
+                        w = int.from_bytes(sof[3:5], "big")
+                        if w and h:
+                            return (w, h)
+                        break
+                    f.seek(seg_len - 2, 1)
+    except Exception:
+        return None
+    return None
+
+
+def _plan_ocr_waves(images, wave_size: int, group_by_size: bool) -> list[list[int]]:
+    """把图片索引切成若干「波」（每波最多 wave_size 张）。
+
+    group_by_size=True 时先按像素尺寸排序（同尺寸相邻 → 同波，减少服务端批内按
+    最大尺寸 padding 造成的视觉 token 浪费；未知尺寸排最后，排序稳定保持原序），
+    再按波切分；False 时保持原始页序。batch_size 由此「显式」生效，避免框架把整本
+    书的请求一次性自动合并。
+    """
+    n = len(images)
+    if n == 0:
+        return []
+    try:
+        size = int(wave_size)
+    except (TypeError, ValueError):
+        size = 1
+    if size < 1:
+        size = 1
+    order = list(range(n))
+    if group_by_size:
+        def _key(i):
+            dim = _image_pixel_size(images[i])
+            return (1, 0, 0) if dim is None else (0, dim[0], dim[1])
+        order.sort(key=_key)
+    return [order[i:i + size] for i in range(0, n, size)]
+
+
 def _server_help_text(exe: str) -> str:
     """获取 llama-server `--help` 输出文本（按 exe 缓存）；失败返回 ''。
 
@@ -780,6 +921,57 @@ def runserver(
                     print(f"llama_server_args.{name} {iv} out of range ({minv}-{maxv}), ignoring")
             except Exception as e:
                 print(f"Invalid llama_server_args.{name}: {e}")
+
+    # 单槽位（--parallel 1）吞吐旋钮（2026-10-14）：并行受限时吞吐 ≈ 每请求用时 ×
+    # 排队，故值得调的只有「单请求前向批大小」与「跨请求缓存复用」两类。三个都是
+    # 真实存在的 llama.cpp 参数（本机 llama13 `--help` 已确认）；不同构建可能缺失，
+    # 按 _server_supports_arg 探测后静默跳过，绝不因缺 flag 中断启动。
+    #   -b/--batch-size（默认 2048）：逻辑批大小。一页图视觉 token ≈3100-3200，
+    #     一次前向即可算完；设得过小会拆成多次前向，明显拖慢 prefill。
+    #   -ub/--ubatch-size（默认 512）：物理 micro-batch，越小峰值显存越低、前向
+    #     次数越多。8GB 显存吃紧可下调（256/128）换稳定，宽裕可上调加速 prefill。
+    #   --cache-reuse N（默认 0=禁用）：以 KV shifting 复用缓存的最小块大小。本项目
+    #     每页图片不同、公共前缀仅约 30 token 系统提示（vs 每页 3100+ 图片 token），
+    #     命中收益 <1%，故默认不加；多页共享较长前置文本时可配置开启。
+    # 反例（勿抄）：网上流传的 --aggregate / -bs/--buffer-size / -bks/--block-size /
+    # --slot-linger-ms 均非 llama.cpp 参数（llama13 `--help` 亦无），照抄会让
+    # llama-server 报 invalid argument 后直接退出。0/缺失一律不加参数（回退内置默认）。
+    _batch_cfg = _cfg_int(
+        sargs.get("batch_size"), name="batch_size", default=0, minv=0, maxv=65536
+    )
+    _ubatch_cfg = _cfg_int(
+        sargs.get("ubatch_size"), name="ubatch_size", default=0, minv=0, maxv=65536
+    )
+    for _name, _flag, _iv in (
+        ("batch_size", "--batch-size", _batch_cfg),
+        ("ubatch_size", "--ubatch-size", _ubatch_cfg),
+        (
+            "cache_reuse",
+            "--cache-reuse",
+            _cfg_int(
+                sargs.get("cache_reuse"),
+                name="cache_reuse",
+                default=0,
+                minv=0,
+                maxv=1048576,
+            ),
+        ),
+    ):
+        if _iv <= 0:
+            continue
+        if _server_supports_arg(exe, _flag):
+            args += [_flag, str(_iv)]
+            print(f"Using {_name} from config: {_iv}")
+        else:
+            print(f"llama-server 构建不支持 {_flag} 启动参数，已跳过")
+    # ubatch 是 batch 的子批：ubatch_size 大于 batch_size 时 llama.cpp 会自行截断为
+    # batch_size。仅告警、仍透传，交由服务端处理，避免错杀看似矛盾但合法的配置。
+    if _batch_cfg and _ubatch_cfg and _ubatch_cfg > _batch_cfg:
+        print(
+            f"提示：ubatch_size({_ubatch_cfg}) 大于 batch_size({_batch_cfg})，"
+            f"llama.cpp 会将其截断为 batch_size；如需降低显存峰值请下调 ubatch_size"
+        )
+
     # GPU 后端：默认自动检测，可用则把全部层加载入显存（--n-gpu-layers 999）。
     # 若配置里显式给出 n_gpu_layers 键，则以其覆盖自动探测（跳过检测）。
     ngl = sargs.get("n_gpu_layers")
@@ -803,7 +995,7 @@ def runserver(
             # llama_server_args.flash_attn：
             #   "0"/false/no/off → 禁用；
             #   "1"/true/yes/on  → 强制开启（按构建语法传值/传裸标志）；
-            #   缺省             → 自动（新构建 auto / 老构建裸标志）。
+            #   缺省/“auto”       → 自动（新构建 auto / 老构建裸标志）。
             # 先归一为字符串再判空回退——整数 0 经 str() 得 "0" 才能命中禁用，
             # 否则 `0 or ""` 会因 int 0 为假而回退到 ""（自动），破坏禁用契约。
             fa_raw = sargs.get("flash_attn")
@@ -1401,6 +1593,8 @@ def batch_infer(
     timeout: int = REQUEST_TIMEOUT,
     on_progress=None,
     on_result=None,
+    batch_size: int | None = None,
+    group_by_size: bool | None = None,
 ):
     """
     并发批量图片识别。return: List[dict], 每元素结构{'img': ..., 'result': ..., 'error': ...}
@@ -1416,6 +1610,10 @@ def batch_infer(
     模型管理可调），未配置则 3：视觉模型每张图数千图像 token，并发过高会让
     多槽位的 KV 缓存溢出到 CPU，单张耗时反而大涨（8GB 显存 + BF16 模型尤其
     明显）。显存充足时可手动调大（如 --workers 6）。
+
+    批处理调度（batch_size/group_by_size，None=读 config.json 的 ocr_batch_size /
+    ocr_group_by_size）：把整本书按「波」提交，每波 ≤ batch_size 张（batch_size=1
+    即完全串行），group_by_size=True 时同尺寸图片同波，减少服务端批内 padding。
     """
     engine = _active_engine()
     global _BATCH_ENGINE
@@ -1432,6 +1630,8 @@ def batch_infer(
                 timeout=timeout,
                 on_progress=on_progress,
                 on_result=on_result,
+                batch_size=batch_size,
+                group_by_size=group_by_size,
             )
         return _batch_infer_impl(
             images,
@@ -1442,6 +1642,8 @@ def batch_infer(
             timeout=timeout,
             on_progress=on_progress,
             on_result=on_result,
+            batch_size=batch_size,
+            group_by_size=group_by_size,
         )
     finally:
         _BATCH_ENGINE = _prev_batch
@@ -1456,6 +1658,8 @@ def _batch_infer_impl(
     timeout: int,
     on_progress,
     on_result,
+    batch_size: int | None = None,
+    group_by_size: bool | None = None,
 ):
 
     def infer_one(img, prompt):
@@ -1522,28 +1726,46 @@ def _batch_infer_impl(
     if len(prompts) == 1:
         prompts = prompts * len(images)
     assert len(images) == len(prompts), "images/prompts必须等长"
+    # 批处理调度：显式按波提交（防止框架一次性合并整本书请求按最大尺寸 padding）。
+    # 显式传入优先，否则读 config.json（ocr_batch_size/ocr_group_by_size，带 TTL 缓存）。
+    if batch_size is None or group_by_size is None:
+        _cfg_bs, _cfg_gb = _batch_schedule_settings()
+        if batch_size is None:
+            batch_size = _cfg_bs
+        if group_by_size is None:
+            group_by_size = _cfg_gb
+    wave_size = max_workers if (max_workers and max_workers > 0) else 1
+    try:
+        _bs = int(batch_size)
+    except (TypeError, ValueError):
+        _bs = 0
+    if _bs > 0:
+        wave_size = min(wave_size, _bs)
+    waves = _plan_ocr_waves(images, wave_size, bool(group_by_size))
+
     results = []
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        fut_map = {
-            pool.submit(infer_one, img, prompts[i]): i for i, img in enumerate(images)
-        }
+    with ThreadPoolExecutor(max_workers=wave_size) as pool:
         done = 0
         total = len(images)
-        for fut in as_completed(fut_map):
-            idx = fut_map[fut]
-            try:
-                res = fut.result()
-            except Exception as e:
-                print(f"[batch_infer] Batch image failed: {e}")
-                res = {"img": images[idx], "result": None, "error": str(e)}
-            results.append(res)
-            done += 1
-            if on_progress is not None:
-                on_progress(done, total)
-            if on_result is not None:
-                on_result(res)
+        for wave in waves:
+            fut_map = {
+                pool.submit(infer_one, images[i], prompts[i]): i for i in wave
+            }
+            for fut in as_completed(fut_map):
+                idx = fut_map[fut]
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    print(f"[batch_infer] Batch image failed: {e}")
+                    res = {"img": images[idx], "result": None, "error": str(e)}
+                results.append(res)
+                done += 1
+                if on_progress is not None:
+                    on_progress(done, total)
+                if on_result is not None:
+                    on_result(res)
 
     # 批次结束后统一清理 ImageItem 缓存（避免逐页 clear 导致重复读盘/编码）
     for img in images:

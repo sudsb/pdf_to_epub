@@ -176,8 +176,90 @@ uv run python mian.py epub "E:\MYBooks\books\毛泽东\主席与毛远新同志�
   - **回退**：按校正前快照**彻底恢复**当前页文字，**已应用的修改一并撤回**；
 - **提示延迟**：「快捷键」设置里可调整悬停提示的响应时间（默认 600ms，0 为立即显示），提示会附带对应快捷键。
 
+### 编辑器命令行（Ctrl+;，2026-10）
+
+**打开方式**：按 `Ctrl+;`（分号），或点工具栏「命令行」按钮。底部弹出半透明输入条（背景可调透明度、提示居中不贴边），Enter 执行、`↑`/`↓` 在**无候选**时翻阅**历史命令**（有候选时用于高亮候选，`Alt+↑`/`Alt+↓` 始终翻历史）、Tab 补全、**Shift+Tab 在「命令行 ↔ 正文」之间切换焦点**（命令行保持打开，可先在正文里选词/定位再切回输入，插入/标记按正文最新光标定位）、Esc 关闭；输入 `help` 可看全部命令。**提示与补全按当前子命令段生效**：多命令下（`;` / `；` / 换行 / 段首括号分隔）只提示和补全光标所在的这一段，`插入`/`标记`/`包围` 等命令在**参数位**也会给出可选项，方便逐段补全。
+
+**全局命令**：跳转/翻页/搜索等命令**无需先点击正文**（没有焦点页时也能执行），例如 `页 12`、`首页`、`下一页`、`搜索 关键词`；`保存`/`导出`/`撤销`/`重做`/`设置` 等工具操作同样可全局执行。
+
+**基本语法**：`[范围]命令 [参数]`。范围是整个语法的基础（行号 = 当前页从上到下第 N 行，`A,B` 或 `A-B` 表示区间）：
+
+| 命令 | 说明 |
+|---|---|
+| `7,10合并` | 把第 7~10 行合并成一段（至少两行） |
+| `7,10删除` / `7,10清空` / `7替换 新文本` | 删除 / 清空（保留空行）/ 替换行内容 |
+| `7,10format 加粗` | 对范围套用格式：加粗/斜体/标题1~6/居中/注释/引用/正文等；也可直接写 `7,10加粗` |
+| `页 12` / `行 3` / `选 3 5 10` | 跳原书第 12 页 / 跳本页第 3 行 / 选中第 3 行第 5~10 字 |
+| `重识别 12-15` / `校正 全部` / `重识别 +3` | 按原书页号重识别/校正（支持 `N`、`N-M`、`+X`=当前页起 X 页、`全部`） |
+| `包围 书名号` / `包围 【】` | 用符号对包住选区/作用行（命名对：方括号/方头括号/六角括号/书名号/尖括号/圆括号/双引号/单引号/直角引号等） |
+| `标记 全文` / `标记 段落` | 插入 全文/注释/段落/换页 标记（也可写 `插入 标记 段落`） |
+| `复制` / `粘贴` / `复制文本` / `粘贴文本` | 剪贴板复制/粘贴（含格式 或 纯文本） |
+| `插图 居中 60%` / `图格式 行内 50%` | 选图插入（布局+宽度一步到位）/ 修改当前选中图的布局与宽度 |
+| `规则 1` / `规则 列表` | 按序号/名称套用已存格式规则；`规则 列表` 打开管理窗 |
+| `首页` / `末页` / `上一页` / `下一页` / `页首` / `页尾` / `行首 3` / `行尾 3` | 各种跳转定位 |
+| `清除格式` / `格式化` / `清空页` | 去格式 / 把块统一为正文 / 清空整页 |
+| `采纳` / `忽略` / `应用校正` / `清除标注` / `回退` / `完成` / `题注` | 纠错与收尾的快捷别名 |
+
+**多命令脚本**：`;` 或 `；`（全角）或换行分隔多条命令**依次执行**；`（…）` 把一组命令合成一个作用单元（可嵌套），单元执行完**最终的选区/光标**会作为后续命令的默认范围：
+
+```
+（7,10合并）加粗        → 先合并 7-10 行，再把合并结果整块加粗
+选 3 5; 包围 书名号      → 先选中第 3 行第 5 个字，再把它包上《》
+（选 3 5 10）插入 注释    → 选中后直接插入剪贴板文字为注释（见下）
+页尾; 插入 标记 段落     → 光标跳到当前页末尾，再插入段落标记
+```
+
+> 注意：只有命令**开头**的 `（`/`(` 才被当作分组符；`包围 ()` 里的括号是字面参数，请放心使用。
+
+**插入命令与剪贴板（亮点）**：
+
+`插入` 在光标处（或替换选中的文字）写入排版好的内容，支持 **注释 / 引用 / 正文 / 标题** 四种格式；注释与引用**默认用 `[]` 包裹**（如 `[本书为内部发行]`），可用 `包围 符号` 指定其它括号，或用 `包围 无` 取消包裹：
+
+```
+插入 注释 本书为内部发行          → 插入注释段「[本书为内部发行]」
+插入 引用 一句名言                → 插入引用段「[一句名言]」
+插入 注释 包围 【】 本书为内部发行 → 用【】包裹 →「【本书为内部发行】」
+插入 注释 包围 无 订正说明         → 不加包裹 →「订正说明」
+插入 正文 普通段落文字             → 插入普通段落（不包裹）
+插入 标题 第一章                  → 插入一级标题段落
+插入 标记 段落                    → 等价于「标记 段落」，插入段落标记
+```
+
+**文本缺省时自动读取系统剪贴板**——先复制、后插入的典型工作流：
+
+| 命令 | 效果 |
+|---|---|
+| `插入 注释` | 把**剪贴板文字**插成注释段并用 `[]` 包裹 |
+| `插入 引用` | 把剪贴板文字插成引用段（`[]` 包裹） |
+| `插入 注释 包围 【】` | 剪贴板文字插成注释段并用 `【】` 包裹 |
+| `插入 正文`（或直接 `插入`） | 把剪贴板文字插成普通段落 |
+| `插入 标记 段落` | 插入段落标记（内容非剪贴板） |
+| `注释 剪贴板` / `引用 剪贴板` | 注释/引用命令同样支持剪贴板来源 |
+
+细节说明：
+- 取的是剪贴板**纯文本**（text/plain）；剪贴板为空会提示「剪贴板为空，请先复制」；
+- 关键字：`剪贴板` / `粘贴板` / `系统剪贴板` / `clipboard` / `自动`（大小写均可）；
+- 包裹：注释/引用默认 `[]`；`包围 符号`（如 `包围 【】`、`包围 方括号`）可换符号，`包围 无`（或 `包裹 无` / `wrap none`）取消包裹；正文/标题默认不包裹；
+- **插入位置 = 焦点位置**。要插入到指定位置：先用鼠标点该行，或用 `行首 N` / `行尾 N` / `选 N A B` / `页首` / `页尾` 把光标定位好，再执行 `插入`；也可在命令行打开时按 **Shift+Tab** 切到正文点好位置、按 **Shift+Tab** 切回再执行；
+- 有选区时**替换整个选区**；无选区时在光标所在行后**新建一段**（注释/引用/正文为 `<p>`，标题为 `<h1>`）；
+- 配合 `;`/`；` 与 `（…）` 可把「定位 + 插入」合成一条命令：如 `（行首 5）插入 引用`、`页尾; 插入 标记 段落`。
+
+**典型使用案例**：
+```
+① 在浏览器复制一段引文 → 回矫正界面按 Ctrl+; 输入「插入 引用」回车
+   → 引文自动成为引用段（[] 包裹），光标后紧跟正文可继续输入。
+② 把某段要标注的文字先 选 3 8 20，再输入 「插入 注释」
+   → 选中文字被替换为注释段，无需手动打字。
+③ 整段搬移：源位置 复制文本 → 目标位置 行尾 3; 插入 正文
+   → 剪贴板文字以其原顺序插入目标行之后。
+④ 页尾插段落标记：输入「页尾; 插入 标记 段落」
+   → 光标先跳到当前页末尾，再插入段落标记。
+```
+
 ### 界面新增项（近期）
 
+- **编辑器命令行（Ctrl+;）**：底部命令输入条，支持行范围操作、`;`/`；` 多命令脚本与 `（…）` 作用域分组；`Shift+Tab` 可在**命令行 ↔ 正文**之间切换焦点；`插入` 命令文本缺省时**自动读取剪贴板**，注释/引用**默认用 `[]` 包裹**（可用 `包围 符号` 调整、`包围 无` 取消），并支持 `插入 标记 段落`（见上方「编辑器命令行」章节）。
+- **行号与正文对齐（设置）**：设置面板可开关**行号栏**并选择其**尺寸（小/中/大）**，行号栏与正文之间留白加宽、更易读；**正文两端对齐**默认开启，可在设置中关闭。均为纯视图层，不影响保存与导出。
 - **替换规则（Replace Rules）**：可预设常用文本替换，批量应用到当前编辑内容。
 - **自动保存（Auto Save）**：在校正过程中自动保存临时状态，减少意外中断丢失。
 - **分隔线与表格**：工具栏新增插入 `<hr>`、表格，支持直接在编辑器中排版表格。
@@ -439,3 +521,62 @@ powershell -ExecutionPolicy Bypass -File .\0pack.ps1 -KeepCudnnAdv    # 保留 c
 - **命令行用法与原 CLI 一致**：`ptoe.exe epub <pdf> [--dpi 0] [--model <key>] ...`、`ptoe.exe correct [<pdf>]`、`ptoe.exe config set engine llama`、`ptoe.exe stop [--engine llama|vllm]` 等；无参数但 stdin 非交互（管道）时仍打印 `nothing to do`。
 - **首次运行**：保证 exe 所在目录（双击时 CWD 即 exe 目录）有 `config.json`，且 `llama_server` / `models_dir` 指向有效路径（见第二节）。
 - 依赖说明：脚本用 `uv run --with pyinstaller`，首次构建自动拉取 pyinstaller，**不写入** `pyproject.toml` / `uv.lock`。
+
+
+- 硬件：RTX 3070 Laptop 8GB + i7-11800H（8C/16T）+ 32GB RAM
+- .venv 里 paddleocr 已装且 detect_gpu()=True（我先前用系统 Python 3.13 检查得出"未安装"是误报，请忽略）
+- 当前配置：engine=paddle、selected_model=DOTS8、dpi=100、parallel=2、ctx_size=16384、max_tokens=8192、cache_type_k/v=q8_0、flash_attn=0、image_preprocess.workers=8、paddle_merge_lines=true
+- 模型实际存在：E:/model/dots/dots.ocr.Q8_0.gguf(1.76GB) + dots.ocr.mmproj-Q8_0.gguf(1.25GB)
+两个必须先懂的机制（决定参数怎么配）
+1. --workers 对 PaddleOCR 无效。 paddleocrmanage.batch_infer 注释明确写着"顺序逐页"，max_workers 被忽略。Paddle 路径下真正影响速度的只有 dpi（分辨率）和 image_preprocess.workers（CPU 预处理并行）。
+2. llama 路径下 parallel 和 ctx_size 是绑定的一对。 每槽上下文 = ctx_size // parallel；视觉页约占 3100 token，代码要求每槽 ≥ 8192 才不截断。所以 parallel=2 + ctx=16384（8192/槽）✅，parallel=4 + ctx=16384（4096/槽）❌ 会截断。且 runserver 取 min(config的parallel, workers)，workers 应 = parallel，多出来的客户端只会排队。
+推荐参数（三种取向）
+参数	速度优先	均衡（推荐）	质量优先
+engine	paddle	paddle 或 llama	llama
+dpi	100	150	200
+workers	—（paddle 无效）	2（llama）/ —（paddle）	1
+parallel	2	2	1
+ctx_size	16384	16384	16384（或 24576）
+batch_size	4096	4096	4096
+ubatch_size	1024	512	1024
+flash_attn	1	1	1
+cache_type_k/v	q8_0	q8_0	q8_0
+max_tokens	3072	4096	8192
+ocr_batch_size	2	2	1
+ocr_group_by_size	true	true	true
+temperature	0	0	0
+cache_reuse	0	0	0
+image_preprocess	gray+sharpen, workers 8	同左	+denoise=true
+关键理由：
+- dpi 是最大杠杆（图像 token 随面积增长）：150 是质量/速度拐点；paddle 的检测器会把长边缩放到 limit_side_len（默认约 960–1280px），A4 上 150dpi≈1240px 已基本够，再往上多半被缩小、白费时间；只有小字密集页才值得 200。
+- flash_attn=1：RTX 3070 是 Ampere（算力 8.6），支持 FA2，长上下文解码明显提速。你当前是 0（关）。若开启后 llama-server 启动失败就改回 0。
+- batch 4096 / ubatch 512：-b 4096 让一页约 3100 图像 token 一次 llama_decode 算完（默认 2048 要拆两次）；-ub 512 压低显存峰值，8GB 稳。显存宽裕可提到 1024。
+- cache_reuse=0：每页图片都不同，公共前缀只有约 30 token 系统提示，命中收益 <1%，开了反而略增开销。
+- ocr_batch_size = workers：显式分波、避免框架自动合并不同尺寸页；ocr_group_by_size=true 让同尺寸页同波提交，减少服务端 padding。
+应用命令（均衡方案）
+若继续用 PaddleOCR（当前引擎，无需起服务）：
+uv run python mian.py config set dpi 150
+uv run python mian.py config set ocr_batch_size 2
+uv run python mian.py config set ocr_group_by_size true
+# image_preprocess.workers 已是 8，可不动
+uv run python mian.py epub "你的书.pdf" --resume
+（paddle 路径想"最快"就把 dpi 降到 100；想"质量"就 200 + image_preprocess.denoise=true。）
+若切到 llama + dots.ocr（能真正并行，通常更快）：
+uv run python mian.py config set engine llama
+uv run python mian.py config set selected_model DOTS8
+uv run python mian.py config set dpi 150
+uv run python mian.py config set ocr_batch_size 2
+uv run python mian.py config set ocr_group_by_size true
+uv run python mian.py config set llama_server_args.parallel 2
+uv run python mian.py config set llama_server_args.ctx_size 16384
+uv run python mian.py config set llama_server_args.batch_size 4096
+uv run python mian.py config set llama_server_args.ubatch_size 512
+uv run python mian.py config set llama_server_args.flash_attn 1
+uv run python mian.py config set llama_server_args.max_tokens 4096
+uv run python mian.py stop          # 改启动参数必须重启服务才生效
+uv run python mian.py epub "你的书.pdf" --model DOTS8 --workers 2 --resume
+调优时盯显存：
+nvidia-smi --query-gpu=memory.used,memory.total --format=csv -l 2
+若显存接近打满（KV 溢出到 CPU 会反而变慢），就把 parallel 降到 1、ubatch_size 降到 256。
+说明：config set engine 只接受 llama/vllm；你 config.json 里的 engine:"paddle" 是别处写入的，切回 llama 用上面的命令即可，切回 paddle 需在 GUI 转换页选引擎。
+要我直接把这些参数写进 config.json（均衡方案）吗？告诉我用 paddle 还是 llama 就行。

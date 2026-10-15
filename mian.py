@@ -3,12 +3,14 @@
 CLI:
   python mian.py [--version]
   python mian.py -e TEXT
-  python mian.py epub <pdf> [--dpi 0] [--model HY] [--workers N] [--thinking]
+  python mian.py epub <pdf> [--dpi 0|150] [--model HY] [--workers N] [--thinking]
                     [--title TITLE] [--author AUTHOR] [--lang zh-CN]
                     [--out-dir DIR] [--epub-path PATH] [--correct]
   python mian.py stop [--engine llama|vllm]   # 停止推理服务（llama-server / vLLM-Omni，释放端口）
 
---dpi 为档位（0-4）而非原始数值：0=100, 1=150, 2=200, 3=300, 4=600（默认 0）。
+--dpi 接受档位 0-4（0=100, 1=150, 2=200, 3=300, 4=600）或原始 DPI 数值（36-1200）；
+未指定时回退到 config.json 的 dpi 键（默认 100）。可用
+`mian.py config set dpi 200` 持久化默认值。
 --correct 开启手动矫正：在浏览器中逐页对照原图与识别文字（默认关闭）。
 
 无参数 + 交互终端（含打包 exe 双击启动）进入终端菜单 _run_menu：
@@ -138,6 +140,40 @@ def _paddle_merge_lines() -> bool:
 
 # 5 档 DPI：档位 -> 实际分辨率。档位越高图片 token 越多（约线性）、识别越精细但越慢。
 DPI_LEVELS = {0: 100, 1: 150, 2: 200, 3: 300, 4: 600}
+
+# 自定义 DPI 的允许范围（原始分辨率数值）：过低文字糊、过高渲染内存/耗时激增。
+DPI_MIN = 36
+DPI_MAX = 1200
+
+
+def resolve_dpi(value, default: int = 100) -> int:
+    """把 --dpi / 交互输入解析为原始 DPI 数值。
+
+    接受两种写法：
+      - 单字符档位 0-4（映射 100/150/200/300/600），兼容旧的 --dpi 0-4 用法；
+      - 任意 36-1200 的原始 DPI（如 150、220、300），便于自定义输入。
+    None / 空串 / 越界或非数字输入 → 回退 default（通常来自 config.json 的 dpi 键）。
+    """
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        if value in DPI_LEVELS:
+            return DPI_LEVELS[value]
+        return value if DPI_MIN <= value <= DPI_MAX else default
+    s = str(value).strip()
+    if not s:
+        return default
+    neg = s.startswith("-")
+    digits = s[1:] if neg else s
+    if digits.isdigit():
+        n = int(s)
+        # 单个数字（0-4）视为档位；其余按原始 DPI（负值自然越界回退）
+        if not neg and len(digits) == 1 and n in DPI_LEVELS:
+            return DPI_LEVELS[n]
+        if DPI_MIN <= n <= DPI_MAX:
+            return n
+    return default
+
 
 # 进度条宽度（字符）
 _BAR_WIDTH = 24
@@ -1147,10 +1183,12 @@ def _menu_epub(cfg: dict) -> None:
     model = _ask(f"模型键（默认 {cfg.get('selected_model', 'HY')}，回车用默认）：")
     if not model:
         model = cfg.get("selected_model", "HY")
-    dpi = 0
-    dpi_in = _ask("DPI 档位 0-4（默认 0=100，回车用默认）：")
-    if dpi_in.isdigit() and int(dpi_in) in DPI_LEVELS:
-        dpi = int(dpi_in)
+    # DPI：默认取 config.json 的 dpi（默认 100）；可输入档位 0-4 或原始数值（36-1200）。
+    dpi_default = resolve_dpi(cfg.get("dpi"), 100)
+    dpi_in = _ask(
+        f"DPI（档位 0-4 或数值 {DPI_MIN}-{DPI_MAX}，默认 {dpi_default}，回车用默认）："
+    )
+    dpi = resolve_dpi(dpi_in, dpi_default)
     rec_workers = int(
         (cfg.get("model_choices") or {}).get(model, {}).get("workers") or 3
     )
@@ -1160,12 +1198,12 @@ def _menu_epub(cfg: dict) -> None:
         workers = int(workers_in)
     correct = _ask("开启手动矫正（浏览器对照原图修字）？(y/N)：").lower() == "y"
     print(
-        f"\n开始转换：{pdf}\n  模型={model}，dpi={DPI_LEVELS[dpi]}，并发={workers}，矫正={'开' if correct else '关'}"
+        f"\n开始转换：{pdf}\n  模型={model}，dpi={dpi}，并发={workers}，矫正={'开' if correct else '关'}"
     )
     try:
         result = pdf_to_epub(
             pdf,
-            dpi=DPI_LEVELS[dpi],
+            dpi=dpi,
             model_key=model,
             max_workers=workers,
             correct=correct,
@@ -1497,10 +1535,9 @@ def main(argv: list[str] | None = None) -> int:
     epub_p.add_argument("pdf", help="Path to the source PDF")
     epub_p.add_argument(
         "--dpi",
-        type=int,
-        choices=sorted(DPI_LEVELS),
-        default=0,
-        help="DPI level 0-4: 0=100, 1=150, 2=200, 3=300, 4=600 (default: 0=100)",
+        default=None,
+        help="DPI：档位 0-4（0=100, 1=150, 2=200, 3=300, 4=600）或原始数值 36-1200"
+        "（默认取 config.json 的 dpi，缺省 100）",
     )
     epub_p.add_argument(
         "--model",
@@ -1657,10 +1694,9 @@ def main(argv: list[str] | None = None) -> int:
     resume_p.add_argument("pdf", help="Path to the source PDF")
     resume_p.add_argument(
         "--dpi",
-        type=int,
-        choices=sorted(DPI_LEVELS),
-        default=0,
-        help="DPI level 0-4: 0=100, 1=150, 2=200, 3=300, 4=600 (default: 0=100)",
+        default=None,
+        help="DPI：档位 0-4（0=100, 1=150, 2=200, 3=300, 4=600）或原始数值 36-1200"
+        "（默认取 config.json 的 dpi，缺省 100）",
     )
     resume_p.add_argument(
         "--model",
@@ -1960,7 +1996,15 @@ def main(argv: list[str] | None = None) -> int:
         cmd = getattr(args, "config_cmd", None)
         cfg = get_config()
         if cmd == "show":
-            for k in ("engine", "llama_server", "models_dir", "selected_model"):
+            for k in (
+                "engine",
+                "llama_server",
+                "models_dir",
+                "selected_model",
+                "dpi",
+                "ocr_batch_size",
+                "ocr_group_by_size",
+            ):
                 print(f"  {k}: {cfg.get(k, '')}")
             print(f"  vllm_server: {cfg.get('vllm_server', '')}")
             print(f"  browser: {cfg.get('browser', '')}")
@@ -2019,9 +2063,12 @@ def main(argv: list[str] | None = None) -> int:
                 "window_maximized",
                 "tabs_position",
                 "paddle_merge_lines",
+                "dpi",
+                "ocr_batch_size",
+                "ocr_group_by_size",
             ):
                 print(
-                    "Error: 可修改的键名仅限 llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / browser / gui_display / window_maximized / tabs_position / paddle_merge_lines / llama_server_args.<参数名> / vllm_server_args.<参数名> / proofread.<param>",
+                    "Error: 可修改的键名仅限 llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / browser / gui_display / window_maximized / tabs_position / paddle_merge_lines / dpi / ocr_batch_size / ocr_group_by_size / llama_server_args.<参数名> / vllm_server_args.<参数名> / proofread.<param>",
                     file=sys.stderr,
                 )
                 return 1
@@ -2061,6 +2108,38 @@ def main(argv: list[str] | None = None) -> int:
                 if parsed is None:
                     print(
                         "Error: paddle_merge_lines 仅接受 true/false（也可写 1/0、on/off、yes/no）",
+                        file=sys.stderr,
+                    )
+                    return 1
+                value = parsed
+            if key == "dpi":
+                # 接受档位 0-4 或原始数值 36-1200；统一存为原始 DPI 数值
+                resolved = resolve_dpi(value, 0)
+                if resolved == 0 or not (DPI_MIN <= resolved <= DPI_MAX):
+                    print(
+                        f"Error: dpi 仅接受档位 0-4 或数值 {DPI_MIN}-{DPI_MAX}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                value = resolved
+            if key == "ocr_batch_size":
+                # 0=自动（按并发数分波）；1=完全串行（最省显存）；>1=每波上限
+                try:
+                    n = int(str(value).strip())
+                except (TypeError, ValueError):
+                    n = -1
+                if n < 0:
+                    print(
+                        "Error: ocr_batch_size 仅接受非负整数（0=自动，1=串行）",
+                        file=sys.stderr,
+                    )
+                    return 1
+                value = n
+            if key == "ocr_group_by_size":
+                parsed = _parse_bool_arg(value)
+                if parsed is None:
+                    print(
+                        "Error: ocr_group_by_size 仅接受 true/false（也可写 1/0、on/off、yes/no）",
                         file=sys.stderr,
                     )
                     return 1
@@ -2107,7 +2186,7 @@ def main(argv: list[str] | None = None) -> int:
             _apply_engine_arg(args.engine)
             result = pdf_to_epub(
                 args.pdf,
-                dpi=DPI_LEVELS[args.dpi],
+                dpi=resolve_dpi(args.dpi, cfg.get("dpi", 100)),
                 model_key=args.model,
                 max_workers=args.workers,
                 thinking=args.thinking,
@@ -2135,7 +2214,7 @@ def main(argv: list[str] | None = None) -> int:
             _apply_engine_arg(args.engine)
             result = pdf_to_epub(
                 args.pdf,
-                dpi=DPI_LEVELS[args.dpi],
+                dpi=resolve_dpi(args.dpi, cfg.get("dpi", 100)),
                 model_key=args.model,
                 max_workers=args.workers,
                 thinking=args.thinking,

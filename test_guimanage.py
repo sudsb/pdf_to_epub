@@ -7,7 +7,9 @@ _browser_gone 判定，以及 mian.py 的 gui 子命令与终端菜单第 8 项�
 测试期间 monkeypatch configmanage._CONFIG_PATH 到临时文件（严禁写真实 config.json）。
 """
 
+import contextlib
 import inspect
+import io
 import json
 import os
 import queue
@@ -19,7 +21,7 @@ import threading
 import time
 import unittest
 import zipfile
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path as _Path
 from unittest import mock
 
@@ -550,6 +552,232 @@ class TestBrowserGoneGuard(GuiServerTestBase):
         )
         self.assertFalse(gone)
         self.assertIsNone(stale)
+
+
+class TestServeLoopNoQuitWhileJobRunning(unittest.TestCase):
+    """矫正/转换长任务运行中，_serve_loop 不得因「浏览器失联」自动退出。
+
+    根因（用户返修单：长时间使用矫正界面后界面无任何异常提示就结束了）：
+    gui_serve 在 browser 模式下用 _browser_gone（pagehide 信标 /api/bye 或
+    心跳失联 idle_timeout*2）判定浏览器已关闭，随即退出 finally，并把仍在
+    运行的矫正子进程 proc.kill() —— 矫正界面瞬间消失、控制台无任何异常、
+    data/correct_server.json 留下大量陈旧实例（从未走到清理）。而浏览器
+    （Thorium/Chrome）在内存吃紧时会把后台标签页挂起/回收，此时页面既不发
+    心跳也可能补发 pagehide，属于误判而非用户真的关闭服务。
+
+    修复：长任务运行中只认 state["finished"]（Ctrl+C / 显式关闭）这一条真实
+    退出通道；gone 判定成立也要把服务留着，让用户回来后页面自己重连。
+    """
+
+    IDLE_TIMEOUT = 1  # 测试里把阈值压到最小，保证 _browser_gone 立即成立
+
+    def _make_state(self, running_instances):
+        return {
+            "finished": threading.Event(),
+            "tab_lost": False,
+            "dlg_queue": queue.Queue(),
+            "dlg_lock": threading.Lock(),
+            "beat_lock": threading.Lock(),
+            "gone_at": None,
+            # 心跳故意置为很久以前 → _browser_gone 立刻判定失联
+            "last_beat": time.monotonic() - 10000.0,
+            "convert": {"lock": threading.Lock(), "proc": None, "running": False},
+            "merge": {
+                "lock": threading.Lock(),
+                "running": False,
+                "stop_event": threading.Event(),
+            },
+            "correct_instances": [
+                {"running": True, "finalized": False, "port": 50000 + i,
+                 "url": "http://127.0.0.1:%d/" % (50000 + i), "proc": None}
+                for i in range(running_instances)
+            ],
+            "epubedit_instances": [],
+        }
+
+    def _loop_target(self, state, buf):
+        with contextlib.redirect_stdout(buf):
+            guimanage._serve_loop(state, self.IDLE_TIMEOUT, watch_gone=True)
+
+    def _run_loop(self, state):
+        buf = io.StringIO()
+        thread = threading.Thread(
+            target=self._loop_target, args=(state, buf), daemon=True
+        )
+        thread.start()
+        return thread, buf
+
+    def test_no_quit_while_correct_running(self):
+        """矫正实例运行中 + 浏览器失联 → 不退出（回归：曾静默强杀矫正）。"""
+        state = self._make_state(1)
+        thread, buf = self._run_loop(state)
+        try:
+            # _browser_gone 需「连续失联 _STALE_CONFIRM_SECONDS」才成立，等它成立
+            time.sleep(5.0)
+            self.assertTrue(thread.is_alive(), "长任务运行中 _serve_loop 竟然退出了")
+            self.assertFalse(state["finished"].is_set())
+            self.assertIn("服务保持后台运行", buf.getvalue())
+        finally:
+            state["finished"].set()
+            thread.join(timeout=3.0)
+
+    def test_quit_when_browser_gone_and_no_job(self):
+        """无长任务 + 浏览器失联 → 正常退出并给出控制台说明。"""
+        state = self._make_state(0)
+        thread, buf = self._run_loop(state)
+        thread.join(timeout=5.0)
+        self.assertFalse(thread.is_alive(), "无任务且浏览器失联时应退出")
+        self.assertTrue(state["finished"].is_set())
+        self.assertIn("配置中心自动退出", buf.getvalue())
+
+    def test_quit_after_job_finishes_when_browser_away(self):
+        """任务结束后浏览器仍未回来 → 自动退出（不无限期占用端口）。"""
+        state = self._make_state(1)
+        thread, buf = self._run_loop(state)
+        try:
+            time.sleep(1.5)
+            self.assertTrue(thread.is_alive())
+            state["correct_instances"][0]["running"] = False  # 矫正任务结束
+            thread.join(timeout=8.0)
+            self.assertFalse(thread.is_alive(), "任务结束后应能自动退出")
+            self.assertTrue(state["finished"].is_set())
+        finally:
+            state["finished"].set()
+            thread.join(timeout=3.0)
+
+    def test_any_job_running_flags(self):
+        """_any_job_running 对四类长任务都能识别。"""
+        state = self._make_state(1)
+        self.assertTrue(guimanage._any_job_running(state))
+        state["correct_instances"][0]["running"] = False
+        self.assertFalse(guimanage._any_job_running(state))
+        with state["convert"]["lock"]:
+            state["convert"]["running"] = True
+        self.assertTrue(guimanage._any_job_running(state))
+        with state["convert"]["lock"]:
+            state["convert"]["running"] = False
+        with state["merge"]["lock"]:
+            state["merge"]["running"] = True
+        self.assertTrue(guimanage._any_job_running(state))
+        with state["merge"]["lock"]:
+            state["merge"]["running"] = False
+        state["epubedit_instances"].append({"running": True})
+        self.assertTrue(guimanage._any_job_running(state))
+
+
+class TestHttpServerWatchdog(unittest.TestCase):
+    """HTTP serve 线程死掉必须被 _serve_loop 重启（白屏自愈）。
+
+    此前 serve_forever 死掉后端口拒绝连接，配置中心刷新即白屏，而主线程还
+    压在监视循环里，进程「看起来还在运行」，控制台只有启动那句 Ctrl+C 提示。
+    """
+
+    def test_restarts_dead_serve_thread(self):
+        state = {"finished": threading.Event()}
+        real = ThreadingHTTPServer(("127.0.0.1", 0), _NoopHandler)
+        state["http_server"] = real
+        state["http_thread"] = threading.Thread(target=lambda: None)  # 已死的线程
+        state["http_thread"].start()
+        state["http_thread"].join(timeout=1.0)
+        self.assertFalse(state["http_thread"].is_alive())
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            guimanage._ensure_http_server(state)
+            self.assertIn("重启", buf.getvalue())
+        new_thread = state["http_thread"]
+        self.assertTrue(new_thread.is_alive())
+        self.assertTrue(real.server_address[1] > 0)
+        # 重启后端口真的能接受连接
+        import urllib.request
+
+        with urllib.request.urlopen(
+            "http://127.0.0.1:%d/" % real.server_address[1], timeout=3
+        ) as resp:
+            self.assertEqual(resp.status, 200)
+        state["finished"].set()
+        guimanage._serve_loop(state, 1, watch_gone=True)  # 退出并停掉重启的线程
+        real.shutdown()
+        real.server_close()
+        new_thread.join(timeout=3.0)
+        self.assertFalse(new_thread.is_alive())
+
+    def test_alive_thread_untouched(self):
+        state = {"finished": threading.Event()}
+        real = ThreadingHTTPServer(("127.0.0.1", 0), _NoopHandler)
+        thread = threading.Thread(target=_run_forever_factory(real), daemon=True)
+        thread.start()
+        state["http_server"] = real
+        state["http_thread"] = thread
+        time.sleep(0.3)
+        self.assertTrue(thread.is_alive())
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            guimanage._ensure_http_server(state)
+            self.assertEqual(buf.getvalue(), "")  # 活着就别乱重启
+        self.assertIs(state["http_thread"], thread)
+        real.shutdown()
+        real.server_close()
+        thread.join(timeout=3.0)
+
+
+def _run_forever_factory(server):
+    def _run():
+        server.serve_forever()
+
+    return _run
+
+
+class _NoopHandler(BaseHTTPRequestHandler):
+    """空 handler：GET/ → 200，仅供看护测试用。"""
+
+    def do_GET(self):  # noqa: N802
+        body = b"ok"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):  # 静音
+        pass
+
+
+class TestCorrectMonitorConsoleEcho(unittest.TestCase):
+    """矫正子进程的出错行必须同时打到控制台（不再只藏在界面日志面板里）。
+
+    矫正子进程 stdout 被 _correct_monitor 收进实例 lines 后只会在界面日志
+    面板显示，用户控制台什么都看不到。界面若无异常提示就结束，用户完全无从
+    判断原因。现在 traceback/错误/失败等行 + 非 0 退出码都回显到控制台。
+    """
+
+    def test_error_lines_echoed_to_console(self):
+        proc = _FakeCorrectProc(
+            [
+                "http://127.0.0.1:8123/\n",
+                "Traceback (most recent call last):\n",
+                "RuntimeError: fitz document closed\n",
+            ]
+        )
+        inst = {"id": "t1", "running": True, "finalized": False}
+        guimanage._correct_monitor(inst, proc)
+        self.assertEqual(inst["exit_code"], 0)
+        # 出错行进 lines（面板可见）
+        self.assertTrue(any("Traceback" in ln for ln in inst["lines"]))
+
+    def test_nonzero_exit_echoed_to_console(self):
+        proc = _FakeCorrectProc(["矫正界面已启动: http://127.0.0.1:8123/\n"])
+        proc.wait = lambda timeout=None: 3  # 非 0 退出码
+        inst = {"id": "t2", "running": True, "finalized": False}
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            guimanage._correct_monitor(inst, proc)
+            out = buf.getvalue()
+        self.assertEqual(inst["exit_code"], 3)
+        self.assertIn("退出码 3", out)
+
+    def test_normal_lines_not_echoed(self):
+        proc = _FakeCorrectProc(["http://127.0.0.1:8123/\n", "预渲染 3/12 页\n"])
+        inst = {"id": "t3", "running": True, "finalized": False}
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            guimanage._correct_monitor(inst, proc)
+            out = buf.getvalue()
+        self.assertNotIn("预渲染", out)
 
 
 class TestOpenBrowserDetached(unittest.TestCase):
@@ -1252,8 +1480,9 @@ class TestGuiConvert(GuiServerTestBase):
             (self._start_body(pdf=None), "缺少 PDF 文件路径"),
             (self._start_body(pdf="C:/x.txt"), "请选择 PDF 文件"),
             (self._start_body(pdf="C:/nope.pdf"), "文件不存在"),
-            (self._start_body(dpi=7), "dpi 仅支持 0-4"),
-            (self._start_body(dpi=True), "dpi 仅支持 0-4"),
+            (self._start_body(dpi=7), "dpi 仅支持档位 0-4"),
+            (self._start_body(dpi=1300), "dpi 仅支持档位 0-4"),
+            (self._start_body(dpi=True), "dpi 仅支持档位 0-4"),
             (self._start_body(model="NOPE"), "未知模型"),
             (self._start_body(engine="bad"), "engine 仅支持 llama / vllm"),
             (self._start_body(workers=0), "workers 必须 >= 1"),
@@ -1271,6 +1500,20 @@ class TestGuiConvert(GuiServerTestBase):
                 self.assertFalse(data["ok"])
                 self.assertIn(expect, data["error"])
         popen.assert_not_called()
+
+    def test_start_accepts_custom_dpi(self):
+        """dpi 支持档位 0-4 与原始数值 36-1200，均透传为 --dpi 字符串。"""
+        for dpi in (0, 4, 36, 300, 1200):
+            with mock.patch.object(
+                guimanage.subprocess, "Popen", return_value=self._make_fake_proc([])
+            ) as popen:
+                status, raw = self._post(
+                    "/api/convert/start", self._start_body(dpi=dpi)
+                )
+            self.assertEqual(status, 200, dpi)
+            argv = popen.call_args[0][0]
+            self.assertIn("--dpi", argv)
+            self.assertEqual(argv[argv.index("--dpi") + 1], str(dpi))
 
     def test_start_convert_with_paddle_engine(self):
         """POST /api/convert/start engine=paddle → 200（合法引擎，不被校验拒绝）。"""

@@ -70,7 +70,10 @@
     "ctx_checkpoints": "0",
     "cache_ram": "0",
     "recycle_every": "0",
-    "recycle_rss_mb": "0"
+    "recycle_rss_mb": "0",
+    "batch_size": "0",
+    "ubatch_size": "0",
+    "cache_reuse": "0"
   },
   "proofread": {
     "similarity_min": 0.67,
@@ -98,7 +101,8 @@
     "mm_proj_config": "",
     "mm_processor_config": "",
     "deploy_config": "",
-    "extra_args": ""
+    "extra_args": "",
+    "kv_cache_dtype": "fp8"
   },
   "shortcuts": {
     "bold": "Ctrl+B",
@@ -321,7 +325,11 @@
       "highlight"
     ],
     "proofread_batch_pages": 0,
-    "undo_depth": 100
+    "undo_depth": 100,
+    "show_line_numbers": false,
+    "line_num_size": "large",
+    "text_justify": true,
+    "brush_merge_delay": 800
   },
   "proofread_engine": "llama",
   "mouse_shortcuts": {},
@@ -342,5 +350,8 @@
     "interval_minutes": 5,
     "new_backup": true
   },
-  "paddle_merge_lines": true
+  "paddle_merge_lines": true,
+  "dpi": 100,
+  "ocr_batch_size": 0,
+  "ocr_group_by_size": true
 }

@@ -7221,6 +7221,8 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 POPUP_RULE_COUNT_MAX,
                 UNDO_DEPTH_DEFAULT,
                 UNDO_DEPTH_CHOICES,
+                LINE_NUM_SIZE_DEFAULT,
+                LINE_NUM_SIZE_CHOICES,
             )
 
             if self.command == "GET":
@@ -7231,6 +7233,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 defaults = DEFAULT_CONFIG.get("ui_settings", {
                     "tip_delay": 600,
                     "err_hover_delay": 1500,
+                    "brush_merge_delay": 800,
                     "editor_font_size": 14,
                     "img_mode": "",
                     "rule_all_pages_confirm": True,
@@ -7239,10 +7242,14 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "popup_rule_count": POPUP_RULE_COUNT_DEFAULT,
                     "proofread_batch_pages": 0,
                     "undo_depth": UNDO_DEPTH_DEFAULT,
+                    "show_line_numbers": False,
+                    "line_num_size": LINE_NUM_SIZE_DEFAULT,
+                    "text_justify": True,
                 })
                 merged = {
                     "tip_delay": stored.get("tip_delay", defaults["tip_delay"]),
                     "err_hover_delay": stored.get("err_hover_delay", defaults["err_hover_delay"]),
+                    "brush_merge_delay": stored.get("brush_merge_delay", defaults.get("brush_merge_delay", 800)),
                     "editor_font_size": stored.get("editor_font_size", defaults["editor_font_size"]),
                     "img_mode": stored.get("img_mode", defaults["img_mode"]),
                     "rule_all_pages_confirm": stored.get("rule_all_pages_confirm", defaults["rule_all_pages_confirm"]),
@@ -7251,6 +7258,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "popup_rule_count": stored.get("popup_rule_count", defaults["popup_rule_count"]),
                     "proofread_batch_pages": stored.get("proofread_batch_pages", defaults.get("proofread_batch_pages", 0)),
                     "undo_depth": stored.get("undo_depth", defaults.get("undo_depth", UNDO_DEPTH_DEFAULT)),
+                    "show_line_numbers": bool(stored.get("show_line_numbers", defaults.get("show_line_numbers", False))),
+                    "line_num_size": stored.get("line_num_size", defaults.get("line_num_size", LINE_NUM_SIZE_DEFAULT)),
+                    "text_justify": bool(stored.get("text_justify", defaults.get("text_justify", True))),
                 }
                 self._send(
                     200,
@@ -7292,6 +7302,16 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     self._send(400, self._json({"ok": False, "error": "err_hover_delay 超出范围（0-10000）"}), "application/json; charset=utf-8")
                     return
                 clean["err_hover_delay"] = v
+            if "brush_merge_delay" in ui:
+                try:
+                    v = int(ui["brush_merge_delay"])
+                except (TypeError, ValueError):
+                    self._send(400, self._json({"ok": False, "error": "brush_merge_delay 必须是数字"}), "application/json; charset=utf-8")
+                    return
+                if not (0 <= v <= 5000):
+                    self._send(400, self._json({"ok": False, "error": "brush_merge_delay 超出范围（0-5000）"}), "application/json; charset=utf-8")
+                    return
+                clean["brush_merge_delay"] = v
             if "editor_font_size" in ui:
                 try:
                     v = int(ui["editor_font_size"])
@@ -7362,6 +7382,24 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     self._send(400, self._json({"ok": False, "error": "undo_depth 取值无效（需为 50/100/200/500）"}), "application/json; charset=utf-8")
                     return
                 clean["undo_depth"] = v
+            if "show_line_numbers" in ui:
+                v = ui["show_line_numbers"]
+                if not isinstance(v, bool):
+                    self._send(400, self._json({"ok": False, "error": "show_line_numbers 必须是布尔值"}), "application/json; charset=utf-8")
+                    return
+                clean["show_line_numbers"] = v
+            if "line_num_size" in ui:
+                v = ui["line_num_size"]
+                if v not in LINE_NUM_SIZE_CHOICES:
+                    self._send(400, self._json({"ok": False, "error": "line_num_size 取值无效（需为 small/medium/large）"}), "application/json; charset=utf-8")
+                    return
+                clean["line_num_size"] = v
+            if "text_justify" in ui:
+                v = ui["text_justify"]
+                if not isinstance(v, bool):
+                    self._send(400, self._json({"ok": False, "error": "text_justify 必须是布尔值"}), "application/json; charset=utf-8")
+                    return
+                clean["text_justify"] = v
             set_ui_settings(clean)
             self._send(200, self._json({"ok": True}), "application/json; charset=utf-8")
         except Exception as e:  # noqa: BLE001
@@ -10330,8 +10368,9 @@ button.primary:active{background:var(--accent-hover);border-color:var(--accent-h
 button:disabled{opacity:.5;cursor:not-allowed;}
 select{font:inherit;padding:5px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-elev);color:var(--text);}
 
-/* U2居中，3s 自动消失 */
-#toast{position:fixed;top:62%;left:50%;transform:translateX(-50%);z-index:90;display:flex;flex-direction:column;gap:6px;align-items:center;pointer-events:none;}
+/* 底部居中、不贴边（bottom 固定偏移 + left 50% 居中），3s 自动消失；
+   fixed 定位随窗口缩放保持相对位置不变，不会贴边或被裁切 */
+#toast{position:fixed;bottom:30px;left:50%;transform:translateX(-50%);z-index:96;display:flex;flex-direction:column;gap:6px;align-items:center;pointer-events:none;}
 .toast{background:#1c2733;color:#fff;font-size:13px;line-height:1.5;padding:8px 16px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.25);opacity:0;transform:translateY(-6px);transition:opacity .2s,transform .2s,background .2s ease,color .2s ease;max-width:70vw;}
 .toast.show{opacity:1;transform:translateY(0);}
 .toast.ok{background:#1a7f37;}
@@ -10405,6 +10444,61 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
 .editable h4::before{content:"H4";color:#1C2733;}
 .editable h5::before{content:"H5";color:#1C2733;}
 .editable h6::before{content:"H6";color:#5A6B7C;}
+/* 文字页面行号（2026-10）：#pages 带 .ptoe-line-num 时，每页 .editable 的直属块
+   （p/div/h1-6）用 CSS 计数器编号。counter-reset 落在**每个 .editable** 上 →
+   每页从 1 重新起算，与原书页码无关。行号写在 ::after 上——伪元素内容不进
+   innerHTML，故 syncContent/collect/保存/导出都不含行号，存储源保持原样。
+   块需 position:relative 才能把绝对定位的 ::after 锚在本块左上（否则会以
+   .page-row/#pages 为定位祖先全部叠在一处）。命令行寻址口径与之一致：只数
+   .editable 的直属 p/div/h1-6（table 等非文字块不编号、也不可寻址）。 */
+/* 尺寸档位（2026-10 调整）：行号最多 3 位数（单页一般 < 500），列宽按 3 位等宽
+   数字留一点余量即可，故三档均比原先收窄；--ln-numw/--ln-gap/--ln-pad 统一用 px，
+   不再用 em——否则 --ln-pad 会随正文字号放大、而行号字号固定，越调越宽且对不齐。
+   --ln-pad 只到「灰底行号栏 + 分隔线」为止；正文另加 --ln-textgap 留白，避免首列
+   文字贴着分隔线。档位值满足 --ln-pad = --ln-numw + --ln-gap + 左侧少量余量。 */
+#pages.ptoe-line-num{--ln-font:12px;--ln-numw:22px;--ln-gap:16px;--ln-pad:44px;--ln-textgap:6px;}
+#pages.ptoe-line-num.ptoe-ln-md{--ln-font:11px;--ln-numw:20px;--ln-gap:15px;--ln-pad:40px;}
+#pages.ptoe-line-num.ptoe-ln-sm{--ln-font:10px;--ln-numw:18px;--ln-gap:13px;--ln-pad:35px;}
+#pages.ptoe-line-num .editable{padding-left:calc(var(--ln-pad,44px) + var(--ln-textgap,6px));counter-reset:ptoe-ln;
+  /* 行号栏独立背景：inset 阴影画出左侧留白灰底 + 1px 右侧分隔线，与正文白底明显
+     区分。inset 阴影固定在元素盒（不随内容滚动），长文档滚动时行号栏始终铺满。 */
+  box-shadow:inset calc(var(--ln-pad,44px) - 1px) 0 0 var(--ln-gutter,#eef1f6),
+             inset var(--ln-pad,44px) 0 0 var(--ln-border,#d3dae3);}
+#pages.ptoe-line-num .editable:focus{
+  box-shadow:inset calc(var(--ln-pad,44px) - 1px) 0 0 var(--ln-gutter,#eef1f6),
+             inset var(--ln-pad,44px) 0 0 var(--ln-border,#d3dae3),
+             0 0 0 2px rgba(47,111,237,.15);}
+#pages.ptoe-line-num .editable > p,
+#pages.ptoe-line-num .editable > div,
+#pages.ptoe-line-num .editable > h1,
+#pages.ptoe-line-num .editable > h2,
+#pages.ptoe-line-num .editable > h3,
+#pages.ptoe-line-num .editable > h4,
+#pages.ptoe-line-num .editable > h5,
+#pages.ptoe-line-num .editable > h6{position:relative;counter-increment:ptoe-ln;}
+#pages.ptoe-line-num .editable > p::after,
+#pages.ptoe-line-num .editable > div::after,
+#pages.ptoe-line-num .editable > h1::after,
+#pages.ptoe-line-num .editable > h2::after,
+#pages.ptoe-line-num .editable > h3::after,
+#pages.ptoe-line-num .editable > h4::after,
+#pages.ptoe-line-num .editable > h5::after,
+#pages.ptoe-line-num .editable > h6::after{
+  content:counter(ptoe-ln);
+  position:absolute;left:calc(-1 * (var(--ln-numw,22px) + var(--ln-gap,16px)));top:0;
+  font-size:var(--ln-font,12px);line-height:1.7;color:#8b98a6;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  -webkit-user-select:none;user-select:none;pointer-events:none;
+  width:var(--ln-numw,22px);text-align:right;
+}
+/* 光标所在行高亮（2026-10）：选区锚点所在块加 .ptoe-cur-line。用 background-image 叠加
+   浅蓝底（保留标题块自身的级别底色）。2026-10 调整：去掉原先压在首列文字上的不透明
+   左侧竖条（inset 3px accent），改为「行号本身变色加粗 + 更淡的整行底色」——竖条会盖住
+   行首字符，且与行号栏贴得太近时更明显；纯视图层，仍不进保存/历史。 */
+#pages.ptoe-line-num .editable > .ptoe-cur-line{
+  background-image:linear-gradient(rgba(59,111,255,.09),rgba(59,111,255,.09));}
+#pages.ptoe-line-num .editable > .ptoe-cur-line::after{
+  color:var(--accent,#316dca);font-weight:700;}
 .ptoe-align-left{text-align:left;} .ptoe-align-center{text-align:center;} .ptoe-align-right{text-align:right;}
 /* 2026-09-24：行内对齐 span（部分选区包裹 <span class="ptoe-align-*">…</span>），
    与 EPUB 导出 CSS（htmlmanage 同规则，含 th/td 兼容）保持一致 */
@@ -10414,6 +10508,11 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
 .editable th span.ptoe-align-left,.editable td span.ptoe-align-left{display:inline;text-align:left;}
 .editable th span.ptoe-align-center,.editable td span.ptoe-align-center{display:inline;text-align:center;}
 .editable th span.ptoe-align-right,.editable td span.ptoe-align-right{display:inline;text-align:right;}
+/* 正文两端对齐/分散对齐（2026-10，req4）：#pages.ptoe-justify 时仅给 .editable 声明
+   text-align:justify，靠 text-align 继承让所有直属块两端对齐；逐块自带的
+   .ptoe-align-* 是元素自身显式声明，会覆盖继承值，故手动对齐设置仍优先生效。
+   纯视图层，不影响保存/导出。 */
+#pages.ptoe-justify .editable{text-align:justify;}
 .ptoe-marker{background:#fff3bf;border:1px solid #e8c24a;border-radius:3px;padding:0 4px;font-size:12px;color:#8a6d00;cursor:help;user-select:all;}
 .ptoe-search{background:#fff1a8;border-radius:2px;padding:0 2px;color:inherit;}
 .editable mark.ptoe-search{background:#fff1a8;color:inherit;border-radius:2px;padding:0 2px;}
@@ -10711,6 +10810,10 @@ body.paint-mode{cursor:copy;}
 #shortcutTable td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:14px;}
 #shortcutTable tr{cursor:pointer;}
 #shortcutTable tr:hover td{background:#f7fafd;}
+/* 分组标题行（功能刷）：不可点（不进入捕获），无悬停高亮 */
+#shortcutTable tr.shortcut-group-row{cursor:default;}
+#shortcutTable tr.shortcut-group-row:hover td{background:none;}
+#shortcutTable tr.shortcut-group-row td{padding-top:14px;font-weight:600;color:#5a6b7c;font-size:12px;}
 kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6px;font-size:12px;font-family:inherit;}
 #closeSettings{margin-top:12px;}
 #formatRulesModalBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
@@ -10822,7 +10925,6 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
         <div class="tb-more-panel" id="morePanelFormat" role="menu">
           <button type="button" class="tb-btn" id="charWrapBtn" role="menuitem" title="文字包围下拉菜单：下划线 / 删除线 / 字符边框 / 底纹" aria-label="文字包围">文字包围 <span class="ptoe-caret">▾</span></button>
           <button type="button" class="tb-btn" id="supSubBtn" role="menuitem" title="上标下标下拉菜单：把选中文字设为上标或下标的小字符" aria-label="上标下标">上标/下标 <span class="ptoe-caret">▾</span></button>
-          <button type="button" class="tb-btn" id="formatBrushBtn" role="menuitem" title="格式刷" aria-label="格式刷">格式刷</button>
           <button type="button" class="tb-btn" id="formatRulesBtn" role="menuitem" title="格式规则：对选中文字一键应用自定义规则（可多条叠加 / 条件分支；Ctrl+Shift+Q）" aria-label="格式规则">格式规则</button>
           <button type="button" class="tb-btn" id="colorBtn" role="menuitem" title="文本颜色" aria-label="文本颜色">文本颜色</button>
           <select id="imgModeSel" title="插入图片的显示模式：全画幅=占满文字宽度，局部=按原尺寸居中，行内=嵌在文字中间（50% 宽度）" style="width:100%;margin-bottom:4px;padding:4px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text);font:inherit;">
@@ -10834,6 +10936,28 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
           <input type="file" id="imgExternalInput" accept="image/*" style="display:none"/>
           <button type="button" class="tb-btn" id="dividerBtn" role="menuitem" onmousedown="event.preventDefault()" title="分隔线下拉菜单：在光标处插入一行分隔线（直线 / 线段 / 点线 / 双线）" aria-label="插入分隔线">分隔线 <span class="ptoe-caret">▾</span></button>
           <button type="button" class="tb-btn" id="tableBtn" role="menuitem" onmousedown="event.preventDefault()" title="插入表格：在光标处插入空表格，行/列数与是否带表头可设（Ctrl+Alt+T）" aria-label="插入表格">插入表格</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Zone 2b: 格式刷（外部工具栏独立下拉，非「更多」内） -->
+    <div class="tb-group" role="group" aria-label="格式刷">
+      <div class="tb-more">
+        <button type="button" class="tb-more-btn" id="formatBrushBtn" aria-label="格式刷" aria-expanded="false" aria-controls="brushPanel" title="格式刷：捕获格式 / 功能刷（合并/标题等，可混合）；快捷键默认 Shift+Ctrl+1..0（可在设置中自定义）">
+          格式刷 <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
+        <div class="tb-more-panel" id="brushPanel" role="menu" aria-label="格式刷菜单" style="min-width:150px;">
+          <button type="button" class="tb-btn" id="brushFmtBtn" role="menuitem" title="捕获当前选区格式，持续应用到后续选中的文字（持续格式刷）" aria-label="格式刷（捕获格式）">格式刷（捕获）</button>
+          <div style="height:1px;margin:3px 8px;background:var(--border);"></div>
+          <div id="brushOpsList" style="display:flex;flex-direction:column;gap:1px;"></div>
+          <button type="button" class="tb-btn" id="brushMixBtn" role="menuitem" title="混合刷：勾选多个功能组合成一个刷，点击段落依次生效" aria-label="混合刷">混合…</button>
+        </div>
+        <div class="tb-more-panel" id="brushMixPanel" role="menu" aria-label="混合刷多选" style="min-width:170px;">
+          <div id="brushMixList" style="display:flex;flex-direction:column;gap:2px;padding:2px 0;"></div>
+          <div style="display:flex;gap:4px;margin-top:4px;">
+            <button type="button" class="tb-btn" id="brushMixApply" style="flex:1;" title="按勾选启用混合刷" aria-label="启用混合刷">启用</button>
+            <button type="button" class="tb-btn" id="brushMixCancel" style="flex:1;" title="取消" aria-label="取消">取消</button>
+          </div>
         </div>
       </div>
     </div>
@@ -10971,6 +11095,16 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
 <div id="pages"></div>
 <div id="popup"></div>
 <div id="tip"></div>
+<!-- 命令行（2026-10，nvim 风格）：Ctrl+; 打开；:7,10merge 按行号合并，默认作用于当前选中页 -->
+<div id="cmdBar" role="dialog" aria-label="命令行">
+  <span id="cmdPrefix">:</span>
+  <input id="cmdInput" type="text" autocomplete="off" spellcheck="false" placeholder="如 7,10merge ／ 页 12 ／ 插入 注释（取剪贴板） ／ 选 3 5 10 ／ help" aria-label="命令输入">
+  <span id="cmdHint">Esc 关闭 · Enter 执行 · ↑↓ 候选 · Ctrl+↑↓ 历史</span>
+</div>
+<div id="cmdSuggest">
+  <div id="cmdSuggestGrip" title="拖动调整高度（双击折叠/展开）"></div>
+  <div id="cmdSuggestList" role="listbox" aria-label="命令候选"></div>
+</div>
 <!-- 右键上下文菜单（2026-08-08）：编辑区内右键弹出；重识别/插入标记/导出/Markdown 提示/保存/暂存 -->
 <div id="contextMenu" hidden>
   <div class="ctx-item ctx-sub" data-ctx="copy">复制 <span class="ctx-arrow">▸</span>
@@ -11317,6 +11451,9 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <h4 style="margin:16px 0 4px;">纠错悬浮窗</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">鼠标悬停校正文本超过设定时间（毫秒）自动弹出采纳/忽略菜单；0 = 悬停即弹出。</p>
       <label style="font-size:13px;">悬停弹出延迟（毫秒） <input type="number" id="errHoverDelayInput" min="0" max="10000" step="100" style="width:90px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
+      <h4 style="margin:16px 0 4px;">增强格式刷</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">武装「合并段落」刷后，拖选多段并停稳超过该时间（毫秒）才自动合并，避免拖选途中瞬时覆盖多段就误合并；0 = 停稳即合并（最快）。正文 / 注释 / 引用 / 加粗 / 斜体单个武装时，先用鼠标选中词语或句子再点击段落，即只对选中文字生效；未选中或混合多个功能时作用于整段。</p>
+      <label style="font-size:13px;">合并延迟（毫秒） <input type="number" id="brushMergeDelayInput" min="0" max="5000" step="100" style="width:90px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
       <h4 style="margin:16px 0 4px;">编辑器字号</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">调整编辑区显示字号（视图偏好，不写入保存内容）。</p>
       <label style="font-size:13px;">字号（px） <input type="number" id="editorFontSizeInput" min="10" max="28" step="1" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
@@ -11332,6 +11469,25 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
           <option value="200">200 步</option>
           <option value="500">500 步</option>
         </select>
+      </label>
+      <h4 style="margin:16px 0 4px;">文字页面行号</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">在虚拟列表各页的文字左侧显示行号（每页从 1 重新计起，与原书页码无关）。行号供命令行按行号寻址使用（Ctrl+; 打开命令行，例如 7,10merge 合并第 7-10 行）。纯视图层，不写入保存内容，也不影响导出。</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
+        <input type="checkbox" id="lineNumShow" style="width:16px;height:16px;">
+        显示行号
+      </label>
+      <label style="font-size:13px;display:flex;align-items:center;gap:8px;margin-top:8px;">行号栏尺寸
+        <select id="lineNumSizeSel" style="padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+          <option value="small">小</option>
+          <option value="medium">中</option>
+          <option value="large">大</option>
+        </select>
+      </label>
+      <h4 style="margin:16px 0 4px;">正文对齐</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">矫正页正文默认两端对齐（分散对齐），段落左右边缘整齐更美观。关闭后按浏览器默认（左对齐）。纯视图层，不影响保存与导出；手动设置的逐块对齐仍然生效。</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
+        <input type="checkbox" id="textJustifyToggle" style="width:16px;height:16px;">
+        正文两端对齐
       </label>
       <h4 style="margin:16px 0 4px;">格式规则</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">把规则应用到全部页前先弹出确认，防止误操作大范围改动。</p>
