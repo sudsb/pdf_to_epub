@@ -791,6 +791,36 @@ function _injectFloatLayoutUI() {
   document.head.appendChild(st);
 })();
 
+// 编辑器动画（2026-10）：段落合并 / 文字拖放的落点脉冲反馈。纯视觉层：只加/去
+// class 播放一次动画，不写内容、不进历史；尊重系统「减少动态效果」设置。
+(function injectEditorAnimStyles() {
+  if (document.getElementById('editorAnimStyles')) return;
+  const st = document.createElement('style');
+  st.id = 'editorAnimStyles';
+  st.textContent = [
+    '@media (prefers-reduced-motion: no-preference){',
+    '@keyframes ptoeMergePulse{0%{background:var(--accent-soft,#e8eeff);box-shadow:0 0 0 0 rgba(49,109,202,.28);',
+    '  transform:translateY(2px) scale(.997);}60%{background:var(--accent-soft,#e8eeff);}',
+    '100%{background:transparent;box-shadow:0 0 0 7px rgba(49,109,202,0);transform:none;}}',
+    '@keyframes ptoeDropPulse{0%{background:#fff3c4;box-shadow:0 0 0 0 rgba(240,180,40,.30);}',
+    '100%{background:transparent;box-shadow:0 0 0 7px rgba(240,180,40,0);}}',
+    '.ptoe-anim-merge{animation:ptoeMergePulse .55s ease-out;border-radius:3px;}',
+    '.ptoe-anim-drop{animation:ptoeDropPulse .6s ease-out;border-radius:3px;}',
+    '}',
+  ].join('');
+  document.head.appendChild(st);
+})();
+
+// 给元素播一次脉冲动画：先移除同名 class 强制重排再重加，动画结束自动清理
+function _ptoeAnimPulse(el, cls) {
+  if (!el || !el.classList) return;
+  el.classList.remove(cls);
+  void el.offsetWidth; // 强制重排以重启动画（连续合并时也能重播）
+  el.classList.add(cls);
+  const done = function () { el.classList.remove(cls); el.removeEventListener('animationend', done); };
+  el.addEventListener('animationend', done);
+}
+
 async function fetchJSON(url, opts) {
   const r = await fetch(url, opts);
   if (!r.ok) {
@@ -2079,6 +2109,8 @@ document.addEventListener('drop', function (e) {
       } else {
         range.insertNode(clone);
       }
+      // 落点脉冲动画（2026-10）：提示图片新位置，纯视觉
+      _ptoeAnimPulse(clone, 'ptoe-anim-drop');
       // 移除原块
       if (_dragImgBlock.parentNode) _dragImgBlock.parentNode.removeChild(_dragImgBlock);
       // 光标移到克隆之后
@@ -2104,6 +2136,22 @@ document.addEventListener('dragend', function () {
   _dragImgBlock = null;
   _dragImgEd = null;
 });
+// 文字拖放落点脉冲（2026-10）：原生文字拖放行为不变，仅在落点块上播一次背景脉冲。
+// 图片拖放走上方专用路径（clone 已单独脉冲），这里跳过；OS 文件拖放不落在块内也不闪。
+document.addEventListener('drop', function (e) {
+  if (_dragImgBlock) return; // 图片拖放由专用路径处理
+  const t = e.target;
+  const ed = (t && t.closest) ? t.closest('.editable') : null;
+  if (!ed) return;
+  setTimeout(function () {
+    // drop 后选区停在落点：取锚点所在块脉冲；不在任何块内则忽略
+    const sel = window.getSelection();
+    let n = (sel && sel.rangeCount) ? sel.getRangeAt(0).startContainer : null;
+    if (n && n.nodeType === 3) n = n.parentElement;
+    const b = (n && n.closest) ? n.closest('p,div,h1,h2,h3,h4,h5,h6') : null;
+    if (b && ed.contains(b)) _ptoeAnimPulse(b, 'ptoe-anim-drop');
+  }, 0);
+}, true);
 
 const remeasurePending = new Map();
 let _remeasureRaf = 0;
@@ -9867,6 +9915,8 @@ function _mergeSelectedBlocks(ed) {
       sel.removeAllRanges();
       sel.addRange(r2);
     } catch (e) {}
+    // 合并动画（2026-10）：结果块背景脉冲一下，纯视觉反馈，不进历史/不影响内容
+    _ptoeAnimPulse(first, 'ptoe-anim-merge');
     // 2026-10-10 修复合并段落后「错误/修正建议位置错误」：合并是直接改写 innerHTML
     // 的离散操作，不派发 input 事件，因而绕过输入路径的 _proofreadAutoDismiss() delta-
     // rebase —— proofreadErrors[i] 的字符偏移仍按合并前文本计算，且被并入块的
@@ -10486,7 +10536,7 @@ let _cmdCaret = null;           // {line,ch} 文档光标（行 1 基 / 字符 0
 let _cmdAnchor = null;          // Shift 扩展选区时的锚点 {line,ch}
 let _cmdCaretMoved = false;     // 命令行内是否用键盘移动过正文光标（关闭时把真实光标落回）
 let _cmdSavedRange = null;      // 打开命令行前的真实选区快照（关闭时恢复，供格式化插入/包围复用）
-const _CMD_HINT_TEXT = '多命令用 ; 分隔、（…）分组作用目标 · ↑↓ 候选/历史 · Tab 补全 · Ctrl+↑↓ 正文行';
+const _CMD_HINT_TEXT = '多命令用 ; 分隔、（…）分组作用目标 · ↑↓ 候选/历史 · Tab 补全（无高亮插首推） · Ctrl+↑↓ 正文行';
 
 function _cmdInputValue() {
   const i = document.getElementById('cmdInput');
@@ -10586,9 +10636,6 @@ const _CMD_BUILTINS = [
   { keys: ['插入', 'insert'], desc: '格式化插入；注释/引用默认用 [] 包裹，文本缺省时取剪贴板，也可插入标记', example: '插入 注释 包围 【】', usage: '插入 注释｜引用｜正文｜标题 [包围 符号] [文本] ｜ 插入 标记 段落（缺省取剪贴板）', run: async function (ctx) {
     await _cmdFormatInsertVerb(ctx.ed, ctx.args);
   } },
-  { keys: ['插入', 'insert'], desc: '格式化插入；文本缺省时自动取剪贴板', example: '插入 注释', usage: '插入 注释｜引用｜正文｜标题 [文本]（缺省取剪贴板）', run: async function (ctx) {
-    await _cmdFormatInsertVerb(ctx.ed, ctx.args);
-  } },
 
   // ---- 格式规则 ----
   { keys: ['规则', 'rule', '格式规则'], desc: '套用已保存的格式规则（序号或名称）', example: '规则 1', usage: '规则 序号 ｜ 规则 名称 ｜ 规则 列表', run: async function (ctx) {
@@ -10616,9 +10663,37 @@ const _CMD_TOOL_ALIAS = {
   '完成': 'finish', '题注': 'insert_caption',
 };
 
+// 命令字母简写（2026-10）：每条命令绑定一个唯一的字母简写，简写之间两两不重复，
+// 也不与内置命令别名（_CMD_BUILTINS keys）、工具别名（_CMD_TOOL_ALIAS keys）、
+// OPS 英文名/中文标签冲突。值必须指向上述三类表中的既有键（唯一事实源仍是那三张表）。
+// 例：pg / page / 页 都执行同一个页跳转。唯一性由 ptoe_cmdshort_test.cjs 校验。
+const _CMD_SHORT_ALIASES = {
+  // 内置命令简写
+  'mg': 'merge', 'del': 'delete', 'clr': 'clear', 'rp': 'replace', 'fmt': 'format',
+  'pg': '页', 'ln': '行', 'se': '选', 'gt': '到', 'fd': '搜索',
+  'h': 'help', 'hd': '隐藏', 'sh': '显示', 'ocr': '重识别', 'pf': '校正',
+  'pgs': '页首', 'pge': '页尾', 'lns': '行首', 'lne': '行尾',
+  'fp': '首页', 'lp': '末页', 'pp': '上一页', 'np': '下一页',
+  'wr': '包围', 'mk': '标记', 'rf': '清除格式', 'nrm': '格式化', 'cp': '清空页',
+  'tb': '表格', 'im': '插图', 'imf': '图格式', 'cy': '复制', 'ct': '复制文本',
+  'pt': '粘贴', 'px': '粘贴文本', 'nt': '注释', 'qt': '引用', 'ins': '插入', 'ru': '规则',
+  // 工具操作简写
+  'sv': 'save', 'ex': 'export', 'st': 'stage', 'u': 'undo', 'rd': 'redo',
+  'hs': 'history', 'cl': 'clean', 't2': 't2s', 's2': 's2t', 'set': 'settings',
+  'ok': '采纳', 'ap': '应用校正', 'ig': '忽略', 'cm': '清除标注',
+  'rv': '回退', 'fn': '完成', 'cap': '题注',
+  // 格式操作简写（OPS 英文名，经 _cmdOpAliasMap 解析；'p' 本身已是单字不再另设）
+  'b': 'bold', 'i': 'italic', 'hdr': 'heading', 'rm': 'remove', 'no': 'note',
+  'ci': 'citation', 'al': 'align_left', 'ac': 'align_center', 'ar': 'align_right',
+  'cb': 'centerbold', 'fl': 'flush', 'id': 'indent', 'ul': 'underline',
+  'ud': 'underdot', 'sk': 'strike', 'cx': 'charbox', 'sd': 'shade',
+  'hl': 'highlight', 'sp': 'sup', 'sb': 'sub', 'sw': 'strip_ws',
+};
+
 function _cmdBuiltinByVerb(verb) {
   if (!verb) return null;
-  for (const b of _CMD_BUILTINS) { if (b.keys.indexOf(verb) >= 0) return b; }
+  const v = _CMD_SHORT_ALIASES[verb] || verb; // 字母简写（2026-10）→ 既有别名键
+  for (const b of _CMD_BUILTINS) { if (b.keys.indexOf(v) >= 0) return b; }
   return null;
 }
 
@@ -10676,6 +10751,11 @@ function _cmdSuggestItems() {
     if (label) push(label, '格式：' + label, '%' + op, 'format');
   }
   for (const name of Object.keys(_CMD_TOOL_ALIAS)) push(name, '工具操作：' + name, name, 'tool');
+  // 字母简写（2026-10）：追加为「简写」候选；desc/example 复用目标条目，Tab 补全同样可用
+  for (const s of Object.keys(_CMD_SHORT_ALIASES)) {
+    const t = items.find(function (x) { return x.key === _CMD_SHORT_ALIASES[s]; });
+    if (t) push(s, t.desc + '（简写）', t.cmd, 'short');
+  }
   return items;
 }
 
@@ -11208,7 +11288,8 @@ function _cmdShowHelp() {
 
 // 常用工具操作直通（无需行范围）；别名表见 _CMD_TOOL_ALIAS
 function _cmdToolOp(verb) {
-  const op = _CMD_TOOL_ALIAS[verb] || _CMD_TOOL_ALIAS[String(verb).toLowerCase()];
+  const v = _CMD_SHORT_ALIASES[verb] || _CMD_SHORT_ALIASES[String(verb).toLowerCase()] || verb; // 字母简写
+  const op = _CMD_TOOL_ALIAS[v] || _CMD_TOOL_ALIAS[String(v).toLowerCase()];
   if (!op) return false;
   if (op === 'history') { openHistory(); return true; }
   if (op === 'settings') { openSettings(); return true; }
@@ -11318,7 +11399,8 @@ function _cmdResolveRange(ed, loc, blocks) {
 async function _cmdExecSpec(spec, ed, blocks) {
   if (!spec) return;
   if (spec.kind === 'search') { _cmdRunSearch(spec.query); return; }
-  const verb = (spec.verb || '').toLowerCase();
+  const rawVerb = (spec.verb || '').toLowerCase();
+  const verb = _CMD_SHORT_ALIASES[rawVerb] || rawVerb; // 字母简写（2026-10）→ 规范名
   const args = spec.args || '';
 
   // 1) 注册表命中且自带 run：直接分发
@@ -12029,8 +12111,11 @@ function _cmdComplete(cur, item) {
 function _cmdAcceptSelected() {
   const input = document.getElementById('cmdInput');
   if (!input) return;
-  if (_cmdSel >= 0 && _cmdItems[_cmdSel]) {
-    input.value = _cmdComplete(input.value, _cmdItems[_cmdSel]);
+  // Tab（2026-10）：无高亮时默认插入第一个推荐候选；↑↓ 高亮后插入高亮项
+  const idx = _cmdSel >= 0 ? _cmdSel
+    : ((_cmdItems.length && !_cmdSuggestHidden && _cmdSuggestVisible()) ? 0 : -1);
+  if (idx >= 0 && _cmdItems[idx]) {
+    input.value = _cmdComplete(input.value, _cmdItems[idx]);
     try { input.setSelectionRange(input.value.length, input.value.length); } catch (e) {}
   }
   _cmdSel = -1;
@@ -12043,7 +12128,8 @@ function _cmdUpdateHint(value) {
   if (!hint) return;
   if (_cmdSel >= 0 && _cmdItems[_cmdSel]) { hint.textContent = _cmdItems[_cmdSel].desc; return; }
   const vt = _cmdVerbToken(_cmdCurrentSegment(value));
-  const head = vt.head;
+  const head0 = vt.head;
+  const head = _CMD_SHORT_ALIASES[head0.toLowerCase()] || head0; // 字母简写 → 规范名
   const b = _cmdBuiltinByVerb(head.toLowerCase());
   if (b) { hint.textContent = b.usage; return; }
   const op = _cmdOpAliasMap()[head] || _cmdOpAliasMap()[head.toLowerCase()];
