@@ -572,6 +572,126 @@ class TestCleanPageHtml(unittest.TestCase):
         )
 
 
+class TestCleanPageHtmlExtended(unittest.TestCase):
+    """clean_page_html 智能清理规则开关（2026-10）：标点/符号/MD/HTML/段落。"""
+
+    def test_clean_punctuation_false_keeps_halfwidth(self):
+        # 关闭标点归一：汉字相邻的半角逗号保持原样
+        self.assertEqual(
+            clean_page_html('<p>你好,世界</p>', clean_punctuation=False),
+            '<p>你好,世界</p>',
+        )
+        # 默认开启 → 转全角
+        self.assertEqual(clean_page_html('<p>你好,世界</p>'), '<p>你好，世界</p>')
+
+    def test_clean_punctuation_period(self):
+        # 句号：汉字相邻的半角点 → 全角。
+        self.assertEqual(clean_page_html('<p>结束.下一句</p>'), '<p>结束\u3002下一句</p>')
+        # 小数点不误伤
+        self.assertEqual(clean_page_html('<p>圆周率 3.14</p>'), '<p>圆周率 3.14</p>')
+
+    def test_clean_symbols_false_keeps_quotes(self):
+        # 关闭符号归一：引号内容含汉字也不转弯引号
+        self.assertEqual(
+            clean_page_html('<p>他说"你好"</p>', clean_symbols=False),
+            '<p>他说"你好"</p>',
+        )
+        # 默认开启 → 转中文弯引号
+        self.assertEqual(
+            clean_page_html('<p>他说"你好"</p>'),
+            '<p>他说\u201c你好\u201d</p>',
+        )
+
+    def test_clean_symbols_ellipsis_unified(self):
+        # 省略号长度归一：一行内多对省略号 → 一对标准 ……
+        self.assertEqual(
+            clean_page_html('<p>他沉默...良久...开口</p>'),
+            '<p>他沉默……良久开口</p>',
+        )
+        self.assertEqual(
+            clean_page_html('<p>等等......</p>', clean_symbols=False),
+            '<p>等等......</p>',
+        )
+
+    def test_clean_md_tags_false_keeps_markers(self):
+        self.assertEqual(
+            clean_page_html('<p>这是**重点**内容</p>', clean_md_tags=False),
+            '<p>这是**重点**内容</p>',
+        )
+        self.assertEqual(
+            clean_page_html('<p>这是**重点**内容</p>'),
+            '<p>这是重点内容</p>',
+        )
+
+    def test_clean_md_tags_strike_and_code(self):
+        self.assertEqual(clean_page_html('<p>~~删除~~</p>'), '<p>删除</p>')
+        self.assertEqual(clean_page_html('<p>`代码`</p>'), '<p>代码</p>')
+
+    def test_clean_html_tags_false_keeps_nonwhitelist_tags(self):
+        # strip_tags=False → <div> 保留（sanitize 仍会规范化，但内容不被剥）
+        out = clean_page_html('<p>a<div>b</div></p>', clean_html_tags=False)
+        self.assertIn("b", out)
+        # 默认开启 → <div> 被剥、内容保留
+        self.assertEqual(clean_page_html('<p>a<div>b</div></p>'), '<p>ab</p>')
+
+    def test_rich_text_preserved_with_all_on(self):
+        # 富文本标签（strong/span class=ptoe-*）在全部开关开启时保留
+        src = '<p>正文<strong>粗</strong><span data-ptoe-marker="note">注</span></p>'
+        self.assertEqual(clean_page_html(src), src)
+
+    def test_clean_paragraphs_true_merges(self):
+        self.assertEqual(
+            clean_page_html('<p>第一段</p><p>续文</p>', clean_paragraphs=True),
+            '<p>第一段续文</p>',
+        )
+        # 默认不合并
+        self.assertEqual(
+            clean_page_html('<p>第一段</p><p>续文</p>'),
+            '<p>第一段</p>\n<p>续文</p>',
+        )
+
+    def test_idempotent_with_all_options(self):
+        src = '<p>你好,世界**重点**他沉默...良久...开口</p>'
+        once = clean_page_html(src)
+        self.assertEqual(clean_page_html(once), once)
+
+
+class TestCleanStats(unittest.TestCase):
+    """clean_page_html(with_stats=True) 返回清理统计。
+
+    统计键：punct、symbols、md、merged、tags、chars（均为整数）。
+    """
+
+    def test_stats_counts(self):
+        raw = '<p>你好,世界</p><p>结束**重点**</p>'
+        res = correctmanage.clean_page_html(raw, with_stats=True)
+        self.assertIsInstance(res, tuple)
+        html, st = res
+        self.assertIsInstance(html, str)
+        self.assertEqual(set(st), {"punct", "symbols", "md", "merged", "tags", "chars"})
+        for k in st:
+            self.assertIsInstance(st[k], int, f"{k}")
+        self.assertEqual(st["punct"], 1)  # 半角逗号 → 全角
+        self.assertEqual(st["md"], 1)  # ** 一对
+
+    def test_stats_merged_and_tags(self):
+        raw = '<div>a</div><p>b</p><p>c</p>'
+        html, st = correctmanage.clean_page_html(
+            raw, clean_paragraphs=True, with_stats=True
+        )
+        self.assertEqual(st["merged"], 1)  # b 与 c 合并（b 末尾无句末标点）
+        self.assertGreaterEqual(st["tags"], 1)  # <div> 被清理
+
+    def test_stats_empty(self):
+        html, st = correctmanage.clean_page_html("   ", with_stats=True)
+        self.assertEqual(
+            st, {"punct": 0, "symbols": 0, "md": 0, "merged": 0, "tags": 0, "chars": 0}
+        )
+
+    def test_default_returns_str(self):
+        self.assertIsInstance(correctmanage.clean_page_html("<p>x</p>"), str)
+
+
 class TestCleanBracketJunkHtml(unittest.TestCase):
     """_clean_bracket_junk_html：历史/已存 HTML 的杂符括号清理（token 级）。"""
 
@@ -2489,8 +2609,12 @@ class TestCleanEndpoint(unittest.TestCase):
             )
             res = requests.post(base + "/api/clean", data=body).json()
             self.assertTrue(res["ok"])
-            # 默认不合并段落（merge_paragraphs=False）
-            self.assertEqual(res["pages"], [{"page": 1, "html": "<p>第一段</p>\n<p>续文</p>"}])
+            # 默认不合并段落（merge_paragraphs=False）；返回含 stats 字段
+            self.assertEqual(len(res["pages"]), 1)
+            self.assertEqual(res["pages"][0]["page"], 1)
+            self.assertEqual(res["pages"][0]["html"], "<p>第一段</p>\n<p>续文</p>")
+            self.assertIn("stats", res["pages"][0])
+            self.assertEqual(res["pages"][0]["stats"]["punct"], 0)
             # 无状态：服务端内容不变
             self.assertEqual(state["pages"][1], "<p>原文</p>")
         finally:
@@ -8897,6 +9021,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "tip_delay": 500,
                     "err_hover_delay": 1000,
                     "brush_merge_delay": 800,
+                    "brush_merge_on_leave": True,
                     "editor_font_size": 16,
                     "img_mode": "full",
                     "rule_all_pages_confirm": True,
@@ -8908,6 +9033,12 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "show_line_numbers": False,
                     "line_num_size": "large",
                     "text_justify": True,
+                    "clean_punctuation": True,
+                    "clean_symbols": True,
+                    "clean_md_tags": True,
+                    "clean_html_tags": True,
+                    "clean_paragraphs": False,
+                    "clean_symbol_map": [["[", "【"], ["]", "】"], ["--", "——"], ["~", "～"]],
                 },
             )
         finally:
@@ -8928,6 +9059,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "tip_delay": 600,
                     "err_hover_delay": 1500,
                     "brush_merge_delay": 800,
+                    "brush_merge_on_leave": True,
                     "editor_font_size": 14,
                     "img_mode": "",
                     "rule_all_pages_confirm": True,
@@ -8939,6 +9071,12 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "show_line_numbers": False,
                     "line_num_size": "large",
                     "text_justify": True,
+                    "clean_punctuation": True,
+                    "clean_symbols": True,
+                    "clean_md_tags": True,
+                    "clean_html_tags": True,
+                    "clean_paragraphs": False,
+                    "clean_symbol_map": [["[", "【"], ["]", "】"], ["--", "——"], ["~", "～"]],
                 },
             )
         finally:
@@ -9302,6 +9440,53 @@ class TestUiSettingsEndpoint(unittest.TestCase):
             res = requests.post(
                 base + "/api/ui_settings",
                 data=_json.dumps({"ui_settings": {"text_justify": "yes"}}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("布尔", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+    def test_post_clean_settings_persists(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps(
+                    {
+                        "ui_settings": {
+                            "clean_punctuation": False,
+                            "clean_paragraphs": True,
+                        }
+                    }
+                ),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(
+                calls,
+                [{"clean_punctuation": False, "clean_paragraphs": True}],
+            )
+        finally:
+            self._stop(server)
+
+    def test_post_clean_settings_bad_type_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"clean_symbols": "yes"}}),
             ).json()
             self.assertFalse(res["ok"])
             self.assertIn("布尔", res["error"])
@@ -10311,6 +10496,7 @@ class TestSetUiSettingsConfig(unittest.TestCase):
                 "tip_delay": 600,
                 "err_hover_delay": 1500,
                 "brush_merge_delay": 800,
+                "brush_merge_on_leave": True,
                 "editor_font_size": 14,
                 "img_mode": "",
                 "rule_all_pages_confirm": True,
@@ -10322,6 +10508,12 @@ class TestSetUiSettingsConfig(unittest.TestCase):
                 "show_line_numbers": False,
                 "line_num_size": "large",
                 "text_justify": True,
+                "clean_punctuation": True,
+                "clean_symbols": True,
+                "clean_md_tags": True,
+                "clean_html_tags": True,
+                "clean_paragraphs": False,
+                "clean_symbol_map": [["[", "【"], ["]", "】"], ["--", "——"], ["~", "～"]],
             },
         )
 
@@ -10375,6 +10567,48 @@ class TestSetUiSettingsConfig(unittest.TestCase):
         self.assertEqual(cfg["ui_settings"]["popup_rule_count"], 3)
         cfg = self.cm.set_ui_settings({"popup_row1": []})
         self.assertEqual(cfg["ui_settings"]["popup_row1"], [])
+
+    def test_clean_settings_defaults_and_persist(self):
+        # 智能清理开关默认值：除 clean_paragraphs=False 外均 True
+        from configmanage import CLEAN_SETTINGS_DEFAULTS
+
+        self.assertEqual(
+            CLEAN_SETTINGS_DEFAULTS,
+            {
+                "clean_punctuation": True,
+                "clean_symbols": True,
+                "clean_md_tags": True,
+                "clean_html_tags": True,
+                "clean_paragraphs": False,
+            },
+        )
+        cfg = self.cm.set_ui_settings({"clean_symbols": False, "clean_paragraphs": True})
+        self.assertEqual(cfg["ui_settings"]["clean_symbols"], False)
+        self.assertEqual(cfg["ui_settings"]["clean_paragraphs"], True)
+        # 未显式传入的键保留默认
+        self.assertEqual(cfg["ui_settings"]["clean_punctuation"], True)
+        self.assertEqual(cfg["ui_settings"]["clean_md_tags"], True)
+        self.assertEqual(cfg["ui_settings"]["clean_html_tags"], True)
+
+    def test_clean_settings_non_bool_falls_back(self):
+        # 非 bool → 按默认值回退（clean_paragraphs 默认 False）
+        from configmanage import CLEAN_SETTINGS_DEFAULTS
+
+        cfg = self.cm.set_ui_settings(
+            {"clean_symbols": "yes", "clean_md_tags": 0, "clean_paragraphs": "true"}
+        )
+        self.assertEqual(cfg["ui_settings"]["clean_symbols"], CLEAN_SETTINGS_DEFAULTS["clean_symbols"])
+        self.assertEqual(cfg["ui_settings"]["clean_md_tags"], CLEAN_SETTINGS_DEFAULTS["clean_md_tags"])
+        self.assertEqual(cfg["ui_settings"]["clean_paragraphs"], CLEAN_SETTINGS_DEFAULTS["clean_paragraphs"])
+
+    def test_get_clean_settings_reads_persisted(self):
+        # get_clean_settings 读已落盘值；缺省时回退默认
+        self.assertEqual(self.cm.get_clean_settings(), dict(self.cm.CLEAN_SETTINGS_DEFAULTS))
+        self.cm.set_ui_settings({"clean_symbols": False, "clean_paragraphs": True})
+        opts = self.cm.get_clean_settings()
+        self.assertEqual(opts["clean_symbols"], False)
+        self.assertEqual(opts["clean_paragraphs"], True)
+        self.assertEqual(opts["clean_punctuation"], True)
 
     def test_popup_defaults_match_current_layout(self):
         # 稳定性守卫：默认值与矫正界面弹出菜单当前硬编码布局一致

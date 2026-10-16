@@ -6509,3 +6509,15 @@ INFO|2026-10-15 19:26:21|=== ptoe start: ['python.exe -m unittest', 'test_guiman
 INFO|2026-10-15 19:26:21|=== ptoe start: ['python.exe -m unittest', 'test_guimanage'] ===
 INFO|2026-10-15 19:29:07|=== ptoe start: ['python.exe -m unittest', 'test_guimanage'] ===
 INFO|2026-10-15 19:29:07|=== ptoe start: ['python.exe -m unittest', 'test_guimanage'] ===
+INFO|2026-10-15 23:20:03|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-10-15 23:20:12|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', 'E:\\MYBooks\\books\\毛泽东思想\\《毛泽东思想万岁》武汉钢二司编 第一卷.pdf', '--engine', 'llama', '--history-id', '761fd3442a46698c_20261013213151_c0d1', '--lang', 'zh-CN'] ===
+INFO|2026-10-16 07:49:24|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-10-16 07:49:28|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', 'E:\\MYBooks\\books\\毛泽东思想\\《毛泽东思想万岁》武汉钢二司编 第一卷.pdf', '--engine', 'llama', '--history-id', '761fd3442a46698c_20261013213151_c0d1', '--lang', 'zh-CN'] ===
+INFO|2026-10-16 08:18:47|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-10-16 08:18:54|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', 'E:\\MYBooks\\books\\毛泽东思想\\《毛泽东思想万岁》武汉钢二司编 第一卷.pdf', '--engine', 'llama', '--history-id', '761fd3442a46698c_20261013213151_c0d1', '--lang', 'zh-CN'] ===
+INFO|2026-10-16 08:41:08|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-10-16 08:41:13|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', 'E:\\MYBooks\\books\\毛泽东思想\\《毛泽东思想万岁》武汉钢二司编 第一卷.pdf', '--engine', 'llama', '--history-id', '761fd3442a46698c_20261013213151_c0d1', '--lang', 'zh-CN'] ===
+INFO|2026-10-16 08:58:00|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-10-16 08:58:05|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', 'E:\\MYBooks\\books\\毛泽东思想\\《毛泽东思想万岁》武汉钢二司编 第一卷.pdf', '--engine', 'llama', '--history-id', '761fd3442a46698c_20261013213151_c0d1', '--lang', 'zh-CN'] ===
+INFO|2026-10-16 13:43:08|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-10-16 13:43:18|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', 'E:\\MYBooks\\books\\毛泽东思想\\《毛泽东思想万岁》武汉钢二司编 第一卷.pdf', '--engine', 'llama', '--history-id', '761fd3442a46698c_20261013213151_c0d1', '--lang', 'zh-CN'] ===

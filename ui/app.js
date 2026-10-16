@@ -184,11 +184,13 @@ function undoLimit() {
 // 故以内存 uiSettings 为准、服务端为准，localStorage 仅作加载前的同步兜底。
 // 弹出菜单可选操作池（与后端 correctmanage.POPUP_ELIGIBLE_OPS 保持一致；paint = 格式刷，不在 OPS 数组中）
 const POPUP_ELIGIBLE_OPS = ['bold','italic','underline','underdot','strike','highlight','charbox','shade','sup','sub','heading','p','remove','note','citation','align_left','align_center','align_right','centerbold','flush','indent','strip_ws','merge','marker_full','marker_note','marker_join','marker_page','charformat','paint'];
-const UI_SETTINGS_DEFAULTS = { tip_delay: 600, err_hover_delay: 1500, brush_merge_delay: 800, editor_font_size: 14, img_mode: '', rule_all_pages_confirm: true,
+const UI_SETTINGS_DEFAULTS = { tip_delay: 600, err_hover_delay: 1500, brush_merge_delay: 800, brush_merge_on_leave: true, editor_font_size: 14, img_mode: '', rule_all_pages_confirm: true,
   popup_row1: ['bold','italic','heading','p','note','citation','paint','remove'],
   popup_row2: ['align_left','align_center','align_right','centerbold','merge','sup','sub'],
   popup_rule_count: 5, proofread_batch_pages: 0, undo_depth: 100, show_line_numbers: false,
-  line_num_size: 'large', text_justify: true };
+  line_num_size: 'large', text_justify: true,
+  clean_punctuation: true, clean_symbols: true, clean_md_tags: true, clean_html_tags: true, clean_paragraphs: false,
+  clean_symbol_map: [['[','【'],[']','】'],['--','——'],['~','～']] };
 let uiSettings = null; // 服务端加载前为 null → 读 localStorage 兜底；加载后为完整对象
 function uiv(key, def) {
   if (uiSettings && key in uiSettings && uiSettings[key] !== undefined && uiSettings[key] !== null) return uiSettings[key];
@@ -228,6 +230,8 @@ async function loadUiSettingsFromServer() {
       document.getElementById('errHoverDelayInput').value = uiSettings.err_hover_delay;
       const bmd = document.getElementById('brushMergeDelayInput');
       if (bmd) bmd.value = uiSettings.brush_merge_delay;
+      const bml = document.getElementById('brushMergeOnLeaveInput');
+      if (bml) bml.checked = !!uiSettings.brush_merge_on_leave;
       const rac = document.getElementById('ruleAllPagesConfirm');
       if (rac) rac.checked = !!uiSettings.rule_all_pages_confirm;
       const pb = document.getElementById('prBatchPages');
@@ -240,6 +244,18 @@ async function loadUiSettingsFromServer() {
       if (lns) lns.value = uis('line_num_size', 'large');
       const tj = document.getElementById('textJustifyToggle');
       if (tj) tj.checked = !!uiBool('text_justify', true);
+      const cp = document.getElementById('cleanPunctuationChk');
+      if (cp) cp.checked = !!uiBool('clean_punctuation', true);
+      const cs = document.getElementById('cleanSymbolsChk');
+      if (cs) cs.checked = !!uiBool('clean_symbols', true);
+      const cm = document.getElementById('cleanMdTagsChk');
+      if (cm) cm.checked = !!uiBool('clean_md_tags', true);
+      const ch = document.getElementById('cleanHtmlTagsChk');
+      if (ch) ch.checked = !!uiBool('clean_html_tags', true);
+      const cpa = document.getElementById('cleanParagraphsChk');
+      if (cpa) cpa.checked = !!uiBool('clean_paragraphs', false);
+      const sme = document.getElementById('cleanSymbolMapEditor');
+      if (sme) sme.value = formatSymbolMap(uiSettings.clean_symbol_map || UI_SETTINGS_DEFAULTS.clean_symbol_map);
       if (document.getElementById('popupRow1List')) initPopupSettings(); // 弹出菜单编辑器同步
     }
   } catch (e) { console.warn('loadUiSettingsFromServer failed: ' + e.message); }
@@ -249,6 +265,7 @@ function saveUIMirror() {
     localStorage.setItem('ptoe_tip_delay', String(uiSettings.tip_delay));
     localStorage.setItem('ptoe_err_hover_delay', String(uiSettings.err_hover_delay));
     localStorage.setItem('ptoe_brush_merge_delay', String(uiSettings.brush_merge_delay != null ? uiSettings.brush_merge_delay : UI_SETTINGS_DEFAULTS.brush_merge_delay));
+    localStorage.setItem('ptoe_brush_merge_on_leave', uiSettings.brush_merge_on_leave ? '1' : '0');
     localStorage.setItem('ptoe_font_size', String(uiSettings.editor_font_size));
     localStorage.setItem('ptoe_img_mode', String(uiSettings.img_mode));
     localStorage.setItem('ptoe_rule_all_pages_confirm', uiSettings.rule_all_pages_confirm ? '1' : '0');
@@ -263,6 +280,14 @@ function saveUIMirror() {
     localStorage.setItem('ptoe_line_num_size', String(uiSettings.line_num_size || UI_SETTINGS_DEFAULTS.line_num_size));
     // 正文两端对齐（2026-10）：'1'/'0'（uiBool 读 'ptoe_'+key）
     localStorage.setItem('ptoe_text_justify', uiSettings.text_justify ? '1' : '0');
+    // 智能清理规则开关（2026-10）：'1'/'0'（uiBool 读 'ptoe_'+key）
+    localStorage.setItem('ptoe_clean_punctuation', uiSettings.clean_punctuation ? '1' : '0');
+    localStorage.setItem('ptoe_clean_symbols', uiSettings.clean_symbols ? '1' : '0');
+    localStorage.setItem('ptoe_clean_md_tags', uiSettings.clean_md_tags ? '1' : '0');
+    localStorage.setItem('ptoe_clean_html_tags', uiSettings.clean_html_tags ? '1' : '0');
+    localStorage.setItem('ptoe_clean_paragraphs', uiSettings.clean_paragraphs ? '1' : '0');
+    // 符号映射表（2026-10-16）：JSON 数组
+    localStorage.setItem('ptoe_clean_symbol_map', JSON.stringify(uiSettings.clean_symbol_map || UI_SETTINGS_DEFAULTS.clean_symbol_map));
   } catch (e) {}
 }
 function saveUiSettings() {
@@ -799,13 +824,51 @@ function _injectFloatLayoutUI() {
   st.id = 'editorAnimStyles';
   st.textContent = [
     '@media (prefers-reduced-motion: no-preference){',
+    // 合并脉冲（蓝色）
     '@keyframes ptoeMergePulse{0%{background:var(--accent-soft,#e8eeff);box-shadow:0 0 0 0 rgba(49,109,202,.28);',
     '  transform:translateY(2px) scale(.997);}60%{background:var(--accent-soft,#e8eeff);}',
     '100%{background:transparent;box-shadow:0 0 0 7px rgba(49,109,202,0);transform:none;}}',
+    // 落点脉冲（金黄）
     '@keyframes ptoeDropPulse{0%{background:#fff3c4;box-shadow:0 0 0 0 rgba(240,180,40,.30);}',
     '100%{background:transparent;box-shadow:0 0 0 7px rgba(240,180,40,0);}}',
+    // 样式变更脉冲（绿色 - 标题/对齐/注释/引用等块级格式）
+    '@keyframes ptoeStylePulse{0%{background:var(--success-soft,#e8f5e9);box-shadow:0 0 0 0 rgba(46,160,67,.28);}',
+    '100%{background:transparent;box-shadow:0 0 0 7px rgba(46,160,67,0);}}',
+    // 清除格式脉冲（红/橙色 - 擦除感）
+    '@keyframes ptoeClearPulse{0%{background:#fff0f0;box-shadow:0 0 0 0 rgba(220,50,50,.30);}',
+    '100%{background:transparent;box-shadow:0 0 0 7px rgba(220,50,50,0);}}',
+    // 浮动切换脉冲（青色 - 图片绕排）
+    '@keyframes ptoeFloatPulse{0%{background:#e0f7fa;box-shadow:0 0 0 0 rgba(0,172,193,.28);}',
+    '100%{background:transparent;box-shadow:0 0 0 7px rgba(0,172,193,0);}}',
+    // 删除/移除脉冲（红色 - 折叠消失感）
+    '@keyframes ptoeRemovePulse{0%{background:#ffebee;box-shadow:inset 0 -3px 0 0 rgba(220,50,50,.4);transform:scaleY(.98);}',
+    '100%{background:transparent;box-shadow:inset 0 0 0 0 transparent;transform:scaleY(1);}}',
+    // 插入/新增脉冲（青绿色 - 从中心展开）
+    '@keyframes ptoeInsertPulse{0%{background:#e0f2f1;box-shadow:0 0 0 0 rgba(0,150,136,.3);transform:scaleX(.95);}',
+    '100%{background:transparent;box-shadow:0 0 0 7px rgba(0,150,136,0);transform:scaleX(1);}}',
+    // 纠错采纳/忽略脉冲
+    '@keyframes ptoeFixPulse{0%{background:#e8f5e9;box-shadow:0 0 0 0 rgba(46,160,67,.3);}',
+    '100%{background:transparent;box-shadow:0 0 0 7px rgba(46,160,67,0);}}',
+    '@keyframes ptoeDismissPulse{0%{background:#fff3e0;box-shadow:0 0 0 0 rgba(255,152,0,.3);}',
+    '100%{background:transparent;box-shadow:0 0 0 7px rgba(255,152,0,0);}}',
+    // 粘贴脉冲（紫色）
+    '@keyframes ptoePastePulse{0%{background:#f3e5f5;box-shadow:0 0 0 0 rgba(156,39,176,.28);}',
+    '100%{background:transparent;box-shadow:0 0 0 7px rgba(156,39,176,0);}}',
+    // 格式刷非合并脉冲（灰蓝）
+    '@keyframes ptoeBrushPulse{0%{background:#eceff1;box-shadow:0 0 0 0 rgba(96,125,139,.25);}',
+    '100%{background:transparent;box-shadow:0 0 0 7px rgba(96,125,139,0);}}',
+    // 类名
     '.ptoe-anim-merge{animation:ptoeMergePulse .55s ease-out;border-radius:3px;}',
     '.ptoe-anim-drop{animation:ptoeDropPulse .6s ease-out;border-radius:3px;}',
+    '.ptoe-anim-style{animation:ptoeStylePulse .45s ease-out;border-radius:3px;}',
+    '.ptoe-anim-clear{animation:ptoeClearPulse .5s ease-out;border-radius:3px;}',
+    '.ptoe-anim-float{animation:ptoeFloatPulse .45s ease-out;border-radius:3px;}',
+    '.ptoe-anim-remove{animation:ptoeRemovePulse .4s ease-out;border-radius:3px;}',
+    '.ptoe-anim-insert{animation:ptoeInsertPulse .5s ease-out;border-radius:3px;}',
+    '.ptoe-anim-fix{animation:ptoeFixPulse .4s ease-out;border-radius:3px;}',
+    '.ptoe-anim-dismiss{animation:ptoeDismissPulse .4s ease-out;border-radius:3px;}',
+    '.ptoe-anim-paste{animation:ptoePastePulse .45s ease-out;border-radius:3px;}',
+    '.ptoe-anim-brush{animation:ptoeBrushPulse .35s ease-out;border-radius:3px;}',
     '}',
   ].join('');
   document.head.appendChild(st);
@@ -3708,34 +3771,157 @@ function jumpToPage() {
 // ---------- 智能清理 / 搜索替换 ----------
 async function cleanAll() {
   // 逐页调用 /api/clean：段首符号、中英文标点、残留 HTML 标签
+  // 2026-10-16 增强：先预览（含统计报告），确认后应用；应用后提供一键撤销
   try {
-    const before = histBegin('智能清理', null); // 全页快照；histEnd 只保留实际变化页
     const res = await fetchJSON('/api/clean', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ pages: collect() })
     });
     const cleaned = res.pages || [];
+    // 构建变化列表：只保留实际变化的页
+    const changed = [];
     for (const it of cleaned) {
       let idx = -1;
       for (let i = 0; i < pages.length; i++) { if (pages[i].page === it.page) { idx = i; break; } }
       if (idx < 0) continue;
-      if (mdMode) mdSourceMap.set(idx, htmlToMd(it.html));
-      else contentMap.set(idx, it.html);
+      const src = pageSource(idx);
+      if (it.html !== src) changed.push({ idx: idx, page: it.page, html: it.html, stats: it.stats || {} });
     }
-    for (const row of [...host.children]) {
-      const idx = Number(row.dataset.i);
-      const ed = row.querySelector('.editable');
-      if (ed) { ed.innerHTML = displayHtml(idx); _reapplyProofread(idx); scheduleRemeasure(idx); }
+    if (changed.length === 0) {
+      showToast('内容已是清理后状态，无需清理', 'ok');
+      return;
     }
-    histEnd(before, '智能清理');
-    for (let i = 0; i < pages.length; i++) editedSet.add(i);
-    dirty = true;
-    updateStatus();
-    setStatus('已清理 ' + cleaned.length + ' 页');
-    showToast('已清理 ' + cleaned.length + ' 页（段首符号 / 标点 / 标签）', 'ok');
+    // 汇总统计
+    let totalPunct = 0, totalSymbols = 0, totalMd = 0, totalTags = 0, totalMerged = 0;
+    for (const c of changed) {
+      totalPunct += (c.stats.punct || 0);
+      totalSymbols += (c.stats.symbols || 0);
+      totalMd += (c.stats.md || 0);
+      totalTags += (c.stats.tags || 0);
+      totalMerged += (c.stats.merged || 0);
+    }
+    // 填充预览模态框
+    const summaryEl = document.getElementById('cleanPreviewSummary');
+    if (summaryEl) {
+      summaryEl.textContent = '共 ' + changed.length + ' 页有变化：标点 ' + totalPunct + ' 处 / 符号 ' + totalSymbols + ' 处 / MD ' + totalMd + ' 处 / 标签 ' + totalTags + ' 处 / 合并 ' + totalMerged + ' 段';
+    }
+    const listEl = document.getElementById('cleanPreviewList');
+    if (listEl) {
+      listEl.innerHTML = '';
+      for (const c of changed) {
+        const item = document.createElement('div');
+        item.className = 'clean-preview-item';
+        const s = c.stats || {};
+        item.textContent = '第 ' + c.page + ' 页：标点 ' + (s.punct || 0) + ' / 符号 ' + (s.symbols || 0) + ' / MD ' + (s.md || 0) + ' / 标签 ' + (s.tags || 0) + ' / 合并 ' + (s.merged || 0);
+        listEl.appendChild(item);
+      }
+    }
+    // 显示预览模态框
+    const bg = document.getElementById('cleanPreviewBg');
+    if (bg) bg.style.display = 'flex';
+    // 存储变化数据供「应用」使用
+    window._cleanChanged = changed;
   } catch (e) {
     showToast('清理失败: ' + e.message, 'fail');
   }
+}
+
+function applyCleanPreview() {
+  const changed = window._cleanChanged || [];
+  if (changed.length === 0) return;
+  const before = histBegin('智能清理', null);
+  for (const c of changed) {
+    if (mdMode) mdSourceMap.set(c.idx, htmlToMd(c.html));
+    else contentMap.set(c.idx, c.html);
+  }
+  for (const row of [...host.children]) {
+    const idx = Number(row.dataset.i);
+    const ed = row.querySelector('.editable');
+    if (ed) { ed.innerHTML = displayHtml(idx); _reapplyProofread(idx); scheduleRemeasure(idx); }
+  }
+  histEnd(before, '智能清理');
+  for (let i = 0; i < pages.length; i++) editedSet.add(i);
+  dirty = true;
+  updateStatus();
+  window._cleanChanged = [];
+  const bg = document.getElementById('cleanPreviewBg');
+  if (bg) bg.style.display = 'none';
+  showToast('已清理 ' + changed.length + ' 页', 'ok', {
+    label: '撤销',
+    timeout: 6000,
+    onClick: function () { undoHistory(); }
+  });
+}
+
+function cancelCleanPreview() {
+  window._cleanChanged = [];
+  const bg = document.getElementById('cleanPreviewBg');
+  if (bg) bg.style.display = 'none';
+}
+
+// ---------- 符号映射表编辑 + 实时预览（2026-10-16） ----------
+function parseSymbolMap(text) {
+  // 解析符号映射表编辑器内容：每行 "src → dst" 或 "src->dst" 或 "src dst"
+  const lines = text.split('\n');
+  const result = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) continue;
+    const m = t.match(/^(.+?)\s*(?:→|->|→)\s*(.+)$/);
+    if (m) {
+      const src = m[1].trim();
+      const dst = m[2].trim();
+      if (src && dst) result.push([src, dst]);
+    }
+  }
+  return result;
+}
+
+function formatSymbolMap(arr) {
+  // 格式化符号映射表为编辑器内容
+  if (!Array.isArray(arr) || arr.length === 0) return '';
+  return arr.map(p => {
+    const src = String(p[0] || '').trim();
+    const dst = String(p[1] || '').trim();
+    return src + ' → ' + dst;
+  }).join('\n');
+}
+
+let _cleanPreviewTimer = null;
+function runCleanPreview() {
+  // 防抖 250ms 后执行实时预览
+  if (_cleanPreviewTimer) clearTimeout(_cleanPreviewTimer);
+  _cleanPreviewTimer = setTimeout(function () {
+    _cleanPreviewTimer = null;
+    const inputEl = document.getElementById('cleanPreviewInput');
+    const outEl = document.getElementById('cleanPreviewOut');
+    if (!inputEl || !outEl) return;
+    const text = inputEl.value.trim();
+    if (!text) { outEl.textContent = ''; return; }
+    // 收集当前开关状态
+    const body = {
+      pages: [{ page: 0, html: '<p>' + text.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</p>' }],
+      clean_punctuation: document.getElementById('cleanPunctuationChk').checked,
+      clean_symbols: document.getElementById('cleanSymbolsChk').checked,
+      clean_md_tags: document.getElementById('cleanMdTagsChk').checked,
+      clean_html_tags: document.getElementById('cleanHtmlTagsChk').checked,
+      clean_paragraphs: document.getElementById('cleanParagraphsChk').checked,
+    };
+    // 收集符号映射表
+    const mapEditor = document.getElementById('cleanSymbolMapEditor');
+    if (mapEditor) {
+      const map = parseSymbolMap(mapEditor.value);
+      if (map.length > 0) body.clean_symbol_map = map;
+    }
+    fetchJSON('/api/clean', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (res) {
+      if (res && res.pages && res.pages[0]) {
+        outEl.textContent = res.pages[0].html.replace(/^<p>/, '').replace(/<\/p>$/, '');
+      }
+    }).catch(function () {});
+  }, 250);
 }
 
 // 搜索结果状态：searchResults 为当前结果列表（上限 200 条），searchCurrent 为
@@ -4421,7 +4607,7 @@ function replaceAll() {
 
 // ---------- 保存 / 完成 ----------
 // U2：三色 toast（ok 成功 / fail 失败 / warn 警告），顶部居中，3s 自动消失
-function showToast(msg, kind) {
+function showToast(msg, kind, action) {
   let wrap = document.getElementById('toast');
   if (!wrap) {
     wrap = document.createElement('div');
@@ -4431,12 +4617,23 @@ function showToast(msg, kind) {
   const t = document.createElement('div');
   t.className = 'toast' + (kind ? ' ' + kind : '');
   t.textContent = msg;
+  if (action && action.label && typeof action.onClick === 'function') {
+    const btn = document.createElement('button');
+    btn.className = 'toast-action-btn';
+    btn.textContent = action.label;
+    btn.addEventListener('click', function () {
+      action.onClick();
+      t.classList.remove('show');
+      setTimeout(function () { t.remove(); }, 250);
+    });
+    t.appendChild(btn);
+  }
   wrap.appendChild(t);
   requestAnimationFrame(function () { t.classList.add('show'); });
   setTimeout(function () {
     t.classList.remove('show');
     setTimeout(function () { t.remove(); }, 250);
-  }, 3000);
+  }, action && action.timeout ? action.timeout : 3000);
 }
 async function save() {
   const btn = document.getElementById('saveBtn');
@@ -7009,6 +7206,8 @@ function _brushMergeBlocks(ed, block) {
   const needSpace = block.textContent.length > 0 && next.textContent.length > 0;
   block.innerHTML += (needSpace ? ' ' : '') + next.innerHTML;
   next.parentNode.removeChild(next);
+  // 合并动画：结果块背景脉冲一下
+  _ptoeAnimPulse(block, 'ptoe-anim-merge');
   return true;
 }
 // scope-only ops：仅这些 op 时默认作用于武装时选中的词语/句子（非整段）
@@ -7031,6 +7230,8 @@ let _brushMergeTimer = null;
 // 武装后最近一次非折叠且落在编辑区内的选区：用于「先武装、再选词、后点击」流程
 // （武装时无选区 → brush.selection 为 null，旧实现会退化成整段）。
 let _brushLiveSelection = null;
+// 记录上一次有效的合并选区（覆盖 ≥2 块），用于「失去焦点/移开即合并」逻辑
+let _brushLastMergeSel = null;
 function _brushWatchSelection() {
   if (!_brushArmed || !_brushArmed.ops || !_brushArmed.ops.length) return;
   // 纯 scope 刷：记录武装期间最近的非折叠选区（auto 覆盖 arm 时的基线）
@@ -7040,23 +7241,67 @@ function _brushWatchSelection() {
     if (led && cap && _selectionInBlock(cap, led)) _brushLiveSelection = cap;
   }
   if (_brushArmed.ops.indexOf('merge') < 0) return;
+  const sel = window.getSelection();
+  const hasValidSel = sel && sel.rangeCount > 0 && !sel.isCollapsed;
+  const ed = hasValidSel ? (sel.rangeCount ? (sel.getRangeAt(0).startContainer.nodeType === 3 ? sel.getRangeAt(0).startContainer.parentElement : sel.getRangeAt(0).startContainer).closest('.editable') : null) : null;
+  if (hasValidSel && ed) {
+    const range = sel.getRangeAt(0);
+    const startBlock = _boundaryBlockInRange(ed, range.startContainer, false);
+    const endBlock = _boundaryBlockInRange(ed, range.endContainer, true);
+    if (startBlock && endBlock) {
+      const blocks = _blocksBetween(ed, startBlock, endBlock);
+      if (blocks.length >= 2) {
+        // 记录当前有效的合并选区
+        _brushLastMergeSel = { ed, startBlock, endBlock, blocks: blocks.slice() };
+      } else {
+        _brushLastMergeSel = null;
+      }
+    } else {
+      _brushLastMergeSel = null;
+    }
+  }
+  // 「失去焦点/移开即合并」逻辑：选区折叠或离开编辑区，且设置开启时，立即合并之前记录的选区
+  const mergeOnLeave = uiBool('brush_merge_on_leave', true);
+  if (mergeOnLeave && _brushLastMergeSel && (!hasValidSel || !ed || _brushLastMergeSel.ed !== ed)) {
+    // 清除防抖计时器
+    if (_brushMergeTimer) { clearTimeout(_brushMergeTimer); _brushMergeTimer = null; }
+    // 立即执行合并
+    const { ed: mergeEd, blocks: mergeBlocks } = _brushLastMergeSel;
+    const row = mergeEd.closest('.page-row');
+    const i = row ? Number(row.dataset.i) : -1;
+    _brushLastMergeSel = null; // 清除，避免重复触发
+    histRun('功能刷合并', [i], function () {
+      for (let k = 1; k < mergeBlocks.length; k++) {
+        const b = mergeBlocks[k];
+        if (!b || !b.parentNode) continue;
+        const needSpace = mergeBlocks[0].textContent.length > 0 && b.textContent.length > 0;
+        mergeBlocks[0].innerHTML += (needSpace ? ' ' : '') + b.innerHTML;
+        b.parentNode.removeChild(b);
+      }
+      syncContent(mergeEd);
+      if (row) { markDirty(i); scheduleRemeasure(i); }
+      _ptoeAnimPulse(mergeBlocks[0], 'ptoe-anim-merge');
+    });
+    showToast('已合并 ' + mergeBlocks.length + ' 段', 'ok');
+    return;
+  }
   // 防抖：重置计时，选区停稳 brushMergeDelay 后才尝试合并
   if (_brushMergeTimer) { clearTimeout(_brushMergeTimer); _brushMergeTimer = null; }
   _brushMergeTimer = setTimeout(function () {
     _brushMergeTimer = null;
     if (!_brushArmed || !_brushArmed.ops || _brushArmed.ops.indexOf('merge') < 0) return;
-    const ed = currentEditable();
-    if (!ed) return;
-    const sel = window.getSelection();
-    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
-    const range = sel.getRangeAt(0);
-    const startBlock = _boundaryBlockInRange(ed, range.startContainer, false);
-    const endBlock = _boundaryBlockInRange(ed, range.endContainer, true);
+    const ed2 = currentEditable();
+    if (!ed2) return;
+    const sel2 = window.getSelection();
+    if (!sel2 || sel2.rangeCount === 0 || sel2.isCollapsed) return;
+    const range = sel2.getRangeAt(0);
+    const startBlock = _boundaryBlockInRange(ed2, range.startContainer, false);
+    const endBlock = _boundaryBlockInRange(ed2, range.endContainer, true);
     if (!startBlock || !endBlock) return;
-    const blocks = _blocksBetween(ed, startBlock, endBlock);
+    const blocks = _blocksBetween(ed2, startBlock, endBlock);
     if (blocks.length < 2) return;
     // 选区覆盖 ≥2 段 → 立即合并
-    const row = ed.closest('.page-row');
+    const row = ed2.closest('.page-row');
     const i = row ? Number(row.dataset.i) : -1;
     histRun('功能刷合并', [i], function () {
       for (let k = 1; k < blocks.length; k++) {
@@ -7066,8 +7311,10 @@ function _brushWatchSelection() {
         blocks[0].innerHTML += (needSpace ? ' ' : '') + b.innerHTML;
         b.parentNode.removeChild(b);
       }
-      syncContent(ed);
+      syncContent(ed2);
       if (row) { markDirty(i); scheduleRemeasure(i); }
+      // 合并动画：结果块背景脉冲一下
+      _ptoeAnimPulse(blocks[0], 'ptoe-anim-merge');
     });
     showToast('已合并 ' + blocks.length + ' 段', 'ok');
   }, brushMergeDelay()); // 选区停稳该毫秒数后才合并（设置-界面可调，默认 800）
@@ -10126,6 +10373,8 @@ function openSettings() {
   document.getElementById('errHoverDelayInput').value = errHoverDelay();
   const bmdIn = document.getElementById('brushMergeDelayInput');
   if (bmdIn) bmdIn.value = brushMergeDelay();
+  const bmlIn = document.getElementById('brushMergeOnLeaveInput');
+  if (bmlIn) bmlIn.checked = !!uiBool('brush_merge_on_leave', true);
   loadFontSettings();
   document.getElementById('editorFontSizeInput').value = parseInt(document.documentElement.style.getPropertyValue('--editor-font-size') || '14', 10);
   const pbIn = document.getElementById('prBatchPages');
@@ -10140,6 +10389,22 @@ function openSettings() {
   if (lnsIn) lnsIn.value = uis('line_num_size', 'large');
   const tjIn = document.getElementById('textJustifyToggle');
   if (tjIn) tjIn.checked = !!uiBool('text_justify', true);
+  const cpIn = document.getElementById('cleanPunctuationChk');
+  if (cpIn) cpIn.checked = !!uiBool('clean_punctuation', true);
+  const csIn = document.getElementById('cleanSymbolsChk');
+  if (csIn) csIn.checked = !!uiBool('clean_symbols', true);
+  const cmIn = document.getElementById('cleanMdTagsChk');
+  if (cmIn) cmIn.checked = !!uiBool('clean_md_tags', true);
+  const chIn = document.getElementById('cleanHtmlTagsChk');
+  if (chIn) chIn.checked = !!uiBool('clean_html_tags', true);
+  const cpaIn = document.getElementById('cleanParagraphsChk');
+  if (cpaIn) cpaIn.checked = !!uiBool('clean_paragraphs', false);
+  // 同步符号映射表到编辑器（2026-10-16）
+  const smeIn = document.getElementById('cleanSymbolMapEditor');
+  if (smeIn) {
+    const sm = uiSettings && uiSettings.clean_symbol_map ? uiSettings.clean_symbol_map : [['[','【'],[']','】'],['--','——'],['~','～']];
+    smeIn.value = formatSymbolMap(sm);
+  }
   document.getElementById('modalBg').style.display = 'flex';
   // 默认激活快捷键标签
   document.querySelectorAll('.settings-tab').forEach(b => b.classList.remove('active'));
@@ -12322,6 +12587,28 @@ function _cmdRenderSuggest(value) {
   }
 })();
 
+// 自动聚焦 iframe：当页面获得可见性/焦点时，请求焦点以便键盘快捷键（如 Ctrl+;）立即生效
+// 解决：切换到矫正标签页后，必须先点击页面才能调起命令行的问题
+(function autoFocusIframe() {
+  // 页面加载完成时尝试聚焦
+  if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    window.focus();
+  } else {
+    window.addEventListener('load', () => window.focus(), { once: true });
+  }
+  // 页面可见性变化时（如从后台切回前台），再次尝试聚焦
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) {
+      // 微任务延迟，确保布局稳定后再聚焦，避免抢占用户正在进行的交互
+      Promise.resolve().then(() => window.focus());
+    }
+  });
+  // 窗口获得焦点时（如从其他应用切回），也尝试聚焦
+  window.addEventListener('focus', function () {
+    window.focus();
+  });
+})();
+
 // 工具操作快捷键映射（op → 直接调用函数；格式/标记操作不在此表，走 applyOp）
 const SHORTCUT_ACTIONS = {
   search: openSearchModal,
@@ -12935,6 +13222,19 @@ document.getElementById('resetUiSettingsBtn').addEventListener('click', () => {
   if (lnsr) lnsr.value = UI_SETTINGS_DEFAULTS.line_num_size;
   const tjr = document.getElementById('textJustifyToggle');
   if (tjr) tjr.checked = !!UI_SETTINGS_DEFAULTS.text_justify;
+  const cpr = document.getElementById('cleanPunctuationChk');
+  if (cpr) cpr.checked = !!UI_SETTINGS_DEFAULTS.clean_punctuation;
+  const csr = document.getElementById('cleanSymbolsChk');
+  if (csr) csr.checked = !!UI_SETTINGS_DEFAULTS.clean_symbols;
+  const cmr = document.getElementById('cleanMdTagsChk');
+  if (cmr) cmr.checked = !!UI_SETTINGS_DEFAULTS.clean_md_tags;
+  const chr = document.getElementById('cleanHtmlTagsChk');
+  if (chr) chr.checked = !!UI_SETTINGS_DEFAULTS.clean_html_tags;
+  const cpar = document.getElementById('cleanParagraphsChk');
+  if (cpar) cpar.checked = !!UI_SETTINGS_DEFAULTS.clean_paragraphs;
+  // 符号映射表恢复默认（2026-10-16）
+  const smeR = document.getElementById('cleanSymbolMapEditor');
+  if (smeR) smeR.value = formatSymbolMap(UI_SETTINGS_DEFAULTS.clean_symbol_map);
   applyFontSize(uiSettings.editor_font_size);
   showToast('界面设置已恢复默认', 'ok');
 });
@@ -13022,6 +13322,11 @@ if (_brushMergeDelayInput) _brushMergeDelayInput.addEventListener('change', (e) 
   e.target.value = d;
   if (uiSettings) { uiSettings.brush_merge_delay = d; saveUiSettings(); }
 });
+// 功能刷离开即合并（服务端持久化 config.json ui_settings；2026-10）
+const _brushMergeOnLeaveInput = document.getElementById('brushMergeOnLeaveInput');
+if (_brushMergeOnLeaveInput) _brushMergeOnLeaveInput.addEventListener('change', (e) => {
+  if (uiSettings) { uiSettings.brush_merge_on_leave = e.target.checked; saveUiSettings(); }
+});
 // 格式规则应用到全部页前需确认（2026-09-13 新增；服务端持久化 config.json ui_settings）
 document.getElementById('ruleAllPagesConfirm').addEventListener('change', (e) => {
   if (uiSettings) { uiSettings.rule_all_pages_confirm = e.target.checked; saveUiSettings(); }
@@ -13048,6 +13353,39 @@ if (_textJustifyToggle) _textJustifyToggle.addEventListener('change', (e) => {
   if (uiSettings) { uiSettings.text_justify = e.target.checked; saveUiSettings(); }
   applyUiPrefs();
 });
+// 智能清理规则开关（2026-10：服务端持久化 config.json ui_settings）
+// 仅影响「智能清理」按钮（服务端 /api/clean 读取同一份配置），不改界面即时状态。
+[
+  ['cleanPunctuationChk', 'clean_punctuation'],
+  ['cleanSymbolsChk', 'clean_symbols'],
+  ['cleanMdTagsChk', 'clean_md_tags'],
+  ['cleanHtmlTagsChk', 'clean_html_tags'],
+  ['cleanParagraphsChk', 'clean_paragraphs'],
+].forEach(([id, key]) => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', (e) => {
+    if (uiSettings) { uiSettings[key] = e.target.checked; saveUiSettings(); }
+    runCleanPreview();
+  });
+});
+// 清理预览模态框事件绑定（2026-10-16）
+document.getElementById('cleanPreviewApply').addEventListener('click', () => { hideTip(); applyCleanPreview(); });
+document.getElementById('cleanPreviewCancel').addEventListener('click', () => { cancelCleanPreview(); });
+document.getElementById('cleanPreviewCancelBtn').addEventListener('click', () => { cancelCleanPreview(); });
+_backdropClickClose('cleanPreviewBg', function () { cancelCleanPreview(); });
+// 符号映射表编辑器 + 实时预览事件绑定（2026-10-16）
+const _cleanSymbolMapEditor = document.getElementById('cleanSymbolMapEditor');
+if (_cleanSymbolMapEditor) {
+  _cleanSymbolMapEditor.addEventListener('input', function () {
+    const map = parseSymbolMap(_cleanSymbolMapEditor.value);
+    if (uiSettings) { uiSettings.clean_symbol_map = map.length > 0 ? map : [['[','【'],[']','】'],['--','——'],['~','～']]; saveUiSettings(); }
+    runCleanPreview();
+  });
+}
+const _cleanPreviewInput = document.getElementById('cleanPreviewInput');
+if (_cleanPreviewInput) {
+  _cleanPreviewInput.addEventListener('input', function () { runCleanPreview(); });
+}
 // 纠错批处理页数（0 = 全部页/整本书；1-50；服务端持久化 config.json ui_settings）
 const _prBatchInput = document.getElementById('prBatchPages');
 if (_prBatchInput) _prBatchInput.addEventListener('change', (e) => {

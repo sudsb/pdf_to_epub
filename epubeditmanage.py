@@ -608,8 +608,11 @@ class _EpubEditHandler(BaseHTTPRequestHandler):
 
     def _api_clean(self) -> None:
         """文本智能清理：body {html: str} → {ok: True, html}。无状态。
+
         调用 correctmanage.clean_page_html（段首 #/* 符号、中英文标点归一、
-        HTML 标签残留清理；默认不合并段落，懒导入保持模块顶层轻量）。"""
+        HTML 标签残留清理、扩展符号/省略号归一、Markdown 残留剥离）。
+        各步骤开关读取 config.json 的 ui_settings（与设置界面同一份配置），
+        body 可传同名字段覆盖（便于测试/单次调用），懒导入保持模块顶层轻量。"""
         body = self._read_body()
         if body is None:
             self._send(400, self._json({"ok": False, "error": "无效的 JSON"}))
@@ -618,10 +621,41 @@ class _EpubEditHandler(BaseHTTPRequestHandler):
         if not isinstance(html_text, str):
             self._send(400, self._json({"ok": False, "error": "html 必须为字符串"}))
             return
+        # 读取 config.json ui_settings（缺失/异常一律回退默认，清理不因配置读取失败而中断）
+        try:
+            from configmanage import CLEAN_SETTINGS_DEFAULTS, get_clean_settings, get_clean_symbol_map
+
+            opts = get_clean_settings()
+            sym_map = get_clean_symbol_map()
+        except Exception:
+            CLEAN_SETTINGS_DEFAULTS = {}
+            opts = {
+                "clean_punctuation": True,
+                "clean_symbols": True,
+                "clean_md_tags": True,
+                "clean_html_tags": True,
+                "clean_paragraphs": False,
+            }
+            sym_map = None
+        # body 覆盖（同名字段，须为 bool）
+        for key in CLEAN_SETTINGS_DEFAULTS or opts:
+            if isinstance(body.get(key), bool):
+                opts[key] = body[key]
+        # body 可覆盖符号映射表
+        if isinstance(body.get("clean_symbol_map"), list):
+            sym_map = body["clean_symbol_map"]
         try:
             from correctmanage import clean_page_html
 
-            cleaned = clean_page_html(html_text)
+            cleaned = clean_page_html(
+                html_text,
+                clean_punctuation=opts["clean_punctuation"],
+                clean_symbols=opts["clean_symbols"],
+                clean_md_tags=opts["clean_md_tags"],
+                clean_html_tags=opts["clean_html_tags"],
+                clean_paragraphs=opts["clean_paragraphs"],
+                symbol_map=sym_map,
+            )
         except Exception as exc:
             self._send(200, self._json({"ok": False, "error": f"清理失败：{exc}"}))
             return

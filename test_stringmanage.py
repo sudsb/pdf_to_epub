@@ -11,6 +11,8 @@ from stringmanage import (
     detect_headings,
     strip_page_numbers,
     strip_think_blocks,
+    _normalize_punctuation_extended,
+    _normalize_ellipsis,
 )
 
 
@@ -260,6 +262,124 @@ class TestDetectHeadings(unittest.TestCase):
         structured = clean_and_structure_text(pages)
         self.assertIn("<h1>工人夜校招生广告</h1>", structured["body"])
         self.assertIn("<p>列位工人来听我们说几句白话：</p>", structured["body"])
+
+
+class TestNormalizePunctuationExtended(unittest.TestCase):
+    """_normalize_punctuation_extended：扩展标点/符号归一化（智能清理用）。"""
+
+    def test_base_punctuation_cjk_context(self):
+        # 基础标点在中文上下文：半角→全角
+        self.assertEqual(_normalize_punctuation_extended("你好,世界"), "你好，世界")
+        self.assertEqual(_normalize_punctuation_extended("他说;好吧"), "他说；好吧")
+        self.assertEqual(_normalize_punctuation_extended("真的:假的"), "真的：假的")
+        self.assertEqual(_normalize_punctuation_extended("什么?真的"), "什么？真的")
+        self.assertEqual(_normalize_punctuation_extended("太好了!"), "太好了！")
+        self.assertEqual(_normalize_punctuation_extended("见(附录)"), "见（附录）")
+        self.assertEqual(_normalize_punctuation_extended("测试)内容"), "测试）内容")
+
+    def test_base_punctuation_latin_context(self):
+        # 基础标点在英文/数字上下文：全角→半角
+        self.assertEqual(_normalize_punctuation_extended("Hello，world"), "Hello,world")
+        self.assertEqual(_normalize_punctuation_extended("Test；case"), "Test;case")
+        self.assertEqual(_normalize_punctuation_extended("A：B"), "A:B")
+        self.assertEqual(_normalize_punctuation_extended("What？"), "What?")
+        self.assertEqual(_normalize_punctuation_extended("Wow！"), "Wow!")
+        self.assertEqual(_normalize_punctuation_extended("Func（x）"), "Func(x)")
+
+    def test_period_cjk_context(self):
+        # 句号：与汉字相邻的半角点 → 全角。
+        self.assertEqual(_normalize_punctuation_extended("你好.世界"), "你好\u3002世界")
+        self.assertEqual(_normalize_punctuation_extended("结束."), "结束\u3002")
+        # 小数点 / 英文语境不误伤
+        self.assertEqual(_normalize_punctuation_extended("1.5"), "1.5")
+        self.assertEqual(_normalize_punctuation_extended("test.OK"), "test.OK")
+
+    def test_quotes_cjk_content(self):
+        # 引号内容含汉字 → 中文弯引号
+        self.assertEqual(
+            _normalize_punctuation_extended('他说"你好"'),
+            "他说\u201c你好\u201d",
+        )
+        self.assertEqual(
+            _normalize_punctuation_extended("它'是'什么"),
+            "它\u2018是\u2019什么",
+        )
+
+    def test_quotes_latin_content_preserved(self):
+        # 引号内容为纯英文 → 保持 ASCII 引号（不误伤英文引语）
+        self.assertEqual(_normalize_punctuation_extended('他说 "hello"'), '他说 "hello"')
+        self.assertEqual(_normalize_punctuation_extended('He said "hi"'), 'He said "hi"')
+        self.assertEqual(_normalize_punctuation_extended("It 'is' good"), "It 'is' good")
+
+    def test_extended_symbols_cjk_context(self):
+        # 扩展符号在中文上下文：半角→全角
+        self.assertEqual(_normalize_punctuation_extended("见[附录]"), "见【附录】")
+        self.assertEqual(_normalize_punctuation_extended("等等..."), "等等……")
+        self.assertEqual(_normalize_punctuation_extended("然后--继续"), "然后——继续")
+        self.assertEqual(_normalize_punctuation_extended("大约~10个"), "大约～10个")
+
+    def test_extended_symbols_latin_context(self):
+        # 扩展符号在英文/数字上下文：全角→半角
+        self.assertEqual(_normalize_punctuation_extended("Wait……"), "Wait...")
+        self.assertEqual(_normalize_punctuation_extended("A——B"), "A--B")
+        self.assertEqual(_normalize_punctuation_extended("About～10"), "About~10")
+
+    def test_mixed_context_preserved(self):
+        # 混合上下文：中文部分转全角，英文部分保持半角
+        # 逗号转全角，空格保留（当前实现不删除标点后空格）
+        self.assertEqual(_normalize_punctuation_extended('你好, "world"'), '你好， "world"')
+        self.assertEqual(_normalize_punctuation_extended("See [附录] and [appendix]"), "See 【附录】 and [appendix]")
+
+    def test_ellipsis_normalization_single_line(self):
+        # 一行内多个省略号 → 只保留第一对标准省略号，后续标记删除，文字保留
+        self.assertEqual(_normalize_punctuation_extended("啊...吧...次"), "啊……吧次")
+        self.assertEqual(_normalize_punctuation_extended("啊……吧……次"), "啊……吧次")
+        self.assertEqual(_normalize_punctuation_extended("测试...更多...结束"), "测试……更多结束")
+        self.assertEqual(_normalize_punctuation_extended("开始...中间...结束..."), "开始……中间结束")
+
+    def test_ellipsis_cross_lines_independent(self):
+        # 跨行处理：各行独立归一化
+        text = "第一行...\n第二行...\n第三行..."
+        expected = "第一行……\n第二行……\n第三行……"
+        self.assertEqual(_normalize_punctuation_extended(text), expected)
+
+    def test_no_ellipsis_unchanged(self):
+        self.assertEqual(_normalize_punctuation_extended("没有省略号"), "没有省略号")
+
+
+class TestNormalizeEllipsis(unittest.TestCase):
+    """_normalize_ellipsis：省略号长度归一化 + 多对合并为一对（文字不丢）。"""
+
+    def test_multiple_ascii_ellipsis(self):
+        # 多对省略号：保留第一对，后续省略号标记删除，两侧文字全部保留
+        self.assertEqual(_normalize_ellipsis("a...b...c"), "a……bc")
+
+    def test_multiple_unicode_ellipsis(self):
+        self.assertEqual(_normalize_ellipsis("a……b……c"), "a……bc")
+
+    def test_mixed_ellipsis(self):
+        self.assertEqual(_normalize_ellipsis("test...more...end"), "test……moreend")
+
+    def test_single_ellipsis_standardized(self):
+        self.assertEqual(_normalize_ellipsis("只有……一个"), "只有……一个")
+        self.assertEqual(_normalize_ellipsis("只有...一个"), "只有……一个")
+
+    def test_long_dot_run_collapsed(self):
+        # 6 个点是一个省略号序列 → 归一为 ……（长度统一）
+        self.assertEqual(_normalize_ellipsis("等等......好"), "等等……好")
+
+    def test_adjacent_ellipsis_noise_collapsed(self):
+        # 纯省略号噪声（连续全角省略号点）→ 单对
+        self.assertEqual(_normalize_ellipsis("………………"), "……")
+        self.assertEqual(_normalize_ellipsis("......"), "……")
+
+    def test_no_ellipsis_unchanged(self):
+        self.assertEqual(_normalize_ellipsis("没有省略号"), "没有省略号")
+
+    def test_cross_lines_independent(self):
+        text = "第一行...\n第二行..."
+        expected = "第一行……\n第二行……"
+        self.assertEqual(_normalize_ellipsis(text), expected)
 
 
 if __name__ == "__main__":

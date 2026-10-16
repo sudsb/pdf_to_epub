@@ -1889,6 +1889,21 @@ _SENT_END_PUNCT = "。！？!?…）)】」』》〉"
 _LEADING_SYMBOL_RE = re.compile(r"^[#*＊+•·▪]+\s*")
 # OCR/文本残留的 Markdown 加粗符号 **（可能多处，含句中）
 _MD_BOLD_RE = re.compile(r"\*{2,}")
+# Markdown 内联标记残留（智能清理 clean_md_tags 开关）：**粗体** / ~~删除~~ / `代码`
+_MD_TAG_RE = re.compile(r"\*{2,}|~{2,}|`+")
+
+# 统计用
+_TAG_COUNT_RE = re.compile(r"<[a-zA-Z/!]")
+
+
+def _char_delta(a: str, b: str) -> int:
+    n = min(len(a), len(b))
+    d = sum(1 for i in range(n) if a[i] != b[i]) + abs(len(a) - len(b))
+    return d
+
+
+def _count_tags(s: str) -> int:
+    return len(_TAG_COUNT_RE.findall(s))
 # 清理：[1]/【2】/［3］ 等方括号包裹的数字统一修正为全角六角括号 〔n〕（2026-08）
 # x = 任意数字（半角/全角均可，内容原样保留）；已是 〔n〕 的不动
 _BRACKET_DIGIT_RE = re.compile(r"[\[［【]\s*([0-9０-９]+)\s*[\]］】]")
@@ -2394,19 +2409,24 @@ _PROOFREAD_SAFE_WORDS: frozenset = frozenset(
 def _normalize_punctuation(text: str) -> str:
     """中英文标点归一化。
 
-    汉字相邻处的半角 ,;:?!() 转全角（中文排版）；字母/数字相邻处的全角
-    标点转半角（英文/数字上下文）。避开小数点/网址等被误伤的常见情况。
+    汉字相邻处的半角 ,;:?!(). 转全角（中文排版）；字母/数字相邻处的全角
+    标点转半角（英文/数字上下文）。避开小数点/网址/省略号等被误伤的常见情况。
     """
     s = str(text)
     for half, full in _HALF_TO_FULL:
         # 半角 → 全角：左邻或右邻是汉字（覆盖 汉字,  /  ,汉字 两种）
         s = re.sub(rf"(?<=[{_CJK_RANGE}]){re.escape(half)}", full, s)
         s = re.sub(rf"{re.escape(half)}(?=[{_CJK_RANGE}])", full, s)
+    # 句号：单独的 .（非 .. 序列成员）与汉字相邻 → 。（不碰小数点 1.5 / 省略号 …）
+    s = re.sub(rf"(?<=[{_CJK_RANGE}])\.(?!\.)", "\u3002", s)
+    s = re.sub(rf"(?<!\.)\.(?=[{_CJK_RANGE}])", "\u3002", s)
     for full, half in _FULL_TO_HALF:
         # 全角 → 半角：左右都是字母/数字（纯英文语境）
         s = re.sub(
             rf"(?<=[{_LATIN_RANGE}]){re.escape(full)}(?=[{_LATIN_RANGE}])", half, s
         )
+    # 全角句号 → 半角句号（纯英文语境）
+    s = re.sub(rf"(?<=[{_LATIN_RANGE}])\u3002(?=[{_LATIN_RANGE}])", ".", s)
     return s
 
 
@@ -2903,6 +2923,10 @@ def _clean_blocks(
     merge_paragraphs: bool,
     strip_leading_symbols: bool,
     normalize_punctuation: bool,
+    clean_symbols: bool = False,
+    clean_md_tags: bool = True,
+    symbol_pairs=None,
+    stats=None,
 ) -> str:
     """按块级标签切分已清洗的 HTML，逐块做文本处理并可选合并相邻段落。
 
@@ -2974,6 +2998,12 @@ def _clean_blocks(
         blocks.append((cur_open or "<p>", cur))
 
     # 块内文本处理（段首符号只作用于块开头第一个文本 token）
+    _normalize_symbols_extended = None
+    if clean_symbols:
+        # 惰性导入：stringmanage 只依赖 stdlib，但沿用本仓「重模块内延迟导入」约定
+        from stringmanage import _normalize_symbols_extended as _nse
+
+        _normalize_symbols_extended = _nse
     for open_tag, toks in blocks:
         if open_tag == _TABLE_BLOCK:
             continue  # 表格：逐字节透传，不做任何文本处理
@@ -2985,12 +3015,31 @@ def _clean_blocks(
             if first and strip_leading_symbols:
                 t2 = _strip_leading_symbols(t2)
                 first = False
+            # OCR/文本残留的 Markdown 标记（**粗体** / ~~删除~~ / `代码`）：
+            # 必须在符号归一前剥离，否则 ~~ 会被 ~ 的半角→全角规则拆开
+            if clean_md_tags:
+                if stats is not None:
+                    spans = re.findall(r"\*{2,}.*?\*{2,}|\~{2,}.*?\~{2,}|`+.*?`+", t2, flags=re.S)
+                    if spans:
+                        stats["md"] += len(spans)
+                t2_new = _MD_TAG_RE.sub("", t2)
+                t2 = t2_new
             if normalize_punctuation:
-                t2 = _normalize_punctuation(t2)
-            # OCR/文本残留的 ** 加粗符号（全 token 处理，含句中）
-            t2 = _MD_BOLD_RE.sub("", t2)
+                nt = _normalize_punctuation(t2)
+                if stats is not None:
+                    stats["punct"] += _char_delta(t2, nt)
+                t2 = nt
+            # 扩展符号归一（引号/方括号/省略号/破折号/波浪号）
+            if _normalize_symbols_extended is not None:
+                nt = _normalize_symbols_extended(t2, half_to_full=symbol_pairs)
+                if stats is not None:
+                    stats["symbols"] += _char_delta(t2, nt)
+                t2 = nt
             # [1]/【2】等方括号数字统一修正为 〔n〕（全 token 处理）
+            before_b = t2
             t2 = _BRACKET_DIGIT_RE.sub("〔\\1〕", t2)
+            if stats is not None and t2 != before_b:
+                stats["symbols"] += _char_delta(before_b, t2)
             toks[i] = t2
 
     # 相邻普通 <p> 段落合并（OCR 拆段修复）
@@ -3026,6 +3075,12 @@ def _clean_blocks(
                 prev_txt = _block_text(merged[-1][1]).strip()
                 next_txt = _block_text(toks).strip()
                 if prev_txt and next_txt and prev_txt[-1] not in _SENT_END_PUNCT:
+                    # 屏障：列表/缩进/冒号引入等
+                    _MERGE_BARRIER_RE = re.compile(r"^\s*(?:[•·▪◦*\-–—]\s|\d{1,3}\s*[.、)）]|[（(]\s*\d{1,3}\s*[）)]|　)")
+                    _MERGE_TAIL_INTRO_RE = re.compile(r"[:：]\s*$")
+                    if _MERGE_BARRIER_RE.match(next_txt) or _MERGE_TAIL_INTRO_RE.search(prev_txt):
+                        merged.append((open_tag, toks))
+                        continue
                     # 英文/数字相接处补一个空格（CJK 之间不加，避免中文被拆开）
                     gap = ""
                     if prev_txt[-1:] and next_txt[:1]:
@@ -3039,6 +3094,8 @@ def _clean_blocks(
                             gap = " "
                     merged[-1][1].append(gap)
                     merged[-1][1].extend(toks)
+                    if stats is not None:
+                        stats["merged"] = stats.get("merged", 0) + 1
                     continue
             merged.append((open_tag, toks))
         blocks = merged
@@ -3059,6 +3116,40 @@ def _clean_blocks(
     return "\n".join(parts)
 
 
+def _clean_pages(items: list, clean_kw: dict) -> list:
+    """批量清理多页 HTML，返回每页的清理结果与统计。
+
+    单页同步执行；多页用 ThreadPoolExecutor 并行（顺序与输入一致）。
+    每项返回 {"page": int, "html": str, "stats": dict}。
+    page 转换失败的项跳过。
+    """
+    valid = []
+    for item in items:
+        try:
+            n = int(item.get("page"))
+        except (TypeError, ValueError):
+            continue
+        valid.append((n, str(item.get("html") or "")))
+
+    if not valid:
+        return []
+
+    def one(pn_html):
+        n, html = pn_html
+        out, st = clean_page_html(html, with_stats=True, **clean_kw)
+        return {"page": n, "html": out, "stats": st}
+
+    if len(valid) == 1:
+        return [one(valid[0])]
+
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+
+    max_workers = min(4, os.cpu_count() or 4)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        return list(pool.map(one, valid))
+
+
 def clean_page_html(
     raw: str,
     *,
@@ -3066,12 +3157,30 @@ def clean_page_html(
     strip_leading_symbols: bool = True,
     normalize_punctuation: bool = True,
     strip_tags: bool = True,
-) -> str:
+    clean_punctuation: bool = True,
+    clean_symbols: bool = True,
+    clean_md_tags: bool = True,
+    clean_html_tags: bool = True,
+    clean_paragraphs: bool = False,
+    symbol_map=None,
+    with_stats: bool = False,
+):
     """矫正界面的智能清理入口：清理段首 #/* 等符号、归一化中英文标点、
     移除残留的 HTML 标签，返回 sanitize 后的规范 HTML。
 
     merge_paragraphs=False（默认不合并）：段落合并已移出默认清理流程，
     仅在显式传入 merge_paragraphs=True 时生效（供格式规则/段落合并 op 使用）。
+
+    2026-10-16 智能清理规则开关（与 config.json 的 ui_settings 同名键对应）：
+    - clean_punctuation：中英文标点归一化（半角↔全角按上下文，含句号）默认开；
+      与旧参数 normalize_punctuation 取「与」，任一为 False 即关闭。
+    - clean_symbols：扩展符号归一化（引号/方括号/省略号/破折号/波浪号）
+      + 省略号长度归一（一行内多对省略号 → 一对标准 ……）默认开。
+    - clean_md_tags：剥离残留 Markdown 标记（**粗体** / ~~删除~~ / `代码`）默认开。
+    - clean_html_tags：剥离非白名单 HTML 标签（保留 rich text）默认开；
+      与旧参数 strip_tags 取「与」，任一为 False 即不剥标签。
+    - clean_paragraphs：段落合并优化（OCR 拆段修复）默认关；
+      与旧参数 merge_paragraphs 取「或」，任一为 True 即合并。
 
     2026-09-21：剥除 $ 紧贴括号包裹（$〔1〕$ → 〔1〕）——OvisOCR/o 系模型
     自造 $ 包裹引注括号；不紧贴括号的 $（价格 $5 / $x$ 等）原样保留。
@@ -3079,18 +3188,42 @@ def clean_page_html(
     幂等：已清理的内容再次清理结果不变。
     """
     text = str(raw or "")
-    if strip_tags:
+    effective_strip_tags = strip_tags and clean_html_tags
+    effective_punct = normalize_punctuation and clean_punctuation
+    effective_merge = merge_paragraphs or clean_paragraphs
+    if effective_strip_tags:
         text = _STRIP_TAG_RE.sub("", text)
     # $ 紧贴括号包裹剥除：必须在标签剥除后 / sanitize 前执行（此时括号
     # 相邻关系最完整，且不依赖标签结构）；幂等（剥完一遍后无 $ 紧贴括号残留）。
     text = _strip_dollar_bracket_hug(text)
     html = sanitize_html(text)
-    return _clean_blocks(
+    stats: dict = {"punct": 0, "symbols": 0, "md": 0, "merged": 0, "tags": 0, "chars": 0}
+    out = _clean_blocks(
         html,
-        merge_paragraphs=merge_paragraphs,
+        merge_paragraphs=effective_merge,
         strip_leading_symbols=strip_leading_symbols,
-        normalize_punctuation=normalize_punctuation,
+        normalize_punctuation=effective_punct,
+        clean_symbols=clean_symbols,
+        clean_md_tags=clean_md_tags,
+        symbol_pairs=symbol_map,
+        stats=stats,
     )
+    # 计算 tags/chars
+    try:
+        stats["tags"] = max(0, _count_tags(str(raw or "")) - _count_tags(out))
+    except Exception:
+        stats["tags"] = 0
+    r = str(raw or "")
+    if not r.strip():
+        stats = {"punct": 0, "symbols": 0, "md": 0, "merged": 0, "tags": 0, "chars": 0}
+    else:
+        stats["chars"] = _char_delta(r, out)
+    # 补齐
+    for k in ("punct", "symbols", "md", "merged", "tags", "chars"):
+        stats[k] = int(stats.get(k, 0))
+    if with_stats:
+        return out, stats
+    return out
 
 
 _HEADING_TAG_RE = re.compile(r"</?h[1-6]([^>]*)>", flags=re.IGNORECASE)
@@ -7223,6 +7356,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 UNDO_DEPTH_CHOICES,
                 LINE_NUM_SIZE_DEFAULT,
                 LINE_NUM_SIZE_CHOICES,
+                CLEAN_SYMBOL_MAP_DEFAULT,
             )
 
             if self.command == "GET":
@@ -7234,6 +7368,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "tip_delay": 600,
                     "err_hover_delay": 1500,
                     "brush_merge_delay": 800,
+                    "brush_merge_on_leave": True,
                     "editor_font_size": 14,
                     "img_mode": "",
                     "rule_all_pages_confirm": True,
@@ -7245,11 +7380,17 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "show_line_numbers": False,
                     "line_num_size": LINE_NUM_SIZE_DEFAULT,
                     "text_justify": True,
+                    "clean_punctuation": True,
+                    "clean_symbols": True,
+                    "clean_md_tags": True,
+                    "clean_html_tags": True,
+                    "clean_paragraphs": False,
                 })
                 merged = {
                     "tip_delay": stored.get("tip_delay", defaults["tip_delay"]),
                     "err_hover_delay": stored.get("err_hover_delay", defaults["err_hover_delay"]),
                     "brush_merge_delay": stored.get("brush_merge_delay", defaults.get("brush_merge_delay", 800)),
+                    "brush_merge_on_leave": bool(stored.get("brush_merge_on_leave", defaults.get("brush_merge_on_leave", True))),
                     "editor_font_size": stored.get("editor_font_size", defaults["editor_font_size"]),
                     "img_mode": stored.get("img_mode", defaults["img_mode"]),
                     "rule_all_pages_confirm": stored.get("rule_all_pages_confirm", defaults["rule_all_pages_confirm"]),
@@ -7261,6 +7402,12 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "show_line_numbers": bool(stored.get("show_line_numbers", defaults.get("show_line_numbers", False))),
                     "line_num_size": stored.get("line_num_size", defaults.get("line_num_size", LINE_NUM_SIZE_DEFAULT)),
                     "text_justify": bool(stored.get("text_justify", defaults.get("text_justify", True))),
+                    "clean_punctuation": bool(stored.get("clean_punctuation", defaults.get("clean_punctuation", True))),
+                    "clean_symbols": bool(stored.get("clean_symbols", defaults.get("clean_symbols", True))),
+                    "clean_md_tags": bool(stored.get("clean_md_tags", defaults.get("clean_md_tags", True))),
+                    "clean_html_tags": bool(stored.get("clean_html_tags", defaults.get("clean_html_tags", True))),
+                    "clean_paragraphs": bool(stored.get("clean_paragraphs", defaults.get("clean_paragraphs", False))),
+                    "clean_symbol_map": stored.get("clean_symbol_map", defaults.get("clean_symbol_map", CLEAN_SYMBOL_MAP_DEFAULT)),
                 }
                 self._send(
                     200,
@@ -7400,6 +7547,35 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     self._send(400, self._json({"ok": False, "error": "text_justify 必须是布尔值"}), "application/json; charset=utf-8")
                     return
                 clean["text_justify"] = v
+            for _clean_key in (
+                "clean_punctuation",
+                "clean_symbols",
+                "clean_md_tags",
+                "clean_html_tags",
+                "clean_paragraphs",
+                "brush_merge_on_leave",
+            ):
+                if _clean_key in ui:
+                    v = ui[_clean_key]
+                    if not isinstance(v, bool):
+                        self._send(400, self._json({"ok": False, "error": f"{_clean_key} 必须是布尔值"}), "application/json; charset=utf-8")
+                        return
+                    clean[_clean_key] = v
+            if "clean_symbol_map" in ui:
+                v = ui["clean_symbol_map"]
+                if not isinstance(v, list) or not v:
+                    self._send(400, self._json({"ok": False, "error": "clean_symbol_map 必须是数组"}), "application/json; charset=utf-8")
+                    return
+                _seen = set()
+                for item in v:
+                    if not isinstance(item, list) or len(item) != 2 or not all(isinstance(x, str) and x for x in item) or item[0] in _seen:
+                        self._send(400, self._json({"ok": False, "error": "clean_symbol_map 格式无效（每项为 [源, 目标] 非空字符串，源不可重复）"}), "application/json; charset=utf-8")
+                        return
+                    _seen.add(item[0])
+                if len(v) > 32:
+                    self._send(400, self._json({"ok": False, "error": "clean_symbol_map 最多 32 项"}), "application/json; charset=utf-8")
+                    return
+                clean["clean_symbol_map"] = [list(p) for p in v]
             set_ui_settings(clean)
             self._send(200, self._json({"ok": True}), "application/json; charset=utf-8")
         except Exception as e:  # noqa: BLE001
@@ -8461,24 +8637,32 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 )
             return
         if path == "/api/clean":
-            # 文本智能清理（段落合并 / 段首 #/* 符号 / 中英文标点 / HTML 标签）：
-            # 无状态 —— 只返回清理结果，由浏览器更新界面（保存时才落盘）。
+            # 文本智能清理（段落合并 / 段首 #/* 符号 / 中英文标点 / HTML 标签 /
+            # 扩展符号+省略号归一 / Markdown 残留剥离）：无状态 —— 只返回清理结果，
+            # 由浏览器更新界面（保存时才落盘）。各步骤开关读取 ui_settings，
+            # body 可传同名字段覆盖（bool）。
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length else b"{}"
                 body = json.loads(raw.decode("utf-8"))
-                cleaned = []
-                for item in body.get("pages") or []:
-                    try:
-                        n = int(item.get("page"))
-                    except (TypeError, ValueError):
-                        continue
-                    cleaned.append(
-                        {
-                            "page": n,
-                            "html": clean_page_html(str(item.get("html") or "")),
-                        }
-                    )
+                from configmanage import CLEAN_SETTINGS_DEFAULTS, get_clean_settings, get_clean_symbol_map
+
+                opts = get_clean_settings()
+                for _k in CLEAN_SETTINGS_DEFAULTS:
+                    if isinstance(body.get(_k), bool):
+                        opts[_k] = body[_k]
+                sym_map = get_clean_symbol_map()
+                if isinstance(body.get("clean_symbol_map"), list):
+                    sym_map = body["clean_symbol_map"]
+                clean_kw = {
+                    "clean_punctuation": opts["clean_punctuation"],
+                    "clean_symbols": opts["clean_symbols"],
+                    "clean_md_tags": opts["clean_md_tags"],
+                    "clean_html_tags": opts["clean_html_tags"],
+                    "clean_paragraphs": opts["clean_paragraphs"],
+                    "symbol_map": sym_map,
+                }
+                cleaned = _clean_pages(body.get("pages") or [], clean_kw)
                 self._send(
                     200,
                     self._json({"ok": True, "pages": cleaned}),
@@ -11454,6 +11638,10 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <h4 style="margin:16px 0 4px;">增强格式刷</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">武装「合并段落」刷后，拖选多段并停稳超过该时间（毫秒）才自动合并，避免拖选途中瞬时覆盖多段就误合并；0 = 停稳即合并（最快）。正文 / 注释 / 引用 / 加粗 / 斜体单个武装时，先用鼠标选中词语或句子再点击段落，即只对选中文字生效；未选中或混合多个功能时作用于整段。</p>
       <label style="font-size:13px;">合并延迟（毫秒） <input type="number" id="brushMergeDelayInput" min="0" max="5000" step="100" style="width:90px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="brushMergeOnLeaveInput" style="width:16px;height:16px;">
+        选中后失去焦点/移开即合并（默认开启）
+      </label>
       <h4 style="margin:16px 0 4px;">编辑器字号</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">调整编辑区显示字号（视图偏好，不写入保存内容）。</p>
       <label style="font-size:13px;">字号（px） <input type="number" id="editorFontSizeInput" min="10" max="28" step="1" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
@@ -11489,6 +11677,43 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
         <input type="checkbox" id="textJustifyToggle" style="width:16px;height:16px;">
         正文两端对齐
       </label>
+      <h4 style="margin:16px 0 4px;">智能清理规则</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">「智能清理」按钮各步骤的启用开关。仅作用于清理结果，不影响未清理内容；关闭某步即清理时跳过该步。</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="cleanPunctuationChk" style="width:16px;height:16px;">
+        中英文标点归一（逗号 / 句号 / 括号等按上下文半角↔全角）
+      </label>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：你好,世界 → 你好，世界</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="cleanSymbolsChk" style="width:16px;height:16px;">
+        扩展符号归一（引号 / 方括号 / 破折号 / 波浪号 + 省略号长度统一）
+      </label>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：看[注] → 看【注】，a--b → a——b</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="cleanMdTagsChk" style="width:16px;height:16px;">
+        清理 Markdown 残留标记（**粗体** / ~~删除~~ / `代码`）
+      </label>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：**重点** → 重点，~~删除~~ → 删除</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="cleanHtmlTagsChk" style="width:16px;height:16px;">
+        清理非富文本 HTML 标签（保留 strong / em / span / br / img 等）
+      </label>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：&lt;font color="red"&gt;红&lt;/font&gt; → 红</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="cleanParagraphsChk" style="width:16px;height:16px;">
+        段落合并优化（OCR 误拆段落自动合并，默认关闭）
+      </label>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：&lt;p&gt;未完&lt;/p&gt;&lt;p&gt;待续&lt;/p&gt; → &lt;p&gt;未完待续&lt;/p&gt;</p>
+      <div style="margin-top:12px;padding:8px;background:#f8f9fa;border-radius:4px;">
+        <p style="font-size:12px;color:#5a6b7c;margin:0 0 4px;">实时预览（输入文本查看清理效果）</p>
+        <textarea id="cleanPreviewInput" rows="2" style="width:100%;box-sizing:border-box;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;resize:vertical;" placeholder="输入文本查看清理效果..."></textarea>
+        <div id="cleanPreviewOut" style="margin-top:4px;padding:4px 6px;background:#fff;border:1px solid var(--border);border-radius:4px;font-size:13px;min-height:20px;"></div>
+      </div>
+      <div style="margin-top:12px;padding:8px;background:#f8f9fa;border-radius:4px;">
+        <p style="font-size:12px;color:#5a6b7c;margin:0 0 4px;">符号映射表（每行一条：半角 → 全角，如 <code>[ → 【</code>）</p>
+        <textarea id="cleanSymbolMapEditor" rows="5" style="width:100%;box-sizing:border-box;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;resize:vertical;" placeholder="[ → 【&#10;] → 】&#10;-- → ——&#10;~ → ～"></textarea>
+        <p style="font-size:11px;color:#8a9bab;margin:4px 0 0;">自定义符号归一映射。留空则恢复默认。修改后自动保存并更新预览。</p>
+      </div>
       <h4 style="margin:16px 0 4px;">格式规则</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">把规则应用到全部页前先弹出确认，防止误操作大范围改动。</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
@@ -11706,6 +11931,18 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   <button type="button" data-tbl-op="alignright" data-tbl-align="right" title="单元格右对齐">右</button>
   <span class="tbl-bar-sep"></span>
   <button type="button" data-tbl-op="deltable" class="danger" title="删除整个表格">删除表格</button>
+</div>
+<!-- 清理预览模态框（2026-10-16）：展示清理统计报告，确认后应用 -->
+<div id="cleanPreviewBg" class="modal-bg" style="display:none;">
+  <div class="modal" style="max-width:640px;max-height:80vh;overflow:auto;">
+    <div class="search-head"><h3>清理预览</h3><button type="button" id="cleanPreviewCancel" class="x-btn" title="关闭" aria-label="关闭">✕</button></div>
+    <p id="cleanPreviewSummary" style="font-size:13px;color:#33414f;font-weight:600;margin:8px 0;"></p>
+    <div id="cleanPreviewList" style="font-size:12px;color:#5a6b7c;line-height:1.8;max-height:40vh;overflow:auto;"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;">
+      <button type="button" id="cleanPreviewCancelBtn">取消</button>
+      <button type="button" id="cleanPreviewApply" class="primary">应用清理</button>
+    </div>
+  </div>
 </div>
 <div id="toast" aria-hidden="true"></div>
 <script src="/ui/app.js"></script>

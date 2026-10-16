@@ -118,6 +118,19 @@ UNDO_DEPTH_CHOICES = (50, 100, 200, 500)
 # 控制行号字号与左侧留白/数字-正文间距。默认大（large）。
 LINE_NUM_SIZE_DEFAULT = "large"
 LINE_NUM_SIZE_CHOICES = ("small", "medium", "large")
+# 智能清理规则默认开关（ui_settings 同名键；2026-10）：
+# /api/clean 与设置界面共用同一份默认值。clean_symbols 含「省略号长度归一」。
+CLEAN_SETTINGS_DEFAULTS = {
+    "clean_punctuation": True,
+    "clean_symbols": True,
+    "clean_md_tags": True,
+    "clean_html_tags": True,
+    "clean_paragraphs": False,
+}
+# 符号映射表默认值（ui_settings.clean_symbol_map；2026-10）：
+# 用户可自定义「符号归一」步骤的半角→全角映射，如保留 -- 不转 ——。
+CLEAN_SYMBOL_MAP_DEFAULT = [["[", "【"], ["]", "】"], ["--", "——"], ["~", "～"]]
+_CLEAN_SYMBOL_MAP_MAX_ITEMS = 32
 
 DEFAULT_CONFIG = {
     "llama_server": "E:/xox/Tools/llama-c/llama-server.exe",
@@ -364,6 +377,8 @@ DEFAULT_CONFIG = {
         # 增强格式刷「合并段落」自动合并延迟（毫秒，0-5000）：拖选多段停稳超过该时间才合并，
         # 防止拖选途中瞬时覆盖 ≥2 段误合并。默认 800。仅视图/交互行为，不影响保存内容。
         "brush_merge_delay": 800,
+        # 格式刷「合并段落」松开鼠标后是否自动合并（bool，默认 true）
+        "brush_merge_on_leave": True,
         "editor_font_size": 14,
         "img_mode": "",
         # 格式规则应用到全部页前是否弹确认（bool，默认 true；非 bool 输入归一为 true）
@@ -384,6 +399,18 @@ DEFAULT_CONFIG = {
         # 正文两端对齐/分散对齐（2026-10）：bool，默认 true，矫正页正文段落左右边缘对齐更美观。
         # 仅视图样式，不影响保存内容/导出。关闭后按浏览器默认（左对齐）。
         "text_justify": True,
+        # 智能清理规则开关（2026-10）：控制 /api/clean 各步骤的启用状态。
+        # clean_punctuation：中英文标点归一化（半角↔全角按上下文），默认开。
+        # clean_symbols：扩展符号归一化（引号/括号/省略号/破折号/波浪号）+ 省略号长度归一，默认开。
+        # clean_md_tags：剥离残留 markdown 标签（**、*、~~、` 等），默认开。
+        # clean_html_tags：剥离非白名单 html 标签，保留 strong/em/span/br/img 等，默认开。
+        # clean_paragraphs：段落合并优化（空白行折叠/相邻短段合并），默认关（保守）。
+        "clean_punctuation": True,
+        "clean_symbols": True,
+        "clean_md_tags": True,
+        "clean_html_tags": True,
+        "clean_paragraphs": False,
+        "clean_symbol_map": CLEAN_SYMBOL_MAP_DEFAULT,
     },
     # 图片预处理（2026-08，OpenCV）：PDF 分割图片时启用，提高 OCR 识别率。
     # enabled 开关；gray 灰度 / denoise 中值去噪 / sharpen 锐化 / binarize 自适应二值化；
@@ -895,6 +922,10 @@ def set_ui_settings(ui: dict) -> dict:
         except (TypeError, ValueError):
             v = 800
         clean["brush_merge_delay"] = max(0, min(5000, v))
+    if "brush_merge_on_leave" in ui:
+        # 格式刷「合并段落」松开鼠标后是否自动合并（bool）：非 bool 回退默认 True
+        v = ui["brush_merge_on_leave"]
+        clean["brush_merge_on_leave"] = True if v is True else False
     if "editor_font_size" in ui:
         try:
             v = int(ui["editor_font_size"])
@@ -967,6 +998,32 @@ def set_ui_settings(ui: dict) -> dict:
         # 正文两端对齐开关（bool）：非 bool 输入回退 True（默认开启），与 show_line_numbers 同构
         v = ui["text_justify"]
         clean["text_justify"] = True if v is True else False
+    # 智能清理规则开关（2026-10）：bool 键，非 bool 按默认值回退
+    for key, default in CLEAN_SETTINGS_DEFAULTS.items():
+        if key in ui:
+            v = ui[key]
+            clean[key] = v if isinstance(v, bool) else default
+    # 符号映射表（2026-10）：list of [src, dst]，每项长度 2 的非空 str，源去重，≤32 项
+    if "clean_symbol_map" in ui:
+        v = ui["clean_symbol_map"]
+        if isinstance(v, list) and v:
+            seen = set()
+            ok = True
+            for item in v:
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    ok = False; break
+                src, dst = item
+                if not isinstance(src, str) or not isinstance(dst, str) or not src or not dst:
+                    ok = False; break
+                if src in seen:
+                    ok = False; break
+                seen.add(src)
+            if ok and len(v) <= _CLEAN_SYMBOL_MAP_MAX_ITEMS:
+                clean["clean_symbol_map"] = [list(p) for p in v]
+            else:
+                clean["clean_symbol_map"] = [list(p) for p in CLEAN_SYMBOL_MAP_DEFAULT]
+        else:
+            clean["clean_symbol_map"] = [list(p) for p in CLEAN_SYMBOL_MAP_DEFAULT]
     with _CFG_LOCK:
         try:
             if os.path.exists(_CONFIG_PATH):
@@ -994,6 +1051,58 @@ def set_ui_settings(ui: dict) -> dict:
             with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
             return cfg
+
+
+def get_clean_settings() -> dict:
+    """返回智能清理各步骤开关（读 config.json 的 ui_settings，缺失/异常回退默认）。
+
+    供 /api/clean 端点使用：/api/clean 只做清理、不落盘，但各步骤是否启用
+    由设置界面写入 ui_settings 后统一生效，避免前端与后端各存一份。
+    """
+    opts = dict(CLEAN_SETTINGS_DEFAULTS)
+    try:
+        cfg = get_config(show_dialogs=False) or {}
+        stored = cfg.get("ui_settings")
+        if isinstance(stored, dict):
+            for key in CLEAN_SETTINGS_DEFAULTS:
+                if isinstance(stored.get(key), bool):
+                    opts[key] = stored[key]
+    except Exception:
+        pass
+    return opts
+
+
+def get_clean_symbol_map() -> list:
+    """返回符号映射表（读 config.json 的 ui_settings.clean_symbol_map）。
+
+    校验：每项为长度 2 的非空 str 列表、无重复源、≤32 项；非法整体回退默认。
+    供 /api/clean 端点使用，与 get_clean_settings 同构。
+    """
+    try:
+        cfg = get_config(show_dialogs=False) or {}
+        stored = cfg.get("ui_settings")
+        if isinstance(stored, dict):
+            v = stored.get("clean_symbol_map")
+            if isinstance(v, list) and v:
+                # 校验每项
+                seen_sources = set()
+                for item in v:
+                    if not isinstance(item, (list, tuple)) or len(item) != 2:
+                        return [list(p) for p in CLEAN_SYMBOL_MAP_DEFAULT]
+                    src, dst = item
+                    if not isinstance(src, str) or not isinstance(dst, str):
+                        return [list(p) for p in CLEAN_SYMBOL_MAP_DEFAULT]
+                    if not src or not dst:
+                        return [list(p) for p in CLEAN_SYMBOL_MAP_DEFAULT]
+                    if src in seen_sources:
+                        return [list(p) for p in CLEAN_SYMBOL_MAP_DEFAULT]
+                    seen_sources.add(src)
+                if len(v) > _CLEAN_SYMBOL_MAP_MAX_ITEMS:
+                    return [list(p) for p in CLEAN_SYMBOL_MAP_DEFAULT]
+                return [list(p) for p in v]
+    except Exception:
+        pass
+    return [list(p) for p in CLEAN_SYMBOL_MAP_DEFAULT]
 
 
 _AUTO_SAVE_DEFAULTS = {"enabled": True, "interval_minutes": 5, "new_backup": True}

@@ -329,7 +329,30 @@
     "show_line_numbers": false,
     "line_num_size": "large",
     "text_justify": true,
-    "brush_merge_delay": 800
+    "brush_merge_delay": 800,
+    "clean_punctuation": true,
+    "clean_symbols": true,
+    "clean_md_tags": true,
+    "clean_html_tags": true,
+    "clean_paragraphs": false,
+    "clean_symbol_map": [
+      [
+        "[",
+        "【"
+      ],
+      [
+        "]",
+        "】"
+      ],
+      [
+        "--",
+        "——"
+      ],
+      [
+        "~",
+        "～"
+      ]
+    ]
   },
   "proofread_engine": "llama",
   "mouse_shortcuts": {},

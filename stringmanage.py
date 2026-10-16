@@ -264,3 +264,177 @@ def clean_and_structure_text(
         "body": "\n".join(body_segs) if merge else "",
         "paragraphs": all_paras,
     }
+
+
+# ---------------------------------------------------------------------------
+# 扩展标点/符号归一化（用于智能清理）
+# ---------------------------------------------------------------------------
+
+# 中英文标点归一化的基础映射（与 correctmanage._normalize_punctuation 保持一致）
+_CJK_RANGE = "\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF"
+_LATIN_RANGE = "A-Za-z0-9"
+
+_HALF_TO_FULL = (
+    (",", "，"),
+    (";", "；"),
+    (":", "："),
+    ("?", "？"),
+    ("!", "！"),
+    ("(", "（"),
+    (")", "）"),
+)
+
+_FULL_TO_HALF = (
+    ("，", ","),
+    ("；", ";"),
+    ("：", ":"),
+    ("？", "?"),
+    ("！", "!"),
+    ("（", "("),
+    ("）", ")"),
+)
+
+# 扩展符号映射：英文符号 → 中文符号（仅在 CJK 上下文生效）
+# 引号需按「引号内容是否含汉字」成对判定，不能用简单替换，见 _normalize_quotes。
+_EXT_HALF_TO_FULL = (
+    ("[", "【"),
+    ("]", "】"),
+    # 半角破折号 -- → ——
+    ("--", "——"),
+    # 半角波浪号 ~ → ～
+    ("~", "～"),
+)
+
+# 反向映射：中文符号 → 英文符号（仅在纯拉丁语境生效）。
+# 省略号 ……→... 单独处理（需要「同行边界」判定），不放进本表。
+_EXT_FULL_TO_HALF = (
+    ("【", "["),
+    ("】", "]"),
+    ("——", "--"),
+    ("～", "~"),
+)
+
+_CJK_RE = re.compile(f"[{_CJK_RANGE}]")
+
+# 省略号归一化：一行内多对省略号 → 单对标准省略号（……）
+# 匹配连续 3 个以上半角点，或连续 1 个以上全角省略号点。
+_ELLIPSIS_RE = re.compile(r"(?:\.{3,}|…+)")
+
+
+def _normalize_ellipsis(text: str) -> str:
+    """归一化省略号长度：一行内多对省略号合并为一对标准省略号（……）。
+
+    策略（按 \\n 分行，不跨行）：
+    - 每个省略号序列（3 个以上半角点，或 1 个以上全角省略号点）统一为标准 ……；
+    - 一行内若出现多对省略号，仅保留第一对，其余省略号标记删除，**文字原样保留**。
+    - 单个省略号也统一为标准 ……。
+    """
+    lines = text.split("\n")
+    out_lines = []
+    for line in lines:
+        matches = list(_ELLIPSIS_RE.finditer(line))
+        if not matches:
+            out_lines.append(line)
+            continue
+        first = matches[0]
+        # 保留第一对省略号，删除同行内后续省略号标记，两侧文字一字不丢
+        rest = _ELLIPSIS_RE.sub("", line[first.end():])
+        out_lines.append(line[:first.start()] + "……" + rest)
+    return "\n".join(out_lines)
+
+
+def _normalize_quotes(text: str) -> str:
+    """ASCII 直/单引号 → 中文弯引号（仅当引号内容含汉字时成对转换）。
+
+    - 双引号 `"..."` → “...”，单引号 `'...'` → ‘...’；
+    - 引号内容为纯英文/数字（如 `他说 "hello"`、`It 'is' good`）保持 ASCII，
+      避免误伤英文引语；
+    - 单引号左邻/右邻为字母数字时不配对（避免 `it's` 被当作引号）。
+    """
+
+    def _dq(m: re.Match) -> str:
+        inner = m.group(1)
+        return "\u201c" + inner + "\u201d" if _CJK_RE.search(inner) else m.group(0)
+
+    def _sq(m: re.Match) -> str:
+        inner = m.group(1)
+        return "\u2018" + inner + "\u2019" if _CJK_RE.search(inner) else m.group(0)
+
+    text = re.sub(r'(?<![A-Za-z0-9])"([^"\n]*)"', _dq, text)
+    text = re.sub(r"(?<![A-Za-z0-9])'([^'\n]*?)'(?![A-Za-z0-9])", _sq, text)
+    return text
+
+
+def _normalize_punctuation_base(text: str) -> str:
+    """基础中英文标点归一化（与 correctmanage._normalize_punctuation 保持一致）。
+
+    汉字相邻处的半角 ,;:?!(). 转全角；字母/数字相邻处的全角标点转半角。
+    `.` 带「非省略号点」保护（(?<!\\.)/(?!\\.)），不会把 `...` 拆成句号。
+    """
+    s = str(text)
+    for half, full in _HALF_TO_FULL:
+        s = re.sub(rf"(?<=[{_CJK_RANGE}]){re.escape(half)}", full, s)
+        s = re.sub(rf"{re.escape(half)}(?=[{_CJK_RANGE}])", full, s)
+    # 句号：单独的 . （非 .. 序列成员）与汉字相邻 → 。
+    s = re.sub(rf"(?<=[{_CJK_RANGE}])\.(?!\.)", "\u3002", s)
+    s = re.sub(rf"\.(?=[{_CJK_RANGE}])", "\u3002", s)
+    for full, half in _FULL_TO_HALF:
+        # 全角 → 半角：左右都是字母/数字，或在字符串边界且另一侧是字母/数字
+        s = re.sub(
+            rf"(?<=[{_LATIN_RANGE}]){re.escape(full)}(?=[{_LATIN_RANGE}])", half, s
+        )
+        # 处理字符串开头/结尾的情况
+        s = re.sub(rf"^{re.escape(full)}(?=[{_LATIN_RANGE}])", half, s)
+        s = re.sub(rf"(?<=[{_LATIN_RANGE}]){re.escape(full)}$", half, s)
+    # 全角句号 → 半角句号（纯英文语境）
+    s = re.sub(rf"(?<=[{_LATIN_RANGE}])\u3002(?=[{_LATIN_RANGE}])", ".", s)
+    return s
+
+
+def _normalize_symbols_core(text: str, half_to_full=None) -> str:
+    """扩展符号核心：方括号/破折号/波浪号半角↔全角 + 省略号 ……→...（拉丁语境）。
+
+    不含引号配对与省略号长度归一（那两步见 _normalize_quotes / _normalize_ellipsis）。
+    """
+    s = str(text)
+    _hf = _EXT_HALF_TO_FULL if half_to_full is None else tuple(tuple(p) for p in half_to_full)
+    _fh = tuple((f, h) for h, f in _hf) if _hf else tuple(_EXT_FULL_TO_HALF)
+    for half, full in _hf:
+        s = re.sub(rf"(?<=[{_CJK_RANGE}]){re.escape(half)}", full, s)
+        s = re.sub(rf"{re.escape(half)}(?=[{_CJK_RANGE}])", full, s)
+    for full, half in _fh:
+        s = re.sub(
+            rf"(?<=[{_LATIN_RANGE}]){re.escape(full)}(?=[{_LATIN_RANGE}])", half, s
+        )
+        s = re.sub(rf"^{re.escape(full)}(?=[{_LATIN_RANGE}])", half, s)
+        s = re.sub(rf"(?<=[{_LATIN_RANGE}]){re.escape(full)}$", half, s)
+    # 省略号：拉丁上下文（含行尾紧邻字母）转半角 ...
+    s = re.sub(rf"(?<=[{_LATIN_RANGE}])……(?=[{_LATIN_RANGE}])", "...", s)
+    s = re.sub(rf"^……(?=[{_LATIN_RANGE}])", "...", s)
+    s = re.sub(rf"(?<=[{_LATIN_RANGE}])……$", "...", s)
+    return s
+
+
+def _normalize_symbols_extended(text: str, half_to_full=None) -> str:
+    """扩展符号归一化（智能清理 clean_symbols 开关用）：
+
+    引号配对 → 省略号长度归一 → 方括号/破折号/波浪号半角↔全角。
+    基础标点（,;:?!(). ）不在此处理，由 clean_punctuation 负责。
+    """
+    s = _normalize_quotes(str(text))
+    s = _normalize_ellipsis(s)
+    return _normalize_symbols_core(s, half_to_full=half_to_full)
+
+
+def _normalize_punctuation_extended(text: str) -> str:
+    """扩展标点/符号归一化（一站式）：
+
+    1. 省略号长度归一（一行内多对省略号 → 一对标准 ……）
+    2. ASCII 引号 → 中文弯引号（引号内容含汉字时）
+    3. 基础标点归一化（半角↔全角，按 CJK/拉丁上下文）
+    4. 扩展符号归一化（方括号/破折号/波浪号）
+    """
+    s = _normalize_ellipsis(str(text))
+    s = _normalize_quotes(s)
+    s = _normalize_punctuation_base(s)
+    return _normalize_symbols_core(s)

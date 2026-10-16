@@ -332,6 +332,11 @@ button:active { transform: scale(0.97); filter: brightness(0.96); }
       if (t.wrapEl) t.wrapEl.dataset.active = active ? "true" : "false";
     });
     state.activeIndex = index;
+    // 聚焦当前激活的 iframe，使键盘快捷键（如 Ctrl+;）立即生效
+    const activeTab = state.tabs[index];
+    if (activeTab && activeTab.iframe) {
+      try { activeTab.iframe.contentWindow.focus(); } catch (e) { /* 跨域或未就绪时静默忽略 */ }
+    }
   }
 
   // ============ 标签栏点击（事件委托：切换 / 关闭） ============
