@@ -353,6 +353,21 @@ uv run python mian.py correct
 
 Loads latest history cache for the PDF (or blank for new entry).
 
+## Batch Clean Correction History (`clean` / `cl`)
+
+```powershell
+uv run python mian.py cl --list                              # List available history versions
+uv run python mian.py cl --history-id <id> --pages 1-5,8     # Clean selected pages (writes back)
+uv run python mian.py clean --pdf "E:\Books\example.pdf"     # Latest version of that PDF, all pages
+uv run python mian.py cl --history-id <id> --dry-run         # Report only, do not save
+```
+
+Runs the same **smart clean** rules as the correction UI (`Settings -> 智能清理`: punctuation /
+symbol / Markdown / paragraph cleanup + the number-punctuation map) headlessly over the stored
+history pages, then writes the result back into that version. `--pages` takes the OCR page syntax
+(`1-5,8`; omitted, `all` or `*` = every page), `--dry-run` previews without saving, and `cl` is the
+short alias of `clean`.
+
 ## Resume Interrupted OCR
 
 ```powershell

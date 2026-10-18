@@ -3,6 +3,12 @@ const BUFFER = 15, GAP = 12;
 // 内存换平滑（2026-08）：滚动方向前方额外预挂载 PRELOAD 行，图片提前加载、行高提前稳定——
 // 滚到那里时高度已测量，滚动中几乎不再触发补偿（减少跳变诱因）。代价：常驻 DOM/预览图内存略增（可接受）。
 const PRELOAD = 15;
+// 吸顶工具栏（#toolbar sticky top:0）在视口顶部的遮挡高度。jumpToPage /
+// jumpToPageIndex / scrollToIndex 统一按 hostTop + prefixTop(idx) - VIEW_TOP_OFFSET
+// 落点，即「跳过去的那一页顶边正好停在工具栏下沿」；viewportPage 判定「当前页」
+// 必须用同一条线（2026-10 修复：判定用窗口顶 y=0，跳转后目标页 rect.top=60，
+// 取到的是被工具栏盖住的上一页 → 搜索范围「当前页」替换打错页 = 替换失效）。
+const VIEW_TOP_OFFSET = 60;
 let _scrollDir = 1, _viewportY = 0, _lastLo = 0; // 最近一次滚动方向（1 向下 / -1 向上）、视口位置与上次窗口下界，供 updateViewport 动态预挂载/空白兜底
 const OPS = [
   ['bold','粗体'], ['italic','斜体'], ['heading','标题'], ['p','正文'],
@@ -26,6 +32,8 @@ const OPS = [
   ['proofread_clear','清除标注'], ['proofread_revert','回退'],
   ['proofread_accept', '采纳纠错'], ['proofread_ignore', '忽略纠错'],
   ['insert_table', '插入表格'], ['insert_caption', '插入题注'],
+  ['table','转成表格'],
+  ['table2text','表格转文本'],
   ['cmdline', '命令行'],
   ['copy_format', '格式复制'], ['copy_text', '纯文本复制'],
   ['paste_format', '格式粘贴'], ['paste_text', '纯文本粘贴'],
@@ -70,7 +78,7 @@ const OP_ICON = {
   // 候选池其余操作字形（2026-10 补齐，全部单字且互不重复）
   underline:'线', underdot:'点', strike:'删', highlight:'突', charbox:'框', shade:'底',
   flush:'顶', indent:'缩', strip_ws:'空',
-  sup:'上', sub:'下', charformat:'格'
+  sup:'上', sub:'下', charformat:'格', table:'表', table2text:'文'
 };
 const OP_TIP = {
   bold:'粗体', italic:'斜体', heading:'标题（循环 H1→H6→正文）', p:'正文',
@@ -83,6 +91,8 @@ const OP_TIP = {
   marker_page:'换页标记（从此处之后的内容显示在新的一页）',
   proofread_accept: '采纳纠错（替换为候选字）', proofread_ignore: '忽略纠错（消除标注）',
   insert_table: '插入表格（行列可设，默认 3 行 × 4 列，可选手表头）',
+  table: '转成表格（把选中文字转成原生表格；支持无竖线的空格/制表符对齐列）',
+  table2text: '表格转文本（把光标所在表格还原成 Markdown 管道文字；光标不在表格内则转当前页全部表格）',
   insert_caption: '插入题注（为选中的图片在其后插入可编辑的题注段落）',
   cmdline: '命令行（nvim 风格：按行号执行命令，作用域为当前选中页）',
   copy_format: '复制选中内容（含格式）', copy_text: '复制选中文本（纯文本）',
@@ -172,26 +182,44 @@ function proofreadBatchCount() {
   if (isFinite(v) && v <= 0) return 0; // 0 = 整本书全部页
   return Math.max(1, Math.min(50, isFinite(v) ? v : 1));
 }
+// 采纳/忽略后是否自动跳转到本页下一个错误并弹出悬浮菜单（默认开启；设置-界面可关；
+// 服务端持久化 config.json ui_settings）。关闭时保持原位不跳转（2026-10-17 新增）。
+function proofreadAutoJump() { return uiBool('proofread_auto_jump', true); }
 // 撤销/回退历史步数档位（50/100/200/500，默认 100；服务端持久化 config.json ui_settings）
 const UNDO_DEPTH_CHOICES = [50, 100, 200, 500];
 function undoLimit() {
   const v = parseInt(uiv('undo_depth', 100), 10);
   return UNDO_DEPTH_CHOICES.indexOf(v) >= 0 ? v : 100;
 }
+// 搜索结果列表显示上限（10-1000，默认 200；设置-界面可改；服务端持久化 config.json
+// ui_settings.search_max_results，与 EPUB 编辑器章内搜索共用同一设置）。超出的匹配
+// 仍统计真实总数，只是不渲染进列表（列表 DOM 非虚拟化，过大拖慢渲染）。
+function searchMaxResults() {
+  const v = parseInt(uiv('search_max_results', 200), 10);
+  if (!isFinite(v)) return 200;
+  return Math.max(10, Math.min(1000, v));
+}
 
 // 设置「界面」页偏好：服务端持久化到 config.json（/api/ui_settings）。
 // correct_pages 每运行随机端口 → localStorage 按 origin 隔离每次失效，
 // 故以内存 uiSettings 为准、服务端为准，localStorage 仅作加载前的同步兜底。
 // 弹出菜单可选操作池（与后端 correctmanage.POPUP_ELIGIBLE_OPS 保持一致；paint = 格式刷，不在 OPS 数组中）
-const POPUP_ELIGIBLE_OPS = ['bold','italic','underline','underdot','strike','highlight','charbox','shade','sup','sub','heading','p','remove','note','citation','align_left','align_center','align_right','centerbold','flush','indent','strip_ws','merge','marker_full','marker_note','marker_join','marker_page','charformat','paint'];
+const POPUP_ELIGIBLE_OPS = ['bold','italic','underline','underdot','strike','highlight','charbox','shade','sup','sub','heading','p','remove','note','citation','align_left','align_center','align_right','centerbold','flush','indent','strip_ws','merge','marker_full','marker_note','marker_join','marker_page','charformat','table','table2text','paint'];
 const UI_SETTINGS_DEFAULTS = { tip_delay: 600, err_hover_delay: 1500, brush_merge_delay: 800, brush_merge_on_leave: true, editor_font_size: 14, img_mode: '', rule_all_pages_confirm: true,
   popup_row1: ['bold','italic','heading','p','note','citation','paint','remove'],
-  popup_row2: ['align_left','align_center','align_right','centerbold','merge','sup','sub'],
-  popup_rule_count: 5, proofread_batch_pages: 0, undo_depth: 100, show_line_numbers: false,
+  popup_row2: ['align_left','align_center','align_right','centerbold','merge','sup','sub','table','table2text'],
+  popup_rule_count: 5, proofread_batch_pages: 0, proofread_auto_jump: true, undo_depth: 100, show_line_numbers: false,
+  search_max_results: 200,
   line_num_size: 'large', text_justify: true,
   clean_punctuation: true, clean_symbols: true, clean_md_tags: true, clean_html_tags: true, clean_paragraphs: false,
-  clean_symbol_map: [['[','【'],[']','】'],['--','——'],['~','～']] };
+  clean_digit_punct: true,
+  clean_symbol_map: [['[','【'],[']','】'],['--','——'],['~','～']],
+  // 数字标点归一（2026-10-18）：数字紧跟的中文标点 → 英文；设置里可自定义（仅单字符源）
+  clean_digit_punct_map: [['。','.'],['，',','],['、',','],['：',':'],['；',';']] };
 let uiSettings = null; // 服务端加载前为 null → 读 localStorage 兜底；加载后为完整对象
+// 自动表格转换开关（config.json 顶层 table_convert）：应用纠错后是否补跑「文字表格 →
+// 原生表格」自动转换；由 /api/config 载入时同步，默认与后端默认一致（开）。
+let _autoTableConvert = true;
 function uiv(key, def) {
   if (uiSettings && key in uiSettings && uiSettings[key] !== undefined && uiSettings[key] !== null) return uiSettings[key];
   const lk = key === 'editor_font_size' ? 'ptoe_font_size' : 'ptoe_' + key;
@@ -236,8 +264,12 @@ async function loadUiSettingsFromServer() {
       if (rac) rac.checked = !!uiSettings.rule_all_pages_confirm;
       const pb = document.getElementById('prBatchPages');
       if (pb) pb.value = uiSettings.proofread_batch_pages;
+      const pj = document.getElementById('prAutoJump');
+      if (pj) pj.checked = !!uiSettings.proofread_auto_jump;
       const ud = document.getElementById('undoDepthInput');
       if (ud) ud.value = String(undoLimit());
+      const smr = document.getElementById('searchMaxResultsInput');
+      if (smr) smr.value = String(searchMaxResults());
       const ln = document.getElementById('lineNumShow');
       if (ln) ln.checked = !!uiBool('show_line_numbers', false);
       const lns = document.getElementById('lineNumSizeSel');
@@ -254,8 +286,12 @@ async function loadUiSettingsFromServer() {
       if (ch) ch.checked = !!uiBool('clean_html_tags', true);
       const cpa = document.getElementById('cleanParagraphsChk');
       if (cpa) cpa.checked = !!uiBool('clean_paragraphs', false);
+      const cdp = document.getElementById('cleanDigitPunctChk');
+      if (cdp) cdp.checked = !!uiBool('clean_digit_punct', true);
       const sme = document.getElementById('cleanSymbolMapEditor');
       if (sme) sme.value = formatSymbolMap(uiSettings.clean_symbol_map || UI_SETTINGS_DEFAULTS.clean_symbol_map);
+      const dpe = document.getElementById('cleanDigitPunctMapEditor');
+      if (dpe) dpe.value = formatSymbolMap(uiSettings.clean_digit_punct_map || UI_SETTINGS_DEFAULTS.clean_digit_punct_map);
       if (document.getElementById('popupRow1List')) initPopupSettings(); // 弹出菜单编辑器同步
     }
   } catch (e) { console.warn('loadUiSettingsFromServer failed: ' + e.message); }
@@ -273,7 +309,10 @@ function saveUIMirror() {
     localStorage.setItem('ptoe_popup_row2', JSON.stringify(uiSettings.popup_row2 || UI_SETTINGS_DEFAULTS.popup_row2));
     localStorage.setItem('ptoe_popup_rule_count', String(uiSettings.popup_rule_count != null ? uiSettings.popup_rule_count : UI_SETTINGS_DEFAULTS.popup_rule_count));
     localStorage.setItem('ptoe_proofread_batch_pages', String(uiSettings.proofread_batch_pages != null ? uiSettings.proofread_batch_pages : UI_SETTINGS_DEFAULTS.proofread_batch_pages));
+    localStorage.setItem('ptoe_proofread_auto_jump', uiSettings.proofread_auto_jump ? '1' : '0');
     localStorage.setItem('ptoe_undo_depth', String(uiSettings.undo_depth != null ? uiSettings.undo_depth : UI_SETTINGS_DEFAULTS.undo_depth));
+    // 搜索结果列表上限（2026-10-18）：数值键（uiv 读 'ptoe_'+key，loadInt 兜底）
+    localStorage.setItem('ptoe_search_max_results', String(uiSettings.search_max_results != null ? uiSettings.search_max_results : UI_SETTINGS_DEFAULTS.search_max_results));
     // 行号显示（2026-10）：'1'/'0'（与其它布尔型 UI 偏好同一口径，uiBool 读 'ptoe_'+key）
     localStorage.setItem('ptoe_show_line_numbers', uiSettings.show_line_numbers ? '1' : '0');
     // 行号栏尺寸（2026-10）：字符串键 small/medium/large（uis 读 'ptoe_'+key）
@@ -286,8 +325,12 @@ function saveUIMirror() {
     localStorage.setItem('ptoe_clean_md_tags', uiSettings.clean_md_tags ? '1' : '0');
     localStorage.setItem('ptoe_clean_html_tags', uiSettings.clean_html_tags ? '1' : '0');
     localStorage.setItem('ptoe_clean_paragraphs', uiSettings.clean_paragraphs ? '1' : '0');
+    // 数字标点归一（2026-10-18）：'1'/'0'（uiBool 读 'ptoe_'+key）
+    localStorage.setItem('ptoe_clean_digit_punct', uiSettings.clean_digit_punct ? '1' : '0');
     // 符号映射表（2026-10-16）：JSON 数组
     localStorage.setItem('ptoe_clean_symbol_map', JSON.stringify(uiSettings.clean_symbol_map || UI_SETTINGS_DEFAULTS.clean_symbol_map));
+    // 数字标点映射表（2026-10-18）：JSON 数组
+    localStorage.setItem('ptoe_clean_digit_punct_map', JSON.stringify(uiSettings.clean_digit_punct_map || UI_SETTINGS_DEFAULTS.clean_digit_punct_map));
   } catch (e) {}
 }
 function saveUiSettings() {
@@ -1066,7 +1109,8 @@ function displayHtml(i) {
   // If there's an active search highlight query, inject highlights into the
   // rendered HTML. Do NOT mutate underlying stored source (collect/pageSource
   // uses raw content). Regex validity already handled upstream; guard anyway.
-  if (_searchHighlightQuery) {
+  // 「当前页」范围：只注入最近一次搜索的那一页（见 _highlightScopeOk）。
+  if (_searchHighlightQuery && _highlightScopeOk(i)) {
     try {
       const re = searchRegexFor(_searchHighlightQuery);
       return _highlightInHtmlSource(base, re);
@@ -1091,6 +1135,12 @@ function stripProofreadMarkup(html) {
   d.innerHTML = s;
   d.querySelectorAll('.ptoe-fix').forEach(function (el) { el.parentNode.removeChild(el); });
   d.querySelectorAll('.ptoe-err').forEach(function (el) {
+    // 空白页填充建议（data-err-empty）的文本是"拟插入的候选字"，并非原文——
+    // 未采纳时整段删除，不能解包保留，否则候选字会污染正文（2026-10-17 修复）。
+    if (el.hasAttribute('data-err-empty') || el.dataset.errEmpty) {
+      el.parentNode.removeChild(el);
+      return;
+    }
     const t = document.createTextNode(el.textContent);
     el.parentNode.replaceChild(t, el);
   });
@@ -1129,15 +1179,20 @@ function _unwrapSearchMarks(root) {
   }
   return changed;
 }
-function collect() {
+// 收集待清理/保存的页为 {page, html}（indices 为页下标数组；空/null = 全部页）。
+// md 模式取源码；富文本去纠错标注/搜索标记/多选类，与既有 collect 口径一致。
+function collectIndices(indices) {
+  const set = (indices && indices.length) ? new Set(indices) : null;
   const out = [];
   for (let i = 0; i < pages.length; i++) {
+    if (set && !set.has(i)) continue;
     const src = pageSource(i);
     const html = mdMode ? mdToHtml(src) : stripProofreadMarkup(_stripSearchMarks(_stripMultiSelClass(src)));
     out.push({ page: pages[i].page, html: html });
   }
   return out;
 }
+function collect() { return collectIndices(null); }
 function collectProofread() {
   // 收集非空纠错状态（key 均为 str(页码)）；dismissed Set → 数组
   const errors = {}, original = {}, dismissed = {};
@@ -1286,7 +1341,7 @@ function jumpToPageIndex(idx) {
   if (idx < 0 || idx >= pages.length) return;
   const hostTop = host.getBoundingClientRect().top + window.scrollY;
   _progJumpTs = Date.now();
-  window.scrollTo({ top: Math.max(0, hostTop + prefixTop(idx) - 60), behavior: 'auto' });
+  window.scrollTo({ top: Math.max(0, hostTop + prefixTop(idx) - VIEW_TOP_OFFSET), behavior: 'auto' });
   updateViewport();
   const row = host.querySelector('.page-row[data-i="' + idx + '"]');
   if (row) { const ed = row.querySelector('.editable'); if (ed) ed.scrollTop = 0; }
@@ -1307,6 +1362,7 @@ function syncContent(ed) {
   if (!mdMode && hasLooseImg(ed)) adoptLooseImgs(ed);
   if (mdMode) mdSourceMap.set(i, editableSource(ed));
   else contentMap.set(i, _stripSearchMarks(stripIndentStyles(_stripMultiSelClass(ed.innerHTML))));
+  _syncTblGrow(ed, i); // 表格增强（2026-10）：含表格的行参与撑行（防「表格太小/光标错位」）
 }
 // 2026-09-24：剥除下划线注入的段落设置 inline style（p/div/h1-6 开标签），
 // 保证存储 html 只含 data-* 语义（与后端 sanitize 剥块级 style 一致）。
@@ -1480,29 +1536,44 @@ function insertImage(row, i) {
 // 把 dataUrl 图片插入到第 i 页文字光标处（整页图插入 / 外部插入 / 裁剪插入共用）。
 // modeOverride 可选：显式指定插入模式（full/fit/inline/float-left/float-right），
 // 缺省读 imgModeSel 下拉框（值经 normalizeImgMode 归一，非法值回退 full）。
+// 吸顶工具栏遮挡线：与 jumpToPage/jumpToPageIndex/scrollToIndex 的落点同一基准（见文件头）
 function viewportPage() {
   // 1) 优先用已挂载行的真实渲染位置（getBoundingClientRect），免受 heights[] 脏数据
   //    影响——虚拟列表只有可见行挂载，挂载行的实际位置即当前视图的真实布局。
+  //    取「顶边在工具栏下沿（含）之上、且最贴近该线」的那一页 = 视口内容第一页。
   const rows = host.querySelectorAll('.page-row');
   if (rows.length > 0) {
-    const viewportTop = window.scrollY;
     let bestIdx = -1, bestTop = -Infinity;
     for (const row of rows) {
       const rect = row.getBoundingClientRect();
-      const rowTopAbs = rect.top + window.scrollY;
-      if (rowTopAbs <= viewportTop && rowTopAbs > bestTop) {
-        bestTop = rowTopAbs;
+      if (rect.top <= VIEW_TOP_OFFSET && rect.top > bestTop) {
+        bestTop = rect.top;
         bestIdx = Number(row.dataset.i);
       }
     }
     if (bestIdx >= 0) return bestIdx;
   }
-  // 2) 兜底：无挂载行时用二分，去掉 -60 偏移，返回“包含视口顶部的那一页”
+  // 2) 兜底：无挂载行时用二分，取「包含工具栏下沿那条线」的那一页（与 1) 同一语义）
   const hostTop = host.getBoundingClientRect().top + window.scrollY;
-  const y = Math.max(0, window.scrollY - hostTop);
+  const y = Math.max(0, window.scrollY - hostTop + VIEW_TOP_OFFSET);
   let lo = 0, hi = pages.length;
   while (lo < hi) { const mid = (lo + hi) >> 1; if (prefixTop(mid) < y) lo = mid + 1; else hi = mid; }
   return lo > 0 ? lo - 1 : 0;
+}
+
+// 「当前页」统一口径（2026-10-18）：优先光标/选区所在页（用户正在编辑/阅读的那一页），
+// 取不到再回退视口页（viewportPage 按滚动线判定）。此前搜索/替换「当前页」只用滚动线，
+// 位于视口顶部、已滚过工具栏下沿的上一页会被当成「当前页」→ 对着正在编辑的那一页搜
+// 「当前页」会「找不到匹配对象」（全局搜索遍历所有页，故正常）。ed 可选：命令行传作用页，
+// 缺省用 currentEditable()（最近聚焦过的编辑区）。
+function currentPageIndex(ed) {
+  const target = (ed && ed.isConnected) ? ed : currentEditable();
+  if (target && target.closest) {
+    const row = target.closest('.page-row');
+    const i = row ? Number(row.dataset.i) : -1;
+    if (i >= 0 && i < pages.length) return i;
+  }
+  return viewportPage();
 }
 // 宽度片段：wPct（1-100）→ { cls, style }。命中档位类（25/50/75/100）用类，否则用内联
 // 宽度（与图片弹窗「自定义宽度」互斥语义一致：档位类与内联 style 只能留一个）。
@@ -1734,13 +1805,113 @@ function insertTable(rows, cols, header) {
   histEnd(before, '插入表格');
   showToast('已插入表格（' + ((header ? 1 : 0) + rows) + ' 行 × ' + cols + ' 列）', 'ok');
 }
-// 弹窗输入 clamp：确认时把行列数钳到 [1,20] 并回写输入框
+// 「转成表格」（手动档，2026-10）：把当前选中的文字交给服务端 /api/table_convert
+// 转成原生 <table> 后就地替换选区。显式选中即认定是表格——不做「必须有 Markdown
+// 分隔行」的要求，并允许无竖线的空格/制表符对齐列（与服务端手动档一致）。
+// 失败不修改编辑区，只 toast；成功走 histBegin/histEnd，可一键撤销。
+function convertSelectionToTable() {
+  const ed = currentEditable();
+  if (!ed) { showToast('请先点击某一页正文', 'warn'); return; }
+  const sel = window.getSelection();
+  let range = null;
+  if (sel && sel.rangeCount > 0) {
+    const r = sel.getRangeAt(0);
+    if (r && !r.collapsed && ed.contains(r.commonAncestorContainer)) range = r.cloneRange();
+  }
+  if (!range) { showToast('请先选中要转换的文字', 'warn'); return; }
+  const text = sel.toString();
+  if (!text.trim()) { showToast('请先选中要转换的文字', 'warn'); return; }
+  const row = ed.closest('.page-row');
+  const i = row ? Number(row.dataset.i) : -1;
+  fetchJSON('/api/table_convert', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: text }),
+  }).then(function (res) {
+    if (!res || !res.ok || !res.html) {
+      showToast('转换失败：' + ((res && res.error) || '服务端未返回结果'), 'fail');
+      return;
+    }
+    const before = histBegin('转成表格', [i]);
+    ed.focus();
+    inDiscreteOp = true;
+    try {
+      withScrollStable(function () {
+        const s2 = window.getSelection();
+        if (range) { s2.removeAllRanges(); try { s2.addRange(range); } catch (e) { /* 选区失效则按当前光标插入 */ } }
+        if (mdMode) {
+          document.execCommand('insertText', false, res.html);
+        } else if (!document.execCommand('insertHTML', false, res.html)) {
+          // 兜底：直接替换选区节点（execCommand 不可用时）
+          try {
+            range.deleteContents();
+            range.insertNode(range.createContextualFragment(res.html));
+          } catch (e2) { /* 忽略：保持原文本不变 */ }
+        }
+      });
+    } finally { inDiscreteOp = false; }
+    syncContent(ed); markDirty(i); scheduleRemeasure(i);
+    histEnd(before, '转成表格');
+    showToast('已转换为表格', 'ok');
+  }).catch(function (e) { showToast('转换失败：' + e, 'fail'); });
+}
+// 「表格转文本」（2026-10）：把光标所在表格（光标不在表格内则当前页全部表格）交给
+// 服务端 /api/table_to_text 还原成 Markdown 管道文字，就地替换为纯文本行。手动操作，
+// 与自动转换开关无关；事后可用「转成表格」再转回原生表格（幂等往返）。
+async function convertTablesToText() {
+  const ed = currentEditable();
+  if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
+  const hit = _tblCellFromSelection();
+  const tables = (hit && hit.table && ed.contains(hit.table))
+    ? [hit.table]
+    : Array.prototype.slice.call(ed.querySelectorAll('table'));
+  if (!tables.length) { showToast('当前页没有表格', 'warn'); return; }
+  const row = ed.closest('.page-row');
+  const i = row ? Number(row.dataset.i) : 0;
+  let res;
+  try {
+    res = await fetchJSON('/api/table_to_text', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ htmls: tables.map(function (t) { return t.outerHTML; }) }),
+    });
+  } catch (e) { showToast('转换失败：' + e, 'fail'); return; }
+  if (!res || !res.ok) { showToast('转换失败：' + ((res && res.error) || '未知错误'), 'fail'); return; }
+  const texts = res.texts || [];
+  const before = histBegin('表格转文本', [i]);
+  inDiscreteOp = true;
+  try {
+    withScrollStable(function () {
+      for (let k = tables.length - 1; k >= 0; k--) { // 倒序替换，避免影响前面的节点
+        const t = tables[k];
+        if (!t.parentNode) continue;
+        const frag = document.createDocumentFragment();
+        const lines = String(texts[k] || '').split('\n');
+        for (let m = 0; m < lines.length; m++) {
+          const d = document.createElement('div');
+          d.textContent = lines[m]; // 纯文本行：由 textContent 负责转义
+          frag.appendChild(d);
+        }
+        t.parentNode.replaceChild(frag, t);
+      }
+    });
+  } finally { inDiscreteOp = false; }
+  syncContent(ed); markDirty(i); scheduleRemeasure(i);
+  histEnd(before, '表格转文本');
+  showToast('已把 ' + tables.length + ' 个表格转为文本', 'ok');
+}
+
+// 弹窗输入 clamp：确认时把行列数钳到合法区间并回写输入框。
+// 上限须与「插入表格」对话框的 max 属性一致：行 200 / 列 50（2026-10 放宽——
+// 原 20 行上限会挡住省份表这类长表格）。
+const TBL_MAX_ROWS = 200, TBL_MAX_COLS = 50;
 function _tableClamp(id) {
   const el = document.getElementById(id);
   if (!el) return 1;
+  const max = (id === 'tableCols') ? TBL_MAX_COLS : TBL_MAX_ROWS;
   let v = Math.floor(Number(el.value));
   if (!isFinite(v) || v < 1) v = 1;
-  if (v > 20) v = 20;
+  if (v > max) v = max;
   el.value = v;
   return v;
 }
@@ -1821,9 +1992,19 @@ function showTblBar() {
   tblBar.style.top = top + 'px';
   _tblBarVisible = true;
   _tblSyncAlignActive();
+  // 手柄层按需刷新：同一表格且已显示时不必重建（selectionchange 触发频繁），
+  // 换表格/首次显示才重建，省掉无谓的几何测量。
+  if (!_tblResizeLayer || _tblResizeLayer.style.display !== 'block' || _tblResizeFor !== _tblKey.table) {
+    _tblShowResizeLayer();
+  }
 }
 function hideTblBar() {
   if (tblBar) tblBar.style.display = 'none';
+  // 手柄层与「更多」菜单都是 position:fixed 浮层，必须随操作条一起收起：否则滚动后
+  // 它们残留在原坐标、盖在无关正文上，hover 时显影成「非表格位置出现表格框线」
+  // （2026-10 修复；应用既有滚动处理器会调用本函数）。
+  _tblHideResizeLayer();
+  _tblMenuClose();
   _tblKey = null;
   _tblBarVisible = false;
 }
@@ -1835,11 +2016,21 @@ function _tblSyncAlignActive() {
     b.classList.toggle('active', b.dataset.tblAlign === cur);
   });
 }
+// 焦点是否落在自家浮层（操作条/更多菜单/选中菜单/尺寸弹窗/手柄层）。
+// 这些浮层的按钮 mousedown 已 preventDefault 保住编辑区选区；此处再兜底，
+// 避免部分浏览器仍塌陷选区后 _tblSyncVisibility 把 _tblKey 清空（见操作条按钮
+// 「点了没反应」的根因）。
+function _tblInOwnUI(el) {
+  return !!(el && el.closest && el.closest('#tblBar,#tblMenu,#tblResizeLayer,#tblSizeModalBg,#popup'));
+}
 // 光标状态变更（点击/键盘移动/选区变化）→ 进入单元格显示、离开隐藏
 function _tblSyncVisibility() {
   if (mdMode) { hideTblBar(); return; }
   const k = _tblCellFromSelection();
-  if (!k) { hideTblBar(); return; }
+  if (!k) {
+    if (_tblInOwnUI(document.activeElement)) return; // 焦点在自家浮层：保持当前表格目标
+    hideTblBar(); return;
+  }
   // 同单元格内打字/微移不重复定位；首次进入或换格时定位
   if (!_tblBarVisible || !_tblKey || _tblKey.cell !== k.cell || _tblKey.i !== k.i) {
     _tblKey = k;
@@ -1847,7 +2038,10 @@ function _tblSyncVisibility() {
   }
 }
 document.addEventListener('selectionchange', _tblSyncVisibility);
-document.addEventListener('mouseup', _tblSyncVisibility);
+document.addEventListener('mouseup', function (e) {
+  if (_tblInOwnUI(e.target)) return; // 点击自家浮层：selectionchange 可能已塌陷选区，勿清目标
+  _tblSyncVisibility();
+});
 document.addEventListener('keyup', (e) => { if (!e.isComposing) _tblSyncVisibility(); });
 
 // 表格操作包裹：单步撤销 + withScrollStable + 提交内容/脏标记/重排
@@ -1860,57 +2054,11 @@ function _tblOperate(label, fn, i) {
   histEnd(before, label);
 }
 
-function _tblAddRow() {
-  if (!_tblKey) return;
-  const tbody = _tblKey.table.querySelector('tbody');
-  if (!tbody) return;
-  if (_tblKey.table.querySelectorAll('tr').length >= 20) { showToast('表格最多 20 行', 'warn'); return; }
-  const curTr = _tblKey.cell.closest('tr');
-  const cols = curTr ? curTr.children.length : 1;
-  const tr = document.createElement('tr');
-  for (let k = 0; k < cols; k++) tr.appendChild(document.createElement('td'));
-  if (curTr && curTr.parentNode === tbody) tbody.insertBefore(tr, curTr.nextSibling);
-  else tbody.insertBefore(tr, tbody.firstChild); // 当前在 thead 行 → 插到 tbody 首行
-}
-function _tblDelRow() {
-  if (!_tblKey) return;
-  if (_tblKey.table.querySelectorAll('tr').length <= 1) { showToast('至少保留 1 行', 'warn'); return; }
-  const tr = _tblKey.cell.closest('tr');
-  if (!tr || !tr.parentNode) return;
-  // 删的是 thead 唯一行 → 顺带移除空 thead 元素
-  if (tr.parentNode.tagName === 'THEAD' && tr.parentNode.querySelectorAll('tr').length === 1) {
-    tr.parentNode.parentNode.removeChild(tr.parentNode);
-  } else {
-    tr.parentNode.removeChild(tr);
-  }
-}
-function _tblAddCol() {
-  if (!_tblKey) return;
-  const trs = _tblKey.table.querySelectorAll('tr');
-  const maxCols = trs.length ? Math.max.apply(null, Array.prototype.map.call(trs, (t) => t.children.length)) : 0;
-  if (maxCols >= 20) { showToast('表格最多 20 列', 'warn'); return; }
-  // 当前列索引 = 当前 cell 在其所在行的 index（含 colspan 累计偏移）
-  const curTr = _tblKey.cell.parentNode;
-  const cellIdx = curTr ? Array.prototype.indexOf.call(curTr.children, _tblKey.cell) : 0;
-  trs.forEach(function (tr) {
-    const inHead = tr.parentNode && tr.parentNode.tagName === 'THEAD';
-    const td = document.createElement(inHead ? 'th' : 'td');
-    // 不足该列的行补到末尾
-    if (cellIdx + 1 < tr.children.length) tr.insertBefore(td, tr.children[cellIdx + 1]);
-    else tr.appendChild(td);
-  });
-}
-function _tblDelCol() {
-  if (!_tblKey) return;
-  const trs = _tblKey.table.querySelectorAll('tr');
-  const maxCols = trs.length ? Math.max.apply(null, Array.prototype.map.call(trs, (t) => t.children.length)) : 0;
-  if (maxCols <= 1) { showToast('至少保留 1 列', 'warn'); return; }
-  const curTr = _tblKey.cell.parentNode;
-  const cellIdx = curTr ? Array.prototype.indexOf.call(curTr.children, _tblKey.cell) : 0;
-  trs.forEach(function (tr) {
-    if (cellIdx < tr.children.length) tr.removeChild(tr.children[cellIdx]);
-  });
-}
+// 操作条「加行/加列」统一走网格感知实现（与「更多」菜单同源）：
+// 旧实现按 children.length / indexOf 定位，遇 colspan/rowspan 会插错位、留残缺格，
+// 且 _tblDelRow/_tblDelCol 在下方网格段重复定义（后者覆盖前者 → 行为不一致）。
+function _tblAddRow() { _tblInsertRow('below'); }
+function _tblAddCol() { _tblInsertCol('right'); }
 function _tblAlign(align) {
   if (!_tblKey) return;
   const cell = _tblKey.cell;
@@ -1934,26 +2082,1008 @@ function _tblDelTable() {
 
 if (tblBar) tblBar.addEventListener('click', function (e) {
   const btn = e.target.closest('button');
-  if (!btn || !_tblKey) return;
-  const op = btn.dataset.tblOp;
-  const i = _tblKey.i;
-  if (op === 'addrow') _tblOperate('表格-加行', _tblAddRow, i);
-  else if (op === 'delrow') _tblOperate('表格-删行', _tblDelRow, i);
-  else if (op === 'addcol') _tblOperate('表格-加列', _tblAddCol, i);
-  else if (op === 'delcol') _tblOperate('表格-删列', _tblDelCol, i);
-  else if (op === 'alignleft' || op === 'aligncenter' || op === 'alignright') {
-    _tblOperate('表格-对齐', () => _tblAlign(op.slice(5)), i);
-  } else if (op === 'deltable') {
-    _tblOperate('删除表格', _tblDelTable, i);
-    hideTblBar();
+  if (!btn) return;
+  _tblDoOp(btn.dataset.tblOp);
+});
+// 保住编辑区选区：按钮 mousedown 默认会夺焦并塌陷选区，导致 mouseup 的
+// _tblSyncVisibility 判定「已离开单元格」→ hideTblBar 置空 _tblKey，随后的 click
+// 找不到目标而静默失效（「加行/加列有时点了没反应」）。preventDefault 保留选区，
+// click 事件仍照常触发。
+if (tblBar) tblBar.addEventListener('mousedown', function (e) { e.preventDefault(); });
+
+// ===================== 表格增强（2026-10） =====================
+// 覆盖用户三条反馈：① 合并/拆分单元格 ② 调整单元格/行列大小 ③ 易用性（插入/移动行列、
+// 垂直对齐、表头、均分列宽、Tab 导航、右键菜单）——全部并入悬浮操作条与「更多」菜单；
+// ④ 修「插入的表格太小 / 鼠标光标与表格错位」（含表格的行放开撑行 + 操作条随滚动重定位）。
+// 契约：结构操作仅富文本模式生效（md 模式无真实表格节点）；尺寸走白名单内联 style
+// （width/height/vertical-align，与 rulemanage.normalize_table_cell_style 同一契约），
+// 表格级 table-layout:fixed 由 _tblEnsureFixed 落到 <table style>。
+// 表格行列上限（2026-10 放宽：原 20 会挡住省份表这类长表格；与「插入表格」对话框的
+// max 属性、`_tableClamp` 保持一致）。仅防误操作导致的行列数失控。
+const TBL_MAX_R = 200, TBL_MAX_C = 50;
+let _tblSel = null;            // {table, anchor:{r,c}, focus:{r,c}} 单元格矩形选区
+let _tblMenuEl = null;         // 「更多」/右键菜单节点
+let _tblResizeLayer = null;    // 列/行拖拽手柄层
+let _tblResizeFor = null;      // 手柄层当前对应的 table（避免 selectionchange 反复重建）
+let _tblSizeModal = null;      // 尺寸弹窗
+let _tblSizeKind = 'col';      // 弹窗默认聚焦：col | row
+let _tblSizePos = null;        // 打开弹窗时的单元格网格坐标
+
+// ---- 网格化：把 colspan/rowspan 摊平成坐标，供合并/拆分/列宽等按「列号」操作 ----
+function _tblTrsOf(table) {
+  return Array.prototype.slice.call(table.querySelectorAll('tr'));
+}
+// 返回 grid[r][c] = {cell, r0, c0} | undefined（被跨格占用或不存在）
+function _tblGrid(table) {
+  const trs = _tblTrsOf(table);
+  const grid = [];
+  for (let r = 0; r < trs.length; r++) grid[r] = [];
+  for (let r = 0; r < trs.length; r++) {
+    let c = 0;
+    const cells = Array.prototype.slice.call(trs[r].children);
+    for (let ci = 0; ci < cells.length; ci++) {
+      const cell = cells[ci];
+      while (grid[r][c] !== undefined) c++;
+      const rs = Math.max(1, parseInt(cell.getAttribute('rowspan'), 10) || 1);
+      const cs = Math.max(1, parseInt(cell.getAttribute('colspan'), 10) || 1);
+      for (let dr = 0; dr < rs; dr++) {
+        if (!grid[r + dr]) grid[r + dr] = [];
+        for (let dc = 0; dc < cs; dc++) grid[r + dr][c + dc] = { cell: cell, r0: r, c0: c };
+      }
+      c += cs;
+    }
+  }
+  return grid;
+}
+function _tblSpanOf(cell) {
+  return {
+    rs: Math.max(1, parseInt(cell.getAttribute('rowspan'), 10) || 1),
+    cs: Math.max(1, parseInt(cell.getAttribute('colspan'), 10) || 1)
+  };
+}
+function _tblCellPos(grid, cell) {
+  for (let r = 0; r < grid.length; r++) {
+    for (let c = 0; c < grid[r].length; c++) {
+      const e = grid[r][c];
+      if (e && e.cell === cell) {
+        const s = _tblSpanOf(cell);
+        return { r: r, c: c, rs: s.rs, cs: s.cs };
+      }
+    }
+  }
+  return null;
+}
+function _tblCellOfNode(node) {
+  if (!node) return null;
+  const el = node.nodeType === 1 ? node : node.parentElement;
+  if (!el || !el.closest) return null;
+  const cell = el.closest('td,th');
+  if (!cell) return null;
+  const table = cell.closest('table');
+  return table ? { cell: cell, table: table } : null;
+}
+function _tblPosOfCell(table, cell) {
+  const p = _tblCellPos(_tblGrid(table), cell);
+  return p ? { table: table, r: p.r, c: p.c } : null;
+}
+
+// ---- 单元格矩形选区（拖选 / Shift 点选）----
+function _tblRectOfSel(sel) {
+  return {
+    r0: Math.min(sel.anchor.r, sel.focus.r), r1: Math.max(sel.anchor.r, sel.focus.r),
+    c0: Math.min(sel.anchor.c, sel.focus.c), c1: Math.max(sel.anchor.c, sel.focus.c)
+  };
+}
+function _tblClearSelPaint() {
+  document.querySelectorAll('.editable td.ptoe-cell-sel,.editable th.ptoe-cell-sel').forEach(function (el) {
+    el.classList.remove('ptoe-cell-sel');
+  });
+}
+function _tblPaintSel() {
+  _tblClearSelPaint();
+  if (!_tblSel || !_tblSel.table || !_tblSel.table.isConnected) return;
+  const rect = _tblRectOfSel(_tblSel);
+  if (rect.r0 === rect.r1 && rect.c0 === rect.c1) return; // 单格不画高亮（避免干扰光标拖选文字）
+  const grid = _tblGrid(_tblSel.table);
+  const seen = [];
+  for (let r = rect.r0; r <= rect.r1; r++) {
+    for (let c = rect.c0; c <= rect.c1; c++) {
+      const e = grid[r] && grid[r][c];
+      if (e && seen.indexOf(e.cell) < 0) { seen.push(e.cell); e.cell.classList.add('ptoe-cell-sel'); }
+    }
+  }
+}
+document.addEventListener('mousedown', function (e) {
+  if (mdMode || !e.target || !e.target.closest) return;
+  if (e.button !== 0) return; // 只认左键起手拖选单元格（中键/右键不参与）
+  if (e.target.closest('#tblBar,#tblMenu,#tblResizeLayer,#tblSizeModalBg')) return;
+  const hit = _tblCellOfNode(e.target);
+  if (!hit) { if (_tblSel) { _tblSel = null; _tblClearSelPaint(); } return; }
+  const p = _tblPosOfCell(hit.table, hit.cell);
+  if (!p) return;
+  if (e.shiftKey && _tblSel && _tblSel.table === hit.table) {
+    _tblSel = { table: hit.table, anchor: _tblSel.anchor, focus: { r: p.r, c: p.c } };
+  } else {
+    _tblSel = { table: hit.table, anchor: { r: p.r, c: p.c }, focus: { r: p.r, c: p.c } };
+  }
+  _tblPaintSel();
+}, true);
+document.addEventListener('mousemove', function (e) {
+  if (mdMode || !_tblSel || e.buttons !== 1) return;
+  const hit = _tblCellOfNode(e.target);
+  if (!hit || hit.table !== _tblSel.table) return;
+  const p = _tblPosOfCell(hit.table, hit.cell);
+  if (!p) return;
+  if (_tblSel.focus.r !== p.r || _tblSel.focus.c !== p.c) {
+    _tblSel.focus = { r: p.r, c: p.c };
+    _tblPaintSel();
+  }
+});
+
+// ---- 结构操作：拆分 / 合并 ----
+function _tblAlignClasses() {
+  return ['ptoe-align-left', 'ptoe-align-center', 'ptoe-align-right', 'ptoe-vtop', 'ptoe-vmid', 'ptoe-vbot'];
+}
+function _tblCopyAlignClasses(src, dst) {
+  _tblAlignClasses().forEach(function (c) { if (src.classList.contains(c)) dst.classList.add(c); });
+}
+// 列 col 在某行 tr 里的插入下标（考虑本行前置 colspan）
+function _tblInsertIdxForCol(tr, col) {
+  let c = 0;
+  const kids = Array.prototype.slice.call(tr.children);
+  for (let i = 0; i < kids.length; i++) {
+    if (c >= col) return i;
+    c += Math.max(1, parseInt(kids[i].getAttribute('colspan'), 10) || 1);
+  }
+  return kids.length;
+}
+// 列 col 对应的子节点下标；该行无此列（被上方 rowspan 占用）→ -1
+function _tblColChildIdx(tr, col) {
+  let c = 0;
+  const kids = Array.prototype.slice.call(tr.children);
+  for (let i = 0; i < kids.length; i++) {
+    if (c === col) return i;
+    if (c > col) return -1;
+    c += Math.max(1, parseInt(kids[i].getAttribute('colspan'), 10) || 1);
+  }
+  return -1;
+}
+// 拆分：把 cell 还原成 rs×cs 个 1×1 单元格（内容留在左上格）。无跨格 → false
+function _tblSplitCell(table, cell) {
+  if (!cell || !cell.parentNode) return false;
+  const s = _tblSpanOf(cell);
+  if (s.rs === 1 && s.cs === 1) return false;
+  const grid = _tblGrid(table);
+  const pos = _tblCellPos(grid, cell);
+  if (!pos) return false;
+  const trs = _tblTrsOf(table);
+  const tr = cell.parentNode;
+  const tag = cell.tagName.toLowerCase();
+  for (let k = 1; k < s.cs; k++) {
+    const nc = document.createElement(tag);
+    _tblCopyAlignClasses(cell, nc);
+    tr.insertBefore(nc, cell.nextSibling);
+  }
+  for (let dr = 1; dr < s.rs; dr++) {
+    const tr2 = trs[pos.r + dr];
+    if (!tr2) break;
+    const tag2 = (tr2.parentNode && tr2.parentNode.tagName === 'THEAD') ? 'th' : 'td';
+    const at = _tblInsertIdxForCol(tr2, pos.c);
+    for (let k = 0; k < s.cs; k++) {
+      const nc = document.createElement(tag2);
+      _tblCopyAlignClasses(cell, nc);
+      tr2.insertBefore(nc, tr2.children[at + k] || null);
+    }
+  }
+  cell.removeAttribute('rowspan');
+  cell.removeAttribute('colspan');
+  return true;
+}
+// 把矩形内所有跨格先拆成 1×1，保证矩形是干净网格
+function _tblUnmergeRect(table, r0, c0, r1, c1) {
+  let guard = 0;
+  for (;;) {
+    if (guard++ > 800) break;
+    const g = _tblGrid(table);
+    let hit = null;
+    for (let r = r0; r <= r1 && !hit; r++) {
+      for (let c = c0; c <= c1; c++) {
+        const e = g[r] && g[r][c];
+        if (e && (_tblSpanOf(e.cell).rs > 1 || _tblSpanOf(e.cell).cs > 1)) { hit = e.cell; break; }
+      }
+    }
+    if (!hit) break;
+    if (!_tblSplitCell(table, hit)) break;
+  }
+}
+function _tblMerge() {
+  if (!_tblKey) return;
+  const table = _tblKey.table;
+  if (!_tblSel || _tblSel.table !== table) {
+    showToast('请先在表格内拖选，或按住 Shift 点选要合并的多个单元格', 'warn');
     return;
   }
-  // 结构/对齐操作后重定位操作条（cell 可能已换/被删）
-  if (_tblKey && _tblKey.table && _tblKey.table.isConnected) {
-    if (!_tblKey.cell.isConnected) _tblKey.cell = _tblKey.table.querySelector('td,th');
-    if (_tblKey.cell) showTblBar(); else hideTblBar();
-  } else hideTblBar();
+  const rect = _tblRectOfSel(_tblSel);
+  if (rect.r0 === rect.r1 && rect.c0 === rect.c1) {
+    showToast('请选择两个及以上单元格再合并', 'warn');
+    return;
+  }
+  const r0 = rect.r0, c0 = rect.c0, r1 = rect.r1, c1 = rect.c1;
+  _tblUnmergeRect(table, r0, c0, r1, c1);
+  const g = _tblGrid(table);
+  const rows = [];
+  for (let r = r0; r <= r1; r++) {
+    const cur = [];
+    for (let c = c0; c <= c1; c++) {
+      const e = g[r] && g[r][c];
+      if (e && cur.indexOf(e.cell) < 0) cur.push(e.cell);
+    }
+    rows.push(cur);
+  }
+  const first = rows[0] && rows[0][0];
+  if (!first) return;
+  const texts = [];
+  rows.forEach(function (row) {
+    row.forEach(function (cell) {
+      if (cell !== first && /[^\s]/.test(cell.textContent)) texts.push(cell.innerHTML);
+    });
+  });
+  rows.forEach(function (row) {
+    row.forEach(function (cell) { if (cell !== first && cell.parentNode) cell.parentNode.removeChild(cell); });
+  });
+  const rs = r1 - r0 + 1, cs = c1 - c0 + 1;
+  if (cs > 1) first.setAttribute('colspan', String(cs)); else first.removeAttribute('colspan');
+  if (rs > 1) first.setAttribute('rowspan', String(rs)); else first.removeAttribute('rowspan');
+  if (texts.length) {
+    const had = /[^\s]/.test(first.textContent);
+    first.innerHTML = (had ? first.innerHTML + ' ' : '') + texts.join(' ');
+  }
+  _tblSel = null;
+  _tblClearSelPaint();
+  _tblKey.cell = first;
+}
+function _tblSplit() {
+  if (!_tblKey) return;
+  const table = _tblKey.table;
+  let did = false;
+  if (_tblSel && _tblSel.table === table) {
+    const rect = _tblRectOfSel(_tblSel);
+    if (rect.r0 !== rect.r1 || rect.c0 !== rect.c1) {
+      const g = _tblGrid(table);
+      const seen = [];
+      for (let r = rect.r0; r <= rect.r1; r++) {
+        for (let c = rect.c0; c <= rect.c1; c++) {
+          const e = g[r] && g[r][c];
+          if (e && seen.indexOf(e.cell) < 0) seen.push(e.cell);
+        }
+      }
+      seen.forEach(function (cell) { if (_tblSplitCell(table, cell)) did = true; });
+      _tblSel = null;
+      _tblClearSelPaint();
+    }
+  }
+  if (!did && !_tblSplitCell(table, _tblKey.cell)) {
+    showToast('当前单元格未合并，无需拆分', 'warn');
+  }
+}
+
+// ---- 结构操作：插入 / 移动行列、表头 ----
+function _tblInThead(cell) {
+  const tr = cell && cell.closest('tr');
+  return !!(tr && tr.parentNode && tr.parentNode.tagName === 'THEAD');
+}
+function _tblGridWidth(grid) {
+  let n = 0;
+  (grid[0] || []).forEach(function (e) { if (e && e.c0 + 1 > n) n = e.c0 + 1; });
+  return n;
+}
+// 全表最大列数（含非首行、按 colspan 展开）——修复残表时以它为基准
+function _tblGridWidthAll(grid) {
+  let n = 0;
+  (grid || []).forEach(function (row) {
+    (row || []).forEach(function (e) {
+      if (!e || !e.cell) return;
+      const w = e.c0 + _tblSpanOf(e.cell).cs;
+      if (w > n) n = w;
+    });
+  });
+  return n;
+}
+// 修复残表：补齐个别缺失的单元格，以及 rowspan 越界导致的缺行。
+// 「个别单元格缺失」多来自导入/手工编辑：某行少一格、或 rowspan 比实际行数长。
+// 逐格补插并每次重算 grid（插入会改变后续列位），上限防死循环。
+function _tblRepairCells(table) {
+  if (!table) return 0;
+  let added = 0;
+  for (let guard = 0; guard < 4000; guard++) {
+    const grid = _tblGrid(table);
+    const trs = _tblTrsOf(table);
+    const nCols = Math.min(TBL_MAX_C, Math.max(1, _tblGridWidthAll(grid)));
+    // ① rowspan 越界 → 表格实际缺行：先补一个【空行】，再由步骤 ② 按占用情况
+    // 补足空格。若此处直接填满 nCols 个格，会与上方 rowspan 覆盖的列错位多出一列。
+    if (grid.length > trs.length) {
+      if (trs.length >= TBL_MAX_R) break; // 触顶不再补行，避免行数失控
+      const lastTr = trs[trs.length - 1];
+      if (!lastTr || !lastTr.parentNode) break;
+      const tr = document.createElement('tr');
+      lastTr.parentNode.insertBefore(tr, lastTr.nextSibling);
+      added++;
+      continue;
+    }
+    // ② 某行缺格 → 在对应列位补一个空格（被上方 rowspan 占用的位置在 grid 中已有值，自动跳过）
+    let done = false;
+    for (let r = 0; r < trs.length && !done; r++) {
+      const tr = trs[r];
+      if (!tr.parentNode) continue;
+      for (let c = 0; c < nCols; c++) {
+        if (grid[r] && grid[r][c]) continue;
+        const inHead = tr.parentNode.tagName === 'THEAD';
+        const cell = document.createElement(inHead ? 'th' : 'td');
+        const at = _tblInsertIdxForCol(tr, c);
+        tr.insertBefore(cell, tr.children[at] || null);
+        added++;
+        done = true;
+        break;
+      }
+    }
+    if (!done) break;
+  }
+  return added;
+}
+function _tblInsertRow(where) {
+  if (!_tblKey) return;
+  const table = _tblKey.table;
+  const trs = _tblTrsOf(table);
+  if (trs.length >= TBL_MAX_R) { showToast('表格最多 ' + TBL_MAX_R + ' 行', 'warn'); return; }
+  const grid = _tblGrid(table);
+  const pos = _tblCellPos(grid, _tblKey.cell);
+  if (!pos) return;
+  const curTr = _tblKey.cell.closest('tr');
+  if (!curTr || !curTr.parentNode) return;
+  const nCols = _tblGridWidth(grid) || 1;
+  const tag = _tblInThead(_tblKey.cell) ? 'th' : 'td';
+  const tr = document.createElement('tr');
+  for (let k = 0; k < nCols; k++) tr.appendChild(document.createElement(tag));
+  if (where === 'above') curTr.parentNode.insertBefore(tr, curTr);
+  else curTr.parentNode.insertBefore(tr, curTr.nextSibling);
+}
+function _tblDelRow() {
+  if (!_tblKey) return;
+  if (_tblTrsOf(_tblKey.table).length <= 1) { showToast('至少保留 1 行', 'warn'); return; }
+  const tr = _tblKey.cell.closest('tr');
+  if (!tr || !tr.parentNode) return;
+  if (tr.parentNode.tagName === 'THEAD' && tr.parentNode.querySelectorAll('tr').length === 1) {
+    tr.parentNode.parentNode.removeChild(tr.parentNode);
+  } else {
+    tr.parentNode.removeChild(tr);
+  }
+}
+function _tblSwapNodes(a, b) {
+  if (!a || !b || a === b || a.parentNode !== b.parentNode) return;
+  const p = a.parentNode;
+  const marker = document.createComment('sw');
+  p.insertBefore(marker, b);
+  p.insertBefore(b, a);
+  p.insertBefore(a, marker);
+  p.removeChild(marker);
+}
+function _tblMoveRow(dir) {
+  if (!_tblKey) return;
+  const tr = _tblKey.cell.closest('tr');
+  if (!tr) return;
+  const sib = dir < 0 ? tr.previousElementSibling : tr.nextElementSibling;
+  if (!sib || sib.tagName !== 'TR') { showToast(dir < 0 ? '已在最上行' : '已在最下行', 'warn'); return; }
+  _tblSwapNodes(tr, sib);
+}
+function _tblInsertCol(where) {
+  if (!_tblKey) return;
+  const table = _tblKey.table;
+  const grid = _tblGrid(table);
+  if (_tblGridWidth(grid) >= TBL_MAX_C) { showToast('表格最多 ' + TBL_MAX_C + ' 列', 'warn'); return; }
+  const pos = _tblCellPos(grid, _tblKey.cell);
+  if (!pos) return;
+  const at = pos.c + (where === 'right' ? pos.cs : 0);
+  _tblTrsOf(table).forEach(function (tr) {
+    const inHead = tr.parentNode && tr.parentNode.tagName === 'THEAD';
+    const td = document.createElement(inHead ? 'th' : 'td');
+    const idx = _tblInsertIdxForCol(tr, at);
+    tr.insertBefore(td, tr.children[idx] || null);
+  });
+}
+function _tblDelCol() {
+  if (!_tblKey) return;
+  const table = _tblKey.table;
+  const grid = _tblGrid(table);
+  if (_tblGridWidth(grid) <= 1) { showToast('至少保留 1 列', 'warn'); return; }
+  const pos = _tblCellPos(grid, _tblKey.cell);
+  if (!pos) return;
+  const trs = _tblTrsOf(table);
+  for (let r = 0; r < trs.length; r++) {
+    const e = grid[r] && grid[r][pos.c];
+    if (e && e.c0 === pos.c && e.cell.parentNode) e.cell.parentNode.removeChild(e.cell);
+  }
+}
+function _tblMoveCol(dir) {
+  if (!_tblKey) return;
+  const table = _tblKey.table;
+  const grid = _tblGrid(table);
+  const pos = _tblCellPos(grid, _tblKey.cell);
+  if (!pos) return;
+  const nCols = _tblGridWidth(grid);
+  const target = dir < 0 ? pos.c - 1 : pos.c + (pos.cs > 1 ? pos.cs : 1);
+  if (target < 0 || target >= nCols) { showToast(dir < 0 ? '已在最左列' : '已在最右列', 'warn'); return; }
+  _tblTrsOf(table).forEach(function (tr) {
+    const iA = _tblColChildIdx(tr, pos.c);
+    const iB = _tblColChildIdx(tr, target);
+    if (iA >= 0 && iB >= 0 && iA !== iB) _tblSwapNodes(tr.children[iA], tr.children[iB]);
+  });
+}
+function _tblToggleHeader() {
+  if (!_tblKey) return;
+  const table = _tblKey.table;
+  const thead = table.querySelector('thead');
+  if (thead) {
+    const tbody = table.querySelector('tbody') || table;
+    Array.prototype.slice.call(thead.querySelectorAll('tr')).forEach(function (tr) {
+      Array.prototype.slice.call(tr.querySelectorAll('th')).forEach(function (th) {
+        const td = document.createElement('td');
+        td.innerHTML = th.innerHTML;
+        _tblCopyAlignClasses(th, td);
+        tr.replaceChild(td, th);
+      });
+      tbody.insertBefore(tr, tbody.firstChild);
+    });
+    if (thead.parentNode) thead.parentNode.removeChild(thead);
+  } else {
+    const firstTr = table.querySelector('tr');
+    if (!firstTr) return;
+    const head = document.createElement('thead');
+    Array.prototype.slice.call(firstTr.querySelectorAll('td')).forEach(function (td) {
+      const th = document.createElement('th');
+      th.innerHTML = td.innerHTML;
+      _tblCopyAlignClasses(td, th);
+      firstTr.replaceChild(th, td);
+    });
+    head.appendChild(firstTr);
+    table.insertBefore(head, table.firstChild);
+  }
+  _tblKey.cell = table.querySelector('td,th');
+  showTblBar();
+}
+
+// ---- 尺寸：列宽 / 行高 / 均分 / 重置 ----
+function _tblEnsureFixed(table, on) {
+  table.style.tableLayout = on ? 'fixed' : '';
+  if (!table.getAttribute('style')) table.removeAttribute('style');
+}
+function _tblSetColWidthPct(table, col, pct) {
+  const grid = _tblGrid(table);
+  if (!(grid[0] && grid[0][col])) return false;
+  pct = Number(pct);
+  if (!isFinite(pct)) return false;
+  pct = Math.round(Math.max(1, Math.min(100, pct)) * 10) / 10; // 保留 1 位小数，拖拽更平滑
+  _tblEnsureFixed(table, true);
+  const trs = _tblTrsOf(table);
+  const seen = [];
+  for (let r = 0; r < trs.length; r++) {
+    const e = grid[r] && grid[r][col];
+    if (e && e.cell && seen.indexOf(e.cell) < 0) { seen.push(e.cell); e.cell.style.width = pct + '%'; }
+  }
+  return true;
+}
+// 快照当前各列像素宽 → 归一化百分比数组（取首行；colspan 按均分折算到其覆盖的各列）。
+// 拖拽全程以该快照为基准做增量计算，杜绝「每次 move 读取已被改写的 DOM 宽度再叠加 delta」
+// 的累加式暴涨（旧实现列宽按指数放大、彻底失控的根因）。
+function _tblSnapshotColPcts(table) {
+  const grid = _tblGrid(table);
+  const nCols = Math.max(1, _tblGridWidthAll(grid));
+  const tW = table.getBoundingClientRect().width || 1;
+  const pcts = new Array(nCols).fill(0);
+  const seen = [];
+  (grid[0] || []).forEach(function (e) {
+    if (!e || !e.cell || seen.indexOf(e.cell) >= 0) return;
+    seen.push(e.cell);
+    const s = _tblSpanOf(e.cell);
+    const w = e.cell.getBoundingClientRect().width / s.cs;
+    for (let k = 0; k < s.cs && e.c0 + k < nCols; k++) pcts[e.c0 + k] = (w / tW) * 100;
+  });
+  const avg = (nCols ? (pcts.reduce(function (a, b) { return a + b; }, 0) / nCols) : 0) || (100 / nCols);
+  for (let c = 0; c < nCols; c++) if (!pcts[c]) pcts[c] = avg; // 首行缺列的兜底
+  const sum = pcts.reduce(function (a, b) { return a + b; }, 0) || 1;
+  return pcts.map(function (p) { return (p / sum) * 100; });
+}
+// 按列百分比数组写入所有单元格（colspan 单元格取所覆盖列之和，保持几何一致）
+function _tblApplyColPcts(table, pcts) {
+  if (!pcts || !pcts.length) return;
+  _tblEnsureFixed(table, true);
+  const grid = _tblGrid(table);
+  const trs = _tblTrsOf(table);
+  const seen = [];
+  for (let r = 0; r < trs.length; r++) {
+    const row = grid[r] || [];
+    for (let c = 0; c < row.length; c++) {
+      const e = row[c];
+      if (!e || !e.cell || seen.indexOf(e.cell) >= 0) continue;
+      if (e.r0 !== r || e.c0 !== c) continue; // 只在单元格左上角处理一次
+      seen.push(e.cell);
+      const s = _tblSpanOf(e.cell);
+      let w = 0;
+      for (let k = 0; k < s.cs; k++) w += (pcts[e.c0 + k] || 0);
+      e.cell.style.width = (Math.round(w * 10) / 10) + '%';
+    }
+  }
+}
+// 各行当前像素高（拖拽行高的基准快照）
+function _tblRowHeightsPx(table) {
+  return _tblTrsOf(table).map(function (tr) { return tr.getBoundingClientRect().height; });
+}
+function _tblSetRowHeight(table, row, num, unit) {
+  const grid = _tblGrid(table);
+  if (!grid[row]) return false;
+  num = Number(num);
+  if (!isFinite(num)) return false;
+  num = Math.round(Math.max(0.5, Math.min(2000, num)) * 100) / 100; // em 允许小数（如 2.5em）
+  const val = num + (unit === 'px' ? 'px' : 'em');
+  const seen = [];
+  for (let c = 0; c < grid[row].length; c++) {
+    const e = grid[row][c];
+    if (e && e.r0 === row && seen.indexOf(e.cell) < 0) { seen.push(e.cell); e.cell.style.height = val; }
+  }
+  return seen.length > 0;
+}
+function _tblDistributeCols(table) {
+  const grid = _tblGrid(table);
+  const cols = _tblGridWidth(grid);
+  if (cols < 1) return;
+  _tblEnsureFixed(table, true);
+  const base = Math.floor(100 / cols);
+  const trs = _tblTrsOf(table);
+  for (let c = 0; c < cols; c++) {
+    const pct = (c === cols - 1) ? (100 - base * (cols - 1)) : base;
+    const seen = [];
+    for (let r = 0; r < trs.length; r++) {
+      const e = grid[r] && grid[r][c];
+      if (e && e.cell && seen.indexOf(e.cell) < 0) { seen.push(e.cell); e.cell.style.width = pct + '%'; }
+    }
+  }
+}
+function _tblResetSizes(table) {
+  _tblEnsureFixed(table, false);
+  table.querySelectorAll('td,th').forEach(function (cell) {
+    cell.style.width = ''; cell.style.height = ''; cell.style.verticalAlign = '';
+    if (!cell.getAttribute('style')) cell.removeAttribute('style');
+  });
+}
+function _tblVAlign(dir) {
+  if (!_tblKey) return;
+  const cell = _tblKey.cell;
+  const map = { top: 'ptoe-vtop', middle: 'ptoe-vmid', bottom: 'ptoe-vbot' };
+  const cls = map[dir];
+  let cur = '';
+  Object.keys(map).forEach(function (k) { if (cell.classList.contains(map[k])) cur = map[k]; });
+  Object.keys(map).forEach(function (k) { cell.classList.remove(map[k]); });
+  if (cur !== cls) cell.classList.add(cls); // 点当前生效值 = 取消
+}
+
+// ---- 尺寸拖拽手柄层（列/行边界） ----
+function _ensureTblResizeLayer() {
+  if (_tblResizeLayer) return _tblResizeLayer;
+  _tblResizeLayer = document.getElementById('tblResizeLayer') || document.createElement('div');
+  if (!_tblResizeLayer.id) { _tblResizeLayer.id = 'tblResizeLayer'; document.body.appendChild(_tblResizeLayer); }
+  _tblResizeLayer.addEventListener('mousedown', function (ev) {
+    const h = ev.target.closest ? ev.target.closest('.tbl-col-h,.tbl-row-h') : null;
+    if (!h || !_tblKey || !_tblKey.table) return;
+    if (ev.button !== 0) return; // 只认左键：中键/右键落在手柄上也不起手（2026-10）
+    ev.preventDefault();
+    ev.stopPropagation();
+    const table = _tblKey.table;
+    const i = _tblKey.i;
+    const tRect = table.getBoundingClientRect();
+    const before = histBegin('表格-尺寸', [i]);
+    inDiscreteOp = true;
+    const isCol = h.classList.contains('tbl-col-h');
+    const idx = parseInt(isCol ? h.dataset.col : h.dataset.row, 10);
+    const start = isCol ? ev.clientX : ev.clientY;
+    const origin = tRect.width || 1;
+    // 关键：拖拽开始即一次性快照基准（列宽百分比数组 / 各行像素高），
+    // 之后所有帧都基于快照 + 累计 delta 计算。旧实现每帧重读「已被改写的 DOM
+    // 宽度」再叠加当帧 delta，形成累加式正反馈 → 列宽/行高指数暴涨、无法控制。
+    const snapCols = isCol ? _tblSnapshotColPcts(table) : null;
+    const snapRows = isCol ? null : _tblRowHeightsPx(table);
+    const MIN_PCT = 4, MIN_ROW = 10;
+    function onMove(e2) {
+      if (e2.buttons !== 1) return; // 拖拽中左键松开 / 按下中·右键 → 冻结（只认左键）
+      const delta = (isCol ? e2.clientX : e2.clientY) - start;
+      if (isCol) {
+        if (!snapCols || idx < 0 || idx + 1 >= snapCols.length) return;
+        const pair = snapCols[idx] + snapCols[idx + 1]; // 相邻两列总占比保持不变
+        let a = snapCols[idx] + (delta / origin) * 100;
+        let b = pair - a;
+        if (a < MIN_PCT) { a = MIN_PCT; b = pair - MIN_PCT; }
+        if (b < MIN_PCT) { b = MIN_PCT; a = pair - MIN_PCT; }
+        const next = snapCols.slice();
+        next[idx] = a; next[idx + 1] = b;
+        _tblApplyColPcts(table, next);
+      } else {
+        if (!snapRows || idx < 0 || idx >= snapRows.length) return;
+        _tblSetRowHeight(table, idx, Math.max(MIN_ROW, snapRows[idx] + delta), 'px');
+      }
+      _tblShowResizeLayer();
+    }
+    function onUp(e2) {
+      if (e2 && e2.button !== 0) return; // 中/右键抬起不结束左键拖拽
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      inDiscreteOp = false;
+      const ed = _tblKey ? _tblKey.ed : null;
+      if (ed) { syncContent(ed); markDirty(i); scheduleRemeasure(i); }
+      histEnd(before, '表格-尺寸');
+      _tblRepositionBar(); // 尺寸变化后操作条/手柄层需按新几何重新定位
+    }
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+  return _tblResizeLayer;
+}
+function _tblHideResizeLayer() {
+  if (!_tblResizeLayer) return;
+  _tblResizeLayer.style.display = 'none';
+  _tblResizeLayer.innerHTML = ''; // 丢弃旧手柄：残留节点即使不可见也不该留在 DOM
+  _tblResizeFor = null;
+}
+function _tblShowResizeLayer() {
+  if (mdMode || !_tblKey || !_tblKey.table || !_tblKey.table.isConnected) { _tblHideResizeLayer(); return; }
+  const table = _tblKey.table;
+  const layer = _ensureTblResizeLayer();
+  const tRect = table.getBoundingClientRect();
+  if (tRect.width <= 0 || tRect.height <= 0) { _tblHideResizeLayer(); return; }
+  layer.innerHTML = '';
+  layer.style.display = 'block';
+  _tblResizeFor = table;
+  layer.style.left = tRect.left + 'px';
+  layer.style.top = tRect.top + 'px';
+  layer.style.width = tRect.width + 'px';
+  layer.style.height = tRect.height + 'px';
+  const grid = _tblGrid(table);
+  const nCols = _tblGridWidth(grid);
+  for (let c = 0; c < nCols - 1; c++) {
+    const e = grid[0] && grid[0][c];
+    if (!e || !e.cell) continue;
+    const cr = e.cell.getBoundingClientRect();
+    const h = document.createElement('div');
+    h.className = 'tbl-col-h';
+    h.style.left = (cr.right - tRect.left) + 'px';
+    h.style.top = '0px';
+    h.style.height = tRect.height + 'px';
+    h.dataset.col = String(c);
+    h.title = '拖动调整第 ' + (c + 1) + ' 列列宽';
+    layer.appendChild(h);
+  }
+  for (let r = 0; r < grid.length - 1; r++) {
+    const e = grid[r] && grid[r][0];
+    if (!e || !e.cell) continue;
+    const cr = e.cell.getBoundingClientRect();
+    const h = document.createElement('div');
+    h.className = 'tbl-row-h';
+    h.style.top = (cr.bottom - tRect.top) + 'px';
+    h.style.left = '0px';
+    h.style.width = tRect.width + 'px';
+    h.dataset.row = String(r);
+    h.title = '拖动调整第 ' + (r + 1) + ' 行行高';
+    layer.appendChild(h);
+  }
+}
+
+// ---- 「更多」菜单 / 表格内右键菜单（同源） ----
+const TBL_MENU_ITEMS = [
+  { head: '行' },
+  { op: 'insertrowabove', label: '上方插入行' },
+  { op: 'insertrowbelow', label: '下方插入行' },
+  { op: 'moverowup', label: '上移本行' },
+  { op: 'moverowdown', label: '下移本行' },
+  { op: 'delrow', label: '删除本行', danger: true },
+  { sep: true },
+  { head: '列' },
+  { op: 'insertcolleft', label: '左侧插入列' },
+  { op: 'insertcolright', label: '右侧插入列' },
+  { op: 'movecolleft', label: '左移本列' },
+  { op: 'movecolright', label: '右移本列' },
+  { op: 'delcol', label: '删除本列', danger: true },
+  { sep: true },
+  { head: '单元格' },
+  { op: 'merge', label: '合并选中单元格' },
+  { op: 'split', label: '拆分单元格' },
+  { op: 'colwidth', label: '设置列宽…' },
+  { op: 'rowheight', label: '设置行高…' },
+  { op: 'distribute', label: '均分列宽' },
+  { op: 'reset', label: '重置尺寸' },
+  { op: 'repair', label: '修复缺失单元格' },
+  { sep: true },
+  { head: '对齐与表头' },
+  { op: 'valigntop', label: '垂直：顶' },
+  { op: 'valignmiddle', label: '垂直：居中' },
+  { op: 'valignbottom', label: '垂直：底' },
+  { op: 'header', label: '首行设为/取消表头' },
+  { sep: true },
+  { op: 'deltable', label: '删除表格', danger: true }
+];
+function _ensureTblMenu() {
+  if (_tblMenuEl) return _tblMenuEl;
+  _tblMenuEl = document.getElementById('tblMenu') || document.createElement('div');
+  if (!_tblMenuEl.id) { _tblMenuEl.id = 'tblMenu'; document.body.appendChild(_tblMenuEl); }
+  _tblMenuEl.addEventListener('click', function (e) {
+    const btn = e.target.closest ? e.target.closest('button') : null;
+    if (!btn) return;
+    _tblDoOp(btn.dataset.tblOp);
+  });
+  // 与操作条同理：保住编辑区选区，避免点菜单项时 _tblKey 被误清
+  _tblMenuEl.addEventListener('mousedown', function (e) { e.preventDefault(); });
+  return _tblMenuEl;
+}
+function _tblMenuOpen(x, y) {
+  if (!_tblKey || !_tblKey.table) return;
+  const cell = _tblKey.cell;
+  const el = _ensureTblMenu();
+  el.innerHTML = '';
+  const vmap = { valigntop: 'ptoe-vtop', valignmiddle: 'ptoe-vmid', valignbottom: 'ptoe-vbot' };
+  TBL_MENU_ITEMS.forEach(function (it) {
+    if (it.sep) {
+      const s = document.createElement('div');
+      s.className = 'tbl-menu-sep';
+      el.appendChild(s);
+      return;
+    }
+    if (it.head) {
+      const hdiv = document.createElement('div');
+      hdiv.className = 'tbl-menu-head';
+      hdiv.textContent = it.head;
+      el.appendChild(hdiv);
+      return;
+    }
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.dataset.tblOp = it.op;
+    b.textContent = it.label;
+    if (it.danger) b.className = 'danger';
+    if (vmap[it.op] && cell && cell.classList.contains(vmap[it.op])) b.classList.add('active');
+    if (it.op === 'valigntop') b.title = '单元格内容顶部对齐';
+    if (it.op === 'valignmiddle') b.title = '单元格内容垂直居中';
+    if (it.op === 'valignbottom') b.title = '单元格内容底部对齐';
+    el.appendChild(b);
+  });
+  el.style.display = 'block';
+  el.style.left = Math.max(8, Math.min(x, window.innerWidth - el.offsetWidth - 8)) + 'px';
+  el.style.top = Math.max(8, Math.min(y, window.innerHeight - el.offsetHeight - 8)) + 'px';
+}
+function _tblMenuClose() {
+  if (_tblMenuEl) _tblMenuEl.style.display = 'none';
+}
+document.addEventListener('contextmenu', function (e) {
+  if (mdMode || !e.target || !e.target.closest) return;
+  if (e.target.closest('#tblMenu')) return;
+  const hit = _tblCellOfNode(e.target);
+  if (!hit) return;
+  e.preventDefault();
+  const row = hit.cell.closest('.page-row');
+  const ed = hit.cell.closest('.editable');
+  _tblKey = { i: row ? Number(row.dataset.i) : -1, cell: hit.cell, table: hit.table, ed: ed };
+  showTblBar();
+  _tblShowResizeLayer();
+  _tblMenuOpen(e.clientX, e.clientY);
 });
+document.addEventListener('mousedown', function (e) {
+  if (_tblMenuEl && _tblMenuEl.style.display === 'block') {
+    if (!(e.target.closest && e.target.closest('#tblMenu'))) _tblMenuClose();
+  }
+}, true);
+
+// ---- 尺寸弹窗 ----
+function _ensureTblSizeModal() {
+  if (_tblSizeModal) return _tblSizeModal;
+  _tblSizeModal = document.getElementById('tblSizeModalBg');
+  if (!_tblSizeModal || _tblSizeAttached) return _tblSizeModal;
+  _tblSizeAttached = true;
+  const close = document.getElementById('tblSizeCancel');
+  const cancel = document.getElementById('tblSizeCancelBtn');
+  const apply = document.getElementById('tblSizeApply');
+  if (close) close.addEventListener('click', _tblCloseSizeDialog);
+  if (cancel) cancel.addEventListener('click', _tblCloseSizeDialog);
+  if (apply) apply.addEventListener('click', _tblApplySizeDialog);
+  _tblSizeModal.addEventListener('mousedown', function (e) { if (e.target === _tblSizeModal) _tblCloseSizeDialog(); });
+  const wIn = document.getElementById('tblSizeColWidth');
+  const hIn = document.getElementById('tblSizeRowHeight');
+  [wIn, hIn].forEach(function (inp) {
+    if (inp) inp.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); _tblApplySizeDialog(); }
+      else if (e.key === 'Escape') { e.preventDefault(); _tblCloseSizeDialog(); }
+    });
+  });
+  return _tblSizeModal;
+}
+function _tblCloseSizeDialog() {
+  if (_tblSizeModal) _tblSizeModal.style.display = 'none';
+}
+function _tblOpenSizeDialog(kind) {
+  if (!_tblKey) return;
+  const bg = _ensureTblSizeModal();
+  if (!bg) return;
+  _tblSizeKind = kind === 'row' ? 'row' : 'col';
+  const grid = _tblGrid(_tblKey.table);
+  _tblSizePos = _tblCellPos(grid, _tblKey.cell);
+  const nCols = _tblGridWidth(grid);
+  const nRows = _tblTrsOf(_tblKey.table).length;
+  const hint = document.getElementById('tblSizeHint');
+  if (hint && _tblSizePos) {
+    hint.textContent = '当前：第 ' + (_tblSizePos.r + 1) + ' 行 / 第 ' + (_tblSizePos.c + 1) + ' 列（表共 ' + nRows + ' 行 ' + nCols + ' 列）';
+  }
+  const wIn = document.getElementById('tblSizeColWidth');
+  const hIn = document.getElementById('tblSizeRowHeight');
+  const unit = document.getElementById('tblSizeRowUnit');
+  const cur = _tblKey.cell.style;
+  if (wIn) wIn.value = (cur.width && /%$/.test(cur.width)) ? String(parseFloat(cur.width)) : '';
+  const m = /^(\d+(?:\.\d+)?)(em|px)$/.exec(cur.height || '');
+  if (hIn) hIn.value = m ? m[1] : '';
+  if (unit) unit.value = m ? m[2] : 'em';
+  bg.style.display = 'flex';
+  setTimeout(function () { if (_tblSizeKind === 'row') { if (hIn) hIn.focus(); } else { if (wIn) wIn.focus(); } }, 0);
+}
+function _tblApplySizeDialog() {
+  const table = _tblKey && _tblKey.table;
+  const wIn = document.getElementById('tblSizeColWidth');
+  const hIn = document.getElementById('tblSizeRowHeight');
+  const unit = document.getElementById('tblSizeRowUnit');
+  const wv = wIn ? wIn.value : '';
+  const hv = hIn ? hIn.value : '';
+  const u = unit ? unit.value : 'em';
+  const pos = _tblSizePos;
+  _tblCloseSizeDialog();
+  if (!table || !table.isConnected || !pos) return;
+  if (wv === '' && hv === '') return;
+  const i = _tblKey.i;
+  _tblOperate('表格-尺寸', function () {
+    if (wv !== '') _tblSetColWidthPct(table, pos.c, parseFloat(wv));
+    if (hv !== '') _tblSetRowHeight(table, pos.r, parseFloat(hv), u);
+  }, i);
+  showTblBar();
+  _tblShowResizeLayer();
+}
+
+// ---- 悬浮条与「更多」菜单统一分派 ----
+function _tblRepositionBar() {
+  if (_tblKey && _tblKey.table && _tblKey.table.isConnected && _tblKey.cell && _tblKey.cell.isConnected) {
+    showTblBar(); // 内部按需刷新列/行拖拽手柄层
+  } else {
+    // 目标表格已失效：不论此前是否可见，浮层一律收起（hideTblBar 同时收手柄层与菜单）
+    hideTblBar();
+  }
+}
+function _tblDoOp(op) {
+  if (!op) return;
+  if (mdMode) { showToast('Markdown 模式不支持表格结构操作', 'warn'); return; }
+  if (!_tblKey || !_tblKey.table || !_tblKey.table.isConnected) { hideTblBar(); return; }
+  const i = _tblKey.i;
+  const run = function (label, fn) { _tblOperate(label, fn, i); };
+  _tblMenuClose();
+  if (op === 'more') {
+    const btn = (tblBar && tblBar.querySelector('[data-tbl-op="more"]')) || tblBar;
+    const r = btn ? btn.getBoundingClientRect() : { left: 40, bottom: 80 };
+    _tblMenuOpen(r.left, r.bottom + 4);
+    return;
+  }
+  if (op === 'colwidth') { _tblOpenSizeDialog('col'); return; }
+  if (op === 'rowheight') { _tblOpenSizeDialog('row'); return; }
+  if (op === 'merge') { run('表格-合并', _tblMerge); }
+  else if (op === 'split') { run('表格-拆分', _tblSplit); }
+  else if (op === 'addrow') { run('表格-加行', _tblAddRow); }
+  else if (op === 'delrow') { run('表格-删行', _tblDelRow); }
+  else if (op === 'insertrowabove') { run('表格-上方插入行', function () { _tblInsertRow('above'); }); }
+  else if (op === 'insertrowbelow') { run('表格-下方插入行', function () { _tblInsertRow('below'); }); }
+  else if (op === 'moverowup') { run('表格-上移行', function () { _tblMoveRow(-1); }); }
+  else if (op === 'moverowdown') { run('表格-下移行', function () { _tblMoveRow(1); }); }
+  else if (op === 'addcol') { run('表格-加列', _tblAddCol); }
+  else if (op === 'delcol') { run('表格-删列', _tblDelCol); }
+  else if (op === 'insertcolleft') { run('表格-左侧插入列', function () { _tblInsertCol('left'); }); }
+  else if (op === 'insertcolright') { run('表格-右侧插入列', function () { _tblInsertCol('right'); }); }
+  else if (op === 'movecolleft') { run('表格-左移列', function () { _tblMoveCol(-1); }); }
+  else if (op === 'movecolright') { run('表格-右移列', function () { _tblMoveCol(1); }); }
+  else if (op === 'distribute') { run('表格-均分列宽', function () { _tblDistributeCols(_tblKey.table); }); }
+  else if (op === 'reset') { run('表格-重置尺寸', function () { _tblResetSizes(_tblKey.table); }); }
+  else if (op === 'repair') {
+    // 补齐缺失单元格/缺行（导入或手工编辑造成的残表）。n 为补齐数量，
+    // 为 0 时 histEnd 会自动丢弃这条空历史（内容未变）。
+    let n = 0;
+    run('表格-修复缺失单元格', function () { n = _tblRepairCells(_tblKey.table); });
+    showToast(n > 0 ? ('已补齐 ' + n + ' 处缺失单元格/行') : '表格结构完整，无需修复', n > 0 ? 'info' : 'warn');
+  }
+  else if (op === 'valigntop') { run('表格-垂直对齐', function () { _tblVAlign('top'); }); }
+  else if (op === 'valignmiddle') { run('表格-垂直对齐', function () { _tblVAlign('middle'); }); }
+  else if (op === 'valignbottom') { run('表格-垂直对齐', function () { _tblVAlign('bottom'); }); }
+  else if (op === 'header') { run('表格-表头', _tblToggleHeader); }
+  else if (op === 'alignleft' || op === 'aligncenter' || op === 'alignright') {
+    run('表格-对齐', function () { _tblAlign(op.slice(5)); });
+  }
+  else if (op === 'deltable') { run('删除表格', _tblDelTable); hideTblBar(); _tblHideResizeLayer(); _tblMenuClose(); return; }
+  // 结构/尺寸操作后重定位操作条与手柄层（cell 可能已换/被删）
+  _tblRepositionBar();
+}
+
+// ---- Tab / Shift+Tab 在单元格间移动（末格补行，仿 Word） ----
+function _tblFocusCell(target) {
+  if (!target) return;
+  const sel = window.getSelection();
+  const r = document.createRange();
+  r.selectNodeContents(target);
+  r.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(r);
+  _tblKey.cell = target;
+  showTblBar();
+  _tblShowResizeLayer();
+}
+function _tblTabMove(back) {
+  if (!_tblKey || !_tblKey.table) return false;
+  const table = _tblKey.table;
+  const cell = _tblKey.cell;
+  const cells = Array.prototype.slice.call(table.querySelectorAll('td,th'));
+  let idx = cells.indexOf(cell);
+  if (idx < 0) return false;
+  if (!back) {
+    if (idx === cells.length - 1) {
+      if (_tblTrsOf(table).length >= TBL_MAX_R) { showToast('表格最多 ' + TBL_MAX_R + ' 行', 'warn'); return false; }
+      const curTr = cell.closest('tr');
+      _tblAddRow();
+      const newTr = curTr ? curTr.nextElementSibling : null;
+      _tblFocusCell(newTr ? newTr.querySelector('td,th') : null);
+      syncContent(_tblKey.ed);
+      markDirty(_tblKey.i);
+      scheduleRemeasure(_tblKey.i);
+      return true;
+    }
+    _tblFocusCell(cells[idx + 1]);
+  } else if (idx > 0) {
+    _tblFocusCell(cells[idx - 1]);
+  }
+  return true;
+}
+host.addEventListener('keydown', function (e) {
+  if (mdMode || e.key !== 'Tab' || e.isComposing) return;
+  if (!_tblKey || !_tblKey.table || !_tblKey.table.isConnected) return;
+  const ed = e.target && e.target.closest ? e.target.closest('.editable') : null;
+  if (!ed || !_tblKey.cell || !ed.contains(_tblKey.cell)) return;
+  e.preventDefault();
+  _tblTabMove(e.shiftKey);
+});
+
+// 窗口尺寸变化时重定位操作条/手柄层（position:fixed 不跟随内容）。
+// 滚动时不做重定位：应用既有的滚动处理器会调用 hideTblBar() 收起这整套浮层，与
+// 「滚动即收起」的既有行为一致。此前既在滚动里重定位、又用 _tblBarVisible 作守卫，
+// 使得 hideTblBar()（滚动/切焦点时调用）之后手柄层成了没人收起的残留浮层
+// —— 正是「滑页后非表格位置出现表格框线」的根因（2026-10 修复）。
+let _tblReposRaf = 0;
+function _tblScheduleRepos() {
+  if (_tblReposRaf) return;
+  _tblReposRaf = window.requestAnimationFrame(function () {
+    _tblReposRaf = 0;
+    if (_tblBarVisible || (_tblResizeLayer && _tblResizeLayer.style.display === 'block')) _tblRepositionBar();
+  });
+}
+window.addEventListener('resize', _tblScheduleRepos);
+
+// ---- 含表格的行参与撑行（默认 .editable{height:0} 不参与 → 表格被裁切/内部滚动） ----
+function _syncTblGrow(ed, i) {
+  if (!ed) return;
+  const row = ed.closest('.page-row');
+  if (!row) return;
+  const want = !!ed.querySelector('table');
+  const had = row.classList.contains('ptoe-has-table');
+  if (want) row.classList.add('ptoe-has-table');
+  else row.classList.remove('ptoe-has-table');
+  if (want !== had) {
+    const idx = (typeof i === 'number' && i >= 0) ? i : Number(row.dataset.i);
+    if (!isNaN(idx)) scheduleRemeasure(idx);
+  }
+}
+// =================== 表格增强 结束 ===================
 
 // 左侧原图裁剪后插入：叠加裁剪层，拖拽选区，确认后 canvas 裁剪为 dataUrl 插入
 function openCrop(row, i) {
@@ -2321,6 +3451,7 @@ function attach(i, opts) {
   row.style.left = '14px'; row.style.right = '14px'; row.style.top = prefixTop(i) + 'px';
   row.style.margin = '0';
   host.appendChild(row);
+  _syncTblGrow(row.querySelector('.editable'), i); // 首次渲染即按内容判定是否含表格
   // 注意：不在 attach 里做滚动补偿——attach 发生在滚动驱动的 updateViewport 中，
   // 且此刻图片多为懒加载未就绪，测量高度偏小，补偿会与翻页手势互相打架。
   // 图片未就绪的行不记录「仅文字」高度：heights[i] 保持未设（走 est 估算），
@@ -2380,7 +3511,7 @@ function updateViewport() {
   if (sy !== _viewportY) { _scrollDir = sy > _viewportY ? 1 : -1; } // 动态方向感知
   if (sy !== _viewportY) { _viewportY = sy; }
   const hostTop = host.getBoundingClientRect().top + window.scrollY;
-  const y = Math.max(0, window.scrollY - hostTop - 60);
+  const y = Math.max(0, window.scrollY - hostTop - VIEW_TOP_OFFSET);
   let lo = 0, hi = pages.length;
   while (lo < hi) { const mid = (lo + hi) >> 1; if (prefixTop(mid) < y) lo = mid + 1; else hi = mid; }
   const viewRows = Math.ceil((window.innerHeight - 140) / (est || 420)) + 1;
@@ -2680,7 +3811,8 @@ function toggleNote(ed) {
   // 2026-09-13 修复：老实现只 toggle 块的 class，导致规则套上的注释点「注释」关不掉
   // ——第二次点击反而又给整块加了一层注释样式。
   // 2026-09-24：部分选区（单块内、未覆盖整块）→ 行内包裹 <span class="ptoe-note">；
-  // 已有行内注释则解包关闭（并顺带清块级注释类）；整块/折叠/跨块 → 块级 toggle
+  // 已有行内注释则解包关闭（并顺带清块级注释类）；整块先解包块内已有行内注释 span
+  // （否则规则套上的注释整块选中时关不掉，2026-10-18）再块级 toggle；折叠/跨块 → 块级 toggle
   // （与 toggleCitation 的部分选区行内化同构，跨块不放行行内包裹）。
   const row = ed.closest('.page-row');
   const i = row ? Number(row.dataset.i) : -1;
@@ -2698,6 +3830,13 @@ function toggleNote(ed) {
       whole.selectNodeContents(block);
       if (r.compareBoundaryPoints(Range.START_TO_START, whole) === 0 &&
           r.compareBoundaryPoints(Range.END_TO_END, whole) === 0) {
+        // 整块选区：块内已有规则行内注释 span → 先解包关闭（块级类一并清）。
+        // 否则「规则套上的注释」整块选中点注释时关不掉，反而整块再叠一层块级注释
+        // （2026-09-13 修复意图的漏网分支；部分选区分支早已正确处理）。
+        if (unwrapSpans(block, 'ptoe-note', whole) > 0) {
+          block.classList.remove('ptoe-note');
+          return;
+        }
         block.classList.toggle('ptoe-note');
         return;
       }
@@ -3340,6 +4479,11 @@ function toggleCitation(ed) {
       whole.selectNodeContents(block);
       if (r.compareBoundaryPoints(Range.START_TO_START, whole) === 0 &&
           r.compareBoundaryPoints(Range.END_TO_END, whole) === 0) {
+        // 整块选区：块内已有规则行内引用 span → 先解包关闭（与 toggleNote 同构）
+        if (unwrapSpans(block, 'ptoe-citation', whole) > 0) {
+          block.classList.remove('ptoe-citation');
+          return;
+        }
         block.classList.toggle('ptoe-citation');
         return;
       }
@@ -3535,6 +4679,11 @@ function applyOp(op) {
    // 弹窗内部自行判定目标编辑区，故候选池按钮与快捷键都走这一入口。
    if (op === 'charformat') { openCharFormatDialog(); return; }
    const ed = currentEditable(); if (!ed) return;
+   // 「转成表格」（2026-10）：把选中文字交给服务端 /api/table_convert 转成原生 <table>，
+   // 成功后就地替换选区。手动档：显式选中即认定是表格（无分隔行/空格对齐列也认）。
+   if (op === 'table') { convertSelectionToTable(); return; }
+   // 「表格转文本」（2026-10）：与「转成表格」互为反向（Markdown 管道文字 ⇄ 原生表格）。
+   if (op === 'table2text') { convertTablesToText(); return; }
    // 新增内联格式（2026-09）：下划线、删除线、字符边框、底纹、突显、上标、下标
    if (INLINE_CLASSES.includes('ptoe-' + op)) {
      applyInlineClass(ed, 'ptoe-' + op, {toggle:true});
@@ -3758,7 +4907,7 @@ function jumpToPage() {
   // updateViewport 挂载行并发出 /preview 图片请求，且行卸载不取消已发出的
   // 请求——跨几百页跳转时会积压成百上千个串行渲染请求，加载近分钟级。
   _progJumpTs = Date.now(); // 程序性跳页：参考行锚定让路（防「跳不过去」）
-  window.scrollTo({ top: Math.max(0, hostTop + prefixTop(idx) - 60), behavior: 'auto' });
+  window.scrollTo({ top: Math.max(0, hostTop + prefixTop(idx) - VIEW_TOP_OFFSET), behavior: 'auto' });
   // 固定行高下同步挂载目标行（scroll 事件异步触发，这里显式调用保证行已存在），
   // 并把页内文字滚动复位到顶部，避免沿用上一页的内部滚动位置
   updateViewport();
@@ -3769,13 +4918,20 @@ function jumpToPage() {
 }
 
 // ---------- 智能清理 / 搜索替换 ----------
-async function cleanAll() {
+// 工具栏「清理」/ 快捷键 = 全部页（保持原行为）。
+async function cleanAll() { return cleanPages(null); }
+
+// 智能清理指定页：indices = 页下标数组（空/null = 全部页）。
+// 2026-10-16 增强：先预览（含统计报告），确认后应用；应用后提供一键撤销。
+// 2026-10-18：新增页范围（命令行「清理 17 / 17-100 / +10 / 当前 / 全部」，无参数=当前页）。
+async function cleanPages(indices) {
   // 逐页调用 /api/clean：段首符号、中英文标点、残留 HTML 标签
-  // 2026-10-16 增强：先预览（含统计报告），确认后应用；应用后提供一键撤销
   try {
     const res = await fetchJSON('/api/clean', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pages: collect() })
+      // 2026-10 修复：规则开关/符号映射表随请求体下发（currentCleanOpts），
+      // 不再依赖 config.json 侧信道——否则界面已启用的规则点按钮不生效
+      body: JSON.stringify(Object.assign({ pages: collectIndices(indices) }, currentCleanOpts()))
     });
     const cleaned = res.pages || [];
     // 构建变化列表：只保留实际变化的页
@@ -3840,7 +4996,7 @@ function applyCleanPreview() {
     if (ed) { ed.innerHTML = displayHtml(idx); _reapplyProofread(idx); scheduleRemeasure(idx); }
   }
   histEnd(before, '智能清理');
-  for (let i = 0; i < pages.length; i++) editedSet.add(i);
+  for (const c of changed) editedSet.add(c.idx); // 只标记真正变化的页（原为全部页；范围清理时会虚高）
   dirty = true;
   updateStatus();
   window._cleanChanged = [];
@@ -3857,6 +5013,56 @@ function cancelCleanPreview() {
   window._cleanChanged = [];
   const bg = document.getElementById('cleanPreviewBg');
   if (bg) bg.style.display = 'none';
+}
+
+// ---------- 智能清理规则开关：界面口径 → 请求体（2026-10 修复） ----------
+// 工具栏「清理」按钮的 /api/clean 以前只发 pages，规则开关全靠服务端读
+// config.json 的侧信道（设置界面异步 POST 落盘）。一旦侧信道不可用——保存
+// 失败/未落盘/与清理请求竞态/多进程写同一份 config 被覆盖——界面里已启用的
+// 规则点「清理」就不生效（实时预览把开关放进 body，所以反而正常）。
+// 现与预览同口径：把当前开关随请求体下发，服务端 /api/clean 以 body 为准。
+const CLEAN_RULE_CHECKS = [
+  ['cleanPunctuationChk', 'clean_punctuation'],
+  ['cleanSymbolsChk', 'clean_symbols'],
+  ['cleanMdTagsChk', 'clean_md_tags'],
+  ['cleanHtmlTagsChk', 'clean_html_tags'],
+  ['cleanParagraphsChk', 'clean_paragraphs'],
+  ['cleanDigitPunctChk', 'clean_digit_punct'],
+];
+let _settingsPanelOpened = false; // 本会话是否打开过设置面板（openSettings 置位）
+
+function currentCleanOpts() {
+  // 取「智能清理」当前规则口径（开关 + 符号映射表）：
+  //   - 设置面板打开过 → 直接读界面现值（用户所见即所发，即使持久化失败也不丢勾选）；
+  //   - 从未打开过 → 界面未被用户改过，取服务端/localStorage 口径（uiBool → 默认值）。
+  const opts = {};
+  CLEAN_RULE_CHECKS.forEach(function (pair) {
+    const id = pair[0], key = pair[1];
+    const el = document.getElementById(id);
+    opts[key] = (el && _settingsPanelOpened) ? !!el.checked : !!uiBool(key, UI_SETTINGS_DEFAULTS[key]);
+  });
+  let sm = [];
+  const ed = document.getElementById('cleanSymbolMapEditor');
+  if (ed && _settingsPanelOpened) sm = parseSymbolMap(ed.value);
+  if (!sm.length) {
+    sm = (uiSettings && Array.isArray(uiSettings.clean_symbol_map) && uiSettings.clean_symbol_map.length)
+      ? uiSettings.clean_symbol_map
+      : UI_SETTINGS_DEFAULTS.clean_symbol_map;
+  }
+  opts.clean_symbol_map = sm;
+  // 数字标点映射表（2026-10-18）：与符号表同口径；只认单字符源（服务端会再校验）
+  let dm = [];
+  const dpe = document.getElementById('cleanDigitPunctMapEditor');
+  if (dpe && _settingsPanelOpened) {
+    dm = parseSymbolMap(dpe.value).filter(function (p) { return p[0].length === 1; });
+  }
+  if (!dm.length) {
+    dm = (uiSettings && Array.isArray(uiSettings.clean_digit_punct_map) && uiSettings.clean_digit_punct_map.length)
+      ? uiSettings.clean_digit_punct_map
+      : UI_SETTINGS_DEFAULTS.clean_digit_punct_map;
+  }
+  opts.clean_digit_punct_map = dm;
+  return opts;
 }
 
 // ---------- 符号映射表编辑 + 实时预览（2026-10-16） ----------
@@ -3898,21 +5104,10 @@ function runCleanPreview() {
     if (!inputEl || !outEl) return;
     const text = inputEl.value.trim();
     if (!text) { outEl.textContent = ''; return; }
-    // 收集当前开关状态
-    const body = {
+    // 收集当前开关状态（与工具栏「清理」按钮同一口径，见 currentCleanOpts）
+    const body = Object.assign({
       pages: [{ page: 0, html: '<p>' + text.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</p>' }],
-      clean_punctuation: document.getElementById('cleanPunctuationChk').checked,
-      clean_symbols: document.getElementById('cleanSymbolsChk').checked,
-      clean_md_tags: document.getElementById('cleanMdTagsChk').checked,
-      clean_html_tags: document.getElementById('cleanHtmlTagsChk').checked,
-      clean_paragraphs: document.getElementById('cleanParagraphsChk').checked,
-    };
-    // 收集符号映射表
-    const mapEditor = document.getElementById('cleanSymbolMapEditor');
-    if (mapEditor) {
-      const map = parseSymbolMap(mapEditor.value);
-      if (map.length > 0) body.clean_symbol_map = map;
-    }
+    }, currentCleanOpts());
     fetchJSON('/api/clean', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
@@ -3924,20 +5119,80 @@ function runCleanPreview() {
   }, 250);
 }
 
-// 搜索结果状态：searchResults 为当前结果列表（上限 200 条），searchCurrent 为
+// 搜索结果状态：searchResults 为当前结果列表（上限 = ui_settings.search_max_results，默认 200 条），searchCurrent 为
 // 当前选中序号（用于上一个/下一个跳转与「替换当前」）
 let searchResults = [];
 let searchCurrent = -1;
 
+// 搜索 / 替换共用的 token 切分：富文本按标签切，只在文本 token 上匹配（标签原样跳过）；
+// Markdown 源码整页就是一个 token——mdMode 下 replaceCurrent/replaceAll 也是整页
+// src.replace()，此前 pageText 仍按 <...> 把源码切掉一截，搜索与替换的文本/序号对不上
+// （命中标签内部的词搜得到却替换不到，2026-10 修复）。
+function _searchTokens(i) {
+  const src = pageSource(i) || '';
+  if (mdMode) return [src];
+  return src.split(/(<[^>]+>)/);
+}
 function pageText(i) {
   // 搜索用的纯文本：与 replaceAll/replaceCurrent 完全相同的 token 切分
   // （标签之间按原文，含实体），保证搜索序号与替换位置一一对应
-  return (pageSource(i) || '').split(/(<[^>]+>)/).filter(function (t) { return t && t.charAt(0) !== '<'; }).join('');
+  if (mdMode) return pageSource(i) || '';
+  return _searchTokens(i).filter(function (t) { return t && t.charAt(0) !== '<'; }).join('');
 }
 
 function decodeEntities(s) {
-  // 仅用于结果预览显示：把页面源码里的实体还原成可读文本
-  return String(s).replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+  // 仅用于结果预览显示：把页面源码里的实体还原成可读文本。
+  // &amp; 必须放在最后解：先解它的话 "&amp;lt;" 会先变成 "&lt;" 再被解成 "<"（双重解码）。
+  return String(s).replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+}
+
+// ---------- 实体安全（2026-10）----------
+// 搜索/替换都在「含实体的源码文本」上跑（见 pageText：标签间原文含实体）。若匹配劈开
+// &xxx; 实体（部分落在实体内部），高亮注入与替换会把实体拆成两半 → 页面上渲染出
+// "&amp;" 这类串味文字，用户编辑该行时 syncContent 还会把串味结果固化进内容。
+// 约定：匹配要么整体避开实体，要么整体包含该实体；完全落在实体内部的不可见命中
+// （如搜 "amp" 命中 &amp; 中段）一律跳过——搜索/高亮/替换当前/全部替换四处同口径，
+// 否则「搜索 N 处、只替换 M 处」会被当成替换失效。
+const _ENTITY_RE = /&(?:#\d+|#x[0-9a-f]+|[a-z][a-z0-9]{1,31});/gi;
+function _entitySpans(text) {
+  const spans = [];
+  if (!text || text.indexOf('&') < 0) return spans;
+  _ENTITY_RE.lastIndex = 0;
+  let m;
+  while ((m = _ENTITY_RE.exec(text)) !== null) spans.push([m.index, m.index + m[0].length]);
+  return spans;
+}
+function _matchEntitySafe(s, e, spans) {
+  for (let k = 0; k < spans.length; k++) {
+    const a = spans[k][0], b = spans[k][1];
+    if (e <= a || s >= b) continue; // 无交集
+    if (s <= a && e >= b) continue; // 整体包含该实体（安全）
+    return false;                   // 劈开实体 / 落在实体内部 → 不安全
+  }
+  return true;
+}
+// 部分替换专用：匹配整体包含的每个实体必须完整落在同一个区域内（区域=捕获组或组间
+// 缝隙），否则按组拼接时仍会把实体劈开（如正则 /&(amp);/ 且不保留组 1）。
+// matchSpans 只传「与该次匹配相交」的实体（调用方先过 _matchEntitySafe）。
+function _regionsEntitySafe(regions, matchSpans) {
+  for (let k = 0; k < matchSpans.length; k++) {
+    const a = matchSpans[k][0], b = matchSpans[k][1];
+    let whole = false;
+    for (let j = 0; j < regions.length; j++) {
+      const r = regions[j];
+      if (r.s <= a && r.e >= b) { whole = true; break; }  // 实体完整落在某一个区域内
+      if (r.e > a && r.s < b) return false;               // 区域边界劈开实体
+    }
+    if (!whole) return false;
+  }
+  return true;
+}
+
+// String.replace 回调里取匹配起点：参数序列为 (match, p1..pn, offset, string[, groups])，
+// 捕获组值只能是字符串/undefined、末位命名组是对象，因此第一个数字就是 offset。
+function _replaceOffset(args) {
+  for (let k = 1; k < args.length; k++) if (typeof args[k] === 'number') return args[k];
+  return 0;
 }
 
 function searchRegexFor(query) {
@@ -3951,6 +5206,8 @@ function searchRegexFor(query) {
 // 只替换非保留组片段，保留组原文不动（典型：匹配「第([一二三四五六七八九十百千]+)章」，
 // 保留组 1 原样、其余部分按「替换为」处理）。
 let searchScope = 'all';              // 'all' | 'page'（当前页）
+let _scopeSearchPage = -1;            // 最近一次搜索实际作用的「当前页」下标：搜索时解析并锁定，
+                                       // 替换沿用同一页——否则搜索后滚动/跳转让视口页变化，替换打到别的页（2026-10 修复「当前页替换失效」）
 let keepGroups = new Set();           // 保留的捕获组编号（1 起；0=整段匹配全部保留）
 let _lastKeepGroupCount = 0;          // 上次渲染的组数：组数增长时把新组默认加入保留
 let sessionDisplayName = '';          // 当前会话历史名：自动备份时随载荷发送（服务端重命名历史）
@@ -4006,10 +5263,20 @@ function _partialApply(text, re, kg, replacement, target, startOrd) {
   const flags = (re.flags.indexOf('d') >= 0) ? re.flags : (re.flags + 'd');
   const re2 = new RegExp(re.source, flags);
   const groupCount = _countCaptureGroups(re.source);
+  const spans = _entitySpans(text); // 实体位置（token 级）：命中须整体避开或整体包含，见 _matchEntitySafe
   let out = '', last = 0, ord = startOrd, replaced = 0, seen = 0;
   re2.lastIndex = 0;
   let m;
   while ((m = re2.exec(text)) !== null) {
+    const mEnd = m.index + m[0].length;
+    if (!_matchEntitySafe(m.index, mEnd, spans)) {
+      // 劈开/落进实体的命中：与搜索侧同口径整体跳过（不计序号、不计 seen，源码原样保留）。
+      // 零宽命中落在实体内部也会走这里，必须推进锚点，否则死循环。
+      out += text.slice(last, mEnd);
+      last = mEnd;
+      if (m.index === re2.lastIndex) re2.lastIndex++;
+      continue;
+    }
     seen++; // 每个 exec 命中的匹配都计数（含零宽/整段保留），用于区分「没匹配」与「匹配但未替换」
     if (m.index === re2.lastIndex) {
       // 零宽匹配守卫：只推进锚点不产生片段，避免死循环（last 同步推进，防止前缀重复拼接）
@@ -4025,11 +5292,19 @@ function _partialApply(text, re, kg, replacement, target, startOrd) {
         out += m[0];                                          // 整段保留：只数不改
       } else {
         const regions = _matchFlatRegions(m, groupCount);
-        for (const r of regions) {
-          if (r.keep !== null && kg.has(r.keep)) out += text.slice(r.s, r.e);
-          else out += _expandKeepRegex(replacement, m, kg);
+        const mSpans = [];
+        for (let k = 0; k < spans.length; k++) {
+          if (spans[k][0] < mEnd && spans[k][1] > m.index) mSpans.push(spans[k]); // 匹配内的实体（已确认完整落在匹配里）
         }
-        replaced++;
+        if (!_regionsEntitySafe(regions, mSpans)) {
+          out += m[0];   // 区域边界会劈开实体 → 原样保留，不计 replaced（宁可少替换也不改坏实体）
+        } else {
+          for (const r of regions) {
+            if (r.keep !== null && kg.has(r.keep)) out += text.slice(r.s, r.e);
+            else out += _expandKeepRegex(replacement, m, kg);
+          }
+          replaced++;
+        }
       }
     } else {
       out += m[0];
@@ -4047,7 +5322,7 @@ function _partialApply(text, re, kg, replacement, target, startOrd) {
 function _partialReplaceTokens(toks, re, kg, replacement, target) {
   let out = '', replaced = 0, ord = 0, seen = 0;
   for (const tok of toks) {
-    if (tok.charAt(0) === '<') { out += tok; continue; }
+    if (!mdMode && tok.charAt(0) === '<') { out += tok; continue; } // mdMode：整页当一个文本 token（源码可能以 < 开头）
     const r = _partialApply(tok, re, kg, replacement, target, ord);
     out += r.out;
     replaced += r.replaced;
@@ -4058,8 +5333,19 @@ function _partialReplaceTokens(toks, re, kg, replacement, target) {
 }
 
 // 按当前范围（全部页/当前页）返回要处理的页索引数组
+// （搜索用「当前页」= 光标/选区所在页优先，取不到再回退视口页，见 currentPageIndex）
 function _searchScopeIndexes() {
-  if (searchScope === 'page') return [viewportPage()];
+  if (searchScope === 'page') return [currentPageIndex()];
+  return pages.map(function (p, i) { return i; });
+}
+// 替换用范围：「当前页」必须沿用最近一次搜索锁定的那一页（结果列表就是那页的
+// 「本页」匹配），只有尚无搜索结果时才现取视口页。参照 epubedit.js 的
+// _pendingSearchIdx 锁定语义——每次重新解析都会因视口变化打到别的页。
+function _replaceScopeIndexes() {
+  if (searchScope === 'page') {
+    if (_scopeSearchPage >= 0 && _scopeSearchPage < pages.length) return [_scopeSearchPage];
+    return [viewportPage()];
+  }
   return pages.map(function (p, i) { return i; });
 }
 
@@ -4137,27 +5423,43 @@ function searchPages() {
   let re;
   try { re = searchRegexFor(query); }
   catch (e) { showToast('正则表达式无效：' + e.message, 'fail'); return; }
-  // 性能：一次遍历统计总数，超出 MAX 只存储前 MAX 条（列表仍显示真实总数）
-  const CONTEXT = 40, MAX = 200;
+  // 性能：一次遍历统计总数，超出 MAX 只存储前 MAX 条（列表仍显示真实总数）。
+  // MAX 由设置-界面「搜索结果·显示上限」配置（ui_settings.search_max_results，10-1000，默认 200）
+  const CONTEXT = 40, MAX = searchMaxResults();
   const results = [];
   let total = 0, pageStart = 0;
   const scopeIdx = _searchScopeIndexes(); // 搜索范围：全部页 / 当前页（2026-09）
   const scopePage = searchScope === 'page';
+  // 锁定本次搜索实际作用的「当前页」：结果列表是这一页的，替换（replaceAll）必须
+  // 打这一页，不能替换时再解析一次视口页（滚动/跳转后会变成别的页 → 当前页替换失效）
+  _scopeSearchPage = (scopePage && scopeIdx.length) ? scopeIdx[0] : -1;
   for (const i of scopeIdx) {
-    const text = pageText(i);
-    re.lastIndex = 0;
-    let m;
-    while ((m = re.exec(text)) !== null) {
-      const withinPage = total - pageStart; // 本页内第几处（0 起）
-      const pageOrd = total;                // 全局第几处（0 起）
-      total++;
-      if (results.length >= MAX) continue;
-      const s = Math.max(0, m.index - CONTEXT);
-      const e2 = Math.min(text.length, m.index + m[0].length + CONTEXT);
-      results.push({
-        i: i, page: pages[i].page, pageOrd: pageOrd, withinPage: withinPage, scopePage: scopePage,
-        ctx: esc(decodeEntities(text.slice(s, m.index))) + '<mark>' + esc(decodeEntities(m[0])) + '</mark>' + esc(decodeEntities(text.slice(m.index + m[0].length, e2)))
-      });
+    // 逐 token 扫描：与 replaceCurrent/replaceAll 完全同一份切分（_searchTokens），
+    // 命中绝不跨标签边界——旧实现把所有文本拼成一个串再 exec，跨 </b><b> 的命中
+    // 搜索能列出、替换却做不到，报「该处匹配已变化」或只替换一部分（看起来就是失效）
+    const toks = _searchTokens(i);
+    let text = '';
+    for (const tok of toks) {
+      if (!mdMode && tok.charAt(0) === '<') continue; // 标签 token：替换侧同样跳过
+      const base = text.length;
+      text += tok;
+      const spans = _entitySpans(tok);
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(tok)) !== null) {
+        const gs = base + m.index, ge = gs + m[0].length; // 页内拼接文本坐标（= pageText 坐标）
+        if (!_matchEntitySafe(m.index, m.index + m[0].length, spans)) continue; // 劈开/落进实体的命中不可见也不可替换 → 跳过
+        const withinPage = total - pageStart; // 本页内第几处（0 起）
+        const pageOrd = total;                // 全局第几处（0 起）
+        total++;
+        if (results.length >= MAX) continue;
+        const s = Math.max(0, gs - CONTEXT);
+        const e2 = Math.min(text.length, ge + CONTEXT);
+        results.push({
+          i: i, page: pages[i].page, pageOrd: pageOrd, withinPage: withinPage, scopePage: scopePage,
+          ctx: esc(decodeEntities(text.slice(s, gs))) + '<mark>' + esc(decodeEntities(m[0])) + '</mark>' + esc(decodeEntities(text.slice(ge, e2)))
+        });
+      }
     }
     pageStart = total; // 下一页匹配的起点
   }
@@ -4167,7 +5469,10 @@ function searchPages() {
   updateSearchNav();
   // Highlight matches in visible pages for quick preview
   applySearchHighlights();
-  openSearchModal();
+  // 弹窗已打开时不再 open/focus：替换后刷新结果列表会把焦点从「替换为」输入框抢回
+  // 搜索框，用户继续按 Enter 就变成重搜（感知为「替换失效」，2026-10 修复）
+  const _sbg = document.getElementById('searchModalBg');
+  if (!_sbg || _sbg.style.display !== 'flex') openSearchModal();
   if (total === 0) showToast('未找到匹配内容', 'warn');
 }
 // ---------- 搜索高亮（在编辑区预览中高亮，输入为空时去高亮） ----------
@@ -4185,8 +5490,25 @@ function _highlightInHtmlSource(html, re) {
   return String(html).split(/(<[^>]+>)/).map(function(tok) {
     if (!tok) return '';
     if (tok.charAt(0) === '<') return tok;
-    return tok.replace(re, function(m) { return '<mark class="ptoe-search">' + esc(m) + '</mark>'; });
+    const spans = _entitySpans(tok);
+    return tok.replace(re, function(m) {
+      // 劈开/落进 &xxx; 实体的命中不高亮（会把实体拆成两半 → 渲染出 &amp; 串味文字），
+      // 与搜索结果、替换同口径跳过
+      if (!_matchEntitySafe(m.index, m.index + m.length, spans)) return m;
+      // 只转义 < >：& 必须原样留给浏览器按实体解析，否则命中的 "&amp;" 会被 esc 成
+      // "&amp;amp;" → 高亮处显示成字面实体，与周围文字不一致
+      return '<mark class="ptoe-search">' + String(m).replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</mark>';
+    });
   }).join('');
+}
+
+// 高亮是否允许落在第 i 页：范围按钮 title 写明「搜索/替换/高亮的生效范围」，
+// 「当前页」时只高亮最近一次搜索锁定的那一页——否则范围外页面照样带高亮，
+// 用户对着高亮点「全部替换」却打不到，看起来就是替换失效（2026-10 修复）。
+function _highlightScopeOk(i) {
+  if (searchScope !== 'page') return true;
+  if (_scopeSearchPage < 0) return true;
+  return i === _scopeSearchPage;
 }
 
 function applySearchHighlights() {
@@ -4204,6 +5526,7 @@ function applySearchHighlights() {
     const isFocused = ed === document.activeElement || ed.contains(document.activeElement);
     // 先解包既有标记，避免嵌套
     _unwrapSearchMarks(ed);
+    if (!_highlightScopeOk(idx)) continue; // 「当前页」范围外：只解包不注入（范围外不该有高亮）
     if (isFocused) continue; // 聚焦行跳过替换，等 blur 时刷新
     const src = displayHtml(idx);
     const highlighted = _highlightInHtmlSource(src, re);
@@ -4234,18 +5557,21 @@ function clearSearchHighlights() {
   }
 }
 
-// 标记只在点击「搜索」后应用（2026-08）；输入框清空时立即消除全部文字标记
+// 标记只在点击「搜索」后应用（2026-08）；输入框清空时立即清除全部标记与结果——
+// 只清标记的话，结果列表会留着上一个词的「N 处匹配」，此时点替换按的是空搜索词
+// （2026-10 修复：改为连结果/序号/锁定页一起清，见 clearSearchState）
 document.getElementById('searchInput').addEventListener('input', function () {
   updateKeepChips(); // 正则/捕获组变化 → 刷新保留组 chips
-  if (!(this.value || '').trim()) clearSearchHighlights();
+  if (!(this.value || '').trim()) clearSearchState();
 });
 
 // 清理搜索状态：清除全部文字标记 + 清空结果列表与计数 + 清空「x / y」位置显示（不动 #searchInput 的值）
 function clearSearchState() {
   searchResults = [];
   searchCurrent = -1;
+  _scopeSearchPage = -1;            // 解除「当前页」锁定（下次搜索重新解析）
   clearSearchHighlights();          // 内部先置空 _searchHighlightQuery，还原不回注
-  renderSearchResults([], 0, 200);  // 清空结果列表 + 计数
+  renderSearchResults([], 0, searchMaxResults());  // 清空结果列表 + 计数（计数口径随当前上限设置）
   updateSearchNav();                // 清空「x / y」位置显示
 }
 document.getElementById('searchClearBtn').addEventListener('click', clearSearchState);
@@ -4465,6 +5791,7 @@ function replaceCurrent() {
   if (!searchResults.length || searchCurrent < 0) { showToast('请先搜索', 'warn'); return; }
   const query = document.getElementById('searchInput').value;
   const repl = document.getElementById('replaceInput').value;
+  if (!query) { showToast('请先输入搜索词', 'warn'); return; } // 空词的正则处处命中，会按序号乱插
   let re;
   try { re = searchRegexFor(query); }
   catch (e) { showToast('正则表达式无效：' + e.message, 'fail'); return; }
@@ -4476,7 +5803,7 @@ function replaceCurrent() {
   let out, c = 0;
   if (_partialModeActive()) {
     // 部分替换：只替换该次匹配中非保留的组片段（目标=页内第 target 处匹配）
-    const rr = _partialReplaceTokens(mdMode ? [src] : src.split(/(<[^>]+>)/), re, keepGroups, repl, target);
+    const rr = _partialReplaceTokens(_searchTokens(i), re, keepGroups, repl, target);
     if (rr.replaced > 0 && rr.text === src) {
       // 匹配被改写但结果与原文一致（如全部捕获组保留且间隙为空）→ 无净变化，不入历史
       histEnd(before, '替换当前'); // 关闭空事务：无实际变化不会推入撤销栈
@@ -4492,11 +5819,22 @@ function replaceCurrent() {
     out = rr.text;
     c = rr.count;
   } else if (mdMode) {
-    out = src.replace(re, function (m) { const n = c++; return (n === target) ? repl : m; });
+    const spans = _entitySpans(src);
+    out = src.replace(re, function () {
+      const m = arguments[0], s0 = _replaceOffset(arguments);
+      if (!_matchEntitySafe(s0, s0 + m.length, spans)) return m; // 劈开实体的命中跳过（与搜索同口径）
+      const n = c++; return (n === target) ? repl : m;
+    });
   } else {
-    out = src.split(/(<[^>]+>)/).map(function (tok) {
+    // 与搜索同一份 token 切分（_searchTokens），序号才与结果列表一一对应
+    out = _searchTokens(i).map(function (tok) {
       if (tok.charAt(0) === '<') return tok;
-      return tok.replace(re, function (m) { const n = c++; return (n === target) ? repl : m; });
+      const spans = _entitySpans(tok);
+      return tok.replace(re, function () {
+        const m = arguments[0], s0 = _replaceOffset(arguments);
+        if (!_matchEntitySafe(s0, s0 + m.length, spans)) return m; // 劈开实体的命中跳过（与搜索同口径）
+        const n = c++; return (n === target) ? repl : m;
+      });
     }).join('');
   }
   if (!_partialModeActive() && c <= target) { showToast('该处匹配已变化，请重新搜索', 'warn'); return; }
@@ -4517,7 +5855,7 @@ function scrollToIndex(idx) {
   const hostTop = host.getBoundingClientRect().top + window.scrollY;
   // 瞬时跳转（同 jumpToPage）：smooth 滚动会逐页挂载中间行、积压图片请求
   _progJumpTs = Date.now(); // 程序性跳页：参考行锚定让路
-  window.scrollTo({ top: Math.max(0, hostTop + prefixTop(idx) - 60), behavior: 'auto' });
+  window.scrollTo({ top: Math.max(0, hostTop + prefixTop(idx) - VIEW_TOP_OFFSET), behavior: 'auto' });
   // 固定行高下同步挂载目标行，并把页内文字滚动复位到顶部
   updateViewport();
   const row = host.querySelector('.page-row[data-i="' + idx + '"]');
@@ -4544,13 +5882,15 @@ function replaceAll() {
   const changed = [];
   let count = 0;
   let replacedTotal = 0, noopTotal = 0, seenTotal = 0; // 2026-09：部分替换的诚实统计
-  const before = histBegin('全部替换', null); // 全页快照；histEnd 只保留实际变化页
-  const scopeIdx = _searchScopeIndexes();     // 替换范围：全部页 / 当前页（2026-09）
+  // 替换范围：「当前页」沿用最近一次搜索锁定的那一页（_replaceScopeIndexes），
+  // 不能替换时再解析视口页——搜索后滚动/跳转就会打到别的页（2026-10 修复失效根因之二）
+  const scopeIdx = _replaceScopeIndexes();
+  const before = histBegin('全部替换', scopeIdx); // 只快照范围内页；histEnd 只保留实际变化页
   if (_partialModeActive()) {
     // 部分替换：正则带捕获组 + 保留组设置——只替换未被保留的组片段
     for (const i of scopeIdx) {
       const src = pageSource(i);
-      const toks = mdMode ? [src] : src.split(/(<[^>]+>)/);
+      const toks = _searchTokens(i); // 与搜索/替换当前同一份切分（mdMode=整页一个 token）
       const rr = _partialReplaceTokens(toks, re, keepGroups, repl, -1);
       seenTotal += rr.seen;
       if (rr.replaced > 0) {
@@ -4564,16 +5904,27 @@ function replaceAll() {
       const src = pageSource(i);
       let out, c = 0;
       if (mdMode) {
-        // Markdown 源码：直接整体替换
-        out = src.replace(re, function () { c++; return repl; });
+        // Markdown 源码：直接整体替换（劈开 &xxx; 实体的命中与搜索同口径跳过）
+        const spans = _entitySpans(src);
+        out = src.replace(re, function () {
+          const m = arguments[0], s0 = _replaceOffset(arguments);
+          if (!_matchEntitySafe(s0, s0 + m.length, spans)) return m;
+          c++; return repl;
+        });
       } else {
-        // 富文本：只替换标签之间的文本 token，不触碰标签/属性，避免破坏 HTML 结构
-        out = src.split(/(<[^>]+>)/).map(function (tok) {
+        // 富文本：只替换标签之间的文本 token，不触碰标签/属性，避免破坏 HTML 结构；
+        // 与搜索同一份 token 切分（_searchTokens），序号才与结果列表一一对应
+        out = _searchTokens(i).map(function (tok) {
           if (tok.charAt(0) === '<') return tok;
-          return tok.replace(re, function () { c++; return repl; });
+          const spans = _entitySpans(tok);
+          return tok.replace(re, function () {
+            const m = arguments[0], s0 = _replaceOffset(arguments);
+            if (!_matchEntitySafe(s0, s0 + m.length, spans)) return m; // 劈开实体 → 不替换
+            c++; return repl;
+          });
         }).join('');
       }
-      if (c > 0) changed.push({ i: i, out: out });
+      if (c > 0 && out !== src) changed.push({ i: i, out: out }); // 只记真正变化的页
       count += c;
     }
   }
@@ -4597,8 +5948,8 @@ function replaceAll() {
     const ed = row.querySelector('.editable');
     if (ed) { ed.innerHTML = displayHtml(idx); _reapplyProofread(idx); scheduleRemeasure(idx); }
   }
-  for (let i = 0; i < pages.length; i++) editedSet.add(i);
-  dirty = true;
+  for (const ch of changed) editedSet.add(ch.i); // 只标记真正改动的页（2026-10 修复：原先无条件全标，「已编辑 X/N」虚高、未改页被当已编辑）
+  if (changed.length) dirty = true; // 只置位不清位（内容确实变化才标脏）
   updateStatus();
   histEnd(before, '全部替换');
   showToast('已替换 ' + count + ' 处' + (searchScope === 'page' ? '（当前页）' : ''), 'ok');
@@ -5774,6 +7125,56 @@ function _insertDividerMd(ed, styleKey, i) {
   });
   setStatus('已插入' + DIVIDER_STYLE_LABEL[styleKey] + '分隔线');
 }
+// 恢复文字纠错状态：proofread {errors, original, dismissed} → 内存变量，按 pageIdx
+// （页码→当前索引 Map）把键映射到当前页下标。供「载入历史版本」(loadHistoryVersion)
+// 与「启动加载 /api/pages」(init) 共用——2026-10-17 抽出：模型纠错后保存再重开，
+// 此前 init 不恢复纠错状态，已识别未应用的错误/建议会丢失、需重新识别。
+// lastPage：上次纠错页码（无则 null）。
+function applyProofreadState(proofread, lastPage, pageIdx) {
+  // 先重置，防旧数据残留
+  proofreadErrors = {};
+  proofreadOriginal = {};
+  proofreadDismissed = {};
+  lastProofreadPage = null;
+  if (!proofread) return;
+  try {
+    const remap = function (k) {
+      const n = Number(k);
+      if (pageIdx.has(n)) return pageIdx.get(n);
+      // 旧格式兼容：key 为 pageIndex（整数且在索引范围内）
+      if (Number.isInteger(n) && n >= 0 && n < pageIdx.size) return n;
+      return -1;
+    };
+    // errors：仅接受数组值，每项需有数字 start/end、字符串 wrong
+    const srcErrors = proofread.errors || {};
+    for (const k in srcErrors) {
+      const idx = remap(k);
+      if (idx < 0) continue;
+      const arr = srcErrors[k];
+      if (!Array.isArray(arr)) continue;
+      const valid = arr.filter(function (e) {
+        return e && typeof e.start === 'number' && typeof e.end === 'number' && typeof e.wrong === 'string' && (!e.candidates || Array.isArray(e.candidates));
+      });
+      if (valid.length) proofreadErrors[idx] = JSON.parse(JSON.stringify(valid));
+    }
+    // original：仅接受字符串值
+    const srcOrig = proofread.original || {};
+    for (const k in srcOrig) {
+      const idx = remap(k);
+      if (idx < 0) continue;
+      if (typeof srcOrig[k] === 'string') proofreadOriginal[idx] = srcOrig[k];
+    }
+    // dismissed：数组→Set
+    const srcDismissed = proofread.dismissed || {};
+    for (const k in srcDismissed) {
+      const idx = remap(k);
+      if (idx < 0) continue;
+      const v = srcDismissed[k];
+      proofreadDismissed[idx] = new Set(Array.isArray(v) ? v : []);
+    }
+  } catch (e) { /* 解析失败则保持清空 */ }
+  lastProofreadPage = typeof lastPage === 'number' ? lastPage : null;
+}
 async function loadHistoryVersion(id, name, ver) {
   const displayName = name + (ver ? ' v' + ver : '');
   if (!confirm('确定用该历史版本（' + displayName + '）替换当前编辑内容？未保存的修改将被覆盖。')) return;
@@ -5817,52 +7218,8 @@ async function loadHistoryVersion(id, name, ver) {
     heights.length = pages.length; heights.fill(0);
     est = pages.length ? 420 : 420;
     loadNonce++;  // 换书后图片 URL 加 ?v= 强制重新加载（缓存/来源已切换）
-    // 恢复文字纠错状态（先重置再填充，防旧数据残留）
-    proofreadErrors = {};
-    proofreadOriginal = {};
-    proofreadDismissed = {};
-    lastProofreadPage = null;
-    if (res.proofread) {
-      try {
-        // 页码→新索引映射（历史版本页数可能与当前会话不同）
-        const pageIdx = new Map(newPages.map((p, idx) => [p.page, idx]));
-        const remap = function (k) {
-          const n = Number(k);
-          if (pageIdx.has(n)) return pageIdx.get(n);
-          // 旧格式兼容：key 为 pageIndex（整数且在新页数范围内）
-          if (Number.isInteger(n) && n >= 0 && n < newPages.length) return n;
-          return -1;
-        };
-        // errors：仅接受数组值，每项需有数字 start/end、字符串 wrong
-        const srcErrors = res.proofread.errors || {};
-        for (const k in srcErrors) {
-          const idx = remap(k);
-          if (idx < 0) continue;
-          const arr = srcErrors[k];
-          if (!Array.isArray(arr)) continue;
-                const valid = arr.filter(function (e) {
-                  return e && typeof e.start === 'number' && typeof e.end === 'number' && typeof e.wrong === 'string' && (!e.candidates || Array.isArray(e.candidates));
-                });
-          if (valid.length) proofreadErrors[idx] = JSON.parse(JSON.stringify(valid));
-        }
-        // original：仅接受字符串值
-        const srcOrig = res.proofread.original || {};
-        for (const k in srcOrig) {
-          const idx = remap(k);
-          if (idx < 0) continue;
-          if (typeof srcOrig[k] === 'string') proofreadOriginal[idx] = srcOrig[k];
-        }
-        // dismissed：数组→Set
-        const srcDismissed = res.proofread.dismissed || {};
-        for (const k in srcDismissed) {
-          const idx = remap(k);
-          if (idx < 0) continue;
-          const v = srcDismissed[k];
-          proofreadDismissed[idx] = new Set(Array.isArray(v) ? v : []);
-        }
-      } catch (e) { /* 解析失败则保持清空 */ }
-      lastProofreadPage = typeof res.last_proofread_page === 'number' ? res.last_proofread_page : null;
-    }
+    // 恢复文字纠错状态（抽为 applyProofreadState：启动加载 /api/pages 复用同一逻辑）
+    applyProofreadState(res.proofread, res.last_proofread_page, new Map(newPages.map((p, idx) => [p.page, idx])));
     host.innerHTML = '';
     rebuildPrefix(); // heights 已重置，prefixH 需按 est 重建（旧累计值不可复用）
     host.style.height = totalHeight() + 'px';
@@ -6064,8 +7421,21 @@ function showPopup(range) {
   const rect = (rects && rects.length > 0) ? rects[0] : range.getBoundingClientRect();
   let left = rect.left + rect.width / 2 - r.width / 2;
   left = Math.max(8, Math.min(left, window.innerWidth - r.width - 8));
-  let top = rect.top - r.height - 8;   // 选中文字正上方，不遮盖选中内容
-  if (top < 8) top = rect.bottom + 8;  // 上方空间不足 → 移到下方
+  const GAP = 8;
+  let top = rect.top - r.height - GAP;   // 选中文字正上方，不遮盖选中内容
+  // 表格内选中文字时，表格操作条（#tblBar）也会显示。两条浮层需错开：把选中菜单
+  // 叠到操作条【上方】并留出 GAP 间距；上方空间不足则改到操作条下方。两者互不遮挡。
+  const barVisible = _tblBarVisible && tblBar && tblBar.style.display === 'flex';
+  if (barVisible) {
+    const br = tblBar.getBoundingClientRect();
+    const hOverlap = rect.left < br.right + 6 && rect.right > br.left - 6;
+    if (hOverlap) {
+      const above = br.top - r.height - GAP;
+      if (above >= 8) top = above;                    // 叠在操作条上方
+      else top = Math.max(8, Math.min(br.bottom + GAP, window.innerHeight - r.height - 8));
+    }
+  }
+  if (top < 8) top = rect.bottom + GAP;  // 上方空间不足 → 移到选中文字下方
   // 下方空间也不足（贴近视口底部）时，钳制到视口内，避免菜单被裁掉/超出屏幕。
   top = Math.max(8, Math.min(top, window.innerHeight - r.height - 8));
   popup.style.left = left + 'px';
@@ -6108,7 +7478,9 @@ let _lastEditableRange = null;
 document.addEventListener('selectionchange', () => {
   const sel = window.getSelection();
   if (!sel || sel.rangeCount === 0 || sel.isCollapsed) hidePopup();
-  hideErrPopup();
+  // 自动跳转后 600ms 内忽略选区变化触发的隐藏——本轮渲染恢复光标会异步触发
+  // selectionchange，若此时隐藏，刚弹出的采纳/忽略窗会立刻消失（2026-10-17 修复）。
+  if (performance.now() >= _errHideBlockUntil) hideErrPopup();
   // 记录在 .editable 内的选区/光标（折叠光标一并记录——插入表格/图片要落在
   // 光标处；只记非折叠选区时，「把光标点进正文再点工具栏」会回退到旧选区甚至页末）
   if (sel && sel.rangeCount > 0) {
@@ -7929,6 +9301,10 @@ function _flushPrPending() { for (const iStr in _prRenderPending) { if (!_prRend
 let _errHoverKey = null;       // {i, k} 当前悬停的错误组
 let _errHoverTimer = null;     // 悬停计时
 let _errHoverLeaveTimer = null; // 离开热区后的宽限关闭计时
+// 自动跳转后短暂屏蔽 selectionchange→hideErrPopup 的时间戳（performance.now 毫秒）：
+// 采纳/忽略触发本轮渲染会恢复光标 → 异步 selectionchange 会把刚弹出的悬浮窗隐藏
+// （「点完采纳窗再也不弹」根因）。设为 performance.now()+600 期间忽略该隐藏（2026-10-17）。
+let _errHideBlockUntil = 0;
 function showErrPopup(rect) {
   const pop = document.getElementById('errPopup');
   pop.style.display = 'flex';
@@ -8089,9 +9465,35 @@ function hideImgPopup() {
   _imgKey = null;
 }
 
+// 该错误组（同一 data-err-i）在本页所有标注元素的并集矩形：错误原文（.ptoe-err，可能
+// 跨多段）与建议（.ptoe-fix）。以并集作悬浮窗锚点，使菜单锚定整组内容，不遮挡其中任一段。
+function _errAnchorRect(i, k) {
+  const row = [...host.children].find(function (r) { return Number(r.dataset.i) === i; });
+  const ed = row && row.querySelector('.editable');
+  if (!ed) return null;
+  const els = ed.querySelectorAll('.ptoe-err[data-err-i="' + k + '"], .ptoe-fix[data-err-i="' + k + '"]');
+  let top = Infinity, left = Infinity, right = -Infinity, bottom = -Infinity;
+  els.forEach(function (el) {
+    const r = el.getBoundingClientRect();
+    if (!r.width && !r.height) return; // 跳过不可见的（离屏/隐藏）
+    top = Math.min(top, r.top); left = Math.min(left, r.left);
+    right = Math.max(right, r.right); bottom = Math.max(bottom, r.bottom);
+  });
+  if (left === Infinity) return null;
+  return { left: left, top: top, right: right, bottom: bottom, width: right - left, height: bottom - top };
+}
+
 // 自动跳转到下一处校正文本（按文档顺序）：采纳/忽略后调用，滚动到下一处并弹出采纳/忽略窗
 // 用户点 采纳/忽略 后自动顺序推进，直至当前页无更多校正项。
+// 2026-10-17：
+//  - 受设置「采纳/忽略后自动跳转」控制（proofreadAutoJump，默认开），关闭则不跳转；
+//  - 滚动改 behavior:'auto'（瞬时）——smooth 为异步动画，紧接着 getBoundingClientRect
+//    取到的是动画前位置，悬浮窗会错位；瞬时滚动后 rect 立即可用；
+//  - 跳转前设 _errHideBlockUntil：屏蔽紧随其后的 selectionchange→hideErrPopup（渲染
+//    恢复光标会异步触发选区变化，把刚弹出的悬浮窗又隐掉，是「点完采纳窗不再弹」的根因）；
+//  - 以 _errAnchorRect 并集矩形为锚点，菜单锚定整组错误/建议，不遮挡正文。
 function advanceToNextError(i, k) {
+  if (!proofreadAutoJump()) { hideErrPopup(); return; } // 设置关闭：不自动跳转
   const errors = proofreadErrors[i];
   if (!errors || !errors.length) { hideErrPopup(); return; }
   // 从 k 开始向后找第一个未 _gone 的条目（splice(k,1) 后原 k+1 移到 k）
@@ -8105,9 +9507,11 @@ function advanceToNextError(i, k) {
   const ed = row.querySelector('.editable');
   const el = ed.querySelector('.ptoe-err[data-err-i="' + nextK + '"]');
   if (!el) { hideErrPopup(); return; }
-  el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  el.scrollIntoView({ block: 'center', behavior: 'auto' });
+  const rect = _errAnchorRect(i, nextK) || el.getBoundingClientRect();
   errKey = { i: i, k: nextK };
-  showErrPopup(el.getBoundingClientRect());
+  _errHideBlockUntil = performance.now() + 600; // 屏蔽紧随其后的 selectionchange 隐藏
+  showErrPopup(rect);
 }
 
 // ---------- 文字纠错下拉菜单 ----------
@@ -8372,6 +9776,63 @@ function _reportApplyResult(st) {
   }
 }
 
+// 应用纠错后补跑「文字表格 → 原生表格」自动转换（2026-10 修复）：应用纠错是纯前端
+// DOM 编辑，服务端 initial_html 的自动档没机会跑，重识别→应用后的管道表仍是文字。
+// 这里把该页顶层行文本交给 /api/table_convert（lines 模式）判定，按回传的 chunks
+// （源行范围 → 表格 HTML）就地替换；含纠错标注的行用哨兵打断，绝不覆盖（保标注）。
+async function _autoConvertPageTables(i) {
+  try {
+    if (!_autoTableConvert) return 0;
+    const row = host.children ? [...host.children].find(function (r) { return Number(r.dataset.i) === i; }) : null;
+    const ed = row ? row.querySelector('.editable') : null;
+    if (!ed) return 0;
+    const blocks = Array.prototype.slice.call(ed.children).filter(function (el) {
+      return /^(DIV|P|H[1-6]|SECTION)$/.test(el.tagName);
+    });
+    if (blocks.length < 2) return 0;
+    const lines = blocks.map(function (el) {
+      return el.querySelector('.ptoe-err') ? '\u0001' : el.textContent;
+    });
+    // 快照在 fetch 前取（fetch 不改 DOM）；没有 chunk 时 before 自然丢弃、不入撤销栈
+    const before = histBegin('自动转表格', [i]);
+    let res = null;
+    try {
+      res = await fetchJSON('/api/table_convert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lines: lines }),
+      });
+    } catch (e) { return 0; } // 静默：补跑失败不影响纠错应用本身
+    if (!res || !res.ok || !res.chunks || !res.chunks.length) return 0;
+    let done = 0;
+    inDiscreteOp = true;
+    try {
+      withScrollStable(function () {
+        for (let k = res.chunks.length - 1; k >= 0; k--) {
+          const ch = res.chunks[k];
+          const s = Number(ch[0]), e = Number(ch[1]);
+          const first = blocks[s], last = blocks[e - 1];
+          if (!first || !last || !first.parentNode) continue;
+          const tmp = document.createElement('div');
+          tmp.innerHTML = String(ch[2] || '');
+          const frag = document.createDocumentFragment();
+          while (tmp.firstChild) frag.appendChild(tmp.firstChild);
+          first.parentNode.insertBefore(frag, first);
+          for (let m = s; m < e; m++) {
+            if (blocks[m] && blocks[m].parentNode) blocks[m].parentNode.removeChild(blocks[m]);
+          }
+          done++;
+        }
+      });
+    } finally { inDiscreteOp = false; }
+    if (!done) return 0;
+    const ed2 = row.querySelector('.editable');
+    if (ed2) { syncContent(ed2); markDirty(i); scheduleRemeasure(i); }
+    histEnd(before, '自动转表格');
+    return done;
+  } catch (e) { return 0; }
+}
+
 // 子项2 应用：把当前页所有有候选的提示替换为 candidates[0]；无候选（增字）=删除 wrong
 function proofreadApplyCurrent() {
   closeProofreadMenu();
@@ -8387,6 +9848,10 @@ function proofreadApplyCurrent() {
   histRun('应用纠错', [i], function () { st = _applyProofreadPage(i); });
   scheduleRemeasure(i);
   if (st) _reportApplyResult(st);
+  // 应用后补跑自动表格转换（重识别→应用的核心修复，独立撤销步）
+  _autoConvertPageTables(i).then(function (n) {
+    if (n) showToast('已自动把 ' + n + ' 个文字表格转为表格', 'ok');
+  });
 }
 
 // 全部应用：对所有「已挂载且有纠错提示」的页执行应用（未挂载页需滚动到可见后再应用）；
@@ -8414,6 +9879,14 @@ function proofreadApplyAll() {
     }
   });
   for (const k of targets) scheduleRemeasure(k);
+  // 每页补跑自动表格转换（各自独立撤销步）
+  if (_autoTableConvert) {
+    (async function () {
+      let conv = 0;
+      for (const k of targets) { conv += await _autoConvertPageTables(k); }
+      if (conv) showToast('已自动把 ' + conv + ' 个文字表格转为表格', 'ok');
+    })();
+  }
   let msg = '已应用 ' + applied + ' 处纠错提示' + (skipped ? '，跳过 ' + skipped + ' 处' : '');
   if (unattached) msg += '；另有 ' + unattached + ' 页未在可见区域';
   showToast(msg, 'ok'); setStatus(msg);
@@ -8712,7 +10185,9 @@ document.addEventListener('mousedown', function (e) {
   // 点击图片弹窗外 → 关闭图片弹窗
   if (_imgKey && !e.target.closest('#imgPopup')) hideImgPopup();
   // 点击表格操作条外部（且不在表格单元格内——换格由 selectionchange 重建目标）→ 关闭操作条
-  if (_tblKey && !e.target.closest('#tblBar') && !e.target.closest('.editable td,.editable th')) hideTblBar();
+  // 点击表格操作条/更多菜单/选中菜单外部（且不在表格单元格内——换格由 selectionchange 重建目标）→ 关闭操作条。
+  // 三个浮层同源于表格场景，点击其任一都不应关闭操作条（否则点菜单项后操作条立即消失）。
+  if (_tblKey && !e.target.closest('#tblBar') && !e.target.closest('#tblMenu') && !e.target.closest('#popup') && !e.target.closest('.editable td,.editable th')) hideTblBar();
 });
 // 点击编辑区内的图片 → 弹出图片设置弹窗（行内图片可能没有 <p> 包裹，pEl 允许为 null）
 document.addEventListener('click', function (e) {
@@ -10367,6 +11842,7 @@ document.addEventListener('click', function (e) {
   }
 }, true);
 function openSettings() {
+  _settingsPanelOpened = true; // 面板已打开：此后清理口径以界面现值为准（currentCleanOpts）
   renderShortcutTable();
   renderMouseShortcutTable();
   document.getElementById('tipDelayInput').value = tipDelay();
@@ -10379,8 +11855,12 @@ function openSettings() {
   document.getElementById('editorFontSizeInput').value = parseInt(document.documentElement.style.getPropertyValue('--editor-font-size') || '14', 10);
   const pbIn = document.getElementById('prBatchPages');
   if (pbIn) pbIn.value = proofreadBatchCount();
+  const pjIn = document.getElementById('prAutoJump');
+  if (pjIn) pjIn.checked = proofreadAutoJump();
   const udIn = document.getElementById('undoDepthInput');
   if (udIn) udIn.value = String(undoLimit());
+  const smrIn = document.getElementById('searchMaxResultsInput');
+  if (smrIn) smrIn.value = String(searchMaxResults());
   const rac = document.getElementById('ruleAllPagesConfirm');
   if (rac) rac.checked = !!uiBool('rule_all_pages_confirm', true);
   const lnc = document.getElementById('lineNumShow');
@@ -10399,11 +11879,21 @@ function openSettings() {
   if (chIn) chIn.checked = !!uiBool('clean_html_tags', true);
   const cpaIn = document.getElementById('cleanParagraphsChk');
   if (cpaIn) cpaIn.checked = !!uiBool('clean_paragraphs', false);
+  const cdpIn = document.getElementById('cleanDigitPunctChk');
+  if (cdpIn) cdpIn.checked = !!uiBool('clean_digit_punct', true);
   // 同步符号映射表到编辑器（2026-10-16）
   const smeIn = document.getElementById('cleanSymbolMapEditor');
   if (smeIn) {
     const sm = uiSettings && uiSettings.clean_symbol_map ? uiSettings.clean_symbol_map : [['[','【'],[']','】'],['--','——'],['~','～']];
     smeIn.value = formatSymbolMap(sm);
+  }
+  // 同步数字标点映射表到编辑器（2026-10-18）
+  const dpeIn = document.getElementById('cleanDigitPunctMapEditor');
+  if (dpeIn) {
+    const dm = (uiSettings && Array.isArray(uiSettings.clean_digit_punct_map) && uiSettings.clean_digit_punct_map.length)
+      ? uiSettings.clean_digit_punct_map
+      : UI_SETTINGS_DEFAULTS.clean_digit_punct_map;
+    dpeIn.value = formatSymbolMap(dm);
   }
   document.getElementById('modalBg').style.display = 'flex';
   // 默认激活快捷键标签
@@ -10412,6 +11902,7 @@ function openSettings() {
   document.querySelectorAll('.settings-panel').forEach(p => p.style.display = 'none');
   document.getElementById('panel-shortcuts').style.display = 'block';
   initPopupSettings();
+  loadCorrectionSettings(); // 2026-10：打开设置时同步「校正格式」栏（服务端持久化）
   syncAutoSaveUi(); // 2026-09：打开设置时同步自动备份开关状态
 }
 function closeSettings() { capturingOp = null; mouseCapturingOp = null; document.getElementById('modalBg').style.display = 'none'; }
@@ -10493,6 +11984,11 @@ async function loadFontSettings() {
       document.getElementById('citationItalicEnabled').checked = res.citationItalicEnabled;
       applyCitationItalic(res.citationItalicEnabled); // 键缺失时不设置 → CSS 兜底斜体
     }
+    if (res && typeof res.table_convert === 'boolean') {
+      const tcc = document.getElementById('tableConvertChk');
+      if (tcc) tcc.checked = res.table_convert; // 与主设置「识别表格转换为表格」同一开关
+      _autoTableConvert = res.table_convert; // 供应用纠错后的自动补跑判定
+    }
   } catch (e) { console.warn('loadFontSettings failed', e); }
 }
 
@@ -10524,6 +12020,18 @@ async function saveFontSettings() {
     applyCitationItalic(citationItalicEnabled);
     setStatus('字体设置已保存');
   } catch (e) { setStatus('字体设置保存失败: ' + e); }
+}
+
+// 自动表格转换开关（config.json 顶层 table_convert）：与字体设置同走 /api/config
+// 关闭后自动档不转换，工具栏「转成表格」/悬浮菜单的手动转换不受影响。
+async function saveTableConvert() {
+  const el = document.getElementById('tableConvertChk');
+  if (!el) return;
+  _autoTableConvert = !!el.checked; // 立即生效：无需等保存回包
+  try {
+    await fetchJSON('/api/config', { method: 'POST', body: JSON.stringify({ table_convert: !!el.checked }) });
+    setStatus(el.checked ? '已开启自动表格转换' : '已关闭自动表格转换（仍可手动转换）');
+  } catch (e) { setStatus('表格转换设置保存失败: ' + e); }
 }
 
 function applyFontCSSVariables(fonts) {
@@ -10855,6 +12363,9 @@ const _CMD_BUILTINS = [
   } },
   { keys: ['校正', 'proofread'], desc: '重新校正：整页/页范围/当前页起 N 页', example: '校正 12', usage: '校正 N ｜ N-M ｜ +X ｜ 全部', run: async function (ctx) {
     await _cmdProofreadSpec(ctx.ed, ctx.args);
+  } },
+  { keys: ['清理', '智能清理', 'clean'], desc: '智能清理：整页/页范围/当前页起 N 页（无参数=当前页）', example: '清理 17-100', usage: '清理 [N ｜ N-M ｜ +X ｜ 当前 ｜ 全部]（无参数=当前页）', global: true, run: async function (ctx) {
+    await _cmdCleanSpec(ctx.ed, ctx.args);
   } },
 
   // ---- 跳转：页首/页尾、行首/行尾、首页/末页、上/下一页 ----
@@ -11764,6 +13275,14 @@ function _cmdPageSpecIndices(args, baseIdx) {
     return { indices: [] };
   }
   return null;
+}
+// 命令行「清理」：无参数 = 当前页（光标页优先，回退视口页）；
+// 带参数复用页范围语法 N / N-M / +X / 当前 / 全部。工具栏按钮仍清全部页（cleanAll）。
+async function _cmdCleanSpec(ed, args) {
+  const ps = _cmdPageSpecIndices(args, currentPageIndex(ed));
+  if (ps === null) { showToast('页范围无效（如 清理 12 / 12-15 / +3 / 当前 / 全部）', 'warn'); return; }
+  if (!ps.indices.length) { showToast('未找到匹配的页', 'warn'); return; }
+  await cleanPages(ps.indices);
 }
 async function _cmdReocrSpec(ed, args) {
   const ps = _cmdPageSpecIndices(args, _cmdPageIndex(ed));
@@ -13172,6 +14691,220 @@ document.querySelectorAll('.settings-tab').forEach(btn => {
     document.getElementById('panel-' + tab).style.display = 'block';
   });
 });
+
+// ---------- 设置-校正格式：重识别返回文本的 MD/LaTeX 格式清理（2026-10） ----------
+// 设置持久化到 config.json 顶层 correction_format，经 /api/correction_format 读写；
+// 仅作用于 /api/reocr 返回文本进入对比前（默认关闭），不影响普通 OCR 流程。
+// 自定义规则为正则替换，标志仅使用 i/m/u（服务端不实现 s/DOTALL）。
+let cfSettings = { enabled: false, strip_markdown: true, strip_latex: true, remove_formula: false, custom_rules: [] };
+let cfRules = [];        // 编辑态自定义规则副本
+let cfEditingId = null;  // 正在编辑的规则 id（null = 新增）
+let _cfPreviewTimer = null;
+
+async function loadCorrectionSettings() {
+  try {
+    const res = await fetchJSON('/api/correction_format');
+    const s = (res && res.settings) || {};
+    cfSettings = {
+      enabled: !!s.enabled,
+      strip_markdown: s.strip_markdown !== false,
+      strip_latex: s.strip_latex !== false,
+      remove_formula: !!s.remove_formula,
+      custom_rules: Array.isArray(s.custom_rules) ? s.custom_rules.slice() : [],
+    };
+  } catch (e) {
+    // 读取失败时保留现状（离线/旧服务端）
+  }
+  cfRules = Array.isArray(cfSettings.custom_rules) ? cfSettings.custom_rules.slice() : [];
+  resetCfEditor();
+  syncCorrectionUi();
+}
+
+function syncCorrectionUi() {
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.checked = !!v; };
+  set('cfEnabled', cfSettings.enabled);
+  set('cfStripMarkdown', cfSettings.strip_markdown);
+  set('cfStripLatex', cfSettings.strip_latex);
+  set('cfRemoveFormula', cfSettings.remove_formula);
+  renderCfRules();
+  updateCfPreview();
+}
+
+function renderCfRules() {
+  const box = document.getElementById('cfRulesList');
+  if (!box) return;
+  box.innerHTML = '';
+  if (!cfRules.length) {
+    const empty = document.createElement('p');
+    empty.style.cssText = 'font-size:12px;color:#8595a5;margin:4px 0 0;';
+    empty.textContent = '暂无自定义规则。';
+    box.appendChild(empty);
+    return;
+  }
+  cfRules.forEach(function (r) {
+    const item = document.createElement('div');
+    item.className = 'rr-item';
+    const head = document.createElement('div');
+    head.className = 'rr-item-head';
+    const nm = document.createElement('strong');
+    nm.textContent = r.name || '(未命名)';
+    head.appendChild(nm);
+    if (r.enabled === false) {
+      const off = document.createElement('span');
+      off.style.cssText = 'color:#c62828;font-size:12px;';
+      off.textContent = '（已停用）';
+      head.appendChild(off);
+    }
+    const desc = document.createElement('span');
+    desc.style.cssText = 'color:#5a6b7c;font-size:12px;word-break:break-all;';
+    desc.textContent = ' /' + (r.pattern || '') + '/' + (r.flags ? r.flags : '') + ' → ' + (r.replacement || '（删除）');
+    head.appendChild(desc);
+    item.appendChild(head);
+    const acts = document.createElement('div');
+    acts.className = 'rr-item-acts';
+    const mk = (label, cls, fn) => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.textContent = label; if (cls) b.className = cls;
+      b.addEventListener('click', fn); return b;
+    };
+    acts.appendChild(mk('编辑', '', () => editCfRule(r.id)));
+    acts.appendChild(mk(r.enabled === false ? '启用' : '停用', '', () => toggleCfRule(r.id)));
+    acts.appendChild(mk('删除', 'danger', () => deleteCfRule(r.id)));
+    item.appendChild(acts);
+    box.appendChild(item);
+  });
+}
+
+function resetCfEditor() {
+  cfEditingId = null;
+  ['cfRuleName', 'cfRulePattern', 'cfRuleFlags', 'cfRuleReplacement'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.value = '';
+  });
+  const save = document.getElementById('cfRuleSaveBtn');
+  if (save) save.textContent = '添加规则';
+  const cancel = document.getElementById('cfRuleCancelBtn');
+  if (cancel) cancel.style.display = 'none';
+}
+
+function editCfRule(id) {
+  const r = cfRules.find(x => x.id === id);
+  if (!r) return;
+  cfEditingId = id;
+  const g = (i) => document.getElementById(i);
+  if (g('cfRuleName')) g('cfRuleName').value = r.name || '';
+  if (g('cfRulePattern')) g('cfRulePattern').value = r.pattern || '';
+  if (g('cfRuleFlags')) g('cfRuleFlags').value = r.flags || '';
+  if (g('cfRuleReplacement')) g('cfRuleReplacement').value = r.replacement || '';
+  const save = g('cfRuleSaveBtn'); if (save) save.textContent = '保存修改';
+  const cancel = g('cfRuleCancelBtn'); if (cancel) cancel.style.display = '';
+}
+
+function _newCfRuleId() {
+  return 'cf' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+
+async function saveCfRule() {
+  const g = (i) => document.getElementById(i);
+  const val = (i) => (g(i) && g(i).value) || '';
+  const name = val('cfRuleName').trim();
+  const pattern = val('cfRulePattern');
+  const flags = val('cfRuleFlags').replace(/[^imu]/g, '');
+  const replacement = val('cfRuleReplacement');
+  if (!name) { showToast('请填写规则名称', 'err'); return; }
+  if (!pattern) { showToast('请填写正则表达式', 'err'); return; }
+  try { new RegExp(pattern, flags); }
+  catch (e) { showToast('正则表达式无效：' + e.message, 'err'); return; }
+  if (cfEditingId) {
+    const r = cfRules.find(x => x.id === cfEditingId);
+    if (r) { r.name = name; r.pattern = pattern; r.flags = flags; r.replacement = replacement; }
+  } else {
+    cfRules.push({ id: _newCfRuleId(), name: name, pattern: pattern, flags: flags, replacement: replacement, enabled: true });
+  }
+  resetCfEditor();
+  await persistCorrectionSettings();
+}
+
+async function toggleCfRule(id) {
+  const r = cfRules.find(x => x.id === id);
+  if (!r) return;
+  r.enabled = (r.enabled === false); // 停用→启用 / 启用→停用
+  await persistCorrectionSettings();
+}
+
+async function deleteCfRule(id) {
+  cfRules = cfRules.filter(x => x.id !== id);
+  if (cfEditingId === id) resetCfEditor();
+  await persistCorrectionSettings();
+}
+
+async function persistCorrectionSettings() {
+  const chk = (id) => { const el = document.getElementById(id); return !!(el && el.checked); };
+  cfSettings.enabled = chk('cfEnabled');
+  cfSettings.strip_markdown = chk('cfStripMarkdown');
+  cfSettings.strip_latex = chk('cfStripLatex');
+  cfSettings.remove_formula = chk('cfRemoveFormula');
+  cfSettings.custom_rules = cfRules.slice();
+  try {
+    const res = await fetchJSON('/api/correction_format', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cfSettings),
+    });
+    if (res && res.settings) {
+      cfSettings = Object.assign({}, cfSettings, res.settings);
+      cfRules = Array.isArray(cfSettings.custom_rules) ? cfSettings.custom_rules.slice() : [];
+    }
+    renderCfRules();
+    updateCfPreview();
+    showToast('校正格式设置已保存', 'ok');
+  } catch (e) {
+    showToast('保存失败：' + e.message, 'err');
+  }
+}
+
+function updateCfPreview() {
+  const inp = document.getElementById('cfPreviewInput');
+  const out = document.getElementById('cfPreviewOut');
+  if (!inp || !out) return;
+  const text = inp.value || '';
+  if (!text) { out.value = ''; return; }
+  if (_cfPreviewTimer) clearTimeout(_cfPreviewTimer);
+  _cfPreviewTimer = setTimeout(async () => {
+    const chk = (id) => { const el = document.getElementById(id); return !!(el && el.checked); };
+    try {
+      const res = await fetchJSON('/api/correction_format', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          enabled: true,
+          strip_markdown: chk('cfStripMarkdown'),
+          strip_latex: chk('cfStripLatex'),
+          remove_formula: chk('cfRemoveFormula'),
+          custom_rules: cfRules.slice(),
+          preview: text,
+        }),
+      });
+      out.value = (res && typeof res.preview === 'string') ? res.preview : '';
+    } catch (e) {
+      out.value = '（预览失败：' + e.message + '）';
+    }
+  }, 220);
+}
+
+// 绑定：开关变化即保存
+['cfEnabled', 'cfStripMarkdown', 'cfStripLatex', 'cfRemoveFormula'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => persistCorrectionSettings());
+});
+// 绑定：规则编辑按钮与预览输入
+(function () {
+  const save = document.getElementById('cfRuleSaveBtn');
+  if (save) save.addEventListener('click', saveCfRule);
+  const cancel = document.getElementById('cfRuleCancelBtn');
+  if (cancel) cancel.addEventListener('click', resetCfEditor);
+  const inp = document.getElementById('cfPreviewInput');
+  if (inp) inp.addEventListener('input', updateCfPreview);
+})();
 // 设置-快捷键：恢复默认
 document.getElementById('resetShortcutsBtn').addEventListener('click', () => {
   bindings = Object.assign({}, DEFAULTS);
@@ -13212,8 +14945,12 @@ document.getElementById('resetUiSettingsBtn').addEventListener('click', () => {
   document.getElementById('editorFontSizeInput').value = uiSettings.editor_font_size;
   const pbIn2 = document.getElementById('prBatchPages');
   if (pbIn2) pbIn2.value = uiSettings.proofread_batch_pages;
+  const pjIn2 = document.getElementById('prAutoJump');
+  if (pjIn2) pjIn2.checked = !!UI_SETTINGS_DEFAULTS.proofread_auto_jump;
   const udIn2 = document.getElementById('undoDepthInput');
   if (udIn2) udIn2.value = String(UI_SETTINGS_DEFAULTS.undo_depth);
+  const smrR = document.getElementById('searchMaxResultsInput');
+  if (smrR) smrR.value = String(UI_SETTINGS_DEFAULTS.search_max_results);
   const rac = document.getElementById('ruleAllPagesConfirm');
   if (rac) rac.checked = true;
   const lnr = document.getElementById('lineNumShow');
@@ -13232,9 +14969,14 @@ document.getElementById('resetUiSettingsBtn').addEventListener('click', () => {
   if (chr) chr.checked = !!UI_SETTINGS_DEFAULTS.clean_html_tags;
   const cpar = document.getElementById('cleanParagraphsChk');
   if (cpar) cpar.checked = !!UI_SETTINGS_DEFAULTS.clean_paragraphs;
+  const cdpr = document.getElementById('cleanDigitPunctChk');
+  if (cdpr) cdpr.checked = !!UI_SETTINGS_DEFAULTS.clean_digit_punct;
   // 符号映射表恢复默认（2026-10-16）
   const smeR = document.getElementById('cleanSymbolMapEditor');
   if (smeR) smeR.value = formatSymbolMap(UI_SETTINGS_DEFAULTS.clean_symbol_map);
+  // 数字标点映射表恢复默认（2026-10-18）
+  const dpeR = document.getElementById('cleanDigitPunctMapEditor');
+  if (dpeR) dpeR.value = formatSymbolMap(UI_SETTINGS_DEFAULTS.clean_digit_punct_map);
   applyFontSize(uiSettings.editor_font_size);
   showToast('界面设置已恢复默认', 'ok');
 });
@@ -13297,6 +15039,11 @@ if (_resetPopupBtn) _resetPopupBtn.addEventListener('click', function () {
   el.addEventListener('change', () => saveFontSettings());
 });
 document.getElementById('citationItalicEnabled').addEventListener('change', () => saveFontSettings());
+// 自动表格转换开关
+(function bindTableConvertChk() {
+  const el = document.getElementById('tableConvertChk');
+  if (el) el.addEventListener('change', saveTableConvert);
+})();
 // 编辑器字号设置
 document.getElementById('editorFontSizeInput').addEventListener('change', (e) => {
   const v = parseInt(e.target.value, 10) || 14;
@@ -13361,6 +15108,7 @@ if (_textJustifyToggle) _textJustifyToggle.addEventListener('change', (e) => {
   ['cleanMdTagsChk', 'clean_md_tags'],
   ['cleanHtmlTagsChk', 'clean_html_tags'],
   ['cleanParagraphsChk', 'clean_paragraphs'],
+  ['cleanDigitPunctChk', 'clean_digit_punct'],
 ].forEach(([id, key]) => {
   const el = document.getElementById(id);
   if (el) el.addEventListener('change', (e) => {
@@ -13382,6 +15130,15 @@ if (_cleanSymbolMapEditor) {
     runCleanPreview();
   });
 }
+// 数字标点映射表编辑器（2026-10-18）：只保留单字符源（与设置校验、引擎口径一致）
+const _cleanDigitPunctMapEditor = document.getElementById('cleanDigitPunctMapEditor');
+if (_cleanDigitPunctMapEditor) {
+  _cleanDigitPunctMapEditor.addEventListener('input', function () {
+    const map = parseSymbolMap(_cleanDigitPunctMapEditor.value).filter(function (p) { return p[0].length === 1; });
+    if (uiSettings) { uiSettings.clean_digit_punct_map = map.length > 0 ? map : [['。','.'],['，',','],['、',','],['：',':'],['；',';']]; saveUiSettings(); }
+    runCleanPreview();
+  });
+}
 const _cleanPreviewInput = document.getElementById('cleanPreviewInput');
 if (_cleanPreviewInput) {
   _cleanPreviewInput.addEventListener('input', function () { runCleanPreview(); });
@@ -13394,6 +15151,13 @@ if (_prBatchInput) _prBatchInput.addEventListener('change', (e) => {
   e.target.value = n;
   if (uiSettings) { uiSettings.proofread_batch_pages = n; saveUiSettings(); }
 });
+// 纠错采纳/忽略后自动跳转开关（2026-10-17 新增；服务端持久化 config.json ui_settings）
+const _prAutoJumpInput = document.getElementById('prAutoJump');
+if (_prAutoJumpInput) _prAutoJumpInput.addEventListener('change', (e) => {
+  const on = !!e.target.checked;
+  if (uiSettings) { uiSettings.proofread_auto_jump = on; saveUiSettings(); }
+  else { try { localStorage.setItem('ptoe_proofread_auto_jump', on ? '1' : '0'); } catch (err) {} }
+});
 // 撤销/回退历史步数（50/100/200/500；服务端持久化 config.json ui_settings）
 const _undoDepthInput = document.getElementById('undoDepthInput');
 if (_undoDepthInput) _undoDepthInput.addEventListener('change', (e) => {
@@ -13404,6 +15168,14 @@ if (_undoDepthInput) _undoDepthInput.addEventListener('change', (e) => {
   while (undoStack.length > n) undoStack.shift();
   while (redoStack.length > n) redoStack.shift();
   histUpdateButtons();
+});
+// 搜索结果列表显示上限（10-1000，默认 200；服务端持久化 config.json ui_settings）
+const _searchMaxResultsInput = document.getElementById('searchMaxResultsInput');
+if (_searchMaxResultsInput) _searchMaxResultsInput.addEventListener('change', (e) => {
+  const v = parseInt(e.target.value, 10);
+  const n = isFinite(v) ? Math.max(10, Math.min(1000, v)) : 200;
+  e.target.value = n;
+  if (uiSettings) { uiSettings.search_max_results = n; saveUiSettings(); }
 });
 // 暂存/保存/完成并转换/快捷键设置（2026-08-07 修复：四个绑定曾整块丢失 → 按钮点击无响应）
 document.getElementById('saveBtn').addEventListener('click', save);
@@ -13654,7 +15426,16 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
       }
     })();
 
-    pages = (await fetchJSON('/api/pages')).pages;
+    const pagesRes = await fetchJSON('/api/pages');
+    pages = pagesRes.pages || [];
+    // 启动即恢复上次未落地的纠错状态（已识别错误/建议 + 已忽略集合 + 上次纠错页），
+    // 修「模型纠错后保存、重新打开 → 未应用的错误丢失、须重新识别」（2026-10-17）。
+    // 此时首屏行尚未挂载（updateViewport 之后才建行），页挂载会按 proofreadErrors 重绘。
+    applyProofreadState(
+      pagesRes.proofread || null,
+      pagesRes.last_proofread_page,
+      new Map(pages.map((p, idx) => [p.page, idx]))
+    );
   } catch (e) { document.body.textContent = '加载失败: ' + e; return; }
   heights.length = pages.length; heights.fill(0);
   est = pages.length ? 420 : 420;

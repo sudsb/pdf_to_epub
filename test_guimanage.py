@@ -1110,6 +1110,41 @@ class TestGuiPaddleMergeLines(GuiServerTestBase):
         self.assertIs(stored, True, "非法值不得写盘（键缺省或保持默认 True）")
 
 
+class TestGuiTableConvert(GuiServerTestBase):
+    """table_convert（识别文字表格转成原生表格）开关的 GET/POST 校验（2026-10-17）。"""
+
+    def _on_disk(self):
+        with open(self._cfg_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_default_true(self):
+        from configmanage import DEFAULT_CONFIG
+
+        self.assertIs(DEFAULT_CONFIG["table_convert"], True)
+
+    def test_get_defaults_true_then_post_false_persists(self):
+        status, _, body = self._get("/api/config")
+        self.assertEqual(status, 200)
+        self.assertIs(json.loads(body)["config"]["table_convert"], True)
+
+        status, raw = self._post("/api/config", {"table_convert": False})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(raw)["ok"])
+        self.assertIs(self._on_disk()["table_convert"], False)
+
+        status, _, body = self._get("/api/config")
+        self.assertEqual(status, 200)
+        self.assertIs(json.loads(body)["config"]["table_convert"], False)
+
+    def test_post_invalid_value_rejected_and_not_written(self):
+        status, raw = self._post("/api/config", {"table_convert": "maybe"})
+        self.assertEqual(status, 400)
+        data = json.loads(raw)
+        self.assertFalse(data["ok"])
+        self.assertIn("table_convert 仅接受 true/false", data["error"])
+        self.assertIs(self._on_disk().get("table_convert", True), True)
+
+
 class TestTabEndpoints(GuiServerTestBase):
     """标签页会话与 /api/tabs 端点测试。"""
 

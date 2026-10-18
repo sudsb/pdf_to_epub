@@ -1,4 +1,11 @@
 import re
+import sys
+
+# Windows 控制台默认 GBK：嵌入 JS 里的 ✕(U+2715)/全角符号会让 print 直接抛
+# UnicodeEncodeError，诊断脚本自己崩掉、掩盖检查结果。统一按 UTF-8 输出，
+# 不可编码字符替换为 ?，保证检查总能跑完（Python 3.7+ 的 TextIOWrapper 才有 reconfigure）。
+if callable(_reconf := getattr(sys.stdout, 'reconfigure', None)):
+    _reconf(encoding='utf-8', errors='replace')
 
 with open('correctmanage.py', 'r', encoding='utf-8') as f:
     content = f.read()

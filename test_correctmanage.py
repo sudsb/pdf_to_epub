@@ -60,6 +60,35 @@ from correctmanage import (
 )
 
 
+class TestTableConvertLoad(unittest.TestCase):
+    """文字表格 → 原生表格：矫正编辑器载入侧接线（2026-10-17）。"""
+
+    def test_page_text_bare_table_not_escaped(self):
+        html = "<table><tbody><tr><td>a</td></tr></tbody></table>"
+        out = _page_text(html)
+        self.assertIn("<table", out)
+        self.assertNotIn("&lt;table", out)
+
+    def test_initial_html_converts_md_table(self):
+        with mock.patch.object(correctmanage, "_tables_enabled", return_value=True):
+            out = initial_html("| A | B |\n| --- | --- |\n| C | D |")
+        self.assertIn("<table", out)
+        self.assertIn("<th>A</th>", out)
+        self.assertNotIn("&lt;table", out)
+
+    def test_initial_html_convert_disabled_keeps_text(self):
+        with mock.patch.object(correctmanage, "_tables_enabled", return_value=False):
+            out = initial_html("| A | B |\n| --- | --- |\n| C | D |")
+        self.assertNotIn("<table", out)
+
+    def test_alignment_class_survives_sanitize(self):
+        out = sanitize_html(
+            '<table><tbody><tr><td class="ptoe-align-center">a</td></tr></tbody></table>'
+        )
+        self.assertIn("<table", out)
+        self.assertIn("ptoe-align-center", out)
+
+
 class TestSanitize(unittest.TestCase):
     def test_plain_text_escaped(self):
         # 文本内容中的 < & 被转义；未知标签 <x> 整体丢弃（白名单设计）
@@ -67,6 +96,36 @@ class TestSanitize(unittest.TestCase):
             sanitize_html("a &lt; b &amp; c"), "<p>a &lt; b &amp; c</p>"
         )
         self.assertEqual(sanitize_html("你好 & <x>"), "<p>你好 &amp; </p>")
+
+    def test_proofread_err_unwrapped_fix_dropped(self):
+        # 残留纠错标注：.ptoe-fix（候选建议）整体删除；.ptoe-err（错误原文）解包保留原文，
+        # 保证正文不含任何纠错建议文本（2026-10-17 服务端兜底）。
+        out = sanitize_html(
+            '<p>你好<s class="ptoe-err" data-err-i="0">错字</s>'
+            '<span class="ptoe-fix" data-err-i="0">对字</span>世界</p>'
+        )
+        self.assertEqual(out, "<p>你好错字世界</p>")
+
+    def test_proofread_err_empty_dropped(self):
+        # 空白页填充建议（data-err-empty）文本是"拟插入的候选字"而非原文 → 整段删除，
+        # 不得解包保留，否则候选字会污染正文（2026-10-17 修复）。
+        self.assertEqual(
+            sanitize_html('<s class="ptoe-err" data-err-i="0" data-err-empty="1">候选字</s>'),
+            "",
+        )
+        self.assertEqual(
+            sanitize_html(
+                '<p><s class="ptoe-err" data-err-i="1" data-err-empty="1">候选</s></p>'
+            ),
+            "",
+        )
+
+    def test_genuine_strike_not_treated_as_proofread(self):
+        # 不带 ptoe-err 类的原生删除线 <s> 仍按格式折为 ptoe-strike，不受纠错剥离影响
+        self.assertEqual(
+            sanitize_html("<p><s>删除线</s></p>"),
+            '<p><span class="ptoe-strike">删除线</span></p>',
+        )
 
     def test_bold_italic_headings(self):
         out = sanitize_html("<div><b>粗</b> <i>斜</i></div><h2>章标题</h2><p>正文</p>")
@@ -479,8 +538,10 @@ class TestCleanPageHtml(unittest.TestCase):
         self.assertEqual(clean_page_html('<p>你好,世界</p>'), '<p>你好，世界</p>')
         # 字母/数字之间的全角标点 → 半角（英文语境）
         self.assertEqual(clean_page_html('<p>ABC，DEF</p>'), '<p>ABC,DEF</p>')
-        # 纯英文语境保留半角
-        self.assertEqual(clean_page_html('<p>英文 test,OK</p>'), '<p>英文 test,OK</p>')
+        # 中文页内（页级语境）：与汉字混排的半角标点也转全角（2026-10 放宽）
+        self.assertEqual(clean_page_html('<p>英文 test,OK</p>'), '<p>英文 test，OK</p>')
+        # 纯英文页（无汉字且含拉丁字母）保留半角
+        self.assertEqual(clean_page_html('<p>test,OK</p>'), '<p>test,OK</p>')
 
     def test_disallowed_tags_stripped(self):
         # OCR 残留的 <div> 等非白名单标签被剥掉（内容保留）
@@ -655,6 +716,108 @@ class TestCleanPageHtmlExtended(unittest.TestCase):
         once = clean_page_html(src)
         self.assertEqual(clean_page_html(once), once)
 
+    def test_punctuation_page_context_pairs(self):
+        # 2026-10 页级中文语境：括号成对转换（修「测试（)」只转一半）
+        self.assertEqual(clean_page_html("<p>测试()</p>"), "<p>测试（）</p>")
+        # 括号内是英文 / 与汉字隔空格 → 也按中文语境整对转
+        self.assertEqual(clean_page_html("<p>中文 (abc) 混排</p>"), "<p>中文 （abc） 混排</p>")
+        # 隔空格/行尾的其他半角标点一并放宽
+        self.assertEqual(clean_page_html("<p>他说abc, 后面</p>"), "<p>他说abc， 后面</p>")
+        # 孤立 ()（全页无拉丁字母）→ 按中文语境转
+        self.assertEqual(clean_page_html("<p>()</p>"), "<p>（）</p>")
+        # 幂等
+        once = clean_page_html("<p>测试()他说abc, 后面</p>")
+        self.assertEqual(clean_page_html(once), once)
+
+    def test_punctuation_english_page_kept_halfwidth(self):
+        # 纯英文页（含拉丁字母、无汉字）：保留半角，全角反向转回半角
+        self.assertEqual(
+            clean_page_html("<p>Hello, world (test) ok.</p>"),
+            "<p>Hello, world (test) ok.</p>",
+        )
+        self.assertEqual(clean_page_html("<p>Func（x）</p>"), "<p>Func(x)</p>")
+
+    def test_punctuation_protections_in_chinese_page(self):
+        # 中文页内：小数/千分位/时间/URL/缩写点不被改坏
+        src = (
+            "<p>圆周率 3.14，共 1,000 个，12:30 开始，见 Fig. 1 与 e.g. 用法，"
+            "地址 https://a.b/c?x=1&amp;y=2 结束。</p>"
+        )
+        self.assertEqual(clean_page_html(src), src)
+
+
+class TestCleanDigitPunct(unittest.TestCase):
+    """clean_page_html 数字标点归一（2026-10）：数字紧跟的中文标点 → 英文。
+
+    规则表可在设置里自定义（ui_settings.clean_digit_punct_map）；开关
+    clean_digit_punct 默认开，且独立于 clean_punctuation。
+    """
+
+    def test_default_on(self):
+        self.assertEqual(clean_page_html("<p>1。2</p>"), "<p>1.2</p>")
+        self.assertEqual(clean_page_html("<p>1，2</p>"), "<p>1,2</p>")
+        # 只动「数字紧跟」的标点：句末的「。」保持原样
+        self.assertEqual(clean_page_html("<p>1，2 与 你好。</p>"), "<p>1,2 与 你好。</p>")
+
+    def test_switch_off(self):
+        self.assertEqual(
+            clean_page_html("<p>1。2</p>", clean_digit_punct=False), "<p>1。2</p>"
+        )
+
+    def test_custom_map(self):
+        self.assertEqual(
+            clean_page_html("<p>1。2</p>", digit_punct_map=[["。", "-"]]), "<p>1-2</p>"
+        )
+        self.assertEqual(
+            clean_page_html("<p>1。2</p>", digit_punct_map=[]), "<p>1。2</p>"
+        )
+
+    def test_stats_counted(self):
+        html, st = clean_page_html("<p>1。2</p>", with_stats=True)
+        self.assertEqual(html, "<p>1.2</p>")
+        self.assertEqual(st["punct"], 1)
+
+
+class TestCleanDigitPunctUiSync(unittest.TestCase):
+    """数字标点归一：设置界面（两处 HTML 同步）与端点接线守卫。"""
+
+    @classmethod
+    def setUpClass(cls):
+        root = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(root, "ui_full.html"), encoding="utf-8") as f:
+            cls.html = f.read()
+        with open(os.path.join(root, "ui", "app.js"), encoding="utf-8") as f:
+            cls.js = f.read()
+        with open(os.path.join(root, "correctmanage.py"), encoding="utf-8") as f:
+            cls.cm_src = f.read()
+
+    def test_controls_in_both_htmls(self):
+        for label, text in (
+            ("ui_full.html", self.html),
+            ("correctmanage._UI_HTML", correctmanage._UI_HTML),
+        ):
+            for needle in ('id="cleanDigitPunctChk"', 'id="cleanDigitPunctMapEditor"'):
+                self.assertIn(needle, text, "%s 缺少 %s" % (label, needle))
+
+    def test_app_js_wiring(self):
+        for needle in (
+            "cleanDigitPunctChk",
+            "cleanDigitPunctMapEditor",
+            "clean_digit_punct_map",
+            "ptoe_clean_digit_punct",
+            "'clean_digit_punct'",
+        ):
+            self.assertIn(needle, self.js, "app.js 缺少 %s" % needle)
+
+    def test_server_wiring(self):
+        for needle in (
+            "get_clean_digit_punct_map",
+            '"digit_punct_map": digit_map,',
+            "clean_digit_punct_map",
+            "CLEAN_DIGIT_PUNCT_MAP_DEFAULT",
+        ):
+            self.assertIn(needle, self.cm_src, "correctmanage.py 缺少 %s" % needle)
+
 
 class TestCleanStats(unittest.TestCase):
     """clean_page_html(with_stats=True) 返回清理统计。
@@ -690,6 +853,40 @@ class TestCleanStats(unittest.TestCase):
 
     def test_default_returns_str(self):
         self.assertIsInstance(correctmanage.clean_page_html("<p>x</p>"), str)
+
+
+class TestCleanPreviewModalCss(unittest.TestCase):
+    """清理预览模态框必须带遮罩定位样式（2026-10 修复）。
+
+    回归守卫：`#cleanPreviewBg` 若只有 `class="modal-bg"` 而无定位规则，
+    预览框会落在文档流末尾、视口之外不可见 → 用户点「智能清理」看不到
+    预览与「应用清理」按钮，表现为"点击无反应，且中英文括号/残留标签
+    都不被处理"。
+    """
+
+    def test_modal_backdrop_has_fixed_positioning(self):
+        compact = re.sub(r"\s+", "", correctmanage._UI_HTML)
+        self.assertIn('id="cleanPreviewBg"', correctmanage._UI_HTML)
+        self.assertIn("#cleanPreviewBg{position:fixed", compact)
+        self.assertIn("align-items:center", compact)
+
+    def test_modal_wiring_ids_present(self):
+        html = correctmanage._UI_HTML
+        for tid in (
+            "cleanPreviewBg",
+            "cleanPreviewSummary",
+            "cleanPreviewList",
+            "cleanPreviewApply",
+            "cleanPreviewCancel",
+            "cleanPreviewCancelBtn",
+        ):
+            self.assertIn(f'id="{tid}"', html)
+
+    def test_modal_backdrop_hidden_by_default(self):
+        # 元素内联 display:none + 定位规则自带 display:none；
+        # JS 显示时置 display:flex（见 ui/app.js cleanAll）。
+        compact = re.sub(r"\s+", "", correctmanage._UI_HTML)
+        self.assertIn('id="cleanPreviewBg"class="modal-bg"style="display:none;"', compact)
 
 
 class TestCleanBracketJunkHtml(unittest.TestCase):
@@ -943,6 +1140,64 @@ class TestPagesEndpoint(unittest.TestCase):
             self.assertEqual(
                 pages[3], "<div>纯文本行一</div>\n<div>纯文本行二</div>"
             )
+        finally:
+            self._stop(server)
+
+    def test_pages_include_proofread_state(self):
+        # 2026-10-17 修复：/api/pages 一并下发纠错状态（此前只回 pages，前端启动即丢
+        # 「已识别未应用」的错误/建议/已忽略集合 → 保存后重开须重新识别）。
+        import threading
+        from http.server import ThreadingHTTPServer
+
+        from correctmanage import _CorrectionHandler
+
+        proofread = {
+            "errors": {"1": [{"start": 0, "end": 1, "wrong": "错", "candidates": ["对"]}]},
+            "original": {"1": "<p>错</p>"},
+            "dismissed": {"1": ["2:xx"]},
+        }
+        state = {
+            "pages": {1: "<p>错</p>"},
+            "finished": threading.Event(),
+            "preview_cache": {},
+            "pdf_path": None,
+            "img_dir": None,
+            "preview_dpi": 110,
+            "preview_quality": 82,
+            "last_heartbeat": 0.0,
+            "gone_at": None,
+            "idle_timeout": 600.0,
+            "auto_finished": False,
+            "proofread": proofread,
+            "last_proofread_page": 4,
+        }
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _CorrectionHandler)
+        server.daemon_threads = True
+        server.state = state
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            import requests
+
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+            res = requests.get(base + "/api/pages").json()
+            self.assertEqual(res["proofread"], proofread)
+            self.assertEqual(res["last_proofread_page"], 4)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_pages_proofread_defaults_when_absent(self):
+        # 状态无 proofread 键时下发结构完整的空默认（前端可安全解析）
+        import requests
+
+        server, base = self._start()
+        try:
+            res = requests.get(base + "/api/pages").json()
+            self.assertEqual(
+                res["proofread"],
+                {"errors": {}, "original": {}, "dismissed": {}},
+            )
+            self.assertIsNone(res["last_proofread_page"])
         finally:
             self._stop(server)
 
@@ -2620,6 +2875,157 @@ class TestCleanEndpoint(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+def _correct_api(path, payload):
+    """起一个临时矫正服务，POST ``payload`` 到 ``path``，返回 (状态码, JSON, state)。"""
+    import json as _json
+    from http.server import ThreadingHTTPServer
+    from threading import Thread
+
+    import requests
+    from correctmanage import _CorrectionHandler
+
+    state = {
+        "pages": {1: "<p>原文</p>"},
+        "finished": __import__("threading").Event(),
+        "preview_cache": {},
+        "pdf_path": None,
+        "img_dir": None,
+        "preview_dpi": 110,
+        "preview_quality": 82,
+        "last_heartbeat": 0.0,
+        "gone_at": None,
+        "idle_timeout": 600.0,
+        "auto_finished": False,
+    }
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _CorrectionHandler)
+    server.daemon_threads = True
+    server.state = state
+    Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        res = requests.post(base + path, data=_json.dumps(payload))
+        return res.status_code, res.json(), state
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+class TestTableConvertEndpoint(unittest.TestCase):
+    """/api/table_convert：文字 → 原生表格（手动档）；lines 模式 → 自动档 + chunks。"""
+
+    def _run(self, payload, path="/api/table_convert"):
+        return _correct_api(path, payload)
+
+    def test_md_table(self):
+        status, res, state = self._run({"text": "| A | B |\n| --- | --- |\n| C | D |"})
+        self.assertEqual(status, 200)
+        self.assertTrue(res["ok"])
+        self.assertIn("<th>A</th><th>B</th>", res["html"])
+        self.assertIn("<td>C</td><td>D</td>", res["html"])
+        # 无状态：服务端内容不变
+        self.assertEqual(state["pages"][1], "<p>原文</p>")
+
+    def test_manual_no_separator(self):
+        status, res, _ = self._run({"text": "| A | B |\n| C | D |"})
+        self.assertEqual(status, 200)
+        self.assertIn("<th>A</th><th>B</th>", res["html"])
+
+    def test_space_aligned(self):
+        status, res, _ = self._run({"text": "省份    数值\n河北    1\n山西    2"})
+        self.assertEqual(status, 200)
+        self.assertIn("<th>省份</th><th>数值</th>", res["html"])
+
+    def test_empty_text_400(self):
+        status, res, _ = self._run({"text": "   "})
+        self.assertEqual(status, 400)
+        self.assertFalse(res["ok"])
+
+    def test_lines_mode_chunks(self):
+        status, res, _ = self._run(
+            {"lines": ["开篇", "| A | B |", "| --- | --- |", "| C | D |", "结尾"]}
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(res["ok"])
+        # 输出行：开篇 / <table>…</table> / 结尾
+        self.assertEqual(len(res["lines"]), 3)
+        self.assertEqual(len(res["chunks"]), 1)
+        start, end, html = res["chunks"][0]
+        self.assertEqual((start, end), (1, 4))
+        self.assertEqual(html, res["lines"][1])
+        self.assertIn("<th>A</th>", html)
+
+    def test_lines_mode_no_table(self):
+        status, res, _ = self._run({"lines": ["甲", "乙"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(res["lines"], ["甲", "乙"])
+        self.assertEqual(res["chunks"], [])
+
+    def test_lines_mode_requires_separator(self):
+        # 自动档：缺 Markdown 分隔行的管道文字不转（与 text 手动档相反）
+        status, res, _ = self._run({"lines": ["| A | B |", "| C | D |"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(res["chunks"], [])
+
+    def test_lines_not_a_list_400(self):
+        status, res, _ = self._run({"lines": "abc"})
+        self.assertEqual(status, 400)
+        self.assertFalse(res["ok"])
+
+    def test_lines_with_non_string_400(self):
+        status, res, _ = self._run({"lines": [1, 2]})
+        self.assertEqual(status, 400)
+        self.assertFalse(res["ok"])
+
+
+class TestTableToTextEndpoint(unittest.TestCase):
+    """/api/table_to_text：原生 <table> → Markdown 管道文字（编辑器「表格转文本」）。"""
+
+    TABLE = (
+        "<table><thead><tr><th>省</th>"
+        '<th class="ptoe-align-right">人口</th></tr></thead>'
+        "<tbody><tr><td>广东</td><td>1.2亿</td></tr></tbody></table>"
+    )
+
+    def _run(self, payload):
+        return _correct_api("/api/table_to_text", payload)
+
+    def test_single_table(self):
+        status, res, state = self._run({"htmls": [self.TABLE]})
+        self.assertEqual(status, 200)
+        self.assertTrue(res["ok"])
+        self.assertEqual(
+            res["texts"], ["| 省 | 人口 |\n| --- | ---: |\n| 广东 | 1.2亿 |"]
+        )
+        self.assertEqual(state["pages"][1], "<p>原文</p>")  # 无状态
+
+    def test_bare_string_accepted(self):
+        status, res, _ = self._run({"htmls": self.TABLE})
+        self.assertEqual(status, 200)
+        self.assertEqual(len(res["texts"]), 1)
+        self.assertTrue(res["texts"][0])
+
+    def test_non_table_gives_empty(self):
+        status, res, _ = self._run({"htmls": ["<p>无表格</p>", self.TABLE]})
+        self.assertEqual(status, 200)
+        self.assertEqual(res["texts"][0], "")
+        self.assertTrue(res["texts"][1])
+
+    def test_empty_400(self):
+        status, res, _ = self._run({"htmls": []})
+        self.assertEqual(status, 400)
+        self.assertFalse(res["ok"])
+
+    def test_bad_type_400(self):
+        status, res, _ = self._run({"htmls": [1]})
+        self.assertEqual(status, 400)
+        self.assertFalse(res["ok"])
+
+    def test_too_many_400(self):
+        status, res, _ = self._run({"htmls": ["<table></table>"] * 201})
+        self.assertEqual(status, 400)
+        self.assertFalse(res["ok"])
 
 
 class TestClipboardHelpers(unittest.TestCase):
@@ -9029,7 +9435,9 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "popup_row2": ["note"],
                     "popup_rule_count": 3,
                     "proofread_batch_pages": 0,
+                    "proofread_auto_jump": True,
                     "undo_depth": 100,
+                    "search_max_results": 200,
                     "show_line_numbers": False,
                     "line_num_size": "large",
                     "text_justify": True,
@@ -9039,6 +9447,8 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "clean_html_tags": True,
                     "clean_paragraphs": False,
                     "clean_symbol_map": [["[", "【"], ["]", "】"], ["--", "——"], ["~", "～"]],
+                    "clean_digit_punct": True,
+                    "clean_digit_punct_map": [["。", "."], ["，", ","], ["、", ","], ["：", ":"], ["；", ";"]],
                 },
             )
         finally:
@@ -9064,10 +9474,12 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "img_mode": "",
                     "rule_all_pages_confirm": True,
                     "popup_row1": ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"],
-                    "popup_row2": ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"],
+                    "popup_row2": ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub", "table", "table2text"],
                     "popup_rule_count": 5,
                     "proofread_batch_pages": 0,
+                    "proofread_auto_jump": True,
                     "undo_depth": 100,
+                    "search_max_results": 200,
                     "show_line_numbers": False,
                     "line_num_size": "large",
                     "text_justify": True,
@@ -9077,6 +9489,8 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "clean_html_tags": True,
                     "clean_paragraphs": False,
                     "clean_symbol_map": [["[", "【"], ["]", "】"], ["--", "——"], ["~", "～"]],
+                    "clean_digit_punct": True,
+                    "clean_digit_punct_map": [["。", "."], ["，", ","], ["、", ","], ["：", ":"], ["；", ";"]],
                 },
             )
         finally:
@@ -9567,6 +9981,45 @@ class TestUiSettingsEndpoint(unittest.TestCase):
         finally:
             self._stop(server)
 
+    def test_post_proofread_auto_jump_persists(self):
+        # 采纳/忽略后自动跳转开关：true/false 均持久化（2026-10-17 新增）
+        import json as _json
+
+        import requests
+
+        for val in (True, False):
+            self._patch_cfg({})
+            calls = self._patch_setter()
+            server, base = self._start()
+            try:
+                res = requests.post(
+                    base + "/api/ui_settings",
+                    data=_json.dumps({"ui_settings": {"proofread_auto_jump": val}}),
+                ).json()
+                self.assertTrue(res["ok"])
+                self.assertEqual(calls, [{"proofread_auto_jump": val}])
+            finally:
+                self._stop(server)
+
+    def test_post_proofread_auto_jump_bad_type_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"proofread_auto_jump": "yes"}}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("布尔", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
     def test_post_undo_depth_persists(self):
         import json as _json
 
@@ -9604,6 +10057,63 @@ class TestUiSettingsEndpoint(unittest.TestCase):
         finally:
             self._stop(server)
 
+    def test_post_search_max_results_persists(self):
+        # 搜索结果列表显示上限（10-1000）：合法值原样传给 set_ui_settings
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"search_max_results": 500}}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(calls, [{"search_max_results": 500}])
+        finally:
+            self._stop(server)
+
+    def test_post_search_max_results_bad_type_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"search_max_results": "abc"}}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("数字", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+    def test_post_search_max_results_out_of_range_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"search_max_results": 5000}}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("超出范围", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
     def test_get_popup_defaults(self):
         import requests
 
@@ -9618,7 +10128,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
             )
             self.assertEqual(
                 res["ui_settings"]["popup_row2"],
-                ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"],
+                ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub", "table", "table2text"],
             )
             self.assertEqual(res["ui_settings"]["popup_rule_count"], 5)
         finally:
@@ -10408,6 +10918,56 @@ class TestSetMouseShortcutsConfig(unittest.TestCase):
         self.assertEqual(patched["mouse_shortcuts"], {})
 
 
+class TestCleanDigitPunctConfig(unittest.TestCase):
+    """数字标点映射表的配置读写与校验（ui_settings.clean_digit_punct_map）。"""
+
+    def setUp(self):
+        self.cm = configmanage
+        self.tmp = tempfile.mkdtemp(prefix="ptoe_cfg_dp_")
+        self.path = str(Path(self.tmp) / "config.json")
+        self._orig_path = configmanage._CONFIG_PATH
+        configmanage._CONFIG_PATH = self.path
+        self.addCleanup(lambda: setattr(configmanage, "_CONFIG_PATH", self._orig_path))
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+
+    def test_default_when_missing(self):
+        self.assertEqual(
+            self.cm.get_clean_digit_punct_map(),
+            [["。", "."], ["，", ","], ["、", ","], ["：", ":"], ["；", ";"]],
+        )
+        self.assertIs(self.cm.get_clean_settings()["clean_digit_punct"], True)
+
+    def test_roundtrip_and_switch(self):
+        self.cm.set_ui_settings(
+            {
+                "clean_digit_punct": False,
+                "clean_digit_punct_map": [["。", "-"], ["，", ","]],
+            }
+        )
+        self.assertIs(self.cm.get_clean_settings()["clean_digit_punct"], False)
+        self.assertEqual(self.cm.get_clean_digit_punct_map(), [["。", "-"], ["，", ","]])
+
+    def test_write_validation_rejects_multichar_src(self):
+        cfg = self.cm.set_ui_settings({"clean_digit_punct_map": [["--", "—"]]})
+        self.assertEqual(
+            cfg["ui_settings"]["clean_digit_punct_map"],
+            [list(p) for p in self.cm.CLEAN_DIGIT_PUNCT_MAP_DEFAULT],
+        )
+
+    def test_read_validation_falls_back(self):
+        import json as _json
+
+        default = [list(p) for p in self.cm.CLEAN_DIGIT_PUNCT_MAP_DEFAULT]
+        # 直接写坏配置（绕过 set_ui_settings 校验）→ 读取时整体回退默认
+        Path(self.path).write_text(
+            _json.dumps(
+                {"ui_settings": {"clean_digit_punct_map": [["。", "."], ["。", ","]]}}
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.cm.get_clean_digit_punct_map(), default)
+
+
 class TestSetUiSettingsConfig(unittest.TestCase):
     """configmanage.set_ui_settings：原子写 + 无变更不写盘 + 清洗/钳制。"""
 
@@ -10501,10 +11061,12 @@ class TestSetUiSettingsConfig(unittest.TestCase):
                 "img_mode": "",
                 "rule_all_pages_confirm": True,
                 "popup_row1": ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"],
-                "popup_row2": ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"],
+                "popup_row2": ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub", "table", "table2text"],
                 "popup_rule_count": 5,
                 "proofread_batch_pages": 0,
+                "proofread_auto_jump": True,
                 "undo_depth": 100,
+                "search_max_results": 200,
                 "show_line_numbers": False,
                 "line_num_size": "large",
                 "text_justify": True,
@@ -10514,6 +11076,8 @@ class TestSetUiSettingsConfig(unittest.TestCase):
                 "clean_html_tags": True,
                 "clean_paragraphs": False,
                 "clean_symbol_map": [["[", "【"], ["]", "】"], ["--", "——"], ["~", "～"]],
+                "clean_digit_punct": True,
+                "clean_digit_punct_map": [["。", "."], ["，", ","], ["、", ","], ["：", ":"], ["；", ";"]],
             },
         )
 
@@ -10523,6 +11087,17 @@ class TestSetUiSettingsConfig(unittest.TestCase):
         self.assertEqual(cfg["ui_settings"]["undo_depth"], 100)
         cfg2 = self.cm.set_ui_settings({"undo_depth": 200})
         self.assertEqual(cfg2["ui_settings"]["undo_depth"], 200)
+
+    def test_search_max_results_defensive_fallback(self):
+        # 搜索结果列表显示上限：越界 clamp 到 10-1000，非数值回退默认 200，合法值保留
+        cfg = self.cm.set_ui_settings({"search_max_results": 99999})
+        self.assertEqual(cfg["ui_settings"]["search_max_results"], 1000)
+        cfg = self.cm.set_ui_settings({"search_max_results": 1})
+        self.assertEqual(cfg["ui_settings"]["search_max_results"], 10)
+        cfg = self.cm.set_ui_settings({"search_max_results": "abc"})
+        self.assertEqual(cfg["ui_settings"]["search_max_results"], 200)
+        cfg = self.cm.set_ui_settings({"search_max_results": 400})
+        self.assertEqual(cfg["ui_settings"]["search_max_results"], 400)
 
     def test_line_num_size_defensive_fallback(self):
         # 非法尺寸 → 回退默认 large；合法尺寸保留
@@ -10538,6 +11113,13 @@ class TestSetUiSettingsConfig(unittest.TestCase):
         cfg2 = self.cm.set_ui_settings({"text_justify": True})
         self.assertEqual(cfg2["ui_settings"]["text_justify"], True)
 
+    def test_proofread_auto_jump_defensive_fallback(self):
+        # 非 bool → 回退默认 True（与 rule_all_pages_confirm 同构）
+        cfg = self.cm.set_ui_settings({"proofread_auto_jump": "yes"})
+        self.assertEqual(cfg["ui_settings"]["proofread_auto_jump"], True)
+        cfg2 = self.cm.set_ui_settings({"proofread_auto_jump": False})
+        self.assertEqual(cfg2["ui_settings"]["proofread_auto_jump"], False)
+
     def test_popup_defensive_fallback(self):
         # 结构性非法（非列表 / 含非法项 / 越界数值 / 布尔）→ 回退默认
         cfg = self.cm.set_ui_settings({"popup_row1": "bold"})
@@ -10548,7 +11130,7 @@ class TestSetUiSettingsConfig(unittest.TestCase):
         cfg = self.cm.set_ui_settings({"popup_row2": ["bogus", "note"]})
         self.assertEqual(
             cfg["ui_settings"]["popup_row2"],
-            ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"],
+            ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub", "table", "table2text"],
         )
         cfg = self.cm.set_ui_settings({"popup_row1": ["bold", "bold"]})  # 重复
         self.assertEqual(
@@ -10580,6 +11162,7 @@ class TestSetUiSettingsConfig(unittest.TestCase):
                 "clean_md_tags": True,
                 "clean_html_tags": True,
                 "clean_paragraphs": False,
+                "clean_digit_punct": True,
             },
         )
         cfg = self.cm.set_ui_settings({"clean_symbols": False, "clean_paragraphs": True})
@@ -10619,7 +11202,7 @@ class TestSetUiSettingsConfig(unittest.TestCase):
         )
 
         self.assertEqual(POPUP_ROW1_DEFAULT, ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"])
-        self.assertEqual(POPUP_ROW2_DEFAULT, ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"])
+        self.assertEqual(POPUP_ROW2_DEFAULT, ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub", "table", "table2text"])
         self.assertEqual(POPUP_RULE_COUNT_DEFAULT, 5)
 
 
@@ -10655,7 +11238,7 @@ class TestConfigEndpoint(unittest.TestCase):
         server.shutdown()
         server.server_close()
 
-    def _patch_cfg(self, fonts=None, citationItalicEnabled=None):
+    def _patch_cfg(self, fonts=None, citationItalicEnabled=None, table_convert=None):
         import configmanage
 
         cfg = {"model_choices": {}, "selected_model": None}
@@ -10663,6 +11246,8 @@ class TestConfigEndpoint(unittest.TestCase):
             cfg["fonts"] = fonts
         if citationItalicEnabled is not None:
             cfg["citationItalicEnabled"] = citationItalicEnabled
+        if table_convert is not None:
+            cfg["table_convert"] = table_convert
         orig = configmanage.get_config
         configmanage.get_config = lambda *a, **k: cfg
         self.addCleanup(lambda: setattr(configmanage, "get_config", orig))
@@ -10754,6 +11339,94 @@ class TestConfigEndpoint(unittest.TestCase):
             ).json()
             self.assertFalse(res["ok"])
             self.assertIn("布尔值", res["error"])
+        finally:
+            self._stop(server)
+
+    # ---- table_convert（识别文字表格自动转原生表格，2026-10）----
+
+    def test_get_table_convert_default_true(self):
+        """GET /api/config：table_convert 缺失时按默认 True 下发，前端复选框才有确定初值。"""
+        import requests
+
+        self._patch_cfg(None, None)
+        server, base = self._start()
+        try:
+            res = requests.get(base + "/api/config").json()
+            self.assertTrue(res["ok"])
+            self.assertIs(res["table_convert"], True)
+        finally:
+            self._stop(server)
+
+    def test_get_table_convert_stored_false(self):
+        import requests
+
+        self._patch_cfg(None, None, table_convert=False)
+        server, base = self._start()
+        try:
+            res = requests.get(base + "/api/config").json()
+            self.assertTrue(res["ok"])
+            self.assertIs(res["table_convert"], False)
+        finally:
+            self._stop(server)
+
+    def test_post_table_convert_persists(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg(None, None)
+        calls = []
+        import configmanage
+
+        orig = configmanage.update_config
+        configmanage.update_config = lambda key, val: calls.append((key, val))
+        self.addCleanup(lambda: setattr(configmanage, "update_config", orig))
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/config", data=_json.dumps({"table_convert": False})
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertIn(("table_convert", False), calls)
+        finally:
+            self._stop(server)
+
+    def test_post_table_convert_noop_skips_write(self):
+        """同值提交不写盘（与 fonts/citationItalicEnabled 的 changed 语义一致）。"""
+        import json as _json
+
+        import requests
+
+        self._patch_cfg(None, None, table_convert=True)
+        calls = []
+        import configmanage
+
+        orig = configmanage.update_config
+        configmanage.update_config = lambda key, val: calls.append((key, val))
+        self.addCleanup(lambda: setattr(configmanage, "update_config", orig))
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/config", data=_json.dumps({"table_convert": True})
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual([k for k, _ in calls if k == "table_convert"], [])
+        finally:
+            self._stop(server)
+
+    def test_post_invalid_table_convert_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg(None, None)
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/config", data=_json.dumps({"table_convert": "maybe"})
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("table_convert 必须是布尔值", res["error"])
         finally:
             self._stop(server)
 
@@ -14436,6 +15109,188 @@ class TestTable(unittest.TestCase):
         )
 
 
+class TestTableEnhancements(unittest.TestCase):
+    """表格增强（2026-10）：合并/拆分、单元格/行列尺寸、垂直对齐、悬浮菜单。
+
+    契约：单元格尺寸走白名单内联 style（width/height/vertical-align，共用一个
+    规范化函数 rulemanage.normalize_table_cell_style）；表格级 table-layout:fixed
+    走 rulemanage.normalize_table_style；垂直对齐复用类名 ptoe-vtop/vmid/vbot。
+    """
+
+    # ---- 后端清洗契约（尺寸/对齐得以持久化） ----
+
+    def test_cell_size_style_kept(self):
+        out = sanitize_html(
+            '<table><tr><td style="width:33.3%;height:2.5em;vertical-align:middle">x</td></tr></table>'
+        )
+        self.assertIn(
+            'style="width:33.3%;height:2.5em;vertical-align:middle"', out
+        )
+
+    def test_cell_size_style_unsafe_dropped(self):
+        out = sanitize_html(
+            '<table><tr><td style="position:fixed;color:red;width:20%">x</td></tr></table>'
+        )
+        self.assertIn("width:20%", out)
+        self.assertNotIn("position", out)
+        self.assertNotIn("color", out)
+
+    def test_cell_size_style_bounds_and_naked_unit(self):
+        self.assertNotIn("width", sanitize_html(
+            '<table><tr><td style="width:9999%">x</td></tr></table>'))
+        # 无单位数值不是合法 CSS 长度，必须丢弃
+        self.assertNotIn("width", sanitize_html(
+            '<table><tr><td style="width:33">x</td></tr></table>'))
+        self.assertNotIn("height", sanitize_html(
+            '<table><tr><td style="height:0px">x</td></tr></table>'))
+
+    def test_table_layout_fixed_kept_others_dropped(self):
+        out = sanitize_html(
+            '<table style="border:1px;table-layout:fixed"><tr><td>x</td></tr></table>'
+        )
+        self.assertEqual(
+            out, '<table style="table-layout:fixed"><tbody><tr><td>x</td></tr></tbody></table>'
+        )
+
+    def test_valign_class_kept_alongside_align(self):
+        out = sanitize_html(
+            '<table><tr><td class="ptoe-vtop ptoe-align-right zz">x</td></tr></table>'
+        )
+        self.assertIn('class="ptoe-vtop ptoe-align-right"', out)
+        self.assertNotIn("zz", out)
+
+    def test_merge_attrs_and_size_roundtrip_idempotent(self):
+        src = (
+            '<table style="table-layout:fixed"><tr>'
+            '<td colspan="2" rowspan="2" style="width:33.3%;height:2.5em;vertical-align:middle">x</td>'
+            "</tr></table>"
+        )
+        once = sanitize_html(src)
+        self.assertIn('colspan="2"', once)
+        self.assertIn('rowspan="2"', once)
+        self.assertEqual(sanitize_html(once), once, "表格清洗必须幂等")
+
+    # ---- rulemanage 规范化函数 ----
+
+    def test_normalize_table_cell_style_shape_and_order(self):
+        n = rulemanage.normalize_table_cell_style
+        self.assertEqual(n("height:2.5em;width:50%"), "width:50%;height:2.5em")
+        self.assertEqual(n("width:50%"), "width:50%")
+        self.assertEqual(n("width:50.00%"), "width:50%")
+        self.assertEqual(n(""), "")
+        self.assertIsInstance(n(None), str)
+
+    def test_normalize_table_cell_style_rejects(self):
+        n = rulemanage.normalize_table_cell_style
+        for bad in ("width:0%", "width:20", "vertical-align:baseline",
+                    "width:-5%", "height:99999px", "position:fixed"):
+            self.assertEqual(n(bad), "", "应被拒绝: " + bad)
+
+    def test_normalize_table_style_only_fixed(self):
+        n = rulemanage.normalize_table_style
+        self.assertEqual(n("table-layout:fixed"), "table-layout:fixed")
+        self.assertEqual(n("border:1px;table-layout:fixed"), "table-layout:fixed")
+        self.assertEqual(n("border:1px"), "")
+
+    # ---- 前端接线契约（内嵌 HTML / ui/app.js） ----
+
+    @staticmethod
+    def _read_js():
+        root = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(root, "ui", "app.js"), encoding="utf-8") as f:
+            return f.read()
+
+    def test_ui_html_has_enhancement_dom(self):
+        html = correctmanage._UI_HTML
+        for tid in ("tblBar", "tblMenu", "tblResizeLayer", "tblSizeModalBg",
+                    "tblSizeColWidth", "tblSizeRowHeight", "tblSizeRowUnit",
+                    "tblSizeApply", "tblSizeCancel"):
+            self.assertIn('id="%s"' % tid, html)
+
+    def test_toolbar_exposes_enhancement_ops(self):
+        html = correctmanage._UI_HTML
+        for op in ("merge", "split", "colwidth", "rowheight", "more"):
+            self.assertIn('data-tbl-op="%s"' % op, html)
+
+    def test_css_row_grow_sel_and_resize_layer(self):
+        # 用「折叠为单空格」而非删除空白：删除会抹掉后代组合器空格，
+        # `.page-row.ptoe-has-table .editable{` 会变成 `...table.editable{`。
+        compact = re.sub(r"\s+", " ", correctmanage._UI_HTML)
+        self.assertIn(".page-row.ptoe-has-table .editable{", compact)
+        self.assertIn("height:auto", compact)
+        self.assertIn("#tblResizeLayer{position:fixed", compact)
+        self.assertIn(".ptoe-cell-sel", compact)
+        self.assertIn(".ptoe-vmid", compact)
+
+    def test_appjs_defines_table_enhancement_functions(self):
+        js = self._read_js()
+        for fn in ("_tblGrid", "_tblSplitCell", "_tblMerge", "_tblSplit",
+                   "_tblInsertRow", "_tblDelRow", "_tblMoveRow", "_tblInsertCol",
+                   "_tblDelCol", "_tblMoveCol", "_tblToggleHeader",
+                   "_tblSetColWidthPct", "_tblSetRowHeight", "_tblDistributeCols",
+                   "_tblResetSizes", "_tblVAlign", "_tblDoOp", "_tblTabMove",
+                   "_syncTblGrow", "_tblShowResizeLayer"):
+            self.assertIn("function %s(" % fn, js, "缺函数 " + fn)
+
+    def test_appjs_dispatch_covers_menu_ops(self):
+        js = self._read_js()
+        for op in ("insertrowabove", "insertrowbelow", "moverowup", "moverowdown",
+                   "insertcolleft", "insertcolright", "movecolleft", "movecolright",
+                   "distribute", "reset", "valigntop", "valignmiddle",
+                   "valignbottom", "header"):
+            self.assertIn("op === '%s'" % op, js, "分派缺 " + op)
+
+    def test_sync_content_hooks_row_grow(self):
+        js = self._read_js()
+        self.assertIn("_syncTblGrow(ed, i);", js)
+        self.assertIn("_syncTblGrow(row.querySelector('.editable'), i);", js)
+
+    # ---- 回归：滚动后浮层残留（2026-10「非表格位置出现表格框线」） ----
+
+    def test_hide_tbl_bar_also_hides_fixed_overlays(self):
+        """hideTblBar() 必须连带收起手柄层与「更多」菜单。
+
+        手柄层/菜单都是 position:fixed 浮层；只收操作条会让它们残留在原坐标、
+        盖在无关正文上，hover 时显影成「滑页后在非表格位置出现表格框线」。
+        应用既有的 window scroll 处理器会调用 hideTblBar()。
+        """
+        js = self._read_js()
+        body = js.split("function hideTblBar()", 1)[1].split("\n}", 1)[0]
+        self.assertIn("_tblHideResizeLayer()", body)
+        self.assertIn("_tblMenuClose()", body)
+
+    def test_hide_resize_layer_clears_dom(self):
+        js = self._read_js()
+        body = js.split("function _tblHideResizeLayer()", 1)[1].split("\n}", 1)[0]
+        self.assertIn("style.display = 'none'", body)
+        self.assertIn("innerHTML = ''", body)
+
+    def test_reposition_bar_hides_when_table_gone(self):
+        # 失效分支不再以 _tblBarVisible 为守卫：原先该守卫使 hideTblBar()（滚动时
+        # 调用）之后手柄层成为没人收起的残留浮层。
+        js = self._read_js()
+        body = js.split("function _tblRepositionBar()", 1)[1].split("\n}", 1)[0]
+        self.assertNotIn("else if (_tblBarVisible)", body)
+        self.assertIn("hideTblBar()", body)
+
+    def test_scroll_does_not_orphan_resize_layer(self):
+        js = self._read_js()
+        # 滚动处理器（应用既有）调用 hideTblBar → 滚动即收起整套浮层
+        self.assertRegex(
+            js, r"addEventListener\('scroll',\s*\(\)\s*=>\s*\{[^}]*hideTblBar\(\)"
+        )
+        # 手柄层不再绑定 scroll 重定位，避免与「滚动即收起」互相打架
+        self.assertNotIn("addEventListener('scroll', _tblScheduleRepos", js)
+
+    def test_resize_layer_hover_hint_is_per_handle(self):
+        # 移除「悬停整层即显影全部手柄线」规则：残留浮层也会在无关正文上显影
+        compact = re.sub(r"\s+", " ", correctmanage._UI_HTML)
+        self.assertNotIn("#tblResizeLayer:hover .tbl-col-h", compact)
+        self.assertNotIn("#tblResizeLayer:hover .tbl-row-h", compact)
+        self.assertIn("#tblResizeLayer .tbl-col-h:hover::after", compact)
+        self.assertIn("#tblResizeLayer .tbl-row-h:hover::after", compact)
+
+
 class TestCharStyleAndDivider(unittest.TestCase):
     """字符样式（span style）与分隔线（2026-09-27）。
 
@@ -15181,6 +16036,303 @@ class TestOpenBrowserDetached(unittest.TestCase):
                     proc.wait(timeout=5)
                 except Exception:  # noqa: BLE001  收尾失败不影响断言
                     pass
+
+
+class TestCleanCorrectionFormatUnit(unittest.TestCase):
+    """clean_correction_format：重识别返回文本的 MD/LaTeX 无关格式清理（默认关闭）。"""
+
+    def test_empty_and_noop_fast_path(self):
+        """空文本/全部关闭时零开销：原样返回同一对象（性能红线）。"""
+        from correctmanage import clean_correction_format
+
+        self.assertEqual(clean_correction_format(""), "")
+        big = "中文文本abc123。" * 20000
+        out = clean_correction_format(
+            big,
+            strip_markdown=False,
+            strip_latex=False,
+            remove_formula=False,
+            custom_rules=[],
+        )
+        self.assertIs(out, big)
+
+    def test_strip_markdown_keeps_text(self):
+        from correctmanage import clean_correction_format
+
+        f = lambda s: clean_correction_format(s, strip_markdown=True, strip_latex=False)
+        self.assertEqual(f("**粗体**"), "粗体")
+        self.assertEqual(f("*斜体*"), "斜体")
+        self.assertEqual(f("# 标题"), "标题")
+        self.assertEqual(f("- 列表项"), "列表项")
+        self.assertEqual(f("> 引用"), "引用")
+        self.assertEqual(f("[文字](http://x)"), "文字")
+        self.assertEqual(f("![图](a.png)"), "图")
+        self.assertEqual(f("`code`"), "code")
+        self.assertEqual(f("~~删~~"), "删")
+
+    def test_strip_latex_keeps_content(self):
+        from correctmanage import clean_correction_format
+
+        f = lambda s: clean_correction_format(s, strip_markdown=False, strip_latex=True)
+        self.assertEqual(f(r"$\frac{1}{2}$"), "1/2")
+        self.assertEqual(f(r"$\textcircled{1}$"), "①")
+        inline = f("文字 $x^2$ 文字")
+        self.assertNotIn("$", inline)
+        self.assertIn("x2", inline)
+
+    def test_remove_formula_drops_content(self):
+        from correctmanage import clean_correction_format
+
+        f = lambda s: clean_correction_format(
+            s, strip_markdown=False, strip_latex=False, remove_formula=True
+        )
+        self.assertEqual(f(r"前 $\frac{1}{2}$ 后"), "前  后")
+        self.assertEqual(f(r"前 \frac{1}{2} 后"), "前  后")
+
+    def test_custom_rules_order_and_disabled_skip(self):
+        from correctmanage import clean_correction_format
+
+        rules = [
+            {"name": "去圆圈", "pattern": "^[①-⑳]\\s*", "flags": "", "replacement": ""},
+            {"name": "停用", "pattern": "不应匹配", "flags": "", "replacement": "X", "enabled": False},
+        ]
+        out = clean_correction_format(
+            "① 正文 不应匹配",
+            strip_markdown=False,
+            strip_latex=False,
+            custom_rules=rules,
+        )
+        self.assertEqual(out, "正文 不应匹配")
+
+
+class TestCorrectionFormatEndpoint(unittest.TestCase):
+    """/api/correction_format：校正格式清理设置（config.json 顶层 correction_format）。"""
+
+    def _patch_cfg_file(self):
+        import json as _json
+
+        tmp = tempfile.mkdtemp(prefix="ptoe_cf_")
+        path = str(Path(tmp) / "config.json")
+        orig_path = configmanage._CONFIG_PATH
+        configmanage._CONFIG_PATH = path
+        self.addCleanup(lambda: setattr(configmanage, "_CONFIG_PATH", orig_path))
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump({"model_choices": {}, "selected_model": None}, f)
+        return path
+
+    def test_get_returns_defaults_when_unset(self):
+        import requests
+
+        orig = configmanage.get_config
+        configmanage.get_config = lambda *a, **k: {
+            "model_choices": {},
+            "selected_model": None,
+        }
+        self.addCleanup(lambda: setattr(configmanage, "get_config", orig))
+        server, base = _start_handler_server(_basic_server_state())
+        try:
+            res = requests.get(base + "/api/correction_format").json()
+            self.assertTrue(res["ok"])
+            s = res["settings"]
+            self.assertFalse(s["enabled"])
+            self.assertTrue(s["strip_markdown"])
+            self.assertTrue(s["strip_latex"])
+            self.assertFalse(s["remove_formula"])
+            self.assertEqual(s["custom_rules"], [])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_post_persists_partial_and_round_trips(self):
+        import json as _json
+
+        import requests
+
+        path = self._patch_cfg_file()
+        server, base = _start_handler_server(_basic_server_state())
+        try:
+            payload = {
+                "enabled": True,
+                "strip_markdown": False,
+                "strip_latex": True,
+                "remove_formula": True,
+                "custom_rules": [
+                    {"name": "去圆圈", "pattern": "^[①-⑳]\\s*", "flags": "", "replacement": ""}
+                ],
+            }
+            res = requests.post(base + "/api/correction_format", json=payload).json()
+            self.assertTrue(res["ok"])
+            self.assertTrue(res["settings"]["enabled"])
+            self.assertTrue(res["settings"]["remove_formula"])
+            self.assertEqual(len(res["settings"]["custom_rules"]), 1)
+            self.assertEqual(res["settings"]["custom_rules"][0]["name"], "去圆圈")
+            with open(path, "r", encoding="utf-8") as f:
+                disk = _json.load(f)
+            self.assertTrue(disk["correction_format"]["enabled"])
+            # 部分覆盖：只提交 enabled 时其余字段沿用现值
+            res2 = requests.post(base + "/api/correction_format", json={"enabled": False}).json()
+            self.assertFalse(res2["settings"]["enabled"])
+            self.assertTrue(res2["settings"]["remove_formula"])
+            got = requests.get(base + "/api/correction_format").json()
+            self.assertFalse(got["settings"]["enabled"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_post_invalid_rule_returns_400_without_write(self):
+        import json as _json
+
+        import requests
+
+        path = self._patch_cfg_file()
+        server, base = _start_handler_server(_basic_server_state())
+        try:
+            res = requests.post(
+                base + "/api/correction_format",
+                json={"custom_rules": [{"name": "", "pattern": "("}]},
+            )
+            self.assertEqual(res.status_code, 400)
+            self.assertFalse(res.json()["ok"])
+            with open(path, "r", encoding="utf-8") as f:
+                disk = _json.load(f)
+            self.assertNotIn("correction_format", disk)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_post_preview_dry_run_does_not_persist(self):
+        import json as _json
+
+        import requests
+
+        path = self._patch_cfg_file()
+        server, base = _start_handler_server(_basic_server_state())
+        try:
+            res = requests.post(
+                base + "/api/correction_format",
+                json={
+                    "preview": "**粗体** 与 $\\frac{1}{2}$",
+                    "strip_markdown": True,
+                    "strip_latex": True,
+                    "remove_formula": False,
+                },
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["preview"], "粗体 与 1/2")
+            with open(path, "r", encoding="utf-8") as f:
+                disk = _json.load(f)
+            self.assertNotIn("correction_format", disk)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestCleanHistoryPages(unittest.TestCase):
+    """headless 按页范围智能清理矫正历史（CLI `clean`/`cl` 的服务端实现）。
+
+    历史文件写在临时 app_base_dir 下，绝不动真实 data/correction_history。
+    """
+
+    def setUp(self):
+        import pdfmanage as _pdf
+
+        self.tmp = tempfile.mkdtemp(prefix="ptoe_hist_clean_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._orig_base = _pdf.app_base_dir
+        _pdf.app_base_dir = lambda: Path(self.tmp)
+        self.addCleanup(setattr, _pdf, "app_base_dir", self._orig_base)
+
+    def _write_history(self, vid, pages, pdf=""):
+        import json as _json
+
+        d = Path(self.tmp) / "data" / "correction_history"
+        d.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "pdf": pdf,
+            "name": Path(pdf).name if pdf else "手动录入",
+            "display_name": "测试",
+            "updated": "2026-10-18 12:00:00",
+            "pages": pages,
+            "proofread": {},
+            "last_proofread_page": 1,
+        }
+        fp = d / f"{vid}.json"
+        fp.write_text(_json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return fp
+
+    @staticmethod
+    def _read_pages(fp):
+        import json as _json
+
+        return _json.loads(Path(fp).read_text(encoding="utf-8"))["pages"]
+
+    @staticmethod
+    def _kw():
+        # 显式规则，不依赖用户真实 config.json
+        return {"clean_digit_punct": True, "digit_punct_map": [["。", "."]]}
+
+    def test_page_range_only_selected(self):
+        vid = "hist_a_20261018120000_0001"
+        fp = self._write_history(
+            vid, {"1": "<p>1。2</p>", "2": "<p>3。4</p>", "3": "<p>无事</p>"}
+        )
+        res = correctmanage.clean_history_pages(vid, pages={2}, clean_kw=self._kw())
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["pages"], [2])
+        self.assertEqual(res["changed"], 1)
+        self.assertEqual(res["total"], 3)
+        pages = self._read_pages(fp)
+        self.assertEqual(pages["1"], "<p>1。2</p>")
+        self.assertEqual(pages["2"], "<p>3.4</p>")
+        self.assertEqual(pages["3"], "<p>无事</p>")
+
+    def test_all_pages_default_writeback(self):
+        vid = "hist_b_20261018120000_0002"
+        fp = self._write_history(
+            vid, {"1": "<p>1。2</p>", "2": "<p>3。4</p>", "3": "<p>无事</p>"}
+        )
+        res = correctmanage.clean_history_pages(vid, clean_kw=self._kw())
+        self.assertEqual(res["changed"], 2)
+        self.assertEqual(res["pages"], [1, 2])
+        pages = self._read_pages(fp)
+        self.assertEqual(pages["1"], "<p>1.2</p>")
+        self.assertEqual(pages["2"], "<p>3.4</p>")
+        self.assertEqual(pages["3"], "<p>无事</p>")
+
+    def test_dry_run_does_not_write(self):
+        vid = "hist_c_20261018120000_0003"
+        fp = self._write_history(vid, {"1": "<p>1。2</p>"})
+        res = correctmanage.clean_history_pages(vid, dry_run=True, clean_kw=self._kw())
+        self.assertTrue(res["dry_run"])
+        self.assertEqual(res["changed"], 1)
+        self.assertEqual(self._read_pages(fp)["1"], "<p>1。2</p>")
+
+    def test_missing_target_raises(self):
+        with self.assertRaises(ValueError):
+            correctmanage.clean_history_pages()
+        with self.assertRaises(ValueError):
+            correctmanage.clean_history_pages("不存在的版本")
+        with self.assertRaises(ValueError):
+            correctmanage.clean_history_pages(pdf_path=str(Path(self.tmp) / "nope.pdf"))
+
+    def test_pdf_picks_latest_version(self):
+        pdf = str(Path(self.tmp) / "book.pdf")
+        pref = correctmanage._history_prefix(pdf)
+        self.assertTrue(pref)
+        self._write_history(f"{pref}_20261018120000_00aa", {"1": "<p>5。6</p>"}, pdf)
+        res = correctmanage.clean_history_pages(pdf_path=pdf, clean_kw=self._kw())
+        self.assertEqual(res["changed"], 1)
+        self.assertEqual(res["pages"], [1])
+
+    def test_default_rules_from_config(self):
+        # 不给 clean_kw → 走 config 的 ui_settings（只读，不写真实 config.json）
+        vid = "hist_d_20261018120000_0004"
+        self._write_history(vid, {"3": "<p>无事</p>"})
+        res = correctmanage.clean_history_pages(vid, pages={3})
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["cleaned"], 1)
+        self.assertEqual(res["changed"], 0)
 
 
 if __name__ == "__main__":

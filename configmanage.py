@@ -104,16 +104,33 @@ POPUP_ELIGIBLE_OPS = [
     "flush", "indent", "strip_ws", "merge",
     "marker_full", "marker_note", "marker_join", "marker_page",
     "charformat",  # 字符格式（打开字体/字号/颜色弹窗；有 OPS 中文标签与 OP_ICON 字形）
+    "table",  # 转成表格（把选中文字转成原生表格；手动档，见 /api/table_convert）
+    "table2text",  # 表格转文本（把光标所在表格还原成 Markdown 管道文字；手动档，见 /api/table_to_text）
     "paint",  # 格式刷（特殊按钮，非 OPS 项）
 ]
 POPUP_ROW1_DEFAULT = ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"]
-POPUP_ROW2_DEFAULT = ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub"]
+POPUP_ROW2_DEFAULT = [
+    "align_left",
+    "align_center",
+    "align_right",
+    "centerbold",
+    "merge",
+    "sup",
+    "sub",
+    "table",  # 转成表格：把选中文字转成原生表格（2026-10 加入默认第二行）
+    "table2text",  # 表格转文本：与「转成表格」互为反向（2026-10 加入默认第二行）
+]
 POPUP_RULE_COUNT_DEFAULT = 5
 POPUP_RULE_COUNT_MIN = 0
 POPUP_RULE_COUNT_MAX = 10
 # 撤销/回退历史步数档位（矫正界面 ui_settings.undo_depth；2026-10）
 UNDO_DEPTH_DEFAULT = 100
 UNDO_DEPTH_CHOICES = (50, 100, 200, 500)
+# 搜索结果列表显示上限（矫正界面 + EPUB 编辑器 ui_settings.search_max_results；2026-10-18）：
+# 搜索仍统计真实总数，超出上限只存储/渲染前 N 条（列表 DOM 非虚拟化，过大拖慢渲染）。
+SEARCH_MAX_RESULTS_DEFAULT = 200
+SEARCH_MAX_RESULTS_MIN = 10
+SEARCH_MAX_RESULTS_MAX = 1000
 # 文字页面行号栏尺寸档位（矫正界面 ui_settings.line_num_size；2026-10）：
 # 控制行号字号与左侧留白/数字-正文间距。默认大（large）。
 LINE_NUM_SIZE_DEFAULT = "large"
@@ -126,11 +143,22 @@ CLEAN_SETTINGS_DEFAULTS = {
     "clean_md_tags": True,
     "clean_html_tags": True,
     "clean_paragraphs": False,
+    "clean_digit_punct": True,
 }
 # 符号映射表默认值（ui_settings.clean_symbol_map；2026-10）：
 # 用户可自定义「符号归一」步骤的半角→全角映射，如保留 -- 不转 ——。
 CLEAN_SYMBOL_MAP_DEFAULT = [["[", "【"], ["]", "】"], ["--", "——"], ["~", "～"]]
 _CLEAN_SYMBOL_MAP_MAX_ITEMS = 32
+# 数字标点映射表默认值（ui_settings.clean_digit_punct_map；2026-10）：
+# 数字紧跟的中文标点 → 英文（1。2 → 1.2、1，2 → 1,2、1。 → 1.）；仅单字符源生效。
+CLEAN_DIGIT_PUNCT_MAP_DEFAULT = [
+    ["。", "."],
+    ["，", ","],
+    ["、", ","],
+    ["：", ":"],
+    ["；", ";"],
+]
+_CLEAN_DIGIT_PUNCT_MAP_MAX_ITEMS = 32
 
 DEFAULT_CONFIG = {
     "llama_server": "E:/xox/Tools/llama-c/llama-server.exe",
@@ -269,6 +297,10 @@ DEFAULT_CONFIG = {
     # 换行分隔）；false = 保留逐行原样（每行一行）。关闭后在配置界面/GUI 复选框
     # 或 `mian.py config set paddle_merge_lines false` 切换。
     "paddle_merge_lines": True,
+    # 识别文字表格并转成程序原生表格（HTML <table>），默认开（2026-10-17）。
+    # 关掉后识别文本里的 Markdown/画框表格保持原文不转换；可经设置页复选框、
+    # `mian.py config set table_convert false` 或 config.json 顶层同名键切换。
+    "table_convert": True,
     # 校正/重识别引擎：'llama'（默认）| 'vllm'。与识别引擎 engine 键独立，用于矫正界面的深度校对与重识别
     "proofread_engine": "llama",
     # vLLM-Omni 可执行文件路径（如 "vllm" 或绝对路径）；空 = 仅连接模式
@@ -358,6 +390,22 @@ DEFAULT_CONFIG = {
             "enabled": False,
         },
     ],
+    # 校正格式清理（2026-10，矫正界面设置「校正格式」栏）：
+    # 大模型重识别（/api/reocr）返回的文本进入与原文对比前，先剥离与内容无关的
+    # 格式字符——Markdown 标记（**、#、-、` 等）与 LaTeX 公式/命令（$…$、\frac、
+    # \textcircled 等）。默认关闭；开关与自定义规则经 /api/correction_format 读写。
+    #   enabled       总开关（False 时整条链路零开销，不影响性能）
+    #   strip_markdown 去 Markdown 标记（保留文字内容）
+    #   strip_latex    去 LaTeX 命令/环境标记（保留公式内容）
+    #   remove_formula 整段移除 LaTeX 公式及其内容（比 strip_latex 更激进）
+    #   custom_rules   自定义清理规则列表，结构同 replace_rules（仅用 i/m/u 标志）
+    "correction_format": {
+        "enabled": False,
+        "strip_markdown": True,
+        "strip_latex": True,
+        "remove_formula": False,
+        "custom_rules": [],
+    },
     # 字体设置（2026-08，2026-09 改下拉）：正文/标题/注释/引用 独立字体，供 CSS 变量使用；
     # 默认空 = 不修改字体，使用阅读器默认（引用格式的内置默认宋体由 CSS fallback 兜底）
      "fonts": {
@@ -389,8 +437,15 @@ DEFAULT_CONFIG = {
         "popup_rule_count": POPUP_RULE_COUNT_DEFAULT,
         # 每批「校正/重识别」处理的页数（0-50，默认 0 = 全部页/整本书）：设为 N 时从当前页起连续处理 N 页
         "proofread_batch_pages": 0,
+        # 采纳/忽略纠错后自动跳转到本页下一处错误并弹出采纳/忽略悬浮按钮（bool，默认开）。
+        # 关闭后点采纳/忽略只处理当前这一条，悬浮窗就地收起、不自动追下一处。
+        # 纯交互行为，不影响保存内容/导出。
+        "proofread_auto_jump": True,
         # 撤销/回退（Ctrl+Z / Ctrl+Y）保留的历史步数：50/100/200/500（默认 100）
         "undo_depth": UNDO_DEPTH_DEFAULT,
+        # 搜索结果列表显示上限（10-1000，默认 200）：搜索/替换弹窗列表最多渲染的条数，
+        # 超出仍统计真实总数并提示「仅显示前 N 条」。矫正界面与 EPUB 编辑器共用。
+        "search_max_results": SEARCH_MAX_RESULTS_DEFAULT,
         # 文字页面行号显示（2026-10）：虚拟列表各页文字块左侧显示行号（每页从 1 起），
         # 供命令行按行号寻址（如 :7,10merge）。纯视图层，不写入保存内容/导出。默认关。
         "show_line_numbers": False,
@@ -411,6 +466,10 @@ DEFAULT_CONFIG = {
         "clean_html_tags": True,
         "clean_paragraphs": False,
         "clean_symbol_map": CLEAN_SYMBOL_MAP_DEFAULT,
+        # clean_digit_punct：数字里夹的中文标点换英文（1。2→1.2 / 1，2→1,2 / 1。→1.），默认开；
+        # clean_digit_punct_map：该规则的自定义映射表（源必须单字符），可在设置面板修改。
+        "clean_digit_punct": True,
+        "clean_digit_punct_map": CLEAN_DIGIT_PUNCT_MAP_DEFAULT,
     },
     # 图片预处理（2026-08，OpenCV）：PDF 分割图片时启用，提高 OCR 识别率。
     # enabled 开关；gray 灰度 / denoise 中值去噪 / sharpen 锐化 / binarize 自适应二值化；
@@ -980,12 +1039,24 @@ def set_ui_settings(ui: dict) -> dict:
         except (TypeError, ValueError):
             v = 0
         clean["proofread_batch_pages"] = max(0, min(50, v))
+    if "proofread_auto_jump" in ui:
+        # 采纳/忽略后是否自动跳转到下一处错误并弹出悬浮按钮（bool）：
+        # 非 bool 回退默认 True（默认开启），与 rule_all_pages_confirm 同构
+        v = ui["proofread_auto_jump"]
+        clean["proofread_auto_jump"] = v if isinstance(v, bool) else True
     if "undo_depth" in ui:
         try:
             v = int(ui["undo_depth"])
         except (TypeError, ValueError):
             v = UNDO_DEPTH_DEFAULT
         clean["undo_depth"] = v if v in UNDO_DEPTH_CHOICES else UNDO_DEPTH_DEFAULT
+    if "search_max_results" in ui:
+        # 搜索结果列表显示上限：10-1000 的整数，非数值/越界按既有数值键口径 clamp（默认 200）
+        try:
+            v = int(ui["search_max_results"])
+        except (TypeError, ValueError):
+            v = SEARCH_MAX_RESULTS_DEFAULT
+        clean["search_max_results"] = max(SEARCH_MAX_RESULTS_MIN, min(SEARCH_MAX_RESULTS_MAX, v))
     if "show_line_numbers" in ui:
         # 行号显示开关（bool）：非 bool 输入回退 False，与 rule_all_pages_confirm 同构
         v = ui["show_line_numbers"]
@@ -1024,6 +1095,28 @@ def set_ui_settings(ui: dict) -> dict:
                 clean["clean_symbol_map"] = [list(p) for p in CLEAN_SYMBOL_MAP_DEFAULT]
         else:
             clean["clean_symbol_map"] = [list(p) for p in CLEAN_SYMBOL_MAP_DEFAULT]
+    # 数字标点映射表（2026-10）：list of [src, dst]，源必须是**单字符**（引擎只认单字符
+    # 源），其余同符号映射表：长度 2 的非空 str、源去重、≤32 项，非法整体回退默认。
+    if "clean_digit_punct_map" in ui:
+        v = ui["clean_digit_punct_map"]
+        if isinstance(v, list) and v:
+            seen_d = set()
+            ok_d = True
+            for item in v:
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    ok_d = False; break
+                src, dst = item
+                if not isinstance(src, str) or not isinstance(dst, str) or not src or not dst:
+                    ok_d = False; break
+                if len(src) != 1 or src in seen_d:
+                    ok_d = False; break
+                seen_d.add(src)
+            if ok_d and len(v) <= _CLEAN_DIGIT_PUNCT_MAP_MAX_ITEMS:
+                clean["clean_digit_punct_map"] = [list(p) for p in v]
+            else:
+                clean["clean_digit_punct_map"] = [list(p) for p in CLEAN_DIGIT_PUNCT_MAP_DEFAULT]
+        else:
+            clean["clean_digit_punct_map"] = [list(p) for p in CLEAN_DIGIT_PUNCT_MAP_DEFAULT]
     with _CFG_LOCK:
         try:
             if os.path.exists(_CONFIG_PATH):
@@ -1103,6 +1196,38 @@ def get_clean_symbol_map() -> list:
     except Exception:
         pass
     return [list(p) for p in CLEAN_SYMBOL_MAP_DEFAULT]
+
+
+def get_clean_digit_punct_map() -> list:
+    """返回数字标点映射表（读 config.json 的 ui_settings.clean_digit_punct_map）。
+
+    校验：每项为长度 2 的非空 str 列表、源为单字符、无重复源、≤32 项；非法整体回退默认。
+    与 get_clean_symbol_map 同构，供 /api/clean 端点使用。
+    """
+    try:
+        cfg = get_config(show_dialogs=False) or {}
+        stored = cfg.get("ui_settings")
+        if isinstance(stored, dict):
+            v = stored.get("clean_digit_punct_map")
+            if isinstance(v, list) and v:
+                seen_sources = set()
+                for item in v:
+                    if not isinstance(item, (list, tuple)) or len(item) != 2:
+                        return [list(p) for p in CLEAN_DIGIT_PUNCT_MAP_DEFAULT]
+                    src, dst = item
+                    if not isinstance(src, str) or not isinstance(dst, str):
+                        return [list(p) for p in CLEAN_DIGIT_PUNCT_MAP_DEFAULT]
+                    if not src or not dst or len(src) != 1:
+                        return [list(p) for p in CLEAN_DIGIT_PUNCT_MAP_DEFAULT]
+                    if src in seen_sources:
+                        return [list(p) for p in CLEAN_DIGIT_PUNCT_MAP_DEFAULT]
+                    seen_sources.add(src)
+                if len(v) > _CLEAN_DIGIT_PUNCT_MAP_MAX_ITEMS:
+                    return [list(p) for p in CLEAN_DIGIT_PUNCT_MAP_DEFAULT]
+                return [list(p) for p in v]
+    except Exception:
+        pass
+    return [list(p) for p in CLEAN_DIGIT_PUNCT_MAP_DEFAULT]
 
 
 _AUTO_SAVE_DEFAULTS = {"enabled": True, "interval_minutes": 5, "new_backup": True}
@@ -1270,4 +1395,115 @@ def set_replace_rules(rules: list) -> list:
             cfg = DEFAULT_CONFIG.copy()
             with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
+            return clean
+
+
+# ---------------------------------------------------------------------------
+# 校正格式清理（2026-10，矫正界面设置「校正格式」栏）
+#
+# 大模型重识别返回的文本进入与原文对比前，先剥离与内容无关的格式字符
+# （Markdown 标记 / LaTeX 公式与命令）。开关与自定义规则持久化到 config.json
+# 顶层 correction_format，经 /api/correction_format GET/POST 读写。
+# 自定义规则复用替换规则的结构与校验（仅使用 i/m/u 标志，无 keep_groups 语义）。
+# ---------------------------------------------------------------------------
+
+_CORRECTION_FORMAT_RULE_MAX = 50
+_CORRECTION_FORMAT_BOOL_KEYS = (
+    "enabled",
+    "strip_markdown",
+    "strip_latex",
+    "remove_formula",
+)
+
+
+def normalize_correction_format(cfg) -> dict:
+    """校验/归一化「校正格式」设置（不落盘）。非法抛 ValueError（中文信息）。
+
+    仅接受显式给出的字段（其余字段由调用方以默认值兜底）；布尔字段须为 bool；
+    custom_rules 复用 _validate_replace_rule 校验/归一化。
+    """
+    if not isinstance(cfg, dict):
+        raise ValueError("correction_format 必须是对象")
+    out: dict = {}
+    for key in _CORRECTION_FORMAT_BOOL_KEYS:
+        if key in cfg:
+            v = cfg[key]
+            if not isinstance(v, bool):
+                raise ValueError(f"{key} 必须是布尔值")
+            out[key] = v
+    if "custom_rules" in cfg:
+        rules = cfg["custom_rules"]
+        if not isinstance(rules, list):
+            raise ValueError("custom_rules 必须是数组")
+        if len(rules) > _CORRECTION_FORMAT_RULE_MAX:
+            raise ValueError(
+                f"自定义清理规则过多（上限 {_CORRECTION_FORMAT_RULE_MAX} 条）"
+            )
+        out["custom_rules"] = [_validate_replace_rule(r) for r in rules]
+    return out
+
+
+def get_correction_format(cfg=None) -> dict:
+    """读取「校正格式」设置（缺失/异常回退默认）。
+
+    传入已读的配置字典可避免重复读盘（重识别主链路每页读一次配置）。
+    """
+    opts = {
+        "enabled": False,
+        "strip_markdown": True,
+        "strip_latex": True,
+        "remove_formula": False,
+        "custom_rules": [],
+    }
+    try:
+        if cfg is None:
+            cfg = get_config(show_dialogs=False) or {}
+        stored = cfg.get("correction_format") if isinstance(cfg, dict) else None
+        if isinstance(stored, dict):
+            for key in _CORRECTION_FORMAT_BOOL_KEYS:
+                if isinstance(stored.get(key), bool):
+                    opts[key] = stored[key]
+            rules = stored.get("custom_rules")
+            if isinstance(rules, list):
+                clean_rules = []
+                for r in rules:
+                    try:
+                        clean_rules.append(_validate_replace_rule(r))
+                    except ValueError:
+                        continue  # 单条坏规则静默跳过，不阻断重识别主链路
+                opts["custom_rules"] = clean_rules
+    except Exception as e:  # noqa: BLE001
+        print(f"[config] 读取校正格式设置失败，使用默认: {e}")
+    return opts
+
+
+def set_correction_format(cfg) -> dict:
+    """写入「校正格式」设置（顶层键 correction_format）并持久化，返回归一化结果。
+
+    仅覆盖显式给出的字段（未给出的沿用现值）；校验失败抛 ValueError 且不落盘。
+    """
+    clean = normalize_correction_format(cfg)
+    with _CFG_LOCK:
+        try:
+            if os.path.exists(_CONFIG_PATH):
+                with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cur = json.load(f)
+            else:
+                cur = DEFAULT_CONFIG.copy()
+            stored = cur.get("correction_format")
+            if not isinstance(stored, dict):
+                stored = {
+                    k: (list(v) if isinstance(v, list) else v)
+                    for k, v in DEFAULT_CONFIG["correction_format"].items()
+                }
+            merged = dict(stored)
+            merged.update(clean)
+            before = cur.get("correction_format")
+            cur["correction_format"] = merged
+            cur = validate_and_patch_config(cur)
+            if before != merged:  # 无变更不写盘
+                _atomic_write_json(_CONFIG_PATH, cur)
+            return merged
+        except Exception as e:
+            print(f"[config] Error updating correction_format, fallback to default: {e}")
             return clean

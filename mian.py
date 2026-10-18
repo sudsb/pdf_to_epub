@@ -38,7 +38,7 @@ REQUEST_TIMEOUT = 600
 _PAGE_RE = re.compile(r"(\d+)(?:\.\w+)?$")
 
 
-def parse_exclude_spec(spec) -> set[int]:
+def parse_exclude_spec(spec, label: str = "排除") -> set[int]:
     """解析排除页码规格，返回页码集合（1-based）。
 
     支持格式：
@@ -56,7 +56,7 @@ def parse_exclude_spec(spec) -> set[int]:
             try:
                 excluded.add(int(v))
             except (TypeError, ValueError):
-                print(f"      ! 排除页码忽略无效项: {v!r}", file=sys.stderr)
+                print(f"      ! {label}页码忽略无效项: {v!r}", file=sys.stderr)
         return excluded
     if isinstance(spec, str):
         s = spec.strip()
@@ -72,7 +72,7 @@ def parse_exclude_spec(spec) -> set[int]:
                     start = int(parts[0].strip())
                     end = int(parts[1].strip())
                 except (ValueError, IndexError):
-                    print(f"      ! 排除页码忽略无效区间: {token!r}", file=sys.stderr)
+                    print(f"      ! {label}页码忽略无效区间: {token!r}", file=sys.stderr)
                     continue
                 if start > end:
                     start, end = end, start
@@ -85,13 +85,87 @@ def parse_exclude_spec(spec) -> set[int]:
                     if n >= 1:
                         excluded.add(n)
                 except ValueError:
-                    print(f"      ! 排除页码忽略无效项: {token!r}", file=sys.stderr)
+                    print(f"      ! {label}页码忽略无效项: {token!r}", file=sys.stderr)
         return excluded
     # 未知类型：尝试转为字符串再解析
     try:
-        return parse_exclude_spec(str(spec))
+        return parse_exclude_spec(str(spec), label=label)
     except Exception:
         return excluded
+
+
+def parse_page_spec(spec) -> set[int] | None:
+    """解析「页范围」规格（要处理的页）：与 parse_exclude_spec 同语法（"1-5,8"）。
+
+    空/None/"all"/"*"/"全部" → None（= 全部页）；返回 1-based 页码集合。
+    """
+    if spec is None:
+        return None
+    s = str(spec).strip().lower()
+    if not s or s in ("all", "*", "全部"):
+        return None
+    sel = parse_exclude_spec(s, label="选择")
+    return sel or None
+
+
+def _run_clean_command(args) -> int:
+    """``mian.py clean`` / 简称 ``cl``：headless 智能清理矫正历史（可按页范围）。
+
+    不清屏、不开界面、不起 HTTP 服务器：直接对 data/correction_history 里的
+    历史版本按页范围跑一遍智能清理（规则取 config.json 的 ui_settings），改动写回该版本。
+    """
+    try:
+        from correctmanage import _history_entries, clean_history_pages
+    except Exception as e:  # noqa: BLE001
+        print(f"Error: 无法加载矫正模块：{e}", file=sys.stderr)
+        return 1
+    try:
+        if getattr(args, "list", False):
+            entries = _history_entries()
+            if not entries:
+                print("没有找到矫正历史（data/correction_history）。")
+                return 0
+            print(f"可用的矫正历史版本（{len(entries)} 个，新→旧）：")
+            for it in entries:
+                print(
+                    "  %s  %s页  %s  %s"
+                    % (
+                        it.get("id"),
+                        it.get("pages") or 0,
+                        it.get("updated") or "",
+                        it.get("pdf") or "（手动录入）",
+                    )
+                )
+            return 0
+        pages = parse_page_spec(getattr(args, "pages", ""))
+        res = clean_history_pages(
+            getattr(args, "history_id", None),
+            getattr(args, "pdf", None),
+            pages,
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:  # noqa: BLE001
+        print(f"Error: 清理失败：{e}", file=sys.stderr)
+        return 1
+    scope = "全部页" if pages is None else f"{len(pages)} 页"
+    print(f"历史版本：{res['history_id']}（{res.get('pdf') or '手动录入'}）")
+    print(f"清理范围：{scope}；处理 {res['cleaned']}/{res['total']} 页")
+    if res["changed"]:
+        head = ", ".join(str(p) for p in res["pages"][:20])
+        more = "" if len(res["pages"]) <= 20 else f" …共 {len(res['pages'])} 页"
+        print(f"改动 {res['changed']} 页（{head}{more}），字符净变化 {res['chars']:+d}")
+    else:
+        print("没有需要改动的页面。")
+    if res.get("dry_run"):
+        print("（--dry-run：未写回历史）")
+    elif res["changed"]:
+        print("已写回矫正历史。")
+    else:
+        print("（无改动，未写回。）")
+    return 0
 
 
 # 布尔型配置值的真值表（大小写不敏感）：paddle_merge_lines 等开关型键共用
@@ -1819,6 +1893,26 @@ def main(argv: list[str] | None = None) -> int:
     model_rm_p = model_sub.add_parser("rm", help="Alias for remove")
     model_rm_p.add_argument("key", help="Model key to remove")
 
+    # ---- clean 子命令（简称 cl）：按页范围对矫正历史做智能清理（headless，不开界面）----
+    for _clean_name in ("clean", "cl"):
+        clean_p = sub.add_parser(
+            _clean_name,
+            help="智能清理矫正历史（可按页范围；headless，不开界面）",
+            description="对既有矫正历史（data/correction_history）执行「智能清理」，"
+            "可用 --pages 指定页范围（如 1-5,8），默认清理全部页；--list 列出可用版本。",
+        )
+        clean_p.add_argument(
+            "--history-id", dest="history_id", help="历史版本 id（用 --list 查看）"
+        )
+        clean_p.add_argument("--pdf", help="改用该 PDF 的最新矫正版本")
+        clean_p.add_argument(
+            "--pages", default="", help="页范围，如 1-5,8（默认全部页；all/* 同义）"
+        )
+        clean_p.add_argument(
+            "--list", action="store_true", help="只列出可用的矫正历史版本（不清理）"
+        )
+        clean_p.add_argument("--dry-run", action="store_true", help="只统计改动，不写回历史")
+
     # ---- config 子命令：快捷查看/修改配置路径 ----
     config_p = sub.add_parser(
         "config",
@@ -1827,10 +1921,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     config_sub = config_p.add_subparsers(dest="config_cmd", metavar="action")
 
+    # show：只读查看当前配置（处理逻辑在 main() 的 config 分支）。
+    # 此前只注册了 set，导致 `config show` 报 invalid choice、该分支不可达。
+    config_sub.add_parser("show", help="查看当前配置（只读，不改动文件）")
     config_set_p = config_sub.add_parser("set", help="修改配置项（key=value）")
     config_set_p.add_argument(
         "key",
-        help="配置键名（llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / browser / gui_display / window_maximized / tabs_position / paddle_merge_lines / llama_server_args.<参数> / vllm_server_args.<参数> / proofread.<param>）",
+        help="配置键名（llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / browser / gui_display / window_maximized / tabs_position / paddle_merge_lines / table_convert / llama_server_args.<参数> / vllm_server_args.<参数> / proofread.<param>）",
     )
     config_set_p.add_argument("value", help="配置值")
 
@@ -1992,6 +2089,9 @@ def main(argv: list[str] | None = None) -> int:
         print("Unknown model action; use 'model list|show|set|add|remove <args>'")
         return 1
 
+    if args.command in ("clean", "cl"):
+        return _run_clean_command(args)
+
     if args.command == "config":
         cmd = getattr(args, "config_cmd", None)
         cfg = get_config()
@@ -2017,6 +2117,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             print(f"  ocr_prompt: {cfg.get('ocr_prompt', '')}")
             print(f"  paddle_merge_lines: {_paddle_merge_lines()}")
+            print(f"  table_convert: {cfg.get('table_convert', True)}")
             sargs = cfg.get("llama_server_args", {}) or {}
             print("  llama_server_args:")
             for ak, av in sargs.items():
@@ -2063,12 +2164,13 @@ def main(argv: list[str] | None = None) -> int:
                 "window_maximized",
                 "tabs_position",
                 "paddle_merge_lines",
+                "table_convert",
                 "dpi",
                 "ocr_batch_size",
                 "ocr_group_by_size",
             ):
                 print(
-                    "Error: 可修改的键名仅限 llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / browser / gui_display / window_maximized / tabs_position / paddle_merge_lines / dpi / ocr_batch_size / ocr_group_by_size / llama_server_args.<参数名> / vllm_server_args.<参数名> / proofread.<param>",
+                    "Error: 可修改的键名仅限 llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / browser / gui_display / window_maximized / tabs_position / paddle_merge_lines / table_convert / dpi / ocr_batch_size / ocr_group_by_size / llama_server_args.<参数名> / vllm_server_args.<参数名> / proofread.<param>",
                     file=sys.stderr,
                 )
                 return 1
@@ -2102,12 +2204,12 @@ def main(argv: list[str] | None = None) -> int:
                     return 1
                 # 归一化存储为 "true"/"false" 字符串（与其他 bool-ish 键风格一致）
                 value = "true" if v in ("true", "1") else "false"
-            if key == "paddle_merge_lines":
+            if key in ("paddle_merge_lines", "table_convert"):
                 # 布尔开关：true/false、1/0、on/off、yes/no 均接受，存为真正的布尔值
                 parsed = _parse_bool_arg(value)
                 if parsed is None:
                     print(
-                        "Error: paddle_merge_lines 仅接受 true/false（也可写 1/0、on/off、yes/no）",
+                        f"Error: {key} 仅接受 true/false（也可写 1/0、on/off、yes/no）",
                         file=sys.stderr,
                     )
                     return 1

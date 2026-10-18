@@ -123,6 +123,8 @@ _CAPTION_CLASS = "ptoe-caption"
 
 
 _ALIGN_CLASSES = {"ptoe-align-center", "ptoe-align-left", "ptoe-align-right"}
+# 单元格垂直对齐类（2026-10 表格增强）：与水平对齐类同策略，单元格内各保留一个。
+_VALIGN_CLASSES = {"ptoe-vtop", "ptoe-vmid", "ptoe-vbot"}
 # 行内对齐样式正则：style="text-align:left|center|right"（含空格容忍）
 _ALIGN_STYLE_RE = re.compile(r"text-align\s*:\s*(left|center|right)\s*(?:;|$)")
 
@@ -1356,6 +1358,8 @@ class _Sanitizer(HTMLParser):
         self._cell_attrs: list[str] = []  # 当前单元格保留的 colspan/rowspan 属性串
         self._cell_buf: list[str] = []  # 单元格行内内容缓冲
         self._cell_stack: list[tuple[str, str]] = []  # 单元格内未闭合行内标签
+        # 表格级保留属性（2026-10 列宽按比例生效）：目前只可能携带 style="table-layout:fixed"
+        self._tbl_table_attrs = ""
 
     def _inline_target(self) -> tuple[list[str], list[tuple[str, str]]]:
         """当前行内写入目标：表格单元格内 → (cell_buf, cell_stack)；否则 → (buf, stack)。"""
@@ -1394,7 +1398,7 @@ class _Sanitizer(HTMLParser):
         if not self._tbl_depth:
             return
         self._tbl_finish_row()
-        parts: list[str] = ["<table>"]
+        parts: list[str] = [f"<table{self._tbl_table_attrs}>"]
         if self._tbl_head:
             parts.append("<thead>")
             for row in self._tbl_head:
@@ -1490,6 +1494,10 @@ class _Sanitizer(HTMLParser):
             self._tbl_body = []
             self._tbl_row = None
             self._cell_open = False
+            # 表格级保留属性（2026-10）：只认 style="table-layout:fixed"
+            # （用户拖拽列宽按比例精确生效所需，见 rulemanage.normalize_table_style）
+            _tstyle = rulemanage.normalize_table_style(dict(attrs).get("style") or "")
+            self._tbl_table_attrs = f' style="{_tstyle}"' if _tstyle else ""
             return
         if self._tbl_depth:
             # 表格结构标签：只作结构累积（thead/tbody/tfoot/tr/th/td）
@@ -1509,17 +1517,32 @@ class _Sanitizer(HTMLParser):
             if tag in ("th", "td"):
                 self._tbl_finish_cell()
                 d = dict(attrs)
-                # 单元格属性：对齐 class（ptoe-align-*）保留，其余 class 丢弃；
-                # colspan/rowspan 合法值保留（非法值不保留，与块级属性同策略）。
+                # 单元格属性：
+                # - 对齐/垂直对齐 class（ptoe-align-* / ptoe-v*）各保留一个，其余 class 丢弃；
+                # - colspan/rowspan 合法值保留（非法值不保留，与块级属性同策略）；
+                # - 尺寸声明 style（width/height/vertical-align）经窄口径白名单过滤后保留
+                #   （2026-10 表格增强：允许用户调整单元格/行列大小，见
+                #   rulemanage.normalize_table_cell_style——绝不整体透传任意 style）。
                 cell_attrs: list[str] = []
+                cls_keep: list[str] = []
                 for c in (d.get("class") or "").split():
-                    if c in _ALIGN_CLASSES:
-                        cell_attrs.append(f'class="{c}"')
-                        break
+                    if c in _ALIGN_CLASSES and not any(
+                        x in _ALIGN_CLASSES for x in cls_keep
+                    ):
+                        cls_keep.append(c)
+                    elif c in _VALIGN_CLASSES and not any(
+                        x in _VALIGN_CLASSES for x in cls_keep
+                    ):
+                        cls_keep.append(c)
+                if cls_keep:
+                    cell_attrs.append(f'class="{" ".join(cls_keep)}"')
                 for k in ("colspan", "rowspan"):
                     v = (d.get(k) or "").strip()
                     if re.fullmatch(r"\d{1,2}", v):
                         cell_attrs.append(f'{k}="{v}"')
+                _cstyle = rulemanage.normalize_table_cell_style(d.get("style") or "")
+                if _cstyle:
+                    cell_attrs.append(f'style="{_html.escape(_cstyle, quote=True)}"')
                 self._cell_open = True
                 self._cell_th = tag == "th"
                 self._cell_attrs = cell_attrs
@@ -1815,8 +1838,52 @@ def _ensure_marker_classes(html: str) -> str:
     return re.sub(r"<span(.*?)>", _repl, html, flags=re.IGNORECASE | re.DOTALL)
 
 
+# 纠错标注剥离（服务端兜底，供 sanitize_html 统一调用）。前端生成的标注形态固定：
+#   <span class="ptoe-fix" data-err-i="N">候选</span>
+#   <s class="ptoe-err" data-err-i="N" [data-err-empty="1"]>文本</s>
+_PTOE_FIX_RE = re.compile(
+    r'<span\b[^>]*\bclass\s*=\s*"[^"]*\bptoe-fix\b[^"]*"[^>]*>.*?</span>',
+    re.IGNORECASE | re.DOTALL,
+)
+_PTOE_ERR_EMPTY_RE = re.compile(
+    r"<s\b[^>]*\bdata-err-empty\b[^>]*>.*?</s>",
+    re.IGNORECASE | re.DOTALL,
+)
+_PTOE_ERR_UNWRAP_RE = re.compile(
+    r'<s\b[^>]*\bclass\s*=\s*"[^"]*\bptoe-err\b[^"]*"[^>]*>(.*?)</s>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_proofread_markup(html: str) -> str:
+    """兜底剥离残留的纠错标注（落库前防线，由 sanitize_html 统一调用）。
+
+    界面把纠错标注叠加在编辑区 live DOM 上，个别路径（syncContent 同步
+    ed.innerHTML）会把标注带进待存 HTML；若不剥离，正文会被污染：
+      - ``.ptoe-fix``（候选建议展示）文本是模型建议，非原文 → 整体删除；
+      - ``<s class="ptoe-err" data-err-empty>``（空白页填充建议）文本是"拟插入
+        的候选字"→ 整体删除；
+      - 其余 ``<s class="ptoe-err">``（错误原文标注）→ 解包保留原文。
+    前端 collect() 已做同样处理，这里再兜一层（2026-10-17 修复：data-err-empty
+    的候选字曾被 _Sanitizer 折成 <span class="ptoe-strike"> 保留下来污染正文）。
+    """
+    if not html or ("ptoe-err" not in html and "ptoe-fix" not in html):
+        return html
+    s = _PTOE_FIX_RE.sub("", html)
+    s = _PTOE_ERR_EMPTY_RE.sub("", s)
+    s = _PTOE_ERR_UNWRAP_RE.sub(r"\1", s)
+    return s
+    if not html or ("ptoe-err" not in html and "ptoe-fix" not in html):
+        return html
+    s = _PTOE_FIX_RE.sub("", html)
+    s = _PTOE_ERR_EMPTY_RE.sub("", s)
+    s = _PTOE_ERR_UNWRAP_RE.sub(r"\1", s)
+    return s
+
+
 def sanitize_html(raw: str) -> str:
     """清洗界面提交的 HTML：只放行白名单标签（含标记 span）并保证结构平衡。"""
+    raw = _strip_proofread_markup(raw)
     s = _Sanitizer()
     try:
         s.feed(raw)
@@ -1907,7 +1974,8 @@ def _count_tags(s: str) -> int:
 # 清理：[1]/【2】/［3］ 等方括号包裹的数字统一修正为全角六角括号 〔n〕（2026-08）
 # x = 任意数字（半角/全角均可，内容原样保留）；已是 〔n〕 的不动
 _BRACKET_DIGIT_RE = re.compile(r"[\[［【]\s*([0-9０-９]+)\s*[\]］】]")
-# 中英文标点归一：与汉字相邻的半角标点转全角；与字母/数字相邻的全角标点转半角
+# 中英文标点归一（2026-10 页级中文语境）：实现委托 stringmanage._normalize_punctuation_base——
+# 中文页（含汉字或全无拉丁字母）内半角标点整体转全角（含成对括号与保护项），纯英文页全角转半角
 _CJK_RANGE = "\u4e00-\u9fff\u3400-\u4dbf"
 _LATIN_RANGE = "A-Za-z0-9"
 _HALF_TO_FULL = (
@@ -2406,28 +2474,19 @@ _PROOFREAD_SAFE_WORDS: frozenset = frozenset(
 )
 
 
-def _normalize_punctuation(text: str) -> str:
-    """中英文标点归一化。
+def _normalize_punctuation(text: str, *, ctx_cjk: bool | None = None) -> str:
+    """中英文标点归一化（2026-10 页级中文语境；实现统一在 stringmanage）。
 
-    汉字相邻处的半角 ,;:?!(). 转全角（中文排版）；字母/数字相邻处的全角
-    标点转半角（英文/数字上下文）。避开小数点/网址/省略号等被误伤的常见情况。
+    ctx_cjk 由 _clean_blocks 按整页判定后传入：中文页内半角 ,;:?!(). 与括号
+    整体转全角（括号成对转换，修「测试（)」只转一半、中文页里的半角括号与
+    隔空格标点不转的问题；保护小数/千分位/时间/URL/查询串/缩写点/省略号）；
+    纯英文页维持原行为（全角 → 半角反向）。
+    ctx_cjk=None（独立调用/测试）时按 text 自身判定：含汉字，或全篇没有
+    拉丁字母（如只输了一个 ()）→ 中文语境。
     """
-    s = str(text)
-    for half, full in _HALF_TO_FULL:
-        # 半角 → 全角：左邻或右邻是汉字（覆盖 汉字,  /  ,汉字 两种）
-        s = re.sub(rf"(?<=[{_CJK_RANGE}]){re.escape(half)}", full, s)
-        s = re.sub(rf"{re.escape(half)}(?=[{_CJK_RANGE}])", full, s)
-    # 句号：单独的 .（非 .. 序列成员）与汉字相邻 → 。（不碰小数点 1.5 / 省略号 …）
-    s = re.sub(rf"(?<=[{_CJK_RANGE}])\.(?!\.)", "\u3002", s)
-    s = re.sub(rf"(?<!\.)\.(?=[{_CJK_RANGE}])", "\u3002", s)
-    for full, half in _FULL_TO_HALF:
-        # 全角 → 半角：左右都是字母/数字（纯英文语境）
-        s = re.sub(
-            rf"(?<=[{_LATIN_RANGE}]){re.escape(full)}(?=[{_LATIN_RANGE}])", half, s
-        )
-    # 全角句号 → 半角句号（纯英文语境）
-    s = re.sub(rf"(?<=[{_LATIN_RANGE}])\u3002(?=[{_LATIN_RANGE}])", ".", s)
-    return s
+    from stringmanage import _normalize_punctuation_base as _base
+
+    return _base(text, ctx_cjk=ctx_cjk)
 
 
 # 括号归一（2026-08）：ULQ/PD 系模型输出的引注标记常带杂符包裹（如 （^{[1]】}、
@@ -2578,6 +2637,230 @@ def _full_punct(text: str) -> str:
 def _strip_leading_symbols(text: str) -> str:
     """段首符号清理：去掉 OCR 常在段首添加的 #、*、• 等装饰符号。"""
     return _LEADING_SYMBOL_RE.sub("", text)
+
+
+# ---------------------------------------------------------------------------
+# 校正格式清理（2026-10）：重识别返回文本进入对比前剥离 MD / LaTeX 格式字符
+#
+# 模型（尤其视觉 OCR）常在返回文本里混入 Markdown 标记与 LaTeX 公式/命令，
+# 这些与正文内容无关的「格式字符」会被 diff 逐字判为纠错项（用户报
+# 「重识别结果里全是 **、$、\frac 之类的标注」）。本模块提供统一清理：
+#   默认（strip_markdown / strip_latex）只去标记、保留文字与公式内容；
+#   remove_formula 进一步整段移除公式及其内容。
+# 由设置界面「校正格式」栏控制（config.json: correction_format，默认关闭）。
+# 性能：仅在 enabled=True 时于 /api/reocr 每页调用一次；正则均模块级预编译，
+#       函数入口按开关短路，关闭时零开销。
+# ---------------------------------------------------------------------------
+
+# --- Markdown 标记 ---
+_CF_MD_FENCE_RE = re.compile(r"^[ \t]*`{3,}.*$", re.M)               # ``` 围栏行
+_CF_MD_HEAD_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+", re.M)        # # 标题
+_CF_MD_QUOTE_RE = re.compile(r"^[ \t]{0,3}>[ \t]?", re.M)            # > 引用
+_CF_MD_UL_RE = re.compile(r"^[ \t]{0,3}[-*+][ \t]+", re.M)           # - 无序列表
+_CF_MD_OL_RE = re.compile(r"^[ \t]{0,3}\d{1,3}[.)][ \t]+", re.M)     # 1. 有序列表
+_CF_MD_HR_RE = re.compile(r"^[ \t]{0,3}(?:[-*_][ \t]*){3,}$", re.M)  # --- 分隔线
+_CF_MD_IMG_RE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")               # 图片
+_CF_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")               # 链接
+_CF_MD_STRIKE_RE = re.compile(r"~~(?=\S)([^~\n]+?)(?<=\S)~~")        # 删除线
+_CF_MD_AST_EMPH_RE = re.compile(r"\*{1,3}(?=\S)([^*\n]+?)(?<=\S)\*{1,3}")  # **粗**/*斜*
+_CF_MD_UND_EMPH_RE = re.compile(
+    r"(?<![\w])_{1,3}(?=\S)([^_\n]+?)(?<=\S)_{1,3}(?![\w])"
+)  # __粗__/_斜_（避开 snake_case）
+_CF_MD_CODE_RE = re.compile(r"`+([^`]*)`+")                          # `代码`
+_CF_MD_MARK_RE = re.compile(r"\*{2,}|~{2,}|`+")                       # 残留标记
+
+# --- LaTeX 公式 / 命令 ---
+_CF_LTX_ENV_RE = re.compile(r"\\begin\s*\{[^}]*\}(.*?)\\end\s*\{[^}]*\}", re.S)
+_CF_LTX_DISPLAY_RE = re.compile(r"\$\$(.+?)\$\$", re.S)              # $$…$$
+_CF_LTX_INLINE_RE = re.compile(r"(?<!\$)\$([^$\n]{1,400})\$(?!\$)")  # $…$（不跨行）
+_CF_LTX_PAREN_RE = re.compile(r"\\\((.+?)\\\)", re.S)                # \(…\)
+_CF_LTX_BRACKET_RE = re.compile(r"\\\[(.+?)\\\]", re.S)              # \[…\]
+_CF_LTX_TEXT_CMD_RE = re.compile(
+    r"\\(?:text|mathrm|mathbf|mathit|mathsf|mathtt|mathcal|operatorname|mbox|hbox|"
+    r"textnormal|textrm|textbf|textit|textup|textmd|textsf|texttt)\s*\{([^{}]*)\}"
+)
+_CF_LTX_FRAC_RE = re.compile(r"\\[dt]?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}")
+_CF_LTX_SQRT_RE = re.compile(r"\\sqrt\s*(?:\[[^\]]*\])?\s*\{([^{}]*)\}")
+_CF_LTX_BRACE_CMD_RE = re.compile(r"\\[a-zA-Z]+\s*(?:\{[^{}]*\})+")   # \cmd{…} 块
+_CF_LTX_NOSPACE_RE = re.compile(
+    r"\\(?:quad|qquad|thinspace|enspace|medspace|thickspace|negthinspace|"
+    r"left|right|big|Big|bigg|Bigg|bigl|bigr|Bigl|Bigr|biggl|biggr|Biggl|Biggr)\b"
+)
+_CF_LTX_MICROSPACE_RE = re.compile(r"\\[ ,;:!]")                     # \, \; \: 等
+_CF_LTX_CMD_RE = re.compile(r"\\[a-zA-Z]+")                          # 剩余未知命令
+_CF_LTX_MATH_JUNK_RE = re.compile(r"[{}$^_&]|\\\\")                  # 结构残符
+_CF_LTX_SYMBOLS = {
+    "times": "×", "div": "÷", "pm": "±", "mp": "∓", "cdot": "·",
+    "leq": "≤", "le": "≤", "geq": "≥", "ge": "≥", "neq": "≠", "ne": "≠",
+    "approx": "≈", "equiv": "≡", "propto": "∝", "sim": "∼", "simeq": "≃",
+    "ll": "≪", "gg": "≫",
+    "rightarrow": "→", "to": "→", "leftarrow": "←", "leftrightarrow": "↔",
+    "Rightarrow": "⇒", "Leftarrow": "⇐", "Leftrightarrow": "⇔",
+    "infty": "∞", "sum": "Σ", "prod": "∏", "int": "∫", "partial": "∂",
+    "nabla": "∇", "angle": "∠", "circ": "∘", "degree": "°",
+    "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε",
+    "varepsilon": "ε", "zeta": "ζ", "eta": "η", "theta": "θ", "iota": "ι",
+    "kappa": "κ", "lambda": "λ", "mu": "μ", "nu": "ν", "xi": "ξ",
+    "pi": "π", "rho": "ρ", "sigma": "σ", "tau": "τ", "upsilon": "υ",
+    "phi": "φ", "varphi": "φ", "chi": "χ", "psi": "ψ", "omega": "ω",
+    "Delta": "Δ", "Gamma": "Γ", "Theta": "Θ", "Lambda": "Λ", "Xi": "Ξ",
+    "Pi": "Π", "Sigma": "Σ", "Upsilon": "Υ", "Phi": "Φ", "Psi": "Ψ",
+    "Omega": "Ω",
+    "cdots": "…", "ldots": "…", "dots": "…", "vdots": "⋮", "ddots": "⋱",
+}
+# 符号命令正则：命令名按长度降序，避免 \le 抢在 \leq 之前匹配
+_CF_LTX_SYMBOL_RE = re.compile(
+    r"\\(?:"
+    + "|".join(
+        sorted((re.escape(k) for k in _CF_LTX_SYMBOLS), key=len, reverse=True)
+    )
+    + r")(?![a-zA-Z])"
+)
+
+
+def _cf_latex_symbol_sub(m: "re.Match[str]") -> str:
+    """符号命令 → 对应 Unicode（未收录则原样返回）。"""
+    return _CF_LTX_SYMBOLS.get(m.group(0)[1:], m.group(0))
+
+
+def _cf_clean_latex_piece(s: str, *, aggressive: bool) -> str:
+    """清理一段 LaTeX：去命令/结构符，保留文字内容。
+
+    aggressive=True 时额外剥除未知命令与 {} ^ _ $ & \\ 等结构字符（用于
+    $…$ / \\(…\\) / 环境内部）；False 仅做已知命令→符号/文字替换（用于无分隔符
+    的裸 LaTeX，避免误伤 C:\\Users 这类路径）。
+    """
+    if not s:
+        return s
+    s = _normalize_textcircled(s)
+    s = _CF_LTX_TEXT_CMD_RE.sub(r"\1", s)
+    for _ in range(4):  # 处理浅层嵌套分数 \frac{\frac{a}{b}}{c}
+        s2 = _CF_LTX_FRAC_RE.sub(r"\1/\2", s)
+        if s2 == s:
+            break
+        s = s2
+    s = _CF_LTX_SQRT_RE.sub(r"√\1", s)
+    s = _CF_LTX_NOSPACE_RE.sub("", s)
+    s = _CF_LTX_MICROSPACE_RE.sub("", s)
+    s = _CF_LTX_SYMBOL_RE.sub(_cf_latex_symbol_sub, s)
+    if aggressive:
+        s = _CF_LTX_CMD_RE.sub("", s)
+        s = _CF_LTX_MATH_JUNK_RE.sub("", s)
+    return s
+
+
+def _cf_strip_math_keep(text: str) -> str:
+    """去 LaTeX 公式/环境标记，保留公式内容（strip_latex、remove_formula=False）。"""
+    text = _CF_LTX_ENV_RE.sub(
+        lambda m: _cf_clean_latex_piece(m.group(1), aggressive=True), text
+    )
+    text = _CF_LTX_DISPLAY_RE.sub(
+        lambda m: _cf_clean_latex_piece(m.group(1), aggressive=True), text
+    )
+    text = _CF_LTX_PAREN_RE.sub(
+        lambda m: _cf_clean_latex_piece(m.group(1), aggressive=True), text
+    )
+    text = _CF_LTX_BRACKET_RE.sub(
+        lambda m: _cf_clean_latex_piece(m.group(1), aggressive=True), text
+    )
+    text = _CF_LTX_INLINE_RE.sub(
+        lambda m: _cf_clean_latex_piece(m.group(1), aggressive=True), text
+    )
+    # 无分隔符的裸 LaTeX 命令（模型偶发直接输出 \frac{a}{b} / \textcircled{1}）
+    if "\\" in text:
+        text = _cf_clean_latex_piece(text, aggressive=False)
+    return text
+
+
+def _cf_remove_math(text: str) -> str:
+    """整段移除 LaTeX 公式/环境及其内容（remove_formula=True）。"""
+    text = _CF_LTX_ENV_RE.sub("", text)
+    text = _CF_LTX_DISPLAY_RE.sub("", text)  # $$…$$ 须先于 $…$
+    text = _CF_LTX_PAREN_RE.sub("", text)
+    text = _CF_LTX_BRACKET_RE.sub("", text)
+    text = _CF_LTX_INLINE_RE.sub("", text)
+    # 无分隔符的裸命令块 \command{…}
+    text = _CF_LTX_BRACE_CMD_RE.sub("", text)
+    return text
+
+
+def _cf_strip_markdown(text: str) -> str:
+    """剥离 Markdown 标记（保留文字内容）。"""
+    text = _CF_MD_FENCE_RE.sub("", text)
+    text = _CF_MD_HEAD_RE.sub("", text)
+    text = _CF_MD_QUOTE_RE.sub("", text)
+    text = _CF_MD_UL_RE.sub("", text)
+    text = _CF_MD_OL_RE.sub("", text)
+    text = _CF_MD_HR_RE.sub("", text)
+    text = _CF_MD_IMG_RE.sub(r"\1", text)
+    text = _CF_MD_LINK_RE.sub(r"\1", text)
+    text = _CF_MD_STRIKE_RE.sub(r"\1", text)
+    text = _CF_MD_AST_EMPH_RE.sub(r"\1", text)
+    text = _CF_MD_UND_EMPH_RE.sub(r"\1", text)
+    text = _CF_MD_CODE_RE.sub(r"\1", text)
+    text = _CF_MD_MARK_RE.sub("", text)
+    return text
+
+
+def _cf_apply_custom_rules(text: str, rules) -> str:
+    """按顺序应用自定义清理规则（正则替换；仅使用 i/m/u 标志）。"""
+    for rule in rules or ():
+        if not isinstance(rule, dict):
+            continue
+        if rule.get("enabled", True) is False:
+            continue
+        pat = rule.get("pattern")
+        if not isinstance(pat, str) or not pat:
+            continue
+        repl = rule.get("replacement")
+        if not isinstance(repl, str):
+            repl = ""
+        flags = 0
+        f = str(rule.get("flags") or "")
+        if "i" in f:
+            flags |= re.IGNORECASE
+        if "m" in f:
+            flags |= re.MULTILINE
+        try:
+            text = re.sub(pat, repl, text, flags=flags)
+        except re.error:
+            continue  # 非法规则已在设置端校验，这里宽容跳过不阻断主链路
+    return text
+
+
+def clean_correction_format(
+    text: str,
+    *,
+    strip_markdown: bool = True,
+    strip_latex: bool = True,
+    remove_formula: bool = False,
+    custom_rules=None,
+) -> str:
+    """剥离模型返回文本中的无关格式字符（Markdown / LaTeX），供与原文对比前使用。
+
+    由设置界面「校正格式」栏控制（config.json: correction_format，默认关闭）；
+    仅在 /api/reocr 归一化链路、enabled=True 时调用（见该处理器注释）。
+
+    参数：
+      strip_markdown  去 Markdown 标记（保留文字）        —— **粗体** → 粗体
+      strip_latex     去 LaTeX 命令/环境标记（保留公式内容）—— $\\frac{a}{b}$ → a/b
+      remove_formula  整段移除 LaTeX 公式及其内容         —— $x^2$ →（删除）
+      custom_rules    自定义规则列表（结构同 replace_rules，仅用 i/m/u）
+
+    实现：模块级预编译正则 + 入口短路，性能开销可忽略。
+    """
+    if not text:
+        return text
+    if remove_formula or strip_latex:
+        if remove_formula:
+            text = _cf_remove_math(text)
+        else:
+            text = _cf_strip_math_keep(text)
+    if strip_markdown:
+        text = _cf_strip_markdown(text)
+    if custom_rules:
+        text = _cf_apply_custom_rules(text, custom_rules)
+    return text
 
 
 def _proofread_plain_text(html: str) -> str:
@@ -2926,6 +3209,7 @@ def _clean_blocks(
     clean_symbols: bool = False,
     clean_md_tags: bool = True,
     symbol_pairs=None,
+    digit_punct_pairs=None,
     stats=None,
 ) -> str:
     """按块级标签切分已清洗的 HTML，逐块做文本处理并可选合并相邻段落。
@@ -2998,12 +3282,27 @@ def _clean_blocks(
         blocks.append((cur_open or "<p>", cur))
 
     # 块内文本处理（段首符号只作用于块开头第一个文本 token）
+    # 页级中文语境判定（2026-10）：整页含汉字，或剥离标签/实体后全无拉丁
+    # 字母（如只在空页输了一个 () 的测试）→ 中文语境，本页半角标点整体转
+    # 全角（含成对括号、隔空格/行尾标点）；纯英文页保持半角。表格虽逐字节
+    # 透传不处理，但其文字同样构成本页语境。
+    _ctx_plain = re.sub(r"<[^>]+>", "", str(html))
+    _ctx_plain = re.sub(r"&#?\w+;", " ", _ctx_plain)  # &nbsp; 等实体不算拉丁字母
+    page_ctx_cjk = bool(re.search(f"[{_CJK_RANGE}]", _ctx_plain)) or not re.search(
+        r"[A-Za-z]", _ctx_plain
+    )
     _normalize_symbols_extended = None
     if clean_symbols:
         # 惰性导入：stringmanage 只依赖 stdlib，但沿用本仓「重模块内延迟导入」约定
         from stringmanage import _normalize_symbols_extended as _nse
 
         _normalize_symbols_extended = _nse
+    _normalize_digit_punct = None
+    if digit_punct_pairs:
+        # 数字标点归一（2026-10）：1。2 → 1.2、1，2 → 1,2、1。 → 1.；表由调用方给
+        from stringmanage import normalize_digit_punct as _ndp
+
+        _normalize_digit_punct = _ndp
     for open_tag, toks in blocks:
         if open_tag == _TABLE_BLOCK:
             continue  # 表格：逐字节透传，不做任何文本处理
@@ -3025,7 +3324,7 @@ def _clean_blocks(
                 t2_new = _MD_TAG_RE.sub("", t2)
                 t2 = t2_new
             if normalize_punctuation:
-                nt = _normalize_punctuation(t2)
+                nt = _normalize_punctuation(t2, ctx_cjk=page_ctx_cjk)
                 if stats is not None:
                     stats["punct"] += _char_delta(t2, nt)
                 t2 = nt
@@ -3040,6 +3339,13 @@ def _clean_blocks(
             t2 = _BRACKET_DIGIT_RE.sub("〔\\1〕", t2)
             if stats is not None and t2 != before_b:
                 stats["symbols"] += _char_delta(before_b, t2)
+            # 数字里的中文标点 → 英文（2026-10「数字标点归一」）：放在标点/符号归一之后，
+            # 用户自定义映射表拥有最终解释权（如 1。2 → 1.2、1，2 → 1,2、1。 → 1.）。
+            if _normalize_digit_punct is not None:
+                nd = _normalize_digit_punct(t2, digit_punct_pairs)
+                if stats is not None:
+                    stats["punct"] += _char_delta(t2, nd)
+                t2 = nd
             toks[i] = t2
 
     # 相邻普通 <p> 段落合并（OCR 拆段修复）
@@ -3150,6 +3456,102 @@ def _clean_pages(items: list, clean_kw: dict) -> list:
         return list(pool.map(one, valid))
 
 
+def clean_history_pages(
+    history_id: str | None = None,
+    pdf_path: str | None = None,
+    pages=None,
+    *,
+    clean_kw: dict | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """对既有矫正历史（data/correction_history）按页范围做智能清理（headless）。
+
+    供 CLI ``mian.py clean`` / 简称 ``cl`` 使用：不起 HTTP 服务器、不开界面，
+    直接读历史版本 JSON、逐页跑 ``clean_page_html``，改动写回同一版本文件。
+
+    - ``history_id``：历史版本 id（文件名 stem；``--list`` 可查）；
+    - ``pdf_path``：改用该 PDF 的**最新**版本（无 history_id 时）；
+    - ``pages``：1-based 页码集合（list/set），None 或空 = 全部页；
+    - ``clean_kw``：清理规则（缺省读 config 的 ui_settings：开关 + 符号表 + 数字标点表）；
+    - ``dry_run``：只统计不落盘。
+
+    返回 ``{"ok", "history_id", "pdf", "total", "cleaned", "changed", "pages", "chars",
+    "dry_run"}``；``pages`` 为实际改动页码（升序）。目标不存在/读取失败抛 ``ValueError``
+    （调用方转成提示与退出码）。
+    """
+    vid = str(history_id or "").strip()
+    if vid.lower().endswith(".json"):  # 允许直接粘贴历史文件名
+        vid = vid[:-5]
+    if not vid:
+        target = str(pdf_path or "").strip()
+        if not target:
+            raise ValueError(
+                "请指定历史版本（--history-id）或 PDF（--pdf）；用 --list 可查看可用版本"
+            )
+        pref = _history_prefix(os.path.abspath(target))
+        entries = _history_entries(pref) if pref else []
+        if not entries:
+            raise ValueError(f"没有找到该 PDF 的矫正历史：{target}")
+        vid = str(entries[0].get("id") or "")
+        if not vid:
+            raise ValueError(f"矫正历史条目缺少 id：{target}")
+    fp = _history_dir() / f"{vid}.json"
+    if not fp.is_file():
+        raise ValueError(f"矫正历史不存在：{vid}")
+    try:
+        raw = json.loads(fp.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(f"矫正历史读取失败：{vid}（{e}）") from e
+    if not isinstance(raw, dict):
+        raise ValueError(f"矫正历史格式异常：{vid}")
+    stored = raw.get("pages")
+    if not isinstance(stored, dict):
+        stored = {}
+    if clean_kw is None:
+        from configmanage import (
+            get_clean_digit_punct_map,
+            get_clean_settings,
+            get_clean_symbol_map,
+        )
+
+        clean_kw = dict(get_clean_settings())
+        clean_kw["symbol_map"] = get_clean_symbol_map()
+        clean_kw["digit_punct_map"] = get_clean_digit_punct_map()
+    sel = {int(p) for p in pages} if pages else None
+    cleaned = 0
+    touched: list[int] = []
+    delta = 0
+    for key in sorted(stored, key=lambda k: int(k)):
+        num = int(key)
+        if sel is not None and num not in sel:
+            continue
+        src = str(stored.get(key) or "")
+        out = clean_page_html(src, **clean_kw)
+        cleaned += 1
+        if out != src:
+            delta += len(out) - len(src)
+            touched.append(num)
+            if not dry_run:
+                stored[key] = out
+    if touched and not dry_run:
+        raw["pages"] = stored
+        raw["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        from configmanage import _atomic_write_json
+
+        _atomic_write_json(str(fp), raw)
+    return {
+        "ok": True,
+        "history_id": vid,
+        "pdf": raw.get("pdf"),
+        "total": len(stored),
+        "cleaned": cleaned,
+        "changed": len(touched),
+        "pages": touched,
+        "chars": delta,
+        "dry_run": bool(dry_run),
+    }
+
+
 def clean_page_html(
     raw: str,
     *,
@@ -3163,6 +3565,8 @@ def clean_page_html(
     clean_html_tags: bool = True,
     clean_paragraphs: bool = False,
     symbol_map=None,
+    clean_digit_punct: bool = True,
+    digit_punct_map=None,
     with_stats: bool = False,
 ):
     """矫正界面的智能清理入口：清理段首 #/* 等符号、归一化中英文标点、
@@ -3172,7 +3576,8 @@ def clean_page_html(
     仅在显式传入 merge_paragraphs=True 时生效（供格式规则/段落合并 op 使用）。
 
     2026-10-16 智能清理规则开关（与 config.json 的 ui_settings 同名键对应）：
-    - clean_punctuation：中英文标点归一化（半角↔全角按上下文，含句号）默认开；
+    - clean_punctuation：中英文标点归一化（页级语境：中文页内半角标点整体
+      转全角、括号成对转换；纯英文页保留半角）默认开；
       与旧参数 normalize_punctuation 取「与」，任一为 False 即关闭。
     - clean_symbols：扩展符号归一化（引号/方括号/省略号/破折号/波浪号）
       + 省略号长度归一（一行内多对省略号 → 一对标准 ……）默认开。
@@ -3181,6 +3586,10 @@ def clean_page_html(
       与旧参数 strip_tags 取「与」，任一为 False 即不剥标签。
     - clean_paragraphs：段落合并优化（OCR 拆段修复）默认关；
       与旧参数 merge_paragraphs 取「或」，任一为 True 即合并。
+    - clean_digit_punct：数字里的中文标点 → 英文（2026-10，映射表可在设置里自定义，
+      见 configmanage.CLEAN_DIGIT_PUNCT_MAP_DEFAULT / ui_settings.clean_digit_punct_map）：
+      1。2 → 1.2、1，2 → 1,2、1。 → 1.。与 clean_punctuation 独立，且在其之后执行
+      （标点/符号归一先跑完，用户表拥有最终解释权）。
 
     2026-09-21：剥除 $ 紧贴括号包裹（$〔1〕$ → 〔1〕）——OvisOCR/o 系模型
     自造 $ 包裹引注括号；不紧贴括号的 $（价格 $5 / $x$ 等）原样保留。
@@ -3198,6 +3607,16 @@ def clean_page_html(
     text = _strip_dollar_bracket_hug(text)
     html = sanitize_html(text)
     stats: dict = {"punct": 0, "symbols": 0, "md": 0, "merged": 0, "tags": 0, "chars": 0}
+    # 数字标点映射表三态：None → stringmanage 默认表（调用方没配过）；
+    # [] → 显式空表（不替换）；list → 按用户表替换。clean_digit_punct=False 则整步跳过。
+    digit_pairs = None
+    if clean_digit_punct:
+        if digit_punct_map is None:
+            from stringmanage import DIGIT_PUNCT_DEFAULT as _dpd
+
+            digit_pairs = [list(p) for p in _dpd]
+        else:
+            digit_pairs = digit_punct_map
     out = _clean_blocks(
         html,
         merge_paragraphs=effective_merge,
@@ -3206,6 +3625,7 @@ def clean_page_html(
         clean_symbols=clean_symbols,
         clean_md_tags=clean_md_tags,
         symbol_pairs=symbol_map,
+        digit_punct_pairs=digit_pairs,
         stats=stats,
     )
     # 计算 tags/chars
@@ -3265,6 +3685,25 @@ def _ensure_block_newlines(html: str) -> str:
     return _BLOCK_OPEN_TAG_RE.sub(lambda m: f"{m.group(0)}\n", str(html))
 
 
+_TABLE_WHOLE_LINE_RE = re.compile(
+    r"^<(?:table|p)\b[^>]*>.*</(?:table|p)>$", flags=re.IGNORECASE
+)
+
+
+def _tables_enabled() -> bool:
+    """矫正编辑器是否自动把识别文本里的文字表格转成原生表格。
+
+    读 config.json 顶层 ``table_convert``（缺失或读取异常一律回退 True，即默认开）；
+    与 ``stringmanage._tables_enabled`` 消费同一键，保证两条链路行为一致。
+    """
+    try:
+        from configmanage import get_config
+
+        return bool(get_config(show_dialogs=False).get("table_convert", True))
+    except Exception:
+        return True
+
+
 def _page_text(raw: str, *, normalize_headings: bool = True) -> str:
     """矫正界面初始内容：普通 OCR 文本按行转 <div>；已清洗的 HTML 原样返回。
 
@@ -3278,7 +3717,11 @@ def _page_text(raw: str, *, normalize_headings: bool = True) -> str:
     <p>（否则「保存后重开，已设置的标题格式丢失」）。OCR 自动标题的归一
     只在写入历史时做一次（_save_ocr_history 走默认 True）。
     """
-    if re.search(r"</?(?:p|div|h[1-6]|span)([^>]*)>", raw, flags=re.IGNORECASE):
+    if re.search(
+        r"</?(?:p|div|h[1-6]|span|table|thead|tbody|tfoot|tr|th|td)([^>]*)>",
+        raw,
+        flags=re.IGNORECASE,
+    ):
         # 2026-08-30：历史/已存 HTML 内容 serve 前做杂符括号清理（token 级，
         # 只动文本节点）——历史版本可能保存过 \\〔^{x〕}\\ 之类大模型杂符包裹，
         # 不清理则界面正文与 reocr 的 current_text 基准不一致、diff 偏移错位。
@@ -3303,11 +3746,26 @@ def initial_html(text: str) -> str:
     部分大模型把原文 〔x〕 引注识别成 \\〔^{x〕}\\ 的杂符包裹格式，这些
     无效字符须在界面可见/保存前清除（与 reocr 对比前清理保持一致，否则
     界面正文与 reocr 的 current_text 基准不一致，diff 偏移会错位）。
+
+    2026-10-17：开关开启时（config 顶层 table_convert，默认开）先把文本里的
+    文字表格转成原生 <table>；转换器产出的整行块（<table>…</table> 与表题
+    <p>…</p>）原样放行，不再按纯文本转义成可见字符。
     """
+    text = str(text)
+    if _tables_enabled():
+        from tableconvertmanage import convert_text_tables
+
+        text = convert_text_tables(text)
     out = []
     for line in str(text).split("\n"):
         line = _normalize_brackets(line.strip())
-        if line:
+        if not line:
+            continue
+        # 转换器产出的整行块（<table>…</table> / 表题 <p>…</p>）原样放行，
+        # 不再当纯文本转义；其余行仍按行转 <div> 以保留段落/行结构。
+        if _TABLE_WHOLE_LINE_RE.match(line):
+            out.append(line)
+        else:
             out.append(f"<div>{_html.escape(line, quote=False)}</div>")
     # 2026-09-15：块之间以 \n 分隔（rulemanage 的页面纯文本约定：段与段的边界
     # 就是换行符）。若无换行，[^\n] 类正则会把相邻 <div> 视作同一行，导致
@@ -4593,23 +5051,33 @@ def _history_entries(prefix: str | None = None) -> list[dict[str, Any]]:
     return list(_HISTORY_INDEX["items"])
 
 
-def _load_latest_history(pdf_path: str | None) -> dict[str, str]:
-    """同一 PDF 最新版本的矫正内容（兼容旧版单文件格式 <prefix>.json）。"""
+def _load_latest_history_meta(pdf_path: str | None) -> dict[str, Any] | None:
+    """同一 PDF 最新版本的完整历史数据（pages / proofread / last_proofread_page）。
+
+    兼容旧版单文件格式 <prefix>.json。文件不存在/损坏返回 None。
+    2026-10-17：从 _load_latest_history 抽出——启动矫正界面时除 pages 外还需
+    回灌 proofread（已识别未应用的错误/建议/已忽略集合）。
+    """
     prefix = _history_prefix(pdf_path)
     if not prefix:
-        return {}
+        return None
     fps = sorted(_history_dir().glob(f"{prefix}_*.json"), reverse=True)
     if not fps:
         legacy = _history_dir() / f"{prefix}.json"
         if legacy.is_file():
             fps = [legacy]
     if not fps:
-        return {}
+        return None
     try:
-        data = json.loads(fps[0].read_text(encoding="utf-8"))
-        return dict(data.get("pages") or {})
+        return json.loads(fps[0].read_text(encoding="utf-8"))
     except Exception:
-        return {}
+        return None
+
+
+def _load_latest_history(pdf_path: str | None) -> dict[str, str]:
+    """同一 PDF 最新版本的矫正内容（兼容旧版单文件格式 <prefix>.json）。"""
+    data = _load_latest_history_meta(pdf_path)
+    return dict((data or {}).get("pages") or {})
 
 
 def _load_history_version(version_id: str) -> dict[str, Any] | None:
@@ -7354,9 +7822,13 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 POPUP_RULE_COUNT_MAX,
                 UNDO_DEPTH_DEFAULT,
                 UNDO_DEPTH_CHOICES,
+                SEARCH_MAX_RESULTS_DEFAULT,
+                SEARCH_MAX_RESULTS_MIN,
+                SEARCH_MAX_RESULTS_MAX,
                 LINE_NUM_SIZE_DEFAULT,
                 LINE_NUM_SIZE_CHOICES,
                 CLEAN_SYMBOL_MAP_DEFAULT,
+                CLEAN_DIGIT_PUNCT_MAP_DEFAULT,
             )
 
             if self.command == "GET":
@@ -7377,6 +7849,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "popup_rule_count": POPUP_RULE_COUNT_DEFAULT,
                     "proofread_batch_pages": 0,
                     "undo_depth": UNDO_DEPTH_DEFAULT,
+                    "search_max_results": SEARCH_MAX_RESULTS_DEFAULT,
                     "show_line_numbers": False,
                     "line_num_size": LINE_NUM_SIZE_DEFAULT,
                     "text_justify": True,
@@ -7385,6 +7858,8 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "clean_md_tags": True,
                     "clean_html_tags": True,
                     "clean_paragraphs": False,
+                    "clean_digit_punct": True,
+                    "proofread_auto_jump": True,
                 })
                 merged = {
                     "tip_delay": stored.get("tip_delay", defaults["tip_delay"]),
@@ -7399,6 +7874,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "popup_rule_count": stored.get("popup_rule_count", defaults["popup_rule_count"]),
                     "proofread_batch_pages": stored.get("proofread_batch_pages", defaults.get("proofread_batch_pages", 0)),
                     "undo_depth": stored.get("undo_depth", defaults.get("undo_depth", UNDO_DEPTH_DEFAULT)),
+                    "search_max_results": stored.get("search_max_results", defaults.get("search_max_results", SEARCH_MAX_RESULTS_DEFAULT)),
                     "show_line_numbers": bool(stored.get("show_line_numbers", defaults.get("show_line_numbers", False))),
                     "line_num_size": stored.get("line_num_size", defaults.get("line_num_size", LINE_NUM_SIZE_DEFAULT)),
                     "text_justify": bool(stored.get("text_justify", defaults.get("text_justify", True))),
@@ -7408,6 +7884,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "clean_html_tags": bool(stored.get("clean_html_tags", defaults.get("clean_html_tags", True))),
                     "clean_paragraphs": bool(stored.get("clean_paragraphs", defaults.get("clean_paragraphs", False))),
                     "clean_symbol_map": stored.get("clean_symbol_map", defaults.get("clean_symbol_map", CLEAN_SYMBOL_MAP_DEFAULT)),
+                    "clean_digit_punct": bool(stored.get("clean_digit_punct", defaults.get("clean_digit_punct", True))),
+                    "clean_digit_punct_map": stored.get("clean_digit_punct_map", defaults.get("clean_digit_punct_map", CLEAN_DIGIT_PUNCT_MAP_DEFAULT)),
+                    "proofread_auto_jump": bool(stored.get("proofread_auto_jump", defaults.get("proofread_auto_jump", True))),
                 }
                 self._send(
                     200,
@@ -7523,12 +8002,27 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     self._send(400, self._json({"ok": False, "error": "proofread_batch_pages 超出范围（0-50，0=全部页）"}), "application/json; charset=utf-8")
                     return
                 clean["proofread_batch_pages"] = v
+            if "proofread_auto_jump" in ui:
+                v = ui["proofread_auto_jump"]
+                if not isinstance(v, bool):
+                    self._send(400, self._json({"ok": False, "error": "proofread_auto_jump 必须是布尔值"}), "application/json; charset=utf-8")
+                    return
+                clean["proofread_auto_jump"] = v
             if "undo_depth" in ui:
                 v = ui["undo_depth"]
                 if not (isinstance(v, int) and not isinstance(v, bool) and v in UNDO_DEPTH_CHOICES):
                     self._send(400, self._json({"ok": False, "error": "undo_depth 取值无效（需为 50/100/200/500）"}), "application/json; charset=utf-8")
                     return
                 clean["undo_depth"] = v
+            if "search_max_results" in ui:
+                # 搜索结果列表显示上限：10-1000 的整数（与 proofread_batch_pages 同口径，越界 400）
+                if not isinstance(ui["search_max_results"], int) or isinstance(ui["search_max_results"], bool):
+                    self._send(400, self._json({"ok": False, "error": "search_max_results 必须是数字"}), "application/json; charset=utf-8")
+                    return
+                if not (SEARCH_MAX_RESULTS_MIN <= ui["search_max_results"] <= SEARCH_MAX_RESULTS_MAX):
+                    self._send(400, self._json({"ok": False, "error": "search_max_results 超出范围（%d-%d）" % (SEARCH_MAX_RESULTS_MIN, SEARCH_MAX_RESULTS_MAX)}), "application/json; charset=utf-8")
+                    return
+                clean["search_max_results"] = ui["search_max_results"]
             if "show_line_numbers" in ui:
                 v = ui["show_line_numbers"]
                 if not isinstance(v, bool):
@@ -7751,6 +8245,75 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 "application/json; charset=utf-8",
             )
 
+    def _correction_format(self) -> None:
+        """校正格式清理设置：GET 读取 / POST 写入 config.json 顶层 correction_format。
+
+        结构 {enabled, strip_markdown, strip_latex, remove_formula, custom_rules}。
+        POST 两种模式：
+          - 预览：body 含字符串 preview 时，用提交的设置（不落盘）清理该文本，
+            返回 {ok, preview}（供设置界面实时预览）。
+          - 保存：否则校验并落盘，返回 {ok, settings}。
+        校验失败返回 400（中文信息），不落盘。清理逻辑见 clean_correction_format。
+        """
+        try:
+            from configmanage import (
+                get_correction_format,
+                normalize_correction_format,
+                set_correction_format,
+            )
+
+            if self.command == "GET":
+                self._send(
+                    200,
+                    self._json({"ok": True, "settings": get_correction_format()}),
+                    "application/json; charset=utf-8",
+                )
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            body = json.loads(raw.decode("utf-8"))
+            if not isinstance(body, dict):
+                self._send(
+                    400,
+                    self._json({"ok": False, "error": "请求体必须为 JSON 对象"}),
+                    "application/json; charset=utf-8",
+                )
+                return
+            if isinstance(body.get("preview"), str):
+                # 预览：用提交的设置（未落盘）清理给定文本
+                opts = normalize_correction_format(body)
+                preview = clean_correction_format(
+                    body["preview"],
+                    strip_markdown=opts.get("strip_markdown", True),
+                    strip_latex=opts.get("strip_latex", True),
+                    remove_formula=opts.get("remove_formula", False),
+                    custom_rules=opts.get("custom_rules"),
+                )
+                self._send(
+                    200,
+                    self._json({"ok": True, "preview": preview}),
+                    "application/json; charset=utf-8",
+                )
+                return
+            settings = set_correction_format(body)
+            self._send(
+                200,
+                self._json({"ok": True, "settings": settings}),
+                "application/json; charset=utf-8",
+            )
+        except ValueError as e:  # 校验失败 → 400（中文信息）
+            self._send(
+                400,
+                self._json({"ok": False, "error": str(e)}),
+                "application/json; charset=utf-8",
+            )
+        except Exception as e:  # noqa: BLE001
+            self._send(
+                500,
+                self._json({"ok": False, "error": str(e)}),
+                "application/json; charset=utf-8",
+            )
+
     def _autosave_action(self) -> None:
         """自动保存动作：POST /api/autosave。
 
@@ -7831,7 +8394,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
             )
 
     def _config(self) -> None:
-        """字体/界面配置：POST 写入 config.json fonts + citationItalicEnabled。
+        """字体/界面配置：POST 写入 config.json fonts + citationItalicEnabled + table_convert。
 
         与 _shortcuts/_proofread_settings 同构：get_config 读取 → 合并 →
         update_config 原子写回。仅在确有变更时写盘。
@@ -7862,6 +8425,15 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "application/json; charset=utf-8",
                 )
                 return
+            # 识别文字表格自动转原生表格（2026-10）：顶层 table_convert，与主设置同一开关
+            tableConvert = body.get("table_convert")
+            if tableConvert is not None and not isinstance(tableConvert, bool):
+                self._send(
+                    400,
+                    self._json({"ok": False, "error": "table_convert 必须是布尔值"}),
+                    "application/json; charset=utf-8",
+                )
+                return
             cfg = get_config(show_dialogs=False) or {}
             changed = False
             if fonts is not None:
@@ -7879,11 +8451,17 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 if cfg.get("citationItalicEnabled") != citationItalicEnabled:
                     cfg["citationItalicEnabled"] = citationItalicEnabled
                     changed = True
+            if tableConvert is not None:
+                if cfg.get("table_convert") != tableConvert:
+                    cfg["table_convert"] = tableConvert
+                    changed = True
             if changed:
                 update_config("fonts", cfg.get("fonts"))
                 update_config(
                     "citationItalicEnabled", cfg.get("citationItalicEnabled")
                 )
+                if tableConvert is not None:
+                    update_config("table_convert", cfg.get("table_convert"))
             self._send(200, self._json({"ok": True}), "application/json; charset=utf-8")
         except Exception as e:  # noqa: BLE001
             self._send(
@@ -7976,7 +8554,15 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 if n in dims:
                     item["w"], item["h"] = dims[n]
                 pages_list.append(item)
-            payload = {"pages": pages_list}
+            # 纠错状态随 pages 一并下发（2026-10-17 修复）：此前 /api/pages 只回 pages，
+            # 前端启动即丢失「已识别未应用」的错误/建议/已忽略集合——保存过的纠错状态
+            # 在重开矫正界面后全部消失，必须重新识别一次。
+            payload = {
+                "pages": pages_list,
+                "proofread": state.get("proofread")
+                or {"errors": {}, "original": {}, "dismissed": {}},
+                "last_proofread_page": state.get("last_proofread_page"),
+            }
             self._send(200, self._json(payload), "application/json; charset=utf-8")
             return
         if path == "/api/format_rules":
@@ -8087,8 +8673,11 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
         if path == "/api/replace_rules":
             self._replace_rules()
             return
+        if path == "/api/correction_format":
+            self._correction_format()
+            return
         if path == "/api/config":
-            # 字体/界面配置：GET 读取 config.json fonts + citationItalicEnabled
+            # 字体/界面配置：GET 读取 config.json fonts + citationItalicEnabled + table_convert
             from configmanage import get_config
 
             cfg = get_config(show_dialogs=False) or {}
@@ -8109,6 +8698,8 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                         "citationItalicEnabled": bool(
                             cfg.get("citationItalicEnabled", False)
                         ),
+                        # 回退规则与 stringmanage 保持一致：缺失/读取异常一律视为开启
+                        "table_convert": bool(cfg.get("table_convert", True)),
                     }
                 ),
                 "application/json; charset=utf-8",
@@ -8645,7 +9236,12 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length else b"{}"
                 body = json.loads(raw.decode("utf-8"))
-                from configmanage import CLEAN_SETTINGS_DEFAULTS, get_clean_settings, get_clean_symbol_map
+                from configmanage import (
+                    CLEAN_SETTINGS_DEFAULTS,
+                    get_clean_digit_punct_map,
+                    get_clean_settings,
+                    get_clean_symbol_map,
+                )
 
                 opts = get_clean_settings()
                 for _k in CLEAN_SETTINGS_DEFAULTS:
@@ -8654,6 +9250,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 sym_map = get_clean_symbol_map()
                 if isinstance(body.get("clean_symbol_map"), list):
                     sym_map = body["clean_symbol_map"]
+                digit_map = get_clean_digit_punct_map()
+                if isinstance(body.get("clean_digit_punct_map"), list):
+                    digit_map = body["clean_digit_punct_map"]
                 clean_kw = {
                     "clean_punctuation": opts["clean_punctuation"],
                     "clean_symbols": opts["clean_symbols"],
@@ -8661,11 +9260,122 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "clean_html_tags": opts["clean_html_tags"],
                     "clean_paragraphs": opts["clean_paragraphs"],
                     "symbol_map": sym_map,
+                    "clean_digit_punct": opts["clean_digit_punct"],
+                    "digit_punct_map": digit_map,
                 }
                 cleaned = _clean_pages(body.get("pages") or [], clean_kw)
                 self._send(
                     200,
                     self._json({"ok": True, "pages": cleaned}),
+                    "application/json; charset=utf-8",
+                )
+            except Exception as e:  # noqa: BLE001
+                self._send(
+                    500,
+                    self._json({"ok": False, "error": str(e)}),
+                    "application/json; charset=utf-8",
+                )
+            return
+        if path == "/api/table_convert":
+            # 手动把选中文字转成原生表格（无状态）：body {"text": str} →
+            # {"ok": true, "html": str}。手动档不强制 Markdown 分隔行，并额外识别
+            # 无竖线的空格/制表符对齐列（设计文档规格 C，仅手动提供）。
+            # 自动档（重识别/应用校正后补转，2026-10）：body {"lines": [str, ...]} →
+            # {"ok": true, "lines": [...], "chunks": [[start, end, html], ...]}；chunks
+            # 标明输入行 [start, end) 被换成了哪个输出行（编辑器据此替换连续 DOM 块）。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b"{}"
+                body = json.loads(raw.decode("utf-8"))
+                lines = body.get("lines")
+                if lines is not None:
+                    if not isinstance(lines, list) or not all(
+                        isinstance(x, str) for x in lines
+                    ):
+                        self._send(
+                            400,
+                            self._json({"ok": False, "error": "lines 必须是字符串数组"}),
+                            "application/json; charset=utf-8",
+                        )
+                        return
+                    from tableconvertmanage import convert_lines
+
+                    out_lines, chunks = convert_lines(lines)
+                    self._send(
+                        200,
+                        self._json(
+                            {
+                                "ok": True,
+                                "lines": out_lines,
+                                "chunks": [[s, e, h] for s, e, h in chunks],
+                            }
+                        ),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+                text = str(body.get("text") or "")
+                if not text.strip():
+                    self._send(
+                        400,
+                        self._json({"ok": False, "error": "text 不能为空"}),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+                from tableconvertmanage import convert_text_tables
+
+                html_text = convert_text_tables(
+                    text, allow_space_aligned=True, require_separator=False
+                )
+                self._send(
+                    200,
+                    self._json({"ok": True, "html": html_text}),
+                    "application/json; charset=utf-8",
+                )
+            except Exception as e:  # noqa: BLE001
+                self._send(
+                    500,
+                    self._json({"ok": False, "error": str(e)}),
+                    "application/json; charset=utf-8",
+                )
+            return
+        if path == "/api/table_to_text":
+            # 表格转文本（无状态，2026-10）：body {"htmls": [str, ...]} →
+            # {"ok": true, "texts": [str, ...]}。每项是一段 <table> HTML，返回对应的
+            # Markdown 管道文字（解析不到表格时该项为空串）。编辑器「表格转文本」用。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b"{}"
+                body = json.loads(raw.decode("utf-8"))
+                htmls = body.get("htmls")
+                if isinstance(htmls, str):
+                    htmls = [htmls]
+                if not isinstance(htmls, list) or not htmls:
+                    self._send(
+                        400,
+                        self._json({"ok": False, "error": "htmls 不能为空"}),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+                if not all(isinstance(h, str) for h in htmls):
+                    self._send(
+                        400,
+                        self._json({"ok": False, "error": "htmls 必须是字符串数组"}),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+                if len(htmls) > 200:
+                    self._send(
+                        400,
+                        self._json({"ok": False, "error": "一次最多转换 200 个表格"}),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+                from tableconvertmanage import table_html_to_pipe_text
+
+                texts = [table_html_to_pipe_text(h) for h in htmls]
+                self._send(
+                    200,
+                    self._json({"ok": True, "texts": texts}),
                     "application/json; charset=utf-8",
                 )
             except Exception as e:  # noqa: BLE001
@@ -9036,6 +9746,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/replace_rules":
             self._replace_rules()
+            return
+        if path == "/api/correction_format":
+            self._correction_format()
             return
         if path == "/api/config":
             self._config()
@@ -9622,6 +10335,21 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     # 归一为 〔x〕（与 clean 流程一致），避免括号样式差异被当作纠错项；
                     # 括号内内容原样保留（此前 2026-08-28 是「不处理、保留原始输出」）
                     new_text = ttos(new_text)
+                    # 2026-10：校正格式清理（设置界面「校正格式」栏）——剥离模型返回
+                    # 文本中的 Markdown 标记 / LaTeX 公式与命令，避免无关格式字符被
+                    # diff 逐字判为纠错项。默认关闭（enabled=False 时零开销）；
+                    # 详见 clean_correction_format 与 config.json: correction_format。
+                    from configmanage import get_correction_format
+
+                    cf_opts = get_correction_format(cfg)
+                    if cf_opts.get("enabled"):
+                        new_text = clean_correction_format(
+                            new_text,
+                            strip_markdown=cf_opts["strip_markdown"],
+                            strip_latex=cf_opts["strip_latex"],
+                            remove_formula=cf_opts["remove_formula"],
+                            custom_rules=cf_opts["custom_rules"],
+                        )
                 # 2026-08-23/28：模型可能把图片页脚的页码一并识别进来，先剥掉末尾页码
                 # （第 N 页 / 字符+数字：页123·P123·No.123 / 括号包裹 / 独立成行裸数字），
                 # 避免被当成正文差异标注；仅清理返回文字最末尾的页码，正文不受影响。
@@ -10188,6 +10916,17 @@ def correct_pages(
         if _shown:
             state["history_name"] = _shown
             state["display_name"] = _shown
+    elif history_pages:
+        # 无指定历史版本、但载入了同一 PDF 最新历史内容时，把其中的纠错状态
+        # （已识别未应用的错误/建议 + 已忽略集合 + 上次纠错页）一并回灌——
+        # 否则「模型纠错后保存、重新打开」会丢失未落地的错误，需重新识别；
+        # 2026-10-17 修复（正文仍由历史 pages 提供，纠错状态不得污染正文）。
+        _latest_meta = _load_latest_history_meta(str(pdf_path))
+        if _latest_meta:
+            if _latest_meta.get("proofread"):
+                state["proofread"] = _latest_meta["proofread"]
+            if _latest_meta.get("last_proofread_page") is not None:
+                state["last_proofread_page"] = _latest_meta["last_proofread_page"]
     server = ThreadingHTTPServer((host, port), _CorrectionHandler)
     server.daemon_threads = True
     server.state = state
@@ -10706,7 +11445,7 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
 /* 全局延迟提示：悬停超过设定时间才显示（含快捷键），延迟可在「快捷键」设置中调整 */
 #tip{position:fixed;z-index:80;display:none;background:#1c2733;color:#fff;font-size:12px;line-height:1.5;padding:5px 9px;border-radius:4px;max-width:320px;pointer-events:none;}
 #tip .tip-key{color:#bcd0e5;margin-left:6px;white-space:nowrap;}
-#popup{position:fixed;z-index:60;display:none;flex-wrap:wrap;gap:3px;max-width:300px;padding:4px 6px;background:#fff;border:1px solid var(--border);border-radius:7px;box-shadow:0 4px 18px rgba(0,0,0,.22);}
+#popup{position:fixed;z-index:65;display:none;flex-wrap:wrap;gap:3px;max-width:300px;padding:4px 6px;background:#fff;border:1px solid var(--border);border-radius:7px;box-shadow:0 4px 18px rgba(0,0,0,.22);}
 .pop-btn{min-width:28px;height:26px;padding:0 6px;font-size:12px;border:1px solid var(--border);background:#fff;color:#1c2733;border-radius:5px;cursor:pointer;line-height:1;}
 /* 右键上下文菜单（2026-08-08）：浅色主题、圆角、分组分隔线、二级菜单向右展开（右缘不足向左） */
 #contextMenu{position:fixed;z-index:80;min-width:172px;padding:5px;background:#fff;border:1px solid var(--border);border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,.22);display:flex;flex-direction:column;gap:1px;user-select:none;}
@@ -10839,6 +11578,39 @@ body.paint-mode{cursor:copy;}
 .dark #tblBar{background:rgba(30,35,45,.94);border-color:#3a4150;}
 .dark #tblBar button{color:#ddd;}
 .dark .tbl-bar-sep{background:#3a4150;}
+/* ---- 表格增强（2026-10）----
+   用户反馈三条：插入的表格太小 / 鼠标光标与表格错位 / 无法调整宽高。
+   ① 最小行高：空表不再塌成一条线；② 垂直对齐类；③ 含表格的行参与撑行
+   （默认 .editable{height:0} 不参与 → 表格被图片高度裁切并内部滚动，同时造成
+   点击落点与所见错位）；④ 合并选区高亮；⑤ 列/行拖拽手柄层；⑥ 更多菜单；⑦ 尺寸弹窗 */
+.editable th,.editable td{height:1.9em;}
+.editable td.ptoe-vtop,.editable th.ptoe-vtop{vertical-align:top;}
+.editable td.ptoe-vmid,.editable th.ptoe-vmid{vertical-align:middle;}
+.editable td.ptoe-vbot,.editable th.ptoe-vbot{vertical-align:bottom;}
+.page-row.ptoe-has-table .editable{height:auto;min-height:0;}
+.editable td.ptoe-cell-sel,.editable th.ptoe-cell-sel{outline:2px solid var(--accent,#316dca);outline-offset:-2px;background:rgba(49,109,202,.12);}
+#tblResizeLayer{position:fixed;z-index:63;display:none;pointer-events:none;}
+#tblResizeLayer .tbl-col-h{position:absolute;width:9px;cursor:col-resize;pointer-events:auto;}
+#tblResizeLayer .tbl-col-h::after{content:'';position:absolute;left:3px;top:0;bottom:0;width:2px;background:var(--accent,#316dca);opacity:0;}
+#tblResizeLayer .tbl-col-h:hover::after{opacity:.95;}
+#tblResizeLayer .tbl-row-h{position:absolute;height:9px;cursor:row-resize;pointer-events:auto;}
+#tblResizeLayer .tbl-row-h::after{content:'';position:absolute;top:3px;left:0;right:0;height:2px;background:var(--accent,#316dca);opacity:0;}
+#tblResizeLayer .tbl-row-h:hover::after{opacity:.95;}
+#tblMenu{position:fixed;z-index:71;background:#fff;border:1px solid #ddd;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.15);min-width:158px;padding:4px;display:none;max-height:72vh;overflow:auto;}
+#tblMenu button{display:block;width:100%;text-align:left;padding:6px 10px;border:none;background:none;cursor:pointer;border-radius:4px;font-size:13px;color:#1c2733;}
+#tblMenu button:hover{background:#f0f0f0;}
+#tblMenu button.active{background:#e0eaff;color:var(--accent);font-weight:600;}
+#tblMenu button.danger{color:#c0392b;}
+#tblMenu .tbl-menu-sep{height:1px;background:#e6e6e6;margin:4px 6px;}
+#tblMenu .tbl-menu-head{padding:4px 10px 2px;font-size:11px;color:var(--text-muted);}
+.dark #tblMenu{background:#232a35;border-color:#3a4150;}
+.dark #tblMenu button{color:#ddd;}
+.dark #tblMenu button:hover{background:#2e3746;}
+.dark #tblMenu .tbl-menu-sep{background:#3a4150;}
+#tblSizeModalBg{position:fixed;inset:0;z-index:67;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+.tbl-size-grid{display:grid;grid-template-columns:auto 1fr;gap:8px 12px;margin:10px 0;font-size:13px;align-items:center;}
+.tbl-size-grid input[type="number"]{width:92px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;}
+.tbl-size-grid select{padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;background:#fff;}
 /* 搜索 / 替换弹窗（工具栏「搜」按钮打开；结果列表点击跳转、↑↓上一个/下一个） */
 #searchModalBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
 .search-modal{max-width:640px;width:94%;display:flex;flex-direction:column;}
@@ -10959,6 +11731,11 @@ body.paint-mode{cursor:copy;}
 #finishModalBg{position:fixed;inset:0;z-index:70;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
 #historyModalBg{position:fixed;inset:0;z-index:70;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
 #helpModalBg{position:fixed;inset:0;z-index:65;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+/* 清理预览模态框（2026-10-16）：遮罩层定位与其它 modal 同构。
+   缺失此规则会让预览框落在文档流末尾不可见，表现为点「清理」毫无反应。 */
+#cleanPreviewBg{position:fixed;inset:0;z-index:68;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+.clean-preview-item{padding:3px 6px;border-bottom:1px dashed var(--border);}
+.clean-preview-item:last-child{border-bottom:none;}
 #historyTable{table-layout:fixed;}
 #historyTable th{position:sticky;top:0;background:#f4f6f9;}
 #historyTable td{word-break:break-all;vertical-align:top;}
@@ -11120,6 +11897,8 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
           <input type="file" id="imgExternalInput" accept="image/*" style="display:none"/>
           <button type="button" class="tb-btn" id="dividerBtn" role="menuitem" onmousedown="event.preventDefault()" title="分隔线下拉菜单：在光标处插入一行分隔线（直线 / 线段 / 点线 / 双线）" aria-label="插入分隔线">分隔线 <span class="ptoe-caret">▾</span></button>
           <button type="button" class="tb-btn" id="tableBtn" role="menuitem" onmousedown="event.preventDefault()" title="插入表格：在光标处插入空表格，行/列数与是否带表头可设（Ctrl+Alt+T）" aria-label="插入表格">插入表格</button>
+          <button type="button" class="tb-btn" id="tableConvertBtn" role="menuitem" data-op="table" onmousedown="event.preventDefault()" title="转成表格：把选中的文字转成原生表格（支持 Markdown 管道表 / 画框表 / 空格对齐列；手动档，不要求分隔行）" aria-label="转成表格">转成表格</button>
+          <button type="button" class="tb-btn" id="tableToTextBtn" role="menuitem" data-op="table2text" onmousedown="event.preventDefault()" title="表格转文本：把光标所在表格还原成 Markdown 管道文字（光标不在表格内则转当前页全部表格；可再用「转成表格」转回）" aria-label="表格转文本">表格转文本</button>
         </div>
       </div>
     </div>
@@ -11531,10 +12310,10 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
     <h3>插入表格</h3>
     <button type="button" class="x-btn" id="tableCloseBtn" title="关闭 (Esc)" aria-label="关闭">✕</button>
   </div>
-  <p class="export-desc">在光标处插入空表格。行数与列数可设为 1-20；勾选「首行表头」则首行改为粗体表头行。</p>
+  <p class="export-desc">在光标处插入空表格。行数 1-200、列数 1-50；勾选「首行表头」则首行改为粗体表头行。</p>
   <div class="table-grid">
-    <label>行数 <input type="number" id="tableRows" value="4" min="1" max="20" step="1"></label>
-    <label>列数 <input type="number" id="tableCols" value="5" min="1" max="20" step="1"></label>
+    <label>行数 <input type="number" id="tableRows" value="4" min="1" max="200" step="1"></label>
+    <label>列数 <input type="number" id="tableCols" value="5" min="1" max="50" step="1"></label>
     <label><input type="checkbox" id="tableHeader" checked> 首行表头</label>
   </div>
   <div class="export-actions">
@@ -11549,6 +12328,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
     <button type="button" class="settings-tab" data-tab="fonts">字体</button>
     <button type="button" class="settings-tab" data-tab="ui">界面</button>
     <button type="button" class="settings-tab" data-tab="popup">弹出菜单</button>
+    <button type="button" class="settings-tab" data-tab="correction">校正格式</button>
   </div>
   <div class="settings-panels">
     <div class="settings-panel" id="panel-shortcuts">
@@ -11635,6 +12415,11 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <h4 style="margin:16px 0 4px;">纠错悬浮窗</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">鼠标悬停校正文本超过设定时间（毫秒）自动弹出采纳/忽略菜单；0 = 悬停即弹出。</p>
       <label style="font-size:13px;">悬停弹出延迟（毫秒） <input type="number" id="errHoverDelayInput" min="0" max="10000" step="100" style="width:90px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="prAutoJump" style="width:16px;height:16px;">
+        采纳/忽略后自动跳到下一个错误（默认开启）
+      </label>
+      <p style="font-size:12px;color:#5a6b7c;margin:4px 0 0;">开启后，点击「采纳」或「忽略」会自动滚动定位到本页下一个错误并弹出悬浮菜单（不会跳到其他页）；关闭后保持原位，需自行找到下一个错误。</p>
       <h4 style="margin:16px 0 4px;">增强格式刷</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">武装「合并段落」刷后，拖选多段并停稳超过该时间（毫秒）才自动合并，避免拖选途中瞬时覆盖多段就误合并；0 = 停稳即合并（最快）。正文 / 注释 / 引用 / 加粗 / 斜体单个武装时，先用鼠标选中词语或句子再点击段落，即只对选中文字生效；未选中或混合多个功能时作用于整段。</p>
       <label style="font-size:13px;">合并延迟（毫秒） <input type="number" id="brushMergeDelayInput" min="0" max="5000" step="100" style="width:90px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
@@ -11658,6 +12443,9 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
           <option value="500">500 步</option>
         </select>
       </label>
+      <h4 style="margin:16px 0 4px;">搜索结果</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">搜索/替换弹窗结果列表最多显示的条数（10-1000，默认 200）。匹配总数始终完整统计并显示，超出上限时提示「仅显示前 N 条」；列表非虚拟渲染，设得越大滚动越可能卡顿。EPUB 编辑器的章内搜索读取同一设置。</p>
+      <label style="font-size:13px;">显示上限（条） <input type="number" id="searchMaxResultsInput" min="10" max="1000" step="10" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
       <h4 style="margin:16px 0 4px;">文字页面行号</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">在虚拟列表各页的文字左侧显示行号（每页从 1 重新计起，与原书页码无关）。行号供命令行按行号寻址使用（Ctrl+; 打开命令行，例如 7,10merge 合并第 7-10 行）。纯视图层，不写入保存内容，也不影响导出。</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
@@ -11681,9 +12469,9 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">「智能清理」按钮各步骤的启用开关。仅作用于清理结果，不影响未清理内容；关闭某步即清理时跳过该步。</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
         <input type="checkbox" id="cleanPunctuationChk" style="width:16px;height:16px;">
-        中英文标点归一（逗号 / 句号 / 括号等按上下文半角↔全角）
+        中英文标点归一（逗号 / 句号 / 括号等半角 → 全角；纯英文页保留半角）
       </label>
-      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：你好,世界 → 你好，世界</p>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：你好,世界 → 你好，世界；测试() → 测试（）</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
         <input type="checkbox" id="cleanSymbolsChk" style="width:16px;height:16px;">
         扩展符号归一（引号 / 方括号 / 破折号 / 波浪号 + 省略号长度统一）
@@ -11704,6 +12492,11 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
         段落合并优化（OCR 误拆段落自动合并，默认关闭）
       </label>
       <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：&lt;p&gt;未完&lt;/p&gt;&lt;p&gt;待续&lt;/p&gt; → &lt;p&gt;未完待续&lt;/p&gt;</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="cleanDigitPunctChk" style="width:16px;height:16px;">
+        数字标点归一（数字紧跟的中文标点 → 英文）
+      </label>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：1。2 → 1.2，1，2 → 1,2，1。 → 1.；映射表可在下方自定义</p>
       <div style="margin-top:12px;padding:8px;background:#f8f9fa;border-radius:4px;">
         <p style="font-size:12px;color:#5a6b7c;margin:0 0 4px;">实时预览（输入文本查看清理效果）</p>
         <textarea id="cleanPreviewInput" rows="2" style="width:100%;box-sizing:border-box;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;resize:vertical;" placeholder="输入文本查看清理效果..."></textarea>
@@ -11714,6 +12507,17 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
         <textarea id="cleanSymbolMapEditor" rows="5" style="width:100%;box-sizing:border-box;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;resize:vertical;" placeholder="[ → 【&#10;] → 】&#10;-- → ——&#10;~ → ～"></textarea>
         <p style="font-size:11px;color:#8a9bab;margin:4px 0 0;">自定义符号归一映射。留空则恢复默认。修改后自动保存并更新预览。</p>
       </div>
+      <div style="margin-top:12px;padding:8px;background:#f8f9fa;border-radius:4px;">
+        <p style="font-size:12px;color:#5a6b7c;margin:0 0 4px;">数字标点映射表（每行一条：中文标点 → 英文，如 <code>。 → .</code>）</p>
+        <textarea id="cleanDigitPunctMapEditor" rows="5" style="width:100%;box-sizing:border-box;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;resize:vertical;" placeholder="。 → .&#10;， → ,&#10;、 → ,&#10;： → :&#10;； → ;"></textarea>
+        <p style="font-size:11px;color:#8a9bab;margin:4px 0 0;">只替换「紧跟数字」的中文标点（1。2 → 1.2、1，2 → 1,2、1。 → 1.），且仅单字符源生效。留空则恢复默认。修改后自动保存并更新预览。</p>
+      </div>
+      <h4 style="margin:16px 0 4px;">表格</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">自动把识别/导入文本里的文字表格（Markdown 管道表、画框表）转成原生表格。关闭后仍可用工具栏「转成表格」或选中文字后的悬浮菜单手动转换。与主设置的「识别表格转换为表格」是同一个开关（config 顶层 table_convert）。</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
+        <input type="checkbox" id="tableConvertChk" style="width:16px;height:16px;">
+        自动把文字表格转换为表格
+      </label>
       <h4 style="margin:16px 0 4px;">格式规则</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">把规则应用到全部页前先弹出确认，防止误操作大范围改动。</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
@@ -11755,6 +12559,32 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">第三行显示格式规则菜单前 N 项（设置为 0 则不显示规则按钮）。</p>
       <label style="font-size:13px;">规则按钮数量 <input type="number" id="popupRuleCountInput" min="0" max="10" step="1" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
       <div style="margin-top:12px;"><button type="button" id="resetPopupSettingsBtn">恢复默认</button></div>
+    </div>
+    <div class="settings-panel" id="panel-correction" style="display:none;">
+      <p style="font-size:12px;color:#5a6b7c;margin:8px 0;">大模型「重识别」返回的文本在与原文逐字对比前，先剥离与内容无关的格式字符（Markdown 标记、LaTeX 公式与命令），避免 **、$、\frac 之类被当成纠错项。默认关闭；开启后仅作用于重识别结果，不影响普通 OCR 流程。</p>
+      <label style="display:block;font-size:13px;margin:10px 0 6px;"><input type="checkbox" id="cfEnabled"> 启用校正格式清理（重识别结果对比前）</label>
+      <div style="display:grid;grid-template-columns:1fr;gap:6px;margin:6px 0 6px 22px;">
+        <label style="font-size:13px;"><input type="checkbox" id="cfStripMarkdown"> 去 Markdown 标记（**粗体**、# 标题、- 列表、`代码` 等，保留文字）</label>
+        <label style="font-size:13px;"><input type="checkbox" id="cfStripLatex"> 去 LaTeX 命令/环境标记（$…$、\frac{a}{b}、\textcircled{n} 等，保留公式内容）</label>
+        <label style="font-size:13px;"><input type="checkbox" id="cfRemoveFormula"> 整段移除 LaTeX 公式（连同公式内容一并删除，比上一项更激进）</label>
+      </div>
+      <h4 style="margin:16px 0 4px;">自定义清理规则</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">在上面的默认清理之后再按顺序执行（正则替换，作用于重识别返回文本）。用于补足默认规则未覆盖的格式残留。</p>
+      <div id="cfRulesList"></div>
+      <div class="rr-edit-grid" style="margin-top:8px;">
+        <label>规则名称 <input type="text" id="cfRuleName" placeholder="如：去行首圈码"></label>
+        <label>正则表达式 <input type="text" id="cfRulePattern" placeholder="如：^[①-⑳]\s*"></label>
+        <label>标志 <input type="text" id="cfRuleFlags" placeholder="i m u（忽略留空）" title="可选：i 忽略大小写 / m 多行 / u Unicode"></label>
+        <label>替换为 <input type="text" id="cfRuleReplacement" placeholder="留空 = 删除匹配内容"></label>
+      </div>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center;">
+        <button type="button" id="cfRuleSaveBtn" class="primary">添加规则</button>
+        <button type="button" id="cfRuleCancelBtn" style="display:none;">取消编辑</button>
+      </div>
+      <h4 style="margin:16px 0 4px;">预览</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">粘贴一段模型返回的文本，实时查看按当前设置清理后的结果（仅预览，不保存、不落盘）。</p>
+      <textarea id="cfPreviewInput" rows="3" style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;resize:vertical;" placeholder="**加粗** 与 $\frac{1}{2}$ 与 \textcircled{1}"></textarea>
+      <textarea id="cfPreviewOut" rows="3" readonly style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;margin-top:6px;background:#f7f9fc;resize:vertical;"></textarea>
     </div>
   </div>
   <button type="button" id="closeSettings" class="primary" style="margin-top:12px;">关闭</button>
@@ -11918,19 +12748,43 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
     <button type="button" class="img-pop-btn" data-img-op="delete" style="flex:1;color:#c0392b;">删除</button>
   </div>
 </div>
-<!-- 表格操作条：光标进入表格单元格时弹出（加行/删行/加列/删列/对齐/删除表格） -->
+<!-- 表格操作条（2026-10 增强）：光标进入表格单元格时弹出。快捷项=常用操作；
+     「更多 ▾」菜单与表格内右键菜单同源（插入/移动行列、垂直对齐、表头、均分列宽、重置尺寸）。 -->
 <div id="tblBar" style="display:none;" aria-label="表格操作">
   <button type="button" data-tbl-op="addrow" title="下方插入一行">加行</button>
-  <button type="button" data-tbl-op="delrow" title="删除当前行">删行</button>
-  <span class="tbl-bar-sep"></span>
   <button type="button" data-tbl-op="addcol" title="右侧插入一列">加列</button>
-  <button type="button" data-tbl-op="delcol" title="删除当前列">删列</button>
+  <button type="button" data-tbl-op="merge" title="合并选中的多个单元格（在表格内拖选，或按住 Shift 点选）">合并</button>
+  <button type="button" data-tbl-op="split" title="拆分当前已合并的单元格">拆分</button>
+  <button type="button" data-tbl-op="colwidth" title="设置当前列宽（百分比）">列宽</button>
+  <button type="button" data-tbl-op="rowheight" title="设置当前行高">行高</button>
   <span class="tbl-bar-sep"></span>
   <button type="button" data-tbl-op="alignleft" data-tbl-align="left" title="单元格左对齐">左</button>
   <button type="button" data-tbl-op="aligncenter" data-tbl-align="center" title="单元格居中">中</button>
   <button type="button" data-tbl-op="alignright" data-tbl-align="right" title="单元格右对齐">右</button>
   <span class="tbl-bar-sep"></span>
+  <button type="button" data-tbl-op="more" title="更多表格操作（插入/移动行列、垂直对齐、表头、均分列宽…）">更多 ▾</button>
   <button type="button" data-tbl-op="deltable" class="danger" title="删除整个表格">删除表格</button>
+</div>
+<!-- 表格「更多」菜单：与表格内右键菜单同源（JS 打开并填充） -->
+<div id="tblMenu" style="display:none;" role="menu" aria-label="表格菜单"></div>
+<!-- 表格列/行尺寸拖拽手柄层：覆盖在表格上；层本身 pointer-events:none，仅手柄可拖 -->
+<div id="tblResizeLayer" aria-hidden="true"></div>
+<!-- 单元格/行列尺寸弹窗（2026-10）：列宽(%)、行高(数值+单位) -->
+<div id="tblSizeModalBg" class="modal-bg" style="display:none;">
+  <div class="modal" style="max-width:420px;">
+    <div class="search-head"><h3>单元格尺寸</h3><button type="button" id="tblSizeCancel" class="x-btn" title="关闭" aria-label="关闭">✕</button></div>
+    <p id="tblSizeHint" style="font-size:12px;color:var(--text-muted);margin:6px 0 0;"></p>
+    <div class="tbl-size-grid">
+      <label for="tblSizeColWidth">列宽</label>
+      <span><input type="number" id="tblSizeColWidth" min="1" max="100" step="1" placeholder="留空不改"> <span style="color:#889">%</span></span>
+      <label for="tblSizeRowHeight">行高</label>
+      <span><input type="number" id="tblSizeRowHeight" min="1" max="2000" step="1" placeholder="留空不改"> <select id="tblSizeRowUnit"><option value="em">em</option><option value="px">px</option></select></span>
+    </div>
+    <div class="export-actions">
+      <button type="button" id="tblSizeCancelBtn">取消</button>
+      <button type="button" id="tblSizeApply" class="primary">应用</button>
+    </div>
+  </div>
 </div>
 <!-- 清理预览模态框（2026-10-16）：展示清理统计报告，确认后应用 -->
 <div id="cleanPreviewBg" class="modal-bg" style="display:none;">

@@ -522,6 +522,9 @@ class _EpubEditHandler(BaseHTTPRequestHandler):
                 self.server.state["gone_at"] = None
             self._send(200, self._json({"ok": True}))
             return
+        if path == "/api/ui_settings":
+            self._api_ui_settings()
+            return
         self._send(404, self._json({"ok": False, "error": "未找到接口"}))
 
     def _serve_asset(self, name: str, ctype: str) -> None:
@@ -660,6 +663,36 @@ class _EpubEditHandler(BaseHTTPRequestHandler):
             self._send(200, self._json({"ok": False, "error": f"清理失败：{exc}"}))
             return
         self._send(200, self._json({"ok": True, "html": cleaned}))
+
+    def _api_ui_settings(self) -> None:
+        """GET /api/ui_settings：返回编辑器关心的界面偏好（config.json 顶层 ui_settings）。
+
+        只读（设置入口在矫正界面设置-界面），EPUB 编辑器章内搜索读取
+        search_max_results（结果列表显示上限，10-1000，默认 200），与矫正界面
+        全局搜索共用同一份配置。缺失/异常一律回退默认，不因配置读取失败而中断。"""
+        max_results = 200
+        try:
+            from configmanage import (
+                get_config,
+                SEARCH_MAX_RESULTS_DEFAULT,
+                SEARCH_MAX_RESULTS_MIN,
+                SEARCH_MAX_RESULTS_MAX,
+            )
+
+            cfg = get_config(show_dialogs=False) or {}
+            stored = cfg.get("ui_settings")
+            if isinstance(stored, dict):
+                try:
+                    max_results = int(stored.get("search_max_results", SEARCH_MAX_RESULTS_DEFAULT))
+                except (TypeError, ValueError):
+                    max_results = SEARCH_MAX_RESULTS_DEFAULT
+                max_results = max(SEARCH_MAX_RESULTS_MIN, min(SEARCH_MAX_RESULTS_MAX, max_results))
+        except Exception:
+            pass  # 回退默认 200（懒导入失败/配置缺失都不影响编辑器启动）
+        self._send(
+            200,
+            self._json({"ok": True, "ui_settings": {"search_max_results": max_results}}),
+        )
 
 
 # --------------------------------------------------------------------------

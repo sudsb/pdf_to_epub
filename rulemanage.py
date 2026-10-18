@@ -273,6 +273,75 @@ def normalize_img_width_style(raw: str) -> str:
     return val
 
 
+# 表格单元格尺寸（2026-10）：td/th 上只认 width / height / vertical-align 三条声明。
+# 与 normalize_img_width_style 同一范式（窄口径白名单，绝不整体透传任意 style）：
+# width/height 必须是「数字+单位」（% 1..100 / px 1..2000 / em 1..50），
+# vertical-align 只认 top|middle|bottom；其余属性（position/background 等）一律丢弃。
+TBL_CELL_STYLE_PROPS = ("width", "height", "vertical-align")
+TBL_VALIGN_VALUES = ("top", "middle", "bottom")
+_TBL_LEN_RE = re.compile(r"^(\d{1,4})(?:\.(\d{1,2}))?\s*(%|px|em)$", re.IGNORECASE)
+_TBL_LEN_BOUNDS = {"%": (1, 100), "px": (1, 2000), "em": (1, 50)}
+
+
+def _canon_tbl_len(val: str) -> str:
+    """'33%' / '2em' / '120px' → 规范化长度；非法/越界/裸数字返回 ''。"""
+    m = _TBL_LEN_RE.match(str(val or "").strip())
+    if not m:
+        return ""
+    num = float(m.group(1) + ("." + m.group(2) if m.group(2) else ""))
+    unit = m.group(3).lower()
+    lo, hi = _TBL_LEN_BOUNDS[unit]
+    if not (lo <= num <= hi):
+        return ""
+    return f"{num:g}{unit}"
+
+
+def normalize_table_cell_style(raw: str) -> str:
+    """原始 style 串 → 规范化的单元格尺寸声明（无存活声明时返回 ""）。
+
+    行为要点（与 normalize_char_style 同一范式：窄口径白名单，绝不整体透传）：
+    - 只认 width / height / vertical-align 三条；输出固定顺序、';' 分隔、无尾分号；
+    - width/height 必须带单位（% / px / em）且落在取值域内；裸数字、负值、越界丢弃；
+    - vertical-align 只认 top|middle|bottom；
+    - 同一属性重复出现时后者覆盖前者（非法者同样覆盖）；
+    - **幂等**：normalize_table_cell_style(normalize_table_cell_style(x)) ==
+      normalize_table_cell_style(x)。
+    """
+    vals: dict[str, str] = {}
+    for decl in str(raw or "").split(";"):
+        if not decl.strip():
+            continue
+        prop, sep, v = decl.partition(":")
+        if not sep:
+            continue
+        key = prop.strip().lower()
+        if key not in TBL_CELL_STYLE_PROPS:
+            continue
+        if key == "vertical-align":
+            vv = v.strip().lower()
+            vals[key] = vv if vv in TBL_VALIGN_VALUES else ""
+        else:
+            vals[key] = _canon_tbl_len(v)
+    return ";".join(f"{k}:{vals[k]}" for k in TBL_CELL_STYLE_PROPS if vals.get(k))
+
+
+def normalize_table_style(raw: str) -> str:
+    """原始 style 串 → 规范化的表格级声明（目前只认 table-layout:fixed）。
+
+    列宽要按比例精确生效需 `table-layout:fixed`；除此之外任何声明都丢弃，
+    避免从外部 HTML 导入的表格携带任意样式。无存活声明时返回 ""。**幂等**。
+    """
+    val = ""
+    for decl in str(raw or "").split(";"):
+        if not decl.strip():
+            continue
+        prop, sep, v = decl.partition(":")
+        if not sep or prop.strip().lower() != "table-layout":
+            continue
+        val = "table-layout:fixed" if v.strip().lower() == "fixed" else ""
+    return val
+
+
 # 冲突组（照抄前端 FORMAT_OP_GROUPS / opsConflict）
 FORMAT_OP_GROUPS = {
     "block_tag": ["p", "heading1", "heading2", "heading3", "heading4", "heading5", "heading6"],

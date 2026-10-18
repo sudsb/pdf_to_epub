@@ -16,6 +16,8 @@ import html
 import re
 from typing import Any, Dict, List
 
+from tableconvertmanage import convert_text_tables
+
 # PaddleOCR 系视觉模型（如 ULQ4/ULQ8）原生输出带坐标的结构化行：
 #   title [337, 99, 611, 123]工人夜校招生广告
 #   text [21, 152, 327, 170]列位工人来听我们几句白话：
@@ -201,6 +203,18 @@ def detect_headings(text: str) -> str:
     return "\n".join(out) if hit else text
 
 
+def _tables_enabled(flag: bool | None = None) -> bool:
+    """文字表格自动转换开关：显式 flag 优先，否则懒读 config 的顶层 ``table_convert``。"""
+    if flag is not None:
+        return bool(flag)
+    try:
+        from configmanage import get_config
+
+        return bool(get_config(show_dialogs=False).get("table_convert", True))
+    except Exception:
+        return True
+
+
 def clean_and_structure_text(
     pages: List[Dict[str, Any]],
     remove_thoughts: bool = True,
@@ -209,6 +223,7 @@ def clean_and_structure_text(
     merge: bool = True,
     to_simplified: bool = False,
     to_traditional: bool = False,
+    convert_tables: bool | None = None,
 ) -> Dict[str, Any]:
     """多页文本清洗/结构化：移除<think>标签、规范空白、繁简转换、分段，保证顺序。输入 pages: [{'page':..., 'text':...}, ...] -> 输出每页/正文合并/所有段落。"""
 
@@ -232,6 +247,11 @@ def clean_and_structure_text(
         t = strip_page_numbers(t)
         # -- ULQ 杂符引注清理 + 括号对统一：【x】/[x]/［x］→〔x〕，混用归一 --
         t = normalize_brackets(t)
+        # -- 文字表格 → 原生 <table>（自动档，规格 A/B；设置 table_convert 可关）--
+        # 必须在 detect_headings 之前：否则表行会被包成 <h1>/<p>；表格转成单行
+        # <table> 后，detect_headings 的「含 < 的行原样保留」规则会自然放行。
+        if _tables_enabled(convert_tables):
+            t = convert_text_tables(t)
         # -- 纯文本标题启发式识别（普通 OCR 无结构输出） --
         # 命中标题的页面整页转 <h1>/<p>，供 htmlmanage 按 h1 分页（每篇新页）
         # + 标题进 EPUB 目录；未命中（无标题页）原样返回，不影响其他路径。
@@ -365,13 +385,84 @@ def _normalize_quotes(text: str) -> str:
     return text
 
 
-def _normalize_punctuation_base(text: str) -> str:
+def _punct_ctx_cjk(text: str) -> bool:
+    """标点归一是否按「中文语境」处理（2026-10 页级判定；correctmanage 按整页传入）。
+
+    中文语境 = 含汉字，或全篇没有拉丁字母（例如只在空页上输了一个 `()` 的
+    测试场景）；两者都不满足（纯英文/数字内容）→ 保留半角。
+    """
+    return bool(re.search(f"[{_CJK_RANGE}]", text)) or not re.search(r"[A-Za-z]", text)
+
+
+# 中文语境下半角标点的保护写法（命中 → 保持半角，避免改坏数据与英文写法）。
+# 括号（()）不在此表：中文页内半角括号一律成对/整体转全角（修「测试（)」
+# 这种只转一半的问题）。
+_PUNCT_PROTECT_CTX = {
+    ",": r"(?<=\d),(?=\d)",                     # 千分位/数字序列 1,000 / 1,2
+    ";": r"(?<=\d);(?=\d)|&[A-Za-z0-9#]{1,16};",  # 数字序列 / HTML 实体 &amp;
+    ":": r"(?<=\d):(?=\d)|:(?=//)",             # 时间 12:30、URL scheme https://
+    "?": r"\?(?=[A-Za-z0-9_#]+=[A-Za-z0-9%._~/?#&-])",  # 查询串 ?a=1
+    "!": r"!(?:==?)",                           # 比较符 != / !==
+}
+# 句号保护（中文语境）：小数点、token 内点（e.g / Fig.1 / test.OK）、
+# 缩写点（e.g. / i.e. 链式点、Dr. / Fig. / No. 等小写缩写、Fig. 1 后接数字
+# 或英文）、行首小数 .5、省略号 .. / ...
+_CTX_DOT_PROTECT = (
+    r"(?<=\d)\.(?=\d)"
+    r"|(?<=[A-Za-z])\.(?=[A-Za-z0-9])"
+    r"|(?<=[A-Za-z])\.(?=[ \t]+[A-Za-z0-9])"
+    r"|(?<=\d)\.(?=[ \t]+[A-Za-z0-9])"
+    r"|(?<=\.)[A-Za-z]{1,4}\."
+    r"|(?<![A-Za-z])[A-Z][a-z]{0,2}\.(?=[ \t])"
+    r"|(?<!\S)\.(?=\d)"
+    r"|(?<!\.)\.(?=\.)"
+)
+
+
+def _ctx_half_to_full(text: str) -> str:
+    """中文语境（页级）：半角 ,;:?!(). 与括号整体转全角（带保护项）。
+
+    相对旧「与汉字直接相邻才转」的放宽：隔空格（他说abc, 后面）、行尾
+    （结束. ）、括号内是英文（中文 (abc) 混排）、孤立 () 都会转换；
+    幂等：已是全角的不再变化。
+    """
+    s = str(text)
+    s = s.replace("(", "（").replace(")", "）")
+    for half, full in _HALF_TO_FULL:
+        if half in "()":
+            continue
+        prot = _PUNCT_PROTECT_CTX.get(half)
+        if prot:
+            s = re.sub(
+                rf"(?P<prot>{prot})|(?P<half>{re.escape(half)})",
+                lambda m: m.group(0) if m.group("prot") is not None else full,
+                s,
+            )
+        else:
+            s = s.replace(half, full)
+    # 句号（放宽：不再要求与汉字直接相邻；保护项原样保留）
+    s = re.sub(
+        rf"(?P<prot>{_CTX_DOT_PROTECT})|(?P<dot>(?<!\.)\.(?!\.))",
+        lambda m: m.group(0) if m.group("prot") is not None else "。",
+        s,
+    )
+    return s
+
+
+def _normalize_punctuation_base(text: str, *, ctx_cjk: bool | None = None) -> str:
     """基础中英文标点归一化（与 correctmanage._normalize_punctuation 保持一致）。
 
-    汉字相邻处的半角 ,;:?!(). 转全角；字母/数字相邻处的全角标点转半角。
+    2026-10 页级中文语境：
+    - 中文语境（ctx_cjk=True；默认按 text 自身判定）→ 整段半角转全角，
+      见 _ctx_half_to_full（保护项：小数/千分位/时间/URL/查询串/缩写点/省略号）；
+    - 纯英文语境 → 原行为：汉字相邻转全角 + 字母/数字相邻的全角标点转回半角。
     `.` 带「非省略号点」保护（(?<!\\.)/(?!\\.)），不会把 `...` 拆成句号。
     """
     s = str(text)
+    if ctx_cjk is None:
+        ctx_cjk = _punct_ctx_cjk(s)
+    if ctx_cjk:
+        return _ctx_half_to_full(s)
     for half, full in _HALF_TO_FULL:
         s = re.sub(rf"(?<=[{_CJK_RANGE}]){re.escape(half)}", full, s)
         s = re.sub(rf"{re.escape(half)}(?=[{_CJK_RANGE}])", full, s)
@@ -438,3 +529,47 @@ def _normalize_punctuation_extended(text: str) -> str:
     s = _normalize_quotes(s)
     s = _normalize_punctuation_base(s)
     return _normalize_symbols_core(s)
+
+
+# 数字里的中文标点 → 英文（智能清理「数字标点归一」；2026-10 规格：
+# 1。2 → 1.2、1，2 → 1,2、1。 → 1.）。表可在设置里自定义
+# （config.json ui_settings.clean_digit_punct_map）；仅认单字符源 + 前一字符是数字。
+DIGIT_PUNCT_DEFAULT = (("。", "."), ("，", ","), ("、", ","), ("：", ":"), ("；", ";"))
+_DIGIT_CHARS = "0-9０-９"
+_DIGIT_PUNCT_CACHE: dict = {}
+
+
+def normalize_digit_punct(text: str, pairs=None) -> str:
+    """把「数字里的」中文标点换成英文（不动正文里其它中文标点）。
+
+    ``pairs`` 为 ``[("。", "."), …]`` 形式的替换表（None → ``DIGIT_PUNCT_DEFAULT``）；
+    只取单字符源。命中位置（前一字符必须是数字，半角/全角皆可）：
+    1. 夹在数字之间：``1。2`` → ``1.2``、``1，2`` → ``1,2``、``1、2`` → ``1,2``；
+    2. 数字之后即收尾（行尾/串尾或紧跟空白）：``1。`` → ``1.``、``共 1。 条`` → ``共 1. 条``。
+    正文里「数字后接中文」的标点属正常中文标点，**不**替换：
+    ``圆周率 3.14，和`` 保持不变（保底：只认数字/空白/串尾收尾）。空表/无命中原样返回。
+    """
+    s = str(text if text is not None else "")
+    if not s:
+        return s
+    mapping: dict = {}
+    for item in (DIGIT_PUNCT_DEFAULT if pairs is None else pairs):
+        try:
+            src, dst = item
+        except (TypeError, ValueError):
+            continue
+        src, dst = str(src), str(dst)
+        if len(src) == 1 and src not in mapping:
+            mapping[src] = dst
+    if not mapping:
+        return s
+    key = tuple(sorted(mapping.items()))
+    pat = _DIGIT_PUNCT_CACHE.get(key)
+    if pat is None:
+        # 后向断言：前一字符是数字；前向断言：后面是数字/空白/串尾（数字内部或数字收尾）
+        pat = re.compile(
+            "(?<=[%s])(?:%s)(?=$|[\\s%s])"
+            % (_DIGIT_CHARS, "|".join(re.escape(k) for k in mapping), _DIGIT_CHARS)
+        )
+        _DIGIT_PUNCT_CACHE[key] = pat
+    return pat.sub(lambda m: mapping[m.group(0)], s)

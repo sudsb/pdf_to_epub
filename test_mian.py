@@ -805,5 +805,104 @@ class TestConfigSetPaddleMergeLines(unittest.TestCase):
         self.assertIsNone(mian._parse_bool_arg("2"))
 
 
+class TestCleanSubcommand(unittest.TestCase):
+    """mian.py clean / 简称 cl（2026-10-18）：页范围解析 + 路由到 headless 清理。"""
+
+    def _run_clean(self, argv, fake=None):
+        import contextlib
+        import io
+
+        import correctmanage
+
+        calls: dict = {}
+        orig = correctmanage.clean_history_pages
+
+        def _fake(history_id=None, pdf_path=None, pages=None, **kw):
+            calls["history_id"] = history_id
+            calls["pdf_path"] = pdf_path
+            calls["pages"] = pages
+            calls["kw"] = kw
+            if fake is not None:
+                return fake()
+            return {
+                "ok": True,
+                "history_id": history_id or "hist_x",
+                "pdf": "a.pdf",
+                "total": 3,
+                "cleaned": 2,
+                "changed": 1,
+                "pages": [2],
+                "chars": 1,
+                "dry_run": bool(kw.get("dry_run")),
+            }
+
+        correctmanage.clean_history_pages = _fake
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = mian.main(list(argv))
+        finally:
+            correctmanage.clean_history_pages = orig
+        return rc, out.getvalue(), err.getvalue(), calls
+
+    def test_parse_page_spec(self):
+        self.assertIsNone(mian.parse_page_spec(None))
+        self.assertIsNone(mian.parse_page_spec(""))
+        self.assertIsNone(mian.parse_page_spec("  all "))
+        self.assertIsNone(mian.parse_page_spec("*"))
+        self.assertEqual(mian.parse_page_spec("2"), {2})
+        self.assertEqual(mian.parse_page_spec("1-3, 5"), {1, 2, 3, 5})
+
+    def test_cl_alias_routes_with_pages(self):
+        rc, out, err, calls = self._run_clean(["cl", "--pages", "1-3,5", "--dry-run"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(calls["pages"], {1, 2, 3, 5})
+        self.assertTrue(calls["kw"]["dry_run"])
+        self.assertIn("历史版本", out)
+        self.assertIn("--dry-run", out)
+
+    def test_clean_default_all_pages(self):
+        rc, out, err, calls = self._run_clean(["clean"])
+        self.assertEqual(rc, 0, err)
+        self.assertIsNone(calls["pages"])
+        self.assertFalse(calls["kw"]["dry_run"])
+        self.assertIn("全部页", out)
+
+    def test_history_id_and_pdf_passed(self):
+        rc, _out, err, calls = self._run_clean(
+            ["clean", "--history-id", "abc123", "--pdf", "D:/x/a.pdf"]
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(calls["history_id"], "abc123")
+        self.assertEqual(calls["pdf_path"], "D:/x/a.pdf")
+
+    def test_value_error_exit_code(self):
+        def _boom():
+            raise ValueError("没有找到该历史版本")
+
+        rc, _out, err, _calls = self._run_clean(["cl", "--history-id", "x"], fake=_boom)
+        self.assertEqual(rc, 1)
+        self.assertIn("没有找到该历史版本", err)
+
+    def test_list_flag(self):
+        import contextlib
+        import io
+
+        import correctmanage
+
+        orig = correctmanage._history_entries
+        correctmanage._history_entries = lambda *a, **kw: [
+            {"id": "hist_1", "pages": 3, "updated": "2026-10-18 12:00:00", "pdf": "a.pdf"}
+        ]
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                rc = mian.main(["clean", "--list"])
+        finally:
+            correctmanage._history_entries = orig
+        self.assertEqual(rc, 0)
+        self.assertIn("hist_1", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

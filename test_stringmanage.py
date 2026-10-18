@@ -13,6 +13,8 @@ from stringmanage import (
     strip_think_blocks,
     _normalize_punctuation_extended,
     _normalize_ellipsis,
+    normalize_digit_punct,
+    DIGIT_PUNCT_DEFAULT,
 )
 
 
@@ -226,6 +228,17 @@ class TestCleanAndStructureIntegration(unittest.TestCase):
         )
 
 
+    def test_clean_and_structure_converts_md_table(self):
+        pages = [{"page": 1, "text": "| A | B |\n| --- | --- |\n| C | D |"}]
+        out = clean_and_structure_text(pages, convert_tables=True)
+        self.assertIn("<table", out["pages"][0]["text"])
+
+    def test_clean_and_structure_table_convert_disabled(self):
+        pages = [{"page": 1, "text": "| A | B |\n| --- | --- |\n| C | D |"}]
+        out = clean_and_structure_text(pages, convert_tables=False)
+        self.assertNotIn("<table", out["pages"][0]["text"])
+
+
 class TestDetectHeadings(unittest.TestCase):
     def test_short_line_becomes_h1(self):
         text = "工人夜校招生广告\n列位工人来听我们说几句白话："
@@ -285,6 +298,19 @@ class TestNormalizePunctuationExtended(unittest.TestCase):
         self.assertEqual(_normalize_punctuation_extended("What？"), "What?")
         self.assertEqual(_normalize_punctuation_extended("Wow！"), "Wow!")
         self.assertEqual(_normalize_punctuation_extended("Func（x）"), "Func(x)")
+
+    def test_page_level_context_pairs_and_loosened(self):
+        # 2026-10 中文语境（页级判定在 correctmanage 传入；此处按段级自身判定）：
+        # 括号成对转换，修「测试（)」只转一半；括号内是英文也整对转
+        self.assertEqual(_normalize_punctuation_extended("测试()"), "测试（）")
+        self.assertEqual(_normalize_punctuation_extended("中文 (abc)"), "中文 （abc）")
+        # 隔空格/行尾的半角逗号一并放宽
+        self.assertEqual(_normalize_punctuation_extended("他说abc, 后面"), "他说abc， 后面")
+        # 无汉字且含拉丁字母 → 保留半角
+        self.assertEqual(_normalize_punctuation_extended("(test) ok."), "(test) ok.")
+        # 中文语境保护项：小数/千分位/时间/缩写点不转
+        self.assertEqual(_normalize_punctuation_extended("3.5 与 1,000 与 12:30"), "3.5 与 1,000 与 12:30")
+        self.assertEqual(_normalize_punctuation_extended("见 Fig. 1 与 e.g. 用法"), "见 Fig. 1 与 e.g. 用法")
 
     def test_period_cjk_context(self):
         # 句号：与汉字相邻的半角点 → 全角。
@@ -380,6 +406,57 @@ class TestNormalizeEllipsis(unittest.TestCase):
         text = "第一行...\n第二行..."
         expected = "第一行……\n第二行……"
         self.assertEqual(_normalize_ellipsis(text), expected)
+
+
+class TestNormalizeDigitPunct(unittest.TestCase):
+    """normalize_digit_punct：数字紧跟的中文标点 → 英文（2026-10 智能清理新规则）。"""
+
+    def test_default_pairs_examples(self):
+        # 用户规格三例：1。2 → 1.2、1，2 → 1,2、1。 → 1.
+        self.assertEqual(normalize_digit_punct("1。2"), "1.2")
+        self.assertEqual(normalize_digit_punct("1，2"), "1,2")
+        self.assertEqual(normalize_digit_punct("1。"), "1.")
+        # 默认表其余项：、：；→ , : ;
+        self.assertEqual(normalize_digit_punct("1、2"), "1,2")
+        self.assertEqual(normalize_digit_punct("1：2"), "1:2")
+        self.assertEqual(normalize_digit_punct("1；2"), "1;2")
+        self.assertEqual(len(DIGIT_PUNCT_DEFAULT), 5)
+
+    def test_only_after_digit(self):
+        # 非「数字紧跟」的中文标点一律不动（正文句末标点保持原样）
+        self.assertEqual(normalize_digit_punct("你好。"), "你好。")
+        self.assertEqual(normalize_digit_punct("a。b"), "a。b")
+        self.assertEqual(normalize_digit_punct("。"), "。")
+        # 数字与标点之间有空格 → 不替换
+        self.assertEqual(normalize_digit_punct("1 。2"), "1 。2")
+
+    def test_digit_then_cjk_prose_kept(self):
+        # 数字后接中文正文：标点属正常中文标点，不替换（保底，2026-10-18 收窄）
+        self.assertEqual(
+            normalize_digit_punct("圆周率 3.14，和 1,000"), "圆周率 3.14，和 1,000"
+        )
+        self.assertEqual(normalize_digit_punct("共 100。页"), "共 100。页")
+        # 数字之后即收尾 → 替换（用户规格第三例）
+        self.assertEqual(normalize_digit_punct("共 100。"), "共 100.")
+        self.assertEqual(normalize_digit_punct("1。 余"), "1. 余")
+
+    def test_fullwidth_digit(self):
+        self.assertEqual(normalize_digit_punct("１。２"), "１.２")
+
+    def test_custom_pairs(self):
+        self.assertEqual(normalize_digit_punct("1。2", [("。", "-")]), "1-2")
+        self.assertEqual(normalize_digit_punct("1。2", []), "1。2")
+        self.assertEqual(normalize_digit_punct("1。2", None), "1.2")
+        # 只认单字符源（多字符源忽略）；非法项跳过而不抛错
+        self.assertEqual(normalize_digit_punct("1。。2", [("。。", "..")]), "1。。2")
+        self.assertEqual(normalize_digit_punct("1。2", ["x", ("。", "."), ("，",)]), "1.2")
+
+    def test_empty_and_none(self):
+        self.assertEqual(normalize_digit_punct(""), "")
+        self.assertEqual(normalize_digit_punct(None), "")
+
+    def test_multiple_occurrences(self):
+        self.assertEqual(normalize_digit_punct("1。2，3、4。"), "1.2,3,4.")
 
 
 if __name__ == "__main__":

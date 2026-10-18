@@ -475,6 +475,26 @@ function runTests() {
         w.applyOp('note');
         assert(!ed.firstChild.classList.contains('ptoe-note'), '再点注释关闭块级注释类');
 
+        // (r2c) 引用同构（2026-10-18）：整块选区 + 规则行内引用 span → 解包关闭，不叠加块级类
+        ed.innerHTML = '<p>正文<span class="ptoe-citation">引用内容</span>尾部</p>';
+        range7 = doc.createRange();
+        range7.selectNodeContents(ed.firstChild);
+        sel.removeAllRanges();
+        sel.addRange(range7);
+        w.applyOp('citation');
+        assert(!ed.querySelector('span.ptoe-citation'), '点引用解包规则行内引用 span');
+        assert(!ed.firstChild.classList.contains('ptoe-citation'), '关闭时不再叠加块级引用类');
+        range7 = doc.createRange();
+        range7.selectNodeContents(ed.firstChild);
+        sel.removeAllRanges();
+        sel.addRange(range7);
+        w.applyOp('citation');
+        assert(ed.firstChild.classList.contains('ptoe-citation'), '再点引用应用块级引用类');
+        sel.removeAllRanges();
+        sel.addRange(range7);
+        w.applyOp('citation');
+        assert(!ed.firstChild.classList.contains('ptoe-citation'), '再点引用关闭块级引用类');
+
         // (r3) 正文 → 清块级注释/引用类 + 解包行内注释 span，保留对齐/图片段落类
         ed.innerHTML = '<p class="ptoe-note ptoe-citation ptoe-align-center ptoe-img-wide">正文<span class="ptoe-note">注</span></p>';
         range7 = doc.createRange();

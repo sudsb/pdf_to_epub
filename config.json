@@ -322,12 +322,14 @@
       "merge",
       "sup",
       "underdot",
-      "highlight"
+      "highlight",
+      "table",
+      "table2text"
     ],
-    "proofread_batch_pages": 0,
+    "proofread_batch_pages": 1,
     "undo_depth": 100,
-    "show_line_numbers": false,
-    "line_num_size": "large",
+    "show_line_numbers": true,
+    "line_num_size": "small",
     "text_justify": true,
     "brush_merge_delay": 800,
     "clean_punctuation": true,
@@ -352,7 +354,33 @@
         "~",
         "～"
       ]
-    ]
+    ],
+    "brush_merge_on_leave": true,
+    "proofread_auto_jump": true,
+    "clean_digit_punct": true,
+    "clean_digit_punct_map": [
+      [
+        "。",
+        "."
+      ],
+      [
+        "，",
+        ","
+      ],
+      [
+        "、",
+        ","
+      ],
+      [
+        "：",
+        ":"
+      ],
+      [
+        "；",
+        ";"
+      ]
+    ],
+    "search_max_results": 200
   },
   "proofread_engine": "llama",
   "mouse_shortcuts": {},
@@ -376,5 +404,13 @@
   "paddle_merge_lines": true,
   "dpi": 100,
   "ocr_batch_size": 0,
-  "ocr_group_by_size": true
+  "ocr_group_by_size": true,
+  "correction_format": {
+    "enabled": false,
+    "strip_markdown": true,
+    "strip_latex": true,
+    "remove_formula": false,
+    "custom_rules": []
+  },
+  "table_convert": true
 }

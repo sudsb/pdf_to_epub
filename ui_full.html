@@ -27,7 +27,8 @@
   --shadow-sm:0 1px 2px rgba(0,0,0,.25);--shadow-md:0 4px 12px rgba(0,0,0,.35);
 }
 *{box-sizing:border-box}
-body{margin:0;font-family:"Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--text);}
+body[data-no-anim="1"] *,body[data-no-anim="1"] *::before,body[data-no-anim="1"] *::after{animation:none !important;transition:none !important;}
+body{margin:0;font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;text-rendering:optimizeLegibility;background:var(--bg);color:var(--text);}
 #toolbar{
   position:sticky;top:0;z-index:20;
   display:flex;align-items:center;gap:4px;
@@ -114,6 +115,11 @@ body{margin:0;font-family:"Microsoft YaHei",system-ui,sans-serif;background:var(
 #toolbar .tb-btn:active{background:var(--bg-active);transform:scale(.98);}
 #toolbar .tb-btn:focus-visible{outline:none;box-shadow:var(--focus-ring);}
 #toolbar .tb-btn:disabled{opacity:.5;cursor:not-allowed;}
+/* 按压反馈：统一微暗 + 微缩，并叠加 CSS-only 水波脉动（不依赖 JS 点击坐标） */
+#toolbar .ic-btn,#toolbar .tb-btn{position:relative;overflow:hidden;}
+#toolbar .ic-btn::after,#toolbar .tb-btn:not(.loading)::after{content:'';position:absolute;left:50%;top:50%;width:10px;height:10px;margin:-5px 0 0 -5px;border-radius:50%;background:currentColor;opacity:0;pointer-events:none;transform:scale(0);}
+@keyframes ptoeRipple{from{opacity:.25;transform:scale(0);}to{opacity:0;transform:scale(7);}}
+#toolbar .ic-btn:active::after,#toolbar .tb-btn:not(.loading):active::after{animation:ptoeRipple .25s ease-out;}
 #toolbar .tb-btn.primary{
   background:var(--accent);border-color:var(--accent);color:#fff;
 }
@@ -165,6 +171,8 @@ body{margin:0;font-family:"Microsoft YaHei",system-ui,sans-serif;background:var(
 #errBadge:hover{background:rgba(224,32,32,.18);border-color:rgba(224,32,32,.45);transform:scale(1.05);}
 #errBadge:active{transform:scale(0.97);}
 #errBadgeNum{font-variant-numeric:tabular-nums;}
+.page-err-badge{display:inline-block;margin-left:8px;padding:0 6px;border-radius:9px;font-size:11px;font-weight:700;line-height:17px;color:#fff;background:#E02020;vertical-align:middle;}
+.page-err-badge[hidden]{display:none;}
 
 /* 保存 / 完成并转换 强视觉区分 */
 #toolbar #saveBtn{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600;padding:0 14px;}
@@ -200,17 +208,20 @@ body{margin:0;font-family:"Microsoft YaHei",system-ui,sans-serif;background:var(
 }
 
 /* Global button styles (outside toolbar) */
-button{font:inherit;padding:5px 11px;border:1px solid var(--border);border-radius:4px;background:var(--bg-elev);color:var(--text);cursor:pointer;}
+button{font:inherit;padding:5px 11px;border:1px solid var(--border);border-radius:4px;background:var(--bg-elev);color:var(--text);cursor:pointer;transition:background var(--transition),border-color var(--transition),color var(--transition),transform .05s ease;}
 button:hover{border-color:var(--accent);color:var(--accent);}
+button:active{background:var(--bg-active);border-color:var(--border-strong);transform:scale(.97);}
 button.active{border-color:var(--accent);background:var(--accent-soft);color:var(--accent);}
 button.primary{background:var(--accent);color:#fff;border-color:var(--accent);}
 button.primary:hover{background:var(--accent-hover);color:#fff;}
+button.primary:active{background:var(--accent-hover);border-color:var(--accent-hover);}
 button:disabled{opacity:.5;cursor:not-allowed;}
 select{font:inherit;padding:5px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-elev);color:var(--text);}
 
-/* U2居中，3s 自动消失 */
-#toast{position:fixed;top:60px;left:50%;transform:translateX(-50%);z-index:90;display:flex;flex-direction:column;gap:6px;align-items:center;pointer-events:none;}
-.toast{background:#1c2733;color:#fff;font-size:13px;line-height:1.5;padding:8px 16px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.25);opacity:0;transform:translateY(-6px);transition:opacity .2s,transform .2s;max-width:70vw;}
+/* 底部居中、不贴边（bottom 固定偏移 + left 50% 居中），3s 自动消失；
+   fixed 定位随窗口缩放保持相对位置不变，不会贴边或被裁切 */
+#toast{position:fixed;bottom:30px;left:50%;transform:translateX(-50%);z-index:96;display:flex;flex-direction:column;gap:6px;align-items:center;pointer-events:none;}
+.toast{background:#1c2733;color:#fff;font-size:13px;line-height:1.5;padding:8px 16px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.25);opacity:0;transform:translateY(-6px);transition:opacity .2s,transform .2s,background .2s ease,color .2s ease;max-width:70vw;}
 .toast.show{opacity:1;transform:translateY(0);}
 .toast.ok{background:#1a7f37;}
 .toast.fail{background:#c0392b;}
@@ -224,6 +235,18 @@ select{font:inherit;padding:5px 8px;border:1px solid var(--border);border-radius
 @keyframes ptoeShimmer{to{background-position:-200% 0;}}
 button.loading::after{content:'';display:inline-block;width:11px;height:11px;margin-left:8px;border:2px solid rgba(255,255,255,.45);border-top-color:#fff;border-radius:50%;animation:ptoe-spin .8s linear infinite;vertical-align:-2px;}
 @keyframes ptoe-spin{to{transform:rotate(360deg);}}
+/* U11 入场动画：菜单/弹窗出现时轻微上浮淡入；尊重系统「减少动态效果」偏好 */
+@keyframes ptoeFadeIn{from{opacity:0;transform:translateY(-4px);}to{opacity:1;transform:none;}}
+@keyframes ptoeFade{from{opacity:0;}to{opacity:1;}}
+.anim-in{animation:ptoeFadeIn .16s ease both;}
+.anim-fade{animation:ptoeFade .16s ease both;}
+#contextMenu,#popup{animation:ptoeFadeIn .16s ease both;}
+#searchModalBg,#exportModalBg,#indentModalBg,#tableModalBg,#charFormatModalBg,#finishModalBg,#historyModalBg,#helpModalBg,#formatRulesModalBg,#frRuleModalBg,#replaceRulesModalBg,#rrEditModalBg{animation:ptoeFade .16s ease both;}
+@media (prefers-reduced-motion: reduce){
+  .anim-in,.anim-fade,#contextMenu,#popup,#searchModalBg,#exportModalBg,#indentModalBg,#tableModalBg,#charFormatModalBg,#finishModalBg,#historyModalBg,#helpModalBg,#formatRulesModalBg,#frRuleModalBg,#replaceRulesModalBg,#rrEditModalBg{animation:none !important;}
+  button,#errBadge,.page-row,.toast{transition:none !important;transform:none !important;}
+  #toolbar .ic-btn::after,#toolbar .tb-btn:not(.loading)::after{animation:none !important;content:none !important;}
+}
 /* U3：hintbar 可折叠（✕ 关闭，localStorage 记忆） */
 #hintbar{padding:6px 14px;font-size:12px;color:#5a6b7c;background:#eef3fb;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;}
 #hintbar .hint-text{flex:1;}
@@ -235,26 +258,122 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
    下发各页原始宽高，前端预计算 heights[]，未挂载行前缀和也精确 → 跳转瞬时定位）。
    每页用各自真实宽高比，个别异常大小页面只影响自身行高，不干扰其他页。
    文字窗内容超出图片高度时在行内滚动（height:0+min-height:100% 不参与撑行）。 */
-.page-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:stretch;background:#fff;border:1px solid var(--border);border-radius:8px;padding:12px;}
+.page-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:stretch;background:#fff;border:1px solid var(--border);border-radius:8px;padding:12px;transition:transform var(--transition),box-shadow var(--transition);}
+.page-row:hover{transform:translateY(-1px);box-shadow:var(--shadow-md);}
 .page-head{grid-column:1 / -1;font-size:12px;color:#5a6b7c;border-bottom:1px dashed var(--border);padding-bottom:6px;}
 .img-panel{position:relative;min-width:0;overflow:hidden;background:#fff;border:1px solid var(--border);border-radius:4px;padding:4px;}
 .img-panel img{width:100%;height:auto;display:block;background:#fff;cursor:zoom-in;}
 .badge{position:absolute;top:8px;left:8px;background:rgba(0,0,0,.55);color:#fff;font-size:11px;padding:2px 8px;border-radius:10px;pointer-events:none;}
-.editable{height:0;min-height:100%;overflow-y:auto;padding:10px 14px;border:1px solid var(--border);border-radius:4px;line-height:1.7;font-size:var(--editor-font-size);outline:none;}
+/* overflow-x 显式声明（2026-10）：此前只写 overflow-y:auto，横向滚动条靠
+   「overflow-x 的 visible 与 overflow-y 的非 visible 同时出现时，visible 计算为
+   auto」这条隐式规则才成立；一旦 overflow-y 被改成 visible（如窄屏媒体查询），
+   溢出内容就会直接顶出编辑区。宽表格/长图超宽时显式 auto 保证出横滚条 */
+.editable{height:0;min-height:100%;overflow-y:auto;overflow-x:auto;padding:10px 14px;border:1px solid var(--border);border-radius:4px;line-height:1.7;font-size:var(--editor-font-size);outline:none;}
 .editable:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(47,111,237,.15);}
-.editable h1{font-size:1.45em;} .editable h2{font-size:1.28em;} .editable h3{font-size:1.12em;}
-.editable h4,.editable h5,.editable h6{font-size:1.02em;}
+.editable h1{font-size:1.5em;} .editable h2{font-size:1.38em;} .editable h3{font-size:1.26em;}
+.editable h4{font-size:1.16em;} .editable h5{font-size:1.07em;} .editable h6{font-size:1em;}
+/* 标题级别指示（2026-09）：h1-h6 块显示「H1..H6」徽章（::before 伪元素）+
+   级别色浅底条，一眼区分各级标题与正文。纯显示层——::before 不序列化，
+   innerHTML/历史/导出正文均不含徽章；正文段落与 ptoe-note/ptoe-marker 样式不变。 */
+.editable h1,.editable h2,.editable h3,.editable h4,.editable h5,.editable h6{border-radius:3px;}
+.editable h1{--h-lv:#2D5AE0;background:rgba(45,90,224,.09);}
+.editable h2{--h-lv:#3B6FFF;background:rgba(59,111,255,.07);}
+.editable h3{--h-lv:#4E7CE8;background:rgba(78,124,232,.07);}
+.editable h4{--h-lv:#6E96ED;background:rgba(110,150,237,.07);}
+.editable h5{--h-lv:#8FADF2;background:rgba(143,173,242,.06);}
+.editable h6{--h-lv:#A8C0F7;background:rgba(168,192,247,.05);}
+.editable h1::before,.editable h2::before,.editable h3::before,
+.editable h4::before,.editable h5::before,.editable h6::before{
+  display:inline-block;margin-right:6px;padding:2px 5px;border-radius:3px;
+  font-size:11px;font-weight:700;line-height:1;vertical-align:1px;
+  background:var(--h-lv);user-select:none;-webkit-user-select:none;pointer-events:none;
+}
+.editable h1::before{content:"H1";color:#fff;}
+.editable h2::before{content:"H2";color:#fff;}
+.editable h3::before{content:"H3";color:#fff;}
+.editable h4::before{content:"H4";color:#1C2733;}
+.editable h5::before{content:"H5";color:#1C2733;}
+.editable h6::before{content:"H6";color:#5A6B7C;}
+/* 文字页面行号（2026-10）：#pages 带 .ptoe-line-num 时，每页 .editable 的直属块
+   （p/div/h1-6）用 CSS 计数器编号。counter-reset 落在**每个 .editable** 上 →
+   每页从 1 重新起算，与原书页码无关。行号写在 ::after 上——伪元素内容不进
+   innerHTML，故 syncContent/collect/保存/导出都不含行号，存储源保持原样。
+   块需 position:relative 才能把绝对定位的 ::after 锚在本块左上（否则会以
+   .page-row/#pages 为定位祖先全部叠在一处）。命令行寻址口径与之一致：只数
+   .editable 的直属 p/div/h1-6（table 等非文字块不编号、也不可寻址）。 */
+/* 尺寸档位（2026-10 调整）：行号最多 3 位数（单页一般 < 500），列宽按 3 位等宽
+   数字留一点余量即可，故三档均比原先收窄；--ln-numw/--ln-gap/--ln-pad 统一用 px，
+   不再用 em——否则 --ln-pad 会随正文字号放大、而行号字号固定，越调越宽且对不齐。
+   --ln-pad 只到「灰底行号栏 + 分隔线」为止；正文另加 --ln-textgap 留白，避免首列
+   文字贴着分隔线。档位值满足 --ln-pad = --ln-numw + --ln-gap + 左侧少量余量。 */
+#pages.ptoe-line-num{--ln-font:12px;--ln-numw:22px;--ln-gap:16px;--ln-pad:44px;--ln-textgap:6px;}
+#pages.ptoe-line-num.ptoe-ln-md{--ln-font:11px;--ln-numw:20px;--ln-gap:15px;--ln-pad:40px;}
+#pages.ptoe-line-num.ptoe-ln-sm{--ln-font:10px;--ln-numw:18px;--ln-gap:13px;--ln-pad:35px;}
+#pages.ptoe-line-num .editable{padding-left:calc(var(--ln-pad,44px) + var(--ln-textgap,6px));counter-reset:ptoe-ln;
+  /* 行号栏独立背景：inset 阴影画出左侧留白灰底 + 1px 右侧分隔线，与正文白底明显
+     区分。inset 阴影固定在元素盒（不随内容滚动），长文档滚动时行号栏始终铺满。 */
+  box-shadow:inset calc(var(--ln-pad,44px) - 1px) 0 0 var(--ln-gutter,#eef1f6),
+             inset var(--ln-pad,44px) 0 0 var(--ln-border,#d3dae3);}
+#pages.ptoe-line-num .editable:focus{
+  box-shadow:inset calc(var(--ln-pad,44px) - 1px) 0 0 var(--ln-gutter,#eef1f6),
+             inset var(--ln-pad,44px) 0 0 var(--ln-border,#d3dae3),
+             0 0 0 2px rgba(47,111,237,.15);}
+#pages.ptoe-line-num .editable > p,
+#pages.ptoe-line-num .editable > div,
+#pages.ptoe-line-num .editable > h1,
+#pages.ptoe-line-num .editable > h2,
+#pages.ptoe-line-num .editable > h3,
+#pages.ptoe-line-num .editable > h4,
+#pages.ptoe-line-num .editable > h5,
+#pages.ptoe-line-num .editable > h6{position:relative;counter-increment:ptoe-ln;}
+#pages.ptoe-line-num .editable > p::after,
+#pages.ptoe-line-num .editable > div::after,
+#pages.ptoe-line-num .editable > h1::after,
+#pages.ptoe-line-num .editable > h2::after,
+#pages.ptoe-line-num .editable > h3::after,
+#pages.ptoe-line-num .editable > h4::after,
+#pages.ptoe-line-num .editable > h5::after,
+#pages.ptoe-line-num .editable > h6::after{
+  content:counter(ptoe-ln);
+  position:absolute;left:calc(-1 * (var(--ln-numw,22px) + var(--ln-gap,16px)));top:0;
+  font-size:var(--ln-font,12px);line-height:1.7;color:#8b98a6;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  -webkit-user-select:none;user-select:none;pointer-events:none;
+  width:var(--ln-numw,22px);text-align:right;
+}
+/* 光标所在行高亮（2026-10）：选区锚点所在块加 .ptoe-cur-line。用 background-image 叠加
+   浅蓝底（保留标题块自身的级别底色）。2026-10 调整：去掉原先压在首列文字上的不透明
+   左侧竖条（inset 3px accent），改为「行号本身变色加粗 + 更淡的整行底色」——竖条会盖住
+   行首字符，且与行号栏贴得太近时更明显；纯视图层，仍不进保存/历史。 */
+#pages.ptoe-line-num .editable > .ptoe-cur-line{
+  background-image:linear-gradient(rgba(59,111,255,.09),rgba(59,111,255,.09));}
+#pages.ptoe-line-num .editable > .ptoe-cur-line::after{
+  color:var(--accent,#316dca);font-weight:700;}
 .ptoe-align-left{text-align:left;} .ptoe-align-center{text-align:center;} .ptoe-align-right{text-align:right;}
+/* 2026-09-24：行内对齐 span（部分选区包裹 <span class="ptoe-align-*">…</span>），
+   与 EPUB 导出 CSS（htmlmanage 同规则，含 th/td 兼容）保持一致 */
+.editable span.ptoe-align-left{display:block;text-align:left;}
+.editable span.ptoe-align-center{display:block;text-align:center;}
+.editable span.ptoe-align-right{display:block;text-align:right;}
+.editable th span.ptoe-align-left,.editable td span.ptoe-align-left{display:inline;text-align:left;}
+.editable th span.ptoe-align-center,.editable td span.ptoe-align-center{display:inline;text-align:center;}
+.editable th span.ptoe-align-right,.editable td span.ptoe-align-right{display:inline;text-align:right;}
+/* 正文两端对齐/分散对齐（2026-10，req4）：#pages.ptoe-justify 时仅给 .editable 声明
+   text-align:justify，靠 text-align 继承让所有直属块两端对齐；逐块自带的
+   .ptoe-align-* 是元素自身显式声明，会覆盖继承值，故手动对齐设置仍优先生效。
+   纯视图层，不影响保存/导出。 */
+#pages.ptoe-justify .editable{text-align:justify;}
 .ptoe-marker{background:#fff3bf;border:1px solid #e8c24a;border-radius:3px;padding:0 4px;font-size:12px;color:#8a6d00;cursor:help;user-select:all;}
 .ptoe-search{background:#fff1a8;border-radius:2px;padding:0 2px;color:inherit;}
 .editable mark.ptoe-search{background:#fff1a8;color:inherit;border-radius:2px;padding:0 2px;}
  .editable .ptoe-note{font-size:12px;color:#556677;}
+ .editable .ptoe-citation{font-family:var(--font-citation,'宋体',SimSun,serif);font-style:var(--citation-italic, italic);}
 .pop-btn:hover{background:#eef3fb;border-color:var(--accent);}
 /* 全局延迟提示：悬停超过设定时间才显示（含快捷键），延迟可在「快捷键」设置中调整 */
 #tip{position:fixed;z-index:80;display:none;background:#1c2733;color:#fff;font-size:12px;line-height:1.5;padding:5px 9px;border-radius:4px;max-width:320px;pointer-events:none;}
 #tip .tip-key{color:#bcd0e5;margin-left:6px;white-space:nowrap;}
-#popup{position:fixed;z-index:60;display:none;flex-wrap:wrap;gap:4px;max-width:360px;padding:6px 8px;background:#fff;border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 18px rgba(0,0,0,.22);}
-.pop-btn{min-width:34px;height:30px;padding:0 8px;font-size:13px;border:1px solid var(--border);background:#fff;color:#1c2733;border-radius:6px;cursor:pointer;line-height:1;}
+#popup{position:fixed;z-index:65;display:none;flex-wrap:wrap;gap:3px;max-width:300px;padding:4px 6px;background:#fff;border:1px solid var(--border);border-radius:7px;box-shadow:0 4px 18px rgba(0,0,0,.22);}
+.pop-btn{min-width:28px;height:26px;padding:0 6px;font-size:12px;border:1px solid var(--border);background:#fff;color:#1c2733;border-radius:5px;cursor:pointer;line-height:1;}
 /* 右键上下文菜单（2026-08-08）：浅色主题、圆角、分组分隔线、二级菜单向右展开（右缘不足向左） */
 #contextMenu{position:fixed;z-index:80;min-width:172px;padding:5px;background:#fff;border:1px solid var(--border);border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,.22);display:flex;flex-direction:column;gap:1px;user-select:none;}
 #contextMenu[hidden]{display:none;} /* 必须显式覆盖：作者样式 #contextMenu{display:flex} 会压过 UA 的 [hidden]{display:none} */
@@ -286,8 +405,9 @@ body.paint-mode{cursor:copy;}
 .ptoe-fix{color:#080;font-size:0.9em;}
 /* 7 new inline format classes (2026-09) */
 .ptoe-underline{text-decoration:underline;}
-/* 下加点：整条虚线式下划线（2026-09） */
-.ptoe-underdot{text-decoration:underline dotted;}
+/* 下加点：整条虚线式下划线（2026-09）；text-decoration 虚线属 CSS3，
+   部分阅读器整条丢弃 → 改用 border-bottom（CJK 无 descender，视觉一致；2026-09-19） */
+.ptoe-underdot{border-bottom:1px dotted #333;}
 .ptoe-strike{text-decoration:line-through;}
 .ptoe-charbox{border:1px solid #333;padding:0 .15em;border-radius:2px;}
 .ptoe-shade{background:#eef1f4;}
@@ -299,12 +419,18 @@ body.paint-mode{cursor:copy;}
 #imgPopup{position:fixed;z-index:65;display:none;flex-direction:column;gap:6px;padding:10px;background:#fff;border:1px solid #ccc;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.2);min-width:140px;}
 .img-pop-btn{background:#f5f5f5;border:1px solid #ddd;border-radius:4px;padding:3px 10px;font-size:13px;cursor:pointer;}
 .img-pop-btn:hover{background:#eef3fb;border-color:var(--accent);}
+.img-pop-btn:disabled{opacity:.5;cursor:not-allowed;background:#f5f5f5;border-color:#ddd;}
+/* 「大小」行的自定义宽度输入（2026-10）：观感对齐字符格式弹窗的 #cfSizeNum */
+#imgCustomW{width:62px;padding:3px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;font-size:13px;}
+#imgCustomW:disabled{opacity:.5;background:#f7f7f7;}
 #errOk{background:#2e8b57;color:#fff;border:none;border-radius:4px;padding:2px 10px;cursor:pointer;font-size:14px;}
 #errNo{background:#c0392b;color:#fff;border:none;border-radius:4px;padding:2px 10px;cursor:pointer;font-size:14px;}
-/* 文字纠错下拉菜单 / 文字包围 / 上标下标 */
-#proofreadMenu, #charWrapMenu, #supSubMenu{position:fixed;z-index:70;background:#fff;border:1px solid #ddd;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.15);min-width:120px;padding:4px;display:none;}
-#proofreadMenu button, #charWrapMenu button, #supSubMenu button{display:block;width:100%;text-align:left;padding:6px 10px;border:none;background:none;cursor:pointer;border-radius:4px;font-size:13px;}
-#proofreadMenu button:hover, #charWrapMenu button:hover, #supSubMenu button:hover{background:#f0f0f0;}
+/* 文字纠错下拉菜单 / 文字包围 / 上标下标 / 分隔线 */
+/* 分隔线菜单 #dividerMenu 必须与前三个同构：openDropMenu 写 left/top 并 display:block，
+   缺 position:fixed 时坐标被忽略、static 块又被 sticky 的 #toolbar 盖住 → 点击像没反应。 */
+#proofreadMenu, #charWrapMenu, #supSubMenu, #dividerMenu{position:fixed;z-index:70;background:#fff;border:1px solid #ddd;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.15);min-width:120px;padding:4px;display:none;}
+#proofreadMenu button, #charWrapMenu button, #supSubMenu button, #dividerMenu button{display:block;width:100%;text-align:left;padding:6px 10px;border:none;background:none;cursor:pointer;border-radius:4px;font-size:13px;}
+#proofreadMenu button:hover, #charWrapMenu button:hover, #supSubMenu button:hover, #dividerMenu button:hover{background:#f0f0f0;}
 /* 下拉指示符：小号低对比三角，提示「校」为下拉菜单；菜单展开时按钮高亮 */
 #proofreadBtn .ptoe-caret{font-size:9px;color:#8a97a6;margin-left:3px;vertical-align:1px;}
 #popup .sep{width:100%;height:0;border-top:1px solid var(--border);margin:2px 0;}
@@ -346,6 +472,72 @@ body.paint-mode{cursor:copy;}
 .editable img.ptoe-img-vtop{vertical-align:top;}
 .editable img.ptoe-img-vmid{vertical-align:middle;}
 .editable img.ptoe-img-vbot{vertical-align:bottom;}
+/* 浮动绕排（2026-10 图文混合）：ptoe-img-float-left / ptoe-img-float-right，
+   类挂在 img 自身上（float 必须作用在图片元素上，挂在包裹 p 标签上文字不绕排），
+   宽度仍复用既有的 ptoe-img-w* 档位；与 ptoe-img-inline 互斥（前端负责去重）。
+   display:inline-block 是**刻意的降级声明**：目标阅读器多看实测支持 CSS float 绕排，
+   而忽略 float 的阅读器（微信阅读无 WebView、静读天下覆盖出版方 CSS）会退化成
+   「按 ptoe-img-w* 比例行内排版、文字接在图片后面」，即现有行内图行为，
+   绝不塌成独占块——所以绝不写成裸 float。
+   margin 取值：内侧 0.5em（图片与绕排文字的间距，em 随正文字号缩放，不贴图）
+              + 下侧 0.4em（图片底部与后续整宽文字的间距，勿让文字紧贴图片下沿）。
+   声明值与 htmlmanage 的 EPUB style.css、ui/epubedit.html 三处逐字相同（勿单边改动）。 */
+.editable img.ptoe-img-float-left{float:left;display:inline-block;max-width:100%;height:auto;margin:0 0.5em 0.4em 0;}
+.editable img.ptoe-img-float-right{float:right;display:inline-block;max-width:100%;height:auto;margin:0 0 0.4em 0.5em;}
+/* 题注（2026-10 图文混合）：图片块之后的独立说明段落 <p class="ptoe-caption">。
+   样式值与 htmlmanage 导出 EPUB 的题注规则保持同一份契约（勿单边改动）。 */
+.editable p.ptoe-caption{font-size:0.85em;color:#666;text-align:center;margin:0.2em 0 0.6em;}
+/* 插入表格（2026-09）：编辑区内表格渲染；边框/表头底色走 CSS 变量，暗色主题自适应。
+   2026-09 反馈修复：默认撑满行宽（width:100%）、单元格最小宽度 + 顶对齐 */
+.editable table{border-collapse:collapse;margin:.5em 0;width:100%;max-width:100%;}
+.editable th,.editable td{border:1px solid var(--border);padding:.3em .6em;text-align:left;vertical-align:top;min-width:3em;}
+.editable th{font-weight:bold;text-align:center;background:#f2f5fa;}
+.dark .editable th{background:var(--bg-hover);}
+/* 表格操作条（2026-09）：光标进入表格单元格时由 JS 定位并显示；
+   加行/删行/加列/删列/对齐/删除表格；对齐按钮按当前单元格 class 高亮 */
+#tblBar{position:fixed;z-index:64;display:none;flex-wrap:wrap;gap:2px;align-items:center;padding:4px 6px;background:rgba(255,255,255,.94);border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.18);}
+.tbl-bar-sep{width:1px;height:16px;background:#d5dbe3;margin:0 3px;}
+#tblBar button{background:transparent;border:1px solid transparent;border-radius:5px;padding:2px 7px;font-size:12px;color:#1c2733;cursor:pointer;white-space:nowrap;}
+#tblBar button:hover{background:#eef3fb;border-color:var(--accent);color:var(--accent);}
+#tblBar button.active{background:#e0eaff;border-color:var(--accent);color:var(--accent);font-weight:600;}
+#tblBar button.danger{color:#c0392b;}
+#tblBar button.danger:hover{background:#fdecea;border-color:#e74c3c;}
+.dark #tblBar{background:rgba(30,35,45,.94);border-color:#3a4150;}
+.dark #tblBar button{color:#ddd;}
+.dark .tbl-bar-sep{background:#3a4150;}
+/* ---- 表格增强（2026-10）----
+   用户反馈三条：插入的表格太小 / 鼠标光标与表格错位 / 无法调整宽高。
+   ① 最小行高：空表不再塌成一条线；② 垂直对齐类；③ 含表格的行参与撑行
+   （默认 .editable{height:0} 不参与 → 表格被图片高度裁切并内部滚动，同时造成
+   点击落点与所见错位）；④ 合并选区高亮；⑤ 列/行拖拽手柄层；⑥ 更多菜单；⑦ 尺寸弹窗 */
+.editable th,.editable td{height:1.9em;}
+.editable td.ptoe-vtop,.editable th.ptoe-vtop{vertical-align:top;}
+.editable td.ptoe-vmid,.editable th.ptoe-vmid{vertical-align:middle;}
+.editable td.ptoe-vbot,.editable th.ptoe-vbot{vertical-align:bottom;}
+.page-row.ptoe-has-table .editable{height:auto;min-height:0;}
+.editable td.ptoe-cell-sel,.editable th.ptoe-cell-sel{outline:2px solid var(--accent,#316dca);outline-offset:-2px;background:rgba(49,109,202,.12);}
+#tblResizeLayer{position:fixed;z-index:63;display:none;pointer-events:none;}
+#tblResizeLayer .tbl-col-h{position:absolute;width:9px;cursor:col-resize;pointer-events:auto;}
+#tblResizeLayer .tbl-col-h::after{content:'';position:absolute;left:3px;top:0;bottom:0;width:2px;background:var(--accent,#316dca);opacity:0;}
+#tblResizeLayer .tbl-col-h:hover::after{opacity:.95;}
+#tblResizeLayer .tbl-row-h{position:absolute;height:9px;cursor:row-resize;pointer-events:auto;}
+#tblResizeLayer .tbl-row-h::after{content:'';position:absolute;top:3px;left:0;right:0;height:2px;background:var(--accent,#316dca);opacity:0;}
+#tblResizeLayer .tbl-row-h:hover::after{opacity:.95;}
+#tblMenu{position:fixed;z-index:71;background:#fff;border:1px solid #ddd;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.15);min-width:158px;padding:4px;display:none;max-height:72vh;overflow:auto;}
+#tblMenu button{display:block;width:100%;text-align:left;padding:6px 10px;border:none;background:none;cursor:pointer;border-radius:4px;font-size:13px;color:#1c2733;}
+#tblMenu button:hover{background:#f0f0f0;}
+#tblMenu button.active{background:#e0eaff;color:var(--accent);font-weight:600;}
+#tblMenu button.danger{color:#c0392b;}
+#tblMenu .tbl-menu-sep{height:1px;background:#e6e6e6;margin:4px 6px;}
+#tblMenu .tbl-menu-head{padding:4px 10px 2px;font-size:11px;color:var(--text-muted);}
+.dark #tblMenu{background:#232a35;border-color:#3a4150;}
+.dark #tblMenu button{color:#ddd;}
+.dark #tblMenu button:hover{background:#2e3746;}
+.dark #tblMenu .tbl-menu-sep{background:#3a4150;}
+#tblSizeModalBg{position:fixed;inset:0;z-index:67;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+.tbl-size-grid{display:grid;grid-template-columns:auto 1fr;gap:8px 12px;margin:10px 0;font-size:13px;align-items:center;}
+.tbl-size-grid input[type="number"]{width:92px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;}
+.tbl-size-grid select{padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;background:#fff;}
 /* 搜索 / 替换弹窗（工具栏「搜」按钮打开；结果列表点击跳转、↑↓上一个/下一个） */
 #searchModalBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
 .search-modal{max-width:640px;width:94%;display:flex;flex-direction:column;}
@@ -358,6 +550,34 @@ body.paint-mode{cursor:copy;}
 .indent-grid select{padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;background:#fff;}
 .indent-preview{border:1px dashed var(--border);border-radius:6px;padding:10px 12px;margin:8px 0 12px;min-height:56px;overflow:auto;background:#fafbfc;}
 .indent-preview p{margin:0;}
+/* 段落设置应用范围（2026-09-24：选中段落 / 当前页全部正文段落 / 全部正文） */
+.indent-mode-row{display:flex;gap:14px;flex-wrap:wrap;font-size:13px;margin:6px 0 2px;padding:6px 10px;background:#f2f5f9;border:1px solid var(--border);border-radius:6px;}
+.indent-mode-row label{display:flex;align-items:center;gap:5px;cursor:pointer;color:#33475b;}
+.indent-mode-row input[type="radio"]{margin:0;accent-color:var(--accent,#316dca);cursor:pointer;}
+/* 插入表格弹窗：行列数输入与「首行表头」勾选（外层复用 .search-modal/.export-actions） */
+#tableModalBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+.table-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 14px;margin:10px 0;font-size:13px;}
+/* 字符格式弹窗（2026-09-27）：外层复用 .search-modal/.export-actions/.indent-mode-row */
+#charFormatModalBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+#cfSizeNum{width:86px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;}
+#cfFontSel{max-width:190px;}
+#cfPreview p{margin:0;}
+/* 分隔线下拉菜单里的字形预览（与正文里最终写入的 8 字形串一致） */
+#dividerMenu .div-glyph{margin-left:8px;font-family:monospace;color:var(--text-muted);letter-spacing:0;}
+#dividerMenu .div-dashed{letter-spacing:.12em;}
+#dividerMenu .div-dotted{letter-spacing:.12em;}
+#dividerMenu .div-double{font-weight:bold;letter-spacing:.05em;}
+/* 分隔线（2026-09-27）：与 htmlmanage 导出 EPUB 的规则保持一致（同一份视觉预期）。
+   标记形态 = 非空段落 + 两个类：基类 + 样式后缀（correctmanage.DIVIDER_STYLES）。
+   四种样式必须一眼可辨；居中、不继承段首缩进、不受逐字符字号/颜色影响。 */
+.editable p.ptoe-divider{text-align:center;text-indent:0;margin:.6em 0;color:#999999;white-space:nowrap;overflow:hidden;font-size:1em;letter-spacing:0;}
+.editable p.ptoe-divider-solid{letter-spacing:0;font-weight:normal;}
+.editable p.ptoe-divider-dashed{letter-spacing:.12em;}
+.editable p.ptoe-divider-dotted{letter-spacing:.12em;}
+.editable p.ptoe-divider-double{letter-spacing:.05em;font-weight:bold;}
+.editable p.ptoe-divider span{color:inherit;font-size:inherit;font-family:inherit;}
+.table-grid label{display:flex;align-items:center;gap:6px;white-space:nowrap;}
+.table-grid input[type="number"]{width:72px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;}
 .export-desc{font-size:13px;color:#5a6b7c;margin:0 0 14px;line-height:1.6;}
 .export-actions{display:flex;gap:10px;justify-content:flex-end;}
 .search-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;}
@@ -380,10 +600,69 @@ body.paint-mode{cursor:copy;}
 .sr-ctx{color:#33414f;line-height:1.5;word-break:break-all;}
 .sr-ctx mark{background:#ffe08a;color:#5c4000;border-radius:2px;padding:0 2px;}
 .sr-empty{color:#8a97a6;padding:6px 2px;}
+/* 2026-09：搜索范围分段按钮 + 保留组 chips + 替换规则列表 */
+.scope-seg{display:inline-flex;background:rgba(0,0,0,.06);border-radius:8px;padding:2px;gap:2px;}
+.scope-btn{border:0;background:transparent;border-radius:6px;padding:4px 10px;font-size:12px;color:#5a6b7c;cursor:pointer;}
+.scope-btn:hover{color:#1c2733;}
+.scope-btn.active{background:#fff;color:#1c2733;box-shadow:0 1px 3px rgba(0,0,0,.15);font-weight:600;}
+.search-row-group{display:flex;align-items:center;gap:6px;margin-bottom:6px;}
+.srow-label{flex:none;min-width:2.6em;font-size:12px;color:#8a97a6;text-align:right;}
+.kg-row{display:none;align-items:center;gap:6px;margin:2px 0 6px;padding:4px 8px;background:rgba(59,111,255,.06);border:1px solid rgba(59,111,255,.25);border-radius:6px;}
+.kg-hint{flex:none;font-size:12px;color:#3b6fff;font-weight:600;}
+.kg-chips{display:flex;flex-wrap:wrap;gap:4px;}
+.kg-chip{border:1px solid var(--border);background:#fff;border-radius:999px;padding:2px 9px;font-size:12px;color:#5a6b7c;cursor:pointer;}
+.kg-chip:hover{border-color:#3b6fff;color:#3b6fff;}
+.kg-chip.on{background:#3b6fff;border-color:#3b6fff;color:#fff;font-weight:600;}
+.sr-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:2px 0 6px;}
+.sr-rules-btn{border:1px solid rgba(59,111,255,.4);background:rgba(59,111,255,.08);color:#3b6fff;border-radius:6px;padding:3px 10px;font-size:12px;cursor:pointer;}
+.sr-rules-btn:hover{background:rgba(59,111,255,.16);}
+#rrList{max-height:320px;overflow:auto;}
+.rr-item{border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:8px;background:#fff;}
+.rr-item-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:13px;}
+.rr-name{font-weight:600;color:#1c2733;}
+.rr-builtin{flex:none;font-size:11px;color:#fff;background:#8a97a6;border-radius:4px;padding:1px 6px;}
+.rr-pat{font-size:12px;background:rgba(0,0,0,.05);border-radius:4px;padding:1px 6px;color:#7c3aed;}
+.rr-repl{font-size:12px;color:#5a6b7c;}
+.rr-item-acts{display:flex;gap:6px;margin-top:8px;}
+.rr-item-acts button{border:1px solid var(--border);background:#fff;border-radius:6px;padding:3px 10px;font-size:12px;cursor:pointer;}
+.rr-item-acts button:hover{border-color:#3b6fff;color:#3b6fff;}
+.rr-item-acts button.danger:hover{border-color:#c62828;color:#c62828;}
+.rr-edit-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px;margin-top:4px;}
+.rr-edit-grid label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:#33414f;}
+.rr-edit-grid input{padding:5px 8px;border:1px solid var(--border);border-radius:6px;font:inherit;width:100%;box-sizing:border-box;}
+.search-head{display:flex;align-items:center;gap:10px;}
+.search-head h3{margin:0;flex:none;}
+.search-head .scope-seg{margin-left:auto;}
+/* 搜索高亮在亮色下的蓝色调（替换默认黄，排在其后以覆盖） */
+.sr-ctx mark{background:#cfe0ff;color:#2047d8;}
+/* 暗色模式适配（2026-09） */
+.dark .scope-seg{background:rgba(255,255,255,.08);}
+.dark .scope-btn{color:#9aa7b8;}
+.dark .scope-btn:hover{color:#e8edf4;}
+.dark .scope-btn.active{background:#2a3442;color:#e8edf4;box-shadow:0 1px 3px rgba(0,0,0,.4);}
+.dark .kg-row{background:rgba(59,111,255,.12);border-color:rgba(59,111,255,.4);}
+.dark .kg-chip{background:#2a3442;border-color:#46525f;color:#b8c2cf;}
+.dark .kg-chip:hover{border-color:#3b6fff;color:#8fb0ff;}
+.dark .kg-chip.on{background:#3b6fff;border-color:#3b6fff;color:#fff;}
+.dark .sr-rules-btn{background:rgba(59,111,255,.2);color:#8fb0ff;border-color:rgba(59,111,255,.5);}
+.dark .rr-item{background:#24303e;border-color:#3a4653;}
+.dark .rr-name{color:#e8edf4;}
+.dark .rr-pat{background:rgba(255,255,255,.08);color:#c9a8ff;}
+.dark .rr-repl{color:#9aa7b8;}
+.dark .rr-item-acts button{background:#2a3442;border-color:#46525f;color:#c7d0da;}
+.dark .rr-edit-grid input{background:#2a3442;border-color:#46525f;color:#e8edf4;}
+.dark .rr-edit-grid label{color:#b8c2cf;}
+.dark .sr-ctx mark{background:rgba(59,111,255,.35);color:#d7e5ff;}
+.dark .sr-item{background:#24303e;border-color:#3a4653;}
 #modalBg{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
 #finishModalBg{position:fixed;inset:0;z-index:70;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
 #historyModalBg{position:fixed;inset:0;z-index:70;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
 #helpModalBg{position:fixed;inset:0;z-index:65;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+/* 清理预览模态框（2026-10-16）：遮罩层定位与其它 modal 同构。
+   缺失此规则会让预览框落在文档流末尾不可见，表现为点「清理」毫无反应。 */
+#cleanPreviewBg{position:fixed;inset:0;z-index:68;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+.clean-preview-item{padding:3px 6px;border-bottom:1px dashed var(--border);}
+.clean-preview-item:last-child{border-bottom:none;}
 #historyTable{table-layout:fixed;}
 #historyTable th{position:sticky;top:0;background:#f4f6f9;}
 #historyTable td{word-break:break-all;vertical-align:top;}
@@ -396,6 +675,22 @@ body.paint-mode{cursor:copy;}
 .modal{background:#fff;border-radius:10px;padding:18px 22px;max-width:520px;width:92%;max-height:80vh;overflow:auto;}
 .modal h3{margin:0 0 10px;}
 .modal h4{margin:14px 0 6px;font-size:14px;color:#1c2733;}
+/* 设置弹窗标签栏（JS-only 切换，样式补全局按钮默认外观） */
+.settings-tabs{display:flex;gap:2px;border-bottom:1px solid var(--border);margin-bottom:10px;}
+.settings-tab{flex:1;padding:7px 8px;border:none;background:transparent;color:var(--text-muted);font-size:13px;border-bottom:2px solid transparent;border-radius:6px 6px 0 0;cursor:pointer;white-space:nowrap;}
+.settings-tab:hover{background:#f4f7fb;color:var(--accent);}
+.settings-tab.active{color:var(--accent);border-bottom-color:var(--accent);background:#eef3fb;}
+/* 设置-弹出菜单：两行按钮 chips 编辑器 */
+.pop-edit-list{display:flex;flex-wrap:wrap;gap:6px;padding:8px;border:1px solid var(--border);border-radius:6px;background:#fafbfd;min-height:38px;margin-top:6px;}
+.pop-edit-chip{display:inline-flex;align-items:center;gap:5px;padding:2px 3px 2px 8px;background:#fff;border:1px solid var(--border);border-radius:14px;font-size:13px;color:#1c2733;box-shadow:0 1px 2px rgba(0,0,0,.04);}
+.pop-edit-chip .pe-ico{color:var(--accent);font-weight:600;min-width:1em;text-align:center;}
+.pop-edit-chip .pe-label{line-height:1.6;}
+.pop-edit-chip .pe-acts{display:inline-flex;border-left:1px solid var(--border);margin-left:1px;padding-left:1px;}
+.pop-edit-chip .pe-act{width:20px;height:20px;padding:0;border:none;background:transparent;color:#8a97a6;font-size:11px;line-height:1;border-radius:3px;cursor:pointer;}
+.pop-edit-chip .pe-act:hover{background:#eef3fb;color:var(--accent);}
+.pop-edit-chip .pe-act[data-pe-act="del"]:hover{color:#c0392b;background:#fdeeee;}
+.pop-edit-add{display:flex;gap:8px;align-items:center;margin-top:8px;}
+.pop-edit-add select{flex:0 0 auto;min-width:180px;max-width:240px;}
 .help-table{width:100%;border-collapse:collapse;font-size:13px;}
 .help-table td{padding:4px 8px;border-bottom:1px solid var(--border);vertical-align:top;}
 .help-table td:first-child{white-space:nowrap;color:#33414f;font-weight:600;}
@@ -403,6 +698,10 @@ body.paint-mode{cursor:copy;}
 #shortcutTable td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:14px;}
 #shortcutTable tr{cursor:pointer;}
 #shortcutTable tr:hover td{background:#f7fafd;}
+/* 分组标题行（功能刷）：不可点（不进入捕获），无悬停高亮 */
+#shortcutTable tr.shortcut-group-row{cursor:default;}
+#shortcutTable tr.shortcut-group-row:hover td{background:none;}
+#shortcutTable tr.shortcut-group-row td{padding-top:14px;font-weight:600;color:#5a6b7c;font-size:12px;}
 kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6px;font-size:12px;font-family:inherit;}
 #closeSettings{margin-top:12px;}
 #formatRulesModalBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
@@ -421,6 +720,8 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
 #formatRulesModalBg .fr-cond{font-size:13px;color:#33414f;}
 #frRuleModalBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
 #frFmtPopupBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+#replaceRulesModalBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+#rrEditModalBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
 #frRuleModalBg .fr-opts{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:13px;}
 #frRuleModalBg .fr-opts label{display:inline-flex;align-items:center;gap:3px;color:#33414f;}
 #frFmtPopupBg .fr-opts{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:13px;}
@@ -466,11 +767,14 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <button type="button" class="ic-btn" id="redoBtn" onmousedown="event.preventDefault()" disabled title="前进下一步 (Ctrl+Y / Ctrl+Shift+Z)" aria-label="前进 (Ctrl+Y)">
         <svg viewBox="0 0 24 24"><path d="M21 7v6h-6"/><path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3L21 13"/></svg>
       </button>
-      <label style="display:inline-flex;align-items:center;gap:2px;"><select id="fontSizeSel" aria-label="字号" title="字号" style="height:28px;padding:0 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text);font:inherit;">
-        <option value="12">12</option><option value="13">13</option><option value="14" selected>14</option>
-        <option value="15">15</option><option value="16">16</option><option value="17">17</option>
-        <option value="18">18</option><option value="20">20</option>
-      </select></label>
+      <!-- 编辑器显示字号（仅视图，不写入内容；与「字符格式」弹窗的逐字符字号区分） -->
+      <label style="display:inline-flex;align-items:center;gap:2px;" title="编辑器显示字号：只改变编辑区文字的显示大小，不修改正文、不写入内容（真正改文字字号请用「字符格式」）">
+        <span aria-hidden="true" style="font-size:12px;line-height:1;color:var(--text-muted);letter-spacing:.5px;user-select:none;">Aa</span>
+        <select id="fontSizeSel" aria-label="编辑器显示字号（仅影响视图，不写入内容）" title="编辑器显示字号（仅影响视图，不写入内容）" style="height:28px;padding:0 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text);font:inherit;">
+          <option value="12">12</option><option value="13">13</option><option value="14" selected>14</option>
+          <option value="15">15</option><option value="16">16</option><option value="17">17</option>
+          <option value="18">18</option><option value="20">20</option>
+        </select></label>
     </div>
     <!-- Zone 2: 格式/插入 -->
     <div class="tb-group" role="group" aria-label="格式/插入">
@@ -492,6 +796,9 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <button type="button" class="ic-btn" data-op="note" onmousedown="event.preventDefault()" title="注释：把当前块设为注释（小字灰色） (Ctrl+Shift+N)" aria-label="注释 (Ctrl+Shift+N)">
         <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><line x1="10" y1="9" x2="8" y2="9"/></svg>
       </button>
+      <button type="button" class="ic-btn" data-op="citation" onmousedown="event.preventDefault()" title="引用：把选中内容设为引用（斜体 + 独立字体，默认宋体；整块/光标处则切换整段）" aria-label="引用">
+        <svg viewBox="0 0 24 24"><text x="12" y="16" text-anchor="middle" font-size="14" fill="currentColor" stroke="none">引</text></svg>
+      </button>
       <button type="button" class="ic-btn" data-op="strip_ws" onmousedown="event.preventDefault()" title="去空（去除段落内全部空白，保留换行）" aria-label="去空">
         <svg viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
       </button>
@@ -506,7 +813,6 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
         <div class="tb-more-panel" id="morePanelFormat" role="menu">
           <button type="button" class="tb-btn" id="charWrapBtn" role="menuitem" title="文字包围下拉菜单：下划线 / 删除线 / 字符边框 / 底纹" aria-label="文字包围">文字包围 <span class="ptoe-caret">▾</span></button>
           <button type="button" class="tb-btn" id="supSubBtn" role="menuitem" title="上标下标下拉菜单：把选中文字设为上标或下标的小字符" aria-label="上标下标">上标/下标 <span class="ptoe-caret">▾</span></button>
-          <button type="button" class="tb-btn" id="formatBrushBtn" role="menuitem" title="格式刷" aria-label="格式刷">格式刷</button>
           <button type="button" class="tb-btn" id="formatRulesBtn" role="menuitem" title="格式规则：对选中文字一键应用自定义规则（可多条叠加 / 条件分支；Ctrl+Shift+Q）" aria-label="格式规则">格式规则</button>
           <button type="button" class="tb-btn" id="colorBtn" role="menuitem" title="文本颜色" aria-label="文本颜色">文本颜色</button>
           <select id="imgModeSel" title="插入图片的显示模式：全画幅=占满文字宽度，局部=按原尺寸居中，行内=嵌在文字中间（50% 宽度）" style="width:100%;margin-bottom:4px;padding:4px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text);font:inherit;">
@@ -516,7 +822,32 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
           </select>
           <button type="button" class="tb-btn" id="imgExternalBtn" role="menuitem" onmousedown="event.preventDefault()" title="从本地文件选择图片，插入到文字光标处" aria-label="插入外部图片">插入图片</button>
           <input type="file" id="imgExternalInput" accept="image/*" style="display:none"/>
-          <button type="button" class="tb-btn" id="indentDlgBtn" role="menuitem" onmousedown="event.preventDefault()" title="段落设置：左/右缩进、首行/悬挂缩进、段前段后与行距（导出 EPUB 生效）" aria-label="段落设置">段落设置</button>
+          <button type="button" class="tb-btn" id="dividerBtn" role="menuitem" onmousedown="event.preventDefault()" title="分隔线下拉菜单：在光标处插入一行分隔线（直线 / 线段 / 点线 / 双线）" aria-label="插入分隔线">分隔线 <span class="ptoe-caret">▾</span></button>
+          <button type="button" class="tb-btn" id="tableBtn" role="menuitem" onmousedown="event.preventDefault()" title="插入表格：在光标处插入空表格，行/列数与是否带表头可设（Ctrl+Alt+T）" aria-label="插入表格">插入表格</button>
+          <button type="button" class="tb-btn" id="tableConvertBtn" role="menuitem" data-op="table" onmousedown="event.preventDefault()" title="转成表格：把选中的文字转成原生表格（支持 Markdown 管道表 / 画框表 / 空格对齐列；手动档，不要求分隔行）" aria-label="转成表格">转成表格</button>
+          <button type="button" class="tb-btn" id="tableToTextBtn" role="menuitem" data-op="table2text" onmousedown="event.preventDefault()" title="表格转文本：把光标所在表格还原成 Markdown 管道文字（光标不在表格内则转当前页全部表格；可再用「转成表格」转回）" aria-label="表格转文本">表格转文本</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Zone 2b: 格式刷（外部工具栏独立下拉，非「更多」内） -->
+    <div class="tb-group" role="group" aria-label="格式刷">
+      <div class="tb-more">
+        <button type="button" class="tb-more-btn" id="formatBrushBtn" aria-label="格式刷" aria-expanded="false" aria-controls="brushPanel" title="格式刷：捕获格式 / 功能刷（合并/标题等，可混合）；快捷键默认 Shift+Ctrl+1..0（可在设置中自定义）">
+          格式刷 <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
+        <div class="tb-more-panel" id="brushPanel" role="menu" aria-label="格式刷菜单" style="min-width:150px;">
+          <button type="button" class="tb-btn" id="brushFmtBtn" role="menuitem" title="捕获当前选区格式，持续应用到后续选中的文字（持续格式刷）" aria-label="格式刷（捕获格式）">格式刷（捕获）</button>
+          <div style="height:1px;margin:3px 8px;background:var(--border);"></div>
+          <div id="brushOpsList" style="display:flex;flex-direction:column;gap:1px;"></div>
+          <button type="button" class="tb-btn" id="brushMixBtn" role="menuitem" title="混合刷：勾选多个功能组合成一个刷，点击段落依次生效" aria-label="混合刷">混合…</button>
+        </div>
+        <div class="tb-more-panel" id="brushMixPanel" role="menu" aria-label="混合刷多选" style="min-width:170px;">
+          <div id="brushMixList" style="display:flex;flex-direction:column;gap:2px;padding:2px 0;"></div>
+          <div style="display:flex;gap:4px;margin-top:4px;">
+            <button type="button" class="tb-btn" id="brushMixApply" style="flex:1;" title="按勾选启用混合刷" aria-label="启用混合刷">启用</button>
+            <button type="button" class="tb-btn" id="brushMixCancel" style="flex:1;" title="取消" aria-label="取消">取消</button>
+          </div>
         </div>
       </div>
     </div>
@@ -528,6 +859,14 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <button type="button" class="tb-btn" id="mdToggleBtn" title="切换 Markdown 源码 / 富文本编辑模式（详见帮助） (Ctrl+Shift+D)">Markdown</button>
       <button type="button" class="tb-btn" id="cleanBtn" title="智能清理：合并被 OCR 拆散的小段落、清除段首 #/* 等符号、归一化中英文标点、移除残留的 HTML 标签 (Ctrl+Shift+C)">清理</button>
       <button type="button" class="tb-btn" id="proofreadBtn" title="文字纠错下拉菜单：校正当前页 / 应用全部候选 / 清除标注 / 回退原文 (Ctrl+K)" aria-label="文字纠错 (Ctrl+K)">校 <span class="ptoe-caret">▾</span></button>
+      <!-- 字符格式（2026-09-27）：逐字符 字号/字体/颜色 弹窗入口 + 清除。并入「文本工具」
+           组而非另开一组，避免工具栏多出第 9 个分组、第三行 -->
+      <button type="button" class="ic-btn" id="charFormatBtn" onmousedown="event.preventDefault()" title="字符格式：为选中文字设置逐字符的字号（8-72 像素）、字体与颜色" aria-label="字符格式">
+        <svg viewBox="0 0 24 24"><path d="M4 19 9.5 5h1L16 19"/><line x1="6" y1="14" x2="14" y2="14"/><line x1="17" y1="19V9"/><line x1="21" y1="19v-5"/><line x1="20" y1="12h2"/></svg>
+      </button>
+      <button type="button" class="ic-btn" id="charFmtClearBtn" onmousedown="event.preventDefault()" title="清除字符格式：移除选中文字的逐字符字号/字体/颜色（整段选中即为整段）" aria-label="清除字符格式">
+        <svg viewBox="0 0 24 24"><path d="M5 17 12 10l3 3 4-4"/><line x1="4" y1="20" x2="20" y2="20"/><path d="M4 4l16 16"/></svg>
+      </button>
       <button type="button" class="ic-btn" data-op="align_left" onmousedown="event.preventDefault()" title="居左 (Ctrl+Shift+Left)" aria-label="居左 (Ctrl+Shift+Left)">
         <svg viewBox="0 0 24 24"><line x1="3" y1="6" x2="15" y2="6"/><line x1="3" y1="12" x2="15" y2="12"/><line x1="3" y1="18" x2="15" y2="18"/></svg>
       </button>
@@ -543,6 +882,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <button type="button" class="ic-btn" data-op="indent" onmousedown="event.preventDefault()" title="缩进" aria-label="缩进">
         <svg viewBox="0 0 24 24"><line x1="3" y1="6" x2="21" y2="6"/><line x1="9" y1="12" x2="21" y2="12"/><line x1="9" y1="18" x2="21" y2="18"/></svg>
       </button>
+      <button type="button" class="ic-btn" id="indentDlgBtn" onmousedown="event.preventDefault()" title="段落设置：左/右缩进、首行/悬挂缩进、段前段后与行距（导出 EPUB 生效）" aria-label="段落设置">¶</button>
     </div>
 
     <!-- Zone 4: 标记 -->
@@ -645,6 +985,16 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
 <div id="pages"></div>
 <div id="popup"></div>
 <div id="tip"></div>
+<!-- 命令行（2026-10，nvim 风格）：Ctrl+; 打开；:7,10merge 按行号合并，默认作用于当前选中页 -->
+<div id="cmdBar" role="dialog" aria-label="命令行">
+  <span id="cmdPrefix">:</span>
+  <input id="cmdInput" type="text" autocomplete="off" spellcheck="false" placeholder="如 7,10merge ／ 页 12 ／ 插入 注释（取剪贴板） ／ 选 3 5 10 ／ help" aria-label="命令输入">
+  <span id="cmdHint">Esc 关闭 · Enter 执行 · ↑↓ 候选 · Ctrl+↑↓ 历史</span>
+</div>
+<div id="cmdSuggest">
+  <div id="cmdSuggestGrip" title="拖动调整高度（双击折叠/展开）"></div>
+  <div id="cmdSuggestList" role="listbox" aria-label="命令候选"></div>
+</div>
 <!-- 右键上下文菜单（2026-08-08）：编辑区内右键弹出；重识别/插入标记/导出/Markdown 提示/保存/暂存 -->
 <div id="contextMenu" hidden>
   <div class="ctx-item ctx-sub" data-ctx="copy">复制 <span class="ctx-arrow">▸</span>
@@ -660,9 +1010,6 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
     </div>
   </div>
   <div class="ctx-sep"></div>
-  <button type="button" class="ctx-item" data-ctx="reocr">重识别</button>
-  <button type="button" class="ctx-item" data-ctx="insertimg">插入图片</button>
-  <button type="button" class="ctx-item" data-ctx="clear">清除</button>
   <div class="ctx-item ctx-sub" data-ctx="marker">插入标记 <span class="ctx-arrow">▸</span>
     <div class="ctx-submenu" id="ctxMarkerSub">
       <button type="button" class="ctx-item" data-ctx-marker="join">段落标记</button>
@@ -680,6 +1027,21 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <button type="button" class="ctx-item" data-ctx-wrap="shade">底纹</button>
     </div>
   </div>
+  <div class="ctx-sep"></div>
+  <button type="button" class="ctx-item" data-ctx="insertimg">插入图片</button>
+  <div class="ctx-item ctx-sub" data-ctx="rules">格式规则 <span class="ctx-arrow">▸</span>
+    <div class="ctx-submenu" id="ctxRulesSub"></div>
+  </div>
+  <button type="button" class="ctx-item" data-ctx="reocr">重识别</button>
+  <button type="button" class="ctx-item" data-ctx="clear">清除校正</button>
+  <button type="button" class="ctx-item" data-ctx="applypr">应用校正</button>
+  <button type="button" class="ctx-item" data-ctx="clearfmt">清除格式</button>
+  <div class="ctx-sep"></div>
+  <button type="button" class="ctx-item" data-ctx="clearpage">清空</button>
+  <button type="button" class="ctx-item" data-ctx="fmtall">格式化</button>
+  <div class="ctx-sep"></div>
+  <button type="button" class="ctx-item" data-ctx="save">保存</button>
+  <button type="button" class="ctx-item" data-ctx="stage">暂存</button>
   <div class="ctx-item ctx-sub" data-ctx="export">导出 <span class="ctx-arrow">▸</span>
     <div class="ctx-submenu" id="ctxExportSub">
       <button type="button" class="ctx-item" data-ctx-export="txt">txt格式</button>
@@ -688,14 +1050,6 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <button type="button" class="ctx-item" data-ctx-export="epub">epub格式</button>
     </div>
   </div>
-  <div class="ctx-item ctx-sub" data-ctx="rules">添加规则 <span class="ctx-arrow">▸</span>
-    <div class="ctx-submenu" id="ctxRulesSub"></div>
-  </div>
-  <button type="button" class="ctx-item" data-ctx="clearpage">清空</button>
-  <button type="button" class="ctx-item" data-ctx="fmtall">格式化</button>
-  <div class="ctx-sep"></div>
-  <button type="button" class="ctx-item" data-ctx="save">保存</button>
-  <button type="button" class="ctx-item" data-ctx="stage">暂存</button>
 </div>
 <div id="proofreadMenu">
   <button type="button" id="prMenuCorrect" role="menuitem">校正</button>
@@ -703,6 +1057,9 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   <button type="button" id="prMenuApply" role="menuitem">应用</button>
   <button type="button" id="prMenuClear" role="menuitem">清除</button>
   <button type="button" id="prMenuRevert" role="menuitem">回退</button>
+  <div style="border-top:1px solid #eee;margin-top:6px;"></div>
+  <button type="button" id="prMenuApplyAll" role="menuitem" title="对所有已挂载页应用纠错提示">全部应用</button>
+  <button type="button" id="prMenuClearAll" role="menuitem" title="清除所有页的纠错标注">全部清除</button>
   <div style="padding:6px 10px;border-top:1px solid #eee;margin-top:6px;">
     <label style="display:block;font-size:13px;" title="默认只执行三条规则：连续重复文字 / 连续标点 / 中文中的连续字母">启用原有规则（半角转全角/引号配对/混淆表/词典） <input type="checkbox" id="prLegacyRules"></label>
     <label style="display:block;font-size:13px;margin-top:6px;">启用 LLM 深度校对 <input type="checkbox" id="prLlmEnable"></label>
@@ -727,25 +1084,103 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   <button type="button" data-sup="sup" role="menuitem">上标</button>
   <button type="button" data-sup="sub" role="menuitem">下标</button>
 </div>
-<div id="searchModalBg"><div class="modal search-modal">
-  <div class="search-head"><h3>搜索 / 替换</h3><button type="button" id="searchCloseBtn" class="x-btn" title="关闭搜索" aria-label="关闭搜索">✕</button></div>
-  <div class="search-row">
-    <input type="text" id="searchInput" placeholder="搜索词（可正则）">
-    <label class="search-regex" title="勾选后按正则表达式搜索，否则按普通文本"><input type="checkbox" id="searchRegex">正则</label>
-    <button type="button" id="searchBtn" class="primary">搜索</button>
-    <button type="button" id="searchClearBtn" class="primary" title="清除全部文字标记与搜索结果" aria-label="清除搜索">清理</button>
+<!-- 分隔线菜单（2026-09-27）：四种样式，字形预览即最终写入内容 -->
+<div id="dividerMenu" class="tb-menu">
+  <button type="button" data-div="solid" role="menuitem" title="实线分隔线">直线 <span class="div-glyph div-solid">────────</span></button>
+  <button type="button" data-div="dashed" role="menuitem" title="线段分隔线">线段 <span class="div-glyph div-dashed">╌╌╌╌╌╌╌╌</span></button>
+  <button type="button" data-div="dotted" role="menuitem" title="点线分隔线">点线 <span class="div-glyph div-dotted">┈┈┈┈┈┈┈</span></button>
+  <button type="button" data-div="double" role="menuitem" title="双线分隔线">双线 <span class="div-glyph div-double">════════</span></button>
+</div>
+<!-- 字符格式弹窗（2026-09-27）：逐字符 字号/字体/颜色，样式落在 span 的 style 上 -->
+<div id="charFormatModalBg"><div class="modal search-modal" role="dialog" aria-modal="true" aria-label="字符格式">
+  <div class="search-head">
+    <h3>字符格式</h3>
+    <button type="button" class="x-btn" id="cfCloseBtn" title="关闭 (Esc)" aria-label="关闭字符格式">✕</button>
   </div>
-  <div class="search-row">
-    <input type="text" id="replaceInput" placeholder="替换为">
-    <button type="button" id="replaceBtn" title="替换当前选中的匹配（支持正则）">替换当前</button>
-    <button type="button" id="replaceAllBtn" title="把当前搜索词在所有页面中替换为「替换为」的内容（支持正则）">全部替换</button>
+  <p class="export-desc">为选中的文字设置逐字符的字号、字体与颜色，随内容保存并在导出 EPUB / Word / Markdown 时生效。不修改的内容项请选「不修改」。</p>
+  <div class="indent-mode-row" role="radiogroup" aria-label="字符格式作用范围">
+    <label title="仅作用于当前选中文字（无选中时按光标所在整块）"><input type="radio" name="cfMode" id="cfModeSel" checked> 选中内容</label>
+    <label title="作用于当前页的全部文字段落"><input type="radio" name="cfMode" id="cfModePage"> 当前页</label>
+    <label title="作用于全书全部文字段落（整书一次撤销，需确认）"><input type="radio" name="cfMode" id="cfModeAll"> 全部</label>
+  </div>
+  <div class="indent-grid">
+    <label title="字号：8-72 整数像素（留空或选「不修改」则不改）">字号
+      <select id="cfSizeSel">
+        <option value="">不修改</option>
+        <option value="8">8</option><option value="9">9</option><option value="10">10</option>
+        <option value="11">11</option><option value="12">12</option><option value="14">14</option>
+        <option value="16">16</option><option value="18">18</option><option value="20">20</option>
+        <option value="22">22</option><option value="24">24</option><option value="28">28</option>
+        <option value="32">32</option><option value="36">36</option><option value="42">42</option>
+        <option value="48">48</option><option value="56">56</option><option value="64">64</option>
+        <option value="72">72</option>
+      </select>
+      <input type="number" id="cfSizeNum" min="8" max="72" step="1" placeholder="自定义 8-72" aria-label="自定义字号（8-72 像素）">
+    </label>
+    <label title="字体：仅下列 10 种字体栈可写入内容，其余会被丢弃">字体
+      <select id="cfFontSel">
+        <option value="">不修改</option>
+        <option value="宋体, SimSun, serif">宋体</option>
+        <option value="黑体, SimHei, sans-serif">黑体</option>
+        <option value="楷体, KaiTi, serif">楷体</option>
+        <option value="仿宋, FangSong, serif">仿宋</option>
+        <option value="微软雅黑, Microsoft YaHei, sans-serif">微软雅黑</option>
+        <option value="等线, DengXian, sans-serif">等线</option>
+        <option value="serif">serif（衬线）</option>
+        <option value="sans-serif">sans-serif（无衬线）</option>
+        <option value="monospace">monospace（等宽）</option>
+        <option value="cursive">cursive（手写）</option>
+      </select>
+    </label>
+    <label title="文字颜色">颜色
+      <span id="cfColorSwatch" aria-hidden="true" style="display:inline-block;width:26px;height:22px;border:1px solid var(--border);border-radius:4px;vertical-align:middle;background:#1c2733;"></span>
+      <button type="button" class="tb-btn" id="cfColorBtn" style="height:22px;" title="选择文字颜色" aria-label="选择文字颜色">选色</button>
+      <button type="button" class="tb-btn" id="cfColorClearBtn" style="height:22px;" title="不修改颜色" aria-label="不修改颜色">不修改</button>
+    </label>
+  </div>
+  <div class="indent-preview" id="cfPreview"><p>预览：示例文字 ABC 123，可查看字号、字体与颜色的实际效果。</p></div>
+  <div class="export-actions">
+    <button type="button" id="cfClearBtn" title="清除所选范围内的逐字符字号/字体/颜色">清除字符格式</button>
+    <button type="button" id="cfCancelBtn" title="取消，不做任何修改">取消</button>
+    <button type="button" id="cfOkBtn" class="primary" title="把字符格式应用到所选范围（选中内容/当前页/全部）">确定</button>
+  </div>
+</div></div>
+<div id="searchModalBg"><div class="modal search-modal">
+  <div class="search-head">
+    <h3>搜索 / 替换</h3>
+    <div class="scope-seg" role="radiogroup" aria-label="搜索范围" title="搜索/替换/高亮的生效范围">
+      <button type="button" class="scope-btn active" data-scope="all">全部页</button>
+      <button type="button" class="scope-btn" data-scope="page">当前页</button>
+    </div>
+    <button type="button" id="searchCloseBtn" class="x-btn" title="关闭搜索" aria-label="关闭搜索">✕</button>
+  </div>
+  <div class="search-row-group">
+    <div class="srow-label">搜索</div>
+    <div class="search-row">
+      <input type="text" id="searchInput" placeholder="搜索词（可正则）">
+      <label class="search-regex" title="勾选后按正则表达式搜索，否则按普通文本"><input type="checkbox" id="searchRegex">正则</label>
+      <button type="button" id="searchBtn" class="primary">搜索</button>
+      <button type="button" id="searchClearBtn" class="primary" title="清除全部文字标记与搜索结果" aria-label="清除搜索">清理</button>
+    </div>
+  </div>
+  <div class="search-row-group">
+    <div class="srow-label">替换</div>
+    <div class="search-row">
+      <input type="text" id="replaceInput" placeholder="替换为（$1 引用捕获组）">
+      <button type="button" id="replaceBtn" title="替换当前选中的匹配（支持正则）">替换当前</button>
+      <button type="button" id="replaceAllBtn" title="把当前搜索词在范围内全部替换为「替换为」的内容（支持正则）">全部替换</button>
+    </div>
+  </div>
+  <div class="kg-row" id="keepGroupsRow" title="正则带捕获组时启用「部分替换」：勾选的组原样保留，只替换其余部分；组0=整段匹配全部保留">
+    <span class="kg-hint">保留组</span>
+    <div class="kg-chips" id="keepGroupsChips"></div>
   </div>
   <div class="search-nav">
     <button type="button" id="searchPrevBtn" title="上一个匹配" aria-label="上一个匹配">↑</button>
     <span id="searchPos"></span>
     <button type="button" id="searchNextBtn" title="下一个匹配" aria-label="下一个匹配">↓</button>
   </div>
-  <div class="sr-head"><span id="srCount"></span></div>
+  <div class="sr-head"><span id="srCount"></span><button type="button" id="replaceRulesOpenBtn" class="sr-rules-btn" title="把带保留组的替换保存为规则，一键复用">替换规则</button></div>
   <div id="searchList"></div>
 </div></div>
 <div id="exportModalBg"><div class="modal search-modal">
@@ -763,7 +1198,12 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
 </div></div>
 <div id="indentModalBg"><div class="modal search-modal">
   <div class="search-head"><h3>段落设置</h3><button type="button" id="indCloseBtn" class="x-btn" title="关闭段落设置" aria-label="关闭段落设置">✕</button></div>
-  <p style="font-size:12px;color:#5a6b7c;margin:4px 0;">作用于当前选中/光标所在段落（可跨多段）。缩进单位为字符，间距单位为行；设置随内容保存并在导出 EPUB 时生效。</p>
+  <p style="font-size:12px;color:#5a6b7c;margin:4px 0;">缩进单位为字符，间距单位为行；设置随内容保存并在导出 EPUB 时生效。</p>
+  <div class="indent-mode-row" role="radiogroup" aria-label="段落设置应用范围">
+    <label title="仅作用于当前选中/光标所在的段落（可跨多段）"><input type="radio" name="indMode" id="indModeSel" checked> 选中段落</label>
+    <label title="作用于当前页的全部正文段落（p/div/h1-h6）"><input type="radio" name="indMode" id="indModePage"> 当前页全部正文段落</label>
+    <label title="作用于全书全部正文段落（整书一次撤销）"><input type="radio" name="indMode" id="indModeAll"> 全部正文</label>
+  </div>
   <div class="indent-grid">
     <label>左缩进 <input type="number" id="indLeft" step="0.5" min="0" max="16"> 字符</label>
     <label>右缩进 <input type="number" id="indRight" step="0.5" min="0" max="16"> 字符</label>
@@ -788,8 +1228,24 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   </div>
   <div class="indent-preview" id="indPreview"><p>预览：段落文本示例，用于查看缩进与间距效果。The quick brown fox 123.</p></div>
   <div class="export-actions">
-    <button type="button" id="indClearBtn" title="清除所选段落的全部缩进与间距设置">清除格式</button>
-    <button type="button" id="indOkBtn" class="primary" title="把设置应用到所选段落">确定</button>
+    <button type="button" id="indClearBtn" title="清除所选范围内的全部缩进与间距设置">清除格式</button>
+    <button type="button" id="indOkBtn" class="primary" title="把设置应用到所选范围（选中段落/当前页/全部）">确定</button>
+  </div>
+</div></div>
+<div id="tableModalBg"><div class="modal search-modal">
+  <div class="search-head">
+    <h3>插入表格</h3>
+    <button type="button" class="x-btn" id="tableCloseBtn" title="关闭 (Esc)" aria-label="关闭">✕</button>
+  </div>
+  <p class="export-desc">在光标处插入空表格。行数 1-200、列数 1-50；勾选「首行表头」则首行改为粗体表头行。</p>
+  <div class="table-grid">
+    <label>行数 <input type="number" id="tableRows" value="4" min="1" max="200" step="1"></label>
+    <label>列数 <input type="number" id="tableCols" value="5" min="1" max="50" step="1"></label>
+    <label><input type="checkbox" id="tableHeader" checked> 首行表头</label>
+  </div>
+  <div class="export-actions">
+    <button type="button" id="tableCancelBtn" title="取消插入">取消</button>
+    <button type="button" id="tableOkBtn" class="primary" title="在光标处插入表格">插入</button>
   </div>
 </div></div>
 <div id="modalBg"><div class="modal">
@@ -798,24 +1254,78 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
     <button type="button" class="settings-tab active" data-tab="shortcuts">快捷键</button>
     <button type="button" class="settings-tab" data-tab="fonts">字体</button>
     <button type="button" class="settings-tab" data-tab="ui">界面</button>
+    <button type="button" class="settings-tab" data-tab="popup">弹出菜单</button>
+    <button type="button" class="settings-tab" data-tab="correction">校正格式</button>
   </div>
   <div class="settings-panels">
     <div class="settings-panel" id="panel-shortcuts">
       <p style="font-size:12px;color:#5a6b7c;margin:8px 0;">每个操作绑定一个组合键；点击某行后按下新组合键完成绑定，Del/Backspace 清除，Esc 取消。绑定保存在本浏览器（localStorage）并同步到配置文件。</p>
       <table id="shortcutTable"></table>
       <div style="margin-top:8px;"><button type="button" id="resetShortcutsBtn">恢复默认</button></div>
+      <h4 style="margin:18px 0 4px;">鼠标动作</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">按住鼠标中键滑动触发对应操作（如中键上滑 = 居中）。点击某行后按住中键滑动完成绑定，Del/Backspace 清除，Esc 取消。绑定保存在配置文件。</p>
+      <table id="mouseShortcutTable"></table>
+      <div style="margin-top:8px;"><button type="button" id="resetMouseShortcutsBtn">恢复默认</button></div>
     </div>
     <div class="settings-panel" id="panel-fonts" style="display:none;">
-      <p style="font-size:12px;color:#5a6b7c;margin:8px 0;">设置各类文本的字体族（CSS font-family），留空则使用浏览器默认。修改后实时生效，保存到配置文件。</p>
+      <p style="font-size:12px;color:#5a6b7c;margin:8px 0;">设置各类文本的字体（CSS font-family）。默认「不修改」= 使用阅读器默认字体，不额外指定。</p>
       <div style="display:grid;grid-template-columns:120px 1fr;gap:8px 12px;align-items:center;margin-top:8px;">
         <label>正文字体</label>
-        <input type="text" id="fontBody" placeholder="如：serif, 'Microsoft YaHei', sans-serif" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+        <select id="fontBody" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+          <option value="">默认（不修改，使用阅读器默认）</option>
+          <option value="宋体, SimSun, serif">宋体</option>
+          <option value="黑体, SimHei, sans-serif">黑体</option>
+          <option value="楷体, KaiTi, serif">楷体</option>
+          <option value="仿宋, FangSong, serif">仿宋</option>
+          <option value="微软雅黑, Microsoft YaHei, sans-serif">微软雅黑</option>
+          <option value="等线, DengXian, sans-serif">等线</option>
+          <option value="serif">serif（衬线）</option>
+          <option value="sans-serif">sans-serif（无衬线）</option>
+          <option value="monospace">monospace（等宽）</option>
+          <option value="cursive">cursive（手写）</option>
+        </select>
         <label>标题字体</label>
-        <input type="text" id="fontHeading" placeholder="如：sans-serif, 'Microsoft YaHei', serif" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+        <select id="fontHeading" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+          <option value="">默认（不修改，使用阅读器默认）</option>
+          <option value="宋体, SimSun, serif">宋体</option>
+          <option value="黑体, SimHei, sans-serif">黑体</option>
+          <option value="楷体, KaiTi, serif">楷体</option>
+          <option value="仿宋, FangSong, serif">仿宋</option>
+          <option value="微软雅黑, Microsoft YaHei, sans-serif">微软雅黑</option>
+          <option value="等线, DengXian, sans-serif">等线</option>
+          <option value="serif">serif（衬线）</option>
+          <option value="sans-serif">sans-serif（无衬线）</option>
+          <option value="monospace">monospace（等宽）</option>
+          <option value="cursive">cursive（手写）</option>
+        </select>
         <label>注释字体</label>
-        <input type="text" id="fontNote" placeholder="如：serif, 'KaiTi', sans-serif" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+        <select id="fontNote" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+          <option value="">默认（不修改，使用阅读器默认）</option>
+          <option value="宋体, SimSun, serif">宋体</option>
+          <option value="黑体, SimHei, sans-serif">黑体</option>
+          <option value="楷体, KaiTi, serif">楷体</option>
+          <option value="仿宋, FangSong, serif">仿宋</option>
+          <option value="微软雅黑, Microsoft YaHei, sans-serif">微软雅黑</option>
+          <option value="等线, DengXian, sans-serif">等线</option>
+          <option value="serif">serif（衬线）</option>
+          <option value="sans-serif">sans-serif（无衬线）</option>
+          <option value="monospace">monospace（等宽）</option>
+          <option value="cursive">cursive（手写）</option>
+        </select>
         <label>引用字体</label>
-        <input type="text" id="fontCitation" placeholder="如：cursive, 'FangSong', serif" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+        <select id="fontCitation" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+          <option value="">默认（不修改，使用阅读器默认）</option>
+          <option value="宋体, SimSun, serif">宋体</option>
+          <option value="黑体, SimHei, sans-serif">黑体</option>
+          <option value="楷体, KaiTi, serif">楷体</option>
+          <option value="仿宋, FangSong, serif">仿宋</option>
+          <option value="微软雅黑, Microsoft YaHei, sans-serif">微软雅黑</option>
+          <option value="等线, DengXian, sans-serif">等线</option>
+          <option value="serif">serif（衬线）</option>
+          <option value="sans-serif">sans-serif（无衬线）</option>
+          <option value="monospace">monospace（等宽）</option>
+          <option value="cursive">cursive（手写）</option>
+        </select>
       </div>
       <div style="margin-top:12px;padding-top:8px;border-top:1px solid var(--border);">
         <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
@@ -832,16 +1342,176 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <h4 style="margin:16px 0 4px;">纠错悬浮窗</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">鼠标悬停校正文本超过设定时间（毫秒）自动弹出采纳/忽略菜单；0 = 悬停即弹出。</p>
       <label style="font-size:13px;">悬停弹出延迟（毫秒） <input type="number" id="errHoverDelayInput" min="0" max="10000" step="100" style="width:90px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="prAutoJump" style="width:16px;height:16px;">
+        采纳/忽略后自动跳到下一个错误（默认开启）
+      </label>
+      <p style="font-size:12px;color:#5a6b7c;margin:4px 0 0;">开启后，点击「采纳」或「忽略」会自动滚动定位到本页下一个错误并弹出悬浮菜单（不会跳到其他页）；关闭后保持原位，需自行找到下一个错误。</p>
+      <h4 style="margin:16px 0 4px;">增强格式刷</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">武装「合并段落」刷后，拖选多段并停稳超过该时间（毫秒）才自动合并，避免拖选途中瞬时覆盖多段就误合并；0 = 停稳即合并（最快）。正文 / 注释 / 引用 / 加粗 / 斜体单个武装时，先用鼠标选中词语或句子再点击段落，即只对选中文字生效；未选中或混合多个功能时作用于整段。</p>
+      <label style="font-size:13px;">合并延迟（毫秒） <input type="number" id="brushMergeDelayInput" min="0" max="5000" step="100" style="width:90px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="brushMergeOnLeaveInput" style="width:16px;height:16px;">
+        选中后失去焦点/移开即合并（默认开启）
+      </label>
       <h4 style="margin:16px 0 4px;">编辑器字号</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">调整编辑区显示字号（视图偏好，不写入保存内容）。</p>
       <label style="font-size:13px;">字号（px） <input type="number" id="editorFontSizeInput" min="10" max="28" step="1" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
+      <h4 style="margin:16px 0 4px;">纠错批处理</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">「校正 / 重识别」一次处理的页数：0 = 全部页（整本书，默认；校正后整本书的错误标注全部显示）；1-50 = 从当前页起向后处理 N 页。应用 / 清除默认仍只作用于当前页。重识别每页需模型推理，整本书耗时长，建议先设小批数。</p>
+      <label style="font-size:13px;">每批页数（0=全部） <input type="number" id="prBatchPages" min="0" max="50" step="1" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
+      <h4 style="margin:16px 0 4px;">撤销 / 回退</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">撤销（Ctrl+Z）/ 前进（Ctrl+Y）保留的历史步数；步数越多占用内存越大。</p>
+      <label style="font-size:13px;">历史步数
+        <select id="undoDepthInput" style="padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+          <option value="50">50 步</option>
+          <option value="100">100 步</option>
+          <option value="200">200 步</option>
+          <option value="500">500 步</option>
+        </select>
+      </label>
+      <h4 style="margin:16px 0 4px;">搜索结果</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">搜索/替换弹窗结果列表最多显示的条数（10-1000，默认 200）。匹配总数始终完整统计并显示，超出上限时提示「仅显示前 N 条」；列表非虚拟渲染，设得越大滚动越可能卡顿。EPUB 编辑器的章内搜索读取同一设置。</p>
+      <label style="font-size:13px;">显示上限（条） <input type="number" id="searchMaxResultsInput" min="10" max="1000" step="10" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
+      <h4 style="margin:16px 0 4px;">文字页面行号</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">在虚拟列表各页的文字左侧显示行号（每页从 1 重新计起，与原书页码无关）。行号供命令行按行号寻址使用（Ctrl+; 打开命令行，例如 7,10merge 合并第 7-10 行）。纯视图层，不写入保存内容，也不影响导出。</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
+        <input type="checkbox" id="lineNumShow" style="width:16px;height:16px;">
+        显示行号
+      </label>
+      <label style="font-size:13px;display:flex;align-items:center;gap:8px;margin-top:8px;">行号栏尺寸
+        <select id="lineNumSizeSel" style="padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+          <option value="small">小</option>
+          <option value="medium">中</option>
+          <option value="large">大</option>
+        </select>
+      </label>
+      <h4 style="margin:16px 0 4px;">正文对齐</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">矫正页正文默认两端对齐（分散对齐），段落左右边缘整齐更美观。关闭后按浏览器默认（左对齐）。纯视图层，不影响保存与导出；手动设置的逐块对齐仍然生效。</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
+        <input type="checkbox" id="textJustifyToggle" style="width:16px;height:16px;">
+        正文两端对齐
+      </label>
+      <h4 style="margin:16px 0 4px;">智能清理规则</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">「智能清理」按钮各步骤的启用开关。仅作用于清理结果，不影响未清理内容；关闭某步即清理时跳过该步。</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="cleanPunctuationChk" style="width:16px;height:16px;">
+        中英文标点归一（逗号 / 句号 / 括号等半角 → 全角；纯英文页保留半角）
+      </label>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：你好,世界 → 你好，世界；测试() → 测试（）</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="cleanSymbolsChk" style="width:16px;height:16px;">
+        扩展符号归一（引号 / 方括号 / 破折号 / 波浪号 + 省略号长度统一）
+      </label>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：看[注] → 看【注】，a--b → a——b</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="cleanMdTagsChk" style="width:16px;height:16px;">
+        清理 Markdown 残留标记（**粗体** / ~~删除~~ / `代码`）
+      </label>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：**重点** → 重点，~~删除~~ → 删除</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="cleanHtmlTagsChk" style="width:16px;height:16px;">
+        清理非富文本 HTML 标签（保留 strong / em / span / br / img 等）
+      </label>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：&lt;font color="red"&gt;红&lt;/font&gt; → 红</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="cleanParagraphsChk" style="width:16px;height:16px;">
+        段落合并优化（OCR 误拆段落自动合并，默认关闭）
+      </label>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：&lt;p&gt;未完&lt;/p&gt;&lt;p&gt;待续&lt;/p&gt; → &lt;p&gt;未完待续&lt;/p&gt;</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="cleanDigitPunctChk" style="width:16px;height:16px;">
+        数字标点归一（数字紧跟的中文标点 → 英文）
+      </label>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：1。2 → 1.2，1，2 → 1,2，1。 → 1.；映射表可在下方自定义</p>
+      <div style="margin-top:12px;padding:8px;background:#f8f9fa;border-radius:4px;">
+        <p style="font-size:12px;color:#5a6b7c;margin:0 0 4px;">实时预览（输入文本查看清理效果）</p>
+        <textarea id="cleanPreviewInput" rows="2" style="width:100%;box-sizing:border-box;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;resize:vertical;" placeholder="输入文本查看清理效果..."></textarea>
+        <div id="cleanPreviewOut" style="margin-top:4px;padding:4px 6px;background:#fff;border:1px solid var(--border);border-radius:4px;font-size:13px;min-height:20px;"></div>
+      </div>
+      <div style="margin-top:12px;padding:8px;background:#f8f9fa;border-radius:4px;">
+        <p style="font-size:12px;color:#5a6b7c;margin:0 0 4px;">符号映射表（每行一条：半角 → 全角，如 <code>[ → 【</code>）</p>
+        <textarea id="cleanSymbolMapEditor" rows="5" style="width:100%;box-sizing:border-box;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;resize:vertical;" placeholder="[ → 【&#10;] → 】&#10;-- → ——&#10;~ → ～"></textarea>
+        <p style="font-size:11px;color:#8a9bab;margin:4px 0 0;">自定义符号归一映射。留空则恢复默认。修改后自动保存并更新预览。</p>
+      </div>
+      <div style="margin-top:12px;padding:8px;background:#f8f9fa;border-radius:4px;">
+        <p style="font-size:12px;color:#5a6b7c;margin:0 0 4px;">数字标点映射表（每行一条：中文标点 → 英文，如 <code>。 → .</code>）</p>
+        <textarea id="cleanDigitPunctMapEditor" rows="5" style="width:100%;box-sizing:border-box;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;resize:vertical;" placeholder="。 → .&#10;， → ,&#10;、 → ,&#10;： → :&#10;； → ;"></textarea>
+        <p style="font-size:11px;color:#8a9bab;margin:4px 0 0;">只替换「紧跟数字」的中文标点（1。2 → 1.2、1，2 → 1,2、1。 → 1.），且仅单字符源生效。留空则恢复默认。修改后自动保存并更新预览。</p>
+      </div>
+      <h4 style="margin:16px 0 4px;">表格</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">自动把识别/导入文本里的文字表格（Markdown 管道表、画框表）转成原生表格。关闭后仍可用工具栏「转成表格」或选中文字后的悬浮菜单手动转换。与主设置的「识别表格转换为表格」是同一个开关（config 顶层 table_convert）。</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
+        <input type="checkbox" id="tableConvertChk" style="width:16px;height:16px;">
+        自动把文字表格转换为表格
+      </label>
       <h4 style="margin:16px 0 4px;">格式规则</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">把规则应用到全部页前先弹出确认，防止误操作大范围改动。</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
         <input type="checkbox" id="ruleAllPagesConfirm" style="width:16px;height:16px;">
         格式规则应用到全部页前需确认
       </label>
+      <h4 style="margin:16px 0 4px;">自动备份</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">编辑过程中按间隔自动备份到本地历史，防止意外丢失。备份不改变「已保存」状态，也进入历史版本管理。</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:8px;">
+        <input type="checkbox" id="autoSaveEnabled" style="width:16px;height:16px;">
+        启用自动备份
+      </label>
+      <label style="font-size:13px;display:flex;align-items:center;gap:8px;">间隔（分钟）
+        <input type="number" id="autoSaveInterval" min="1" max="60" step="1" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;">
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="autoSaveNewBackup" style="width:16px;height:16px;">
+        每次备份生成新历史版本（不勾选则更新最近一版）
+      </label>
       <div style="margin-top:12px;"><button type="button" id="resetUiSettingsBtn">恢复默认</button></div>
+    </div>
+    <div class="settings-panel" id="panel-popup" style="display:none;">
+      <p style="font-size:12px;color:#5a6b7c;margin:8px 0;">选中文字时弹出的快捷菜单分两行按钮，第三行是格式规则快捷按钮。每行可自由调整顺序、移出或加回按钮；改动即时生效并保存到配置文件。</p>
+      <h4 style="margin:14px 0 4px;">第一行按钮</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 2px;">▲/▼ 调整顺序，✕ 移出菜单；移出的按钮回到下方下拉框中，可随时加回。</p>
+      <div id="popupRow1List" class="pop-edit-list"></div>
+      <div class="pop-edit-add">
+        <select id="popupRow1AddSel" title="从备选操作中添加按钮到第一行"></select>
+        <button type="button" id="popupRow1AddBtn">添加</button>
+      </div>
+      <h4 style="margin:18px 0 4px;">第二行按钮</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 2px;">同上：调整顺序或移出菜单。</p>
+      <div id="popupRow2List" class="pop-edit-list"></div>
+      <div class="pop-edit-add">
+        <select id="popupRow2AddSel" title="从备选操作中添加按钮到第二行"></select>
+        <button type="button" id="popupRow2AddBtn">添加</button>
+      </div>
+      <h4 style="margin:18px 0 4px;">规则快捷按钮</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">第三行显示格式规则菜单前 N 项（设置为 0 则不显示规则按钮）。</p>
+      <label style="font-size:13px;">规则按钮数量 <input type="number" id="popupRuleCountInput" min="0" max="10" step="1" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
+      <div style="margin-top:12px;"><button type="button" id="resetPopupSettingsBtn">恢复默认</button></div>
+    </div>
+    <div class="settings-panel" id="panel-correction" style="display:none;">
+      <p style="font-size:12px;color:#5a6b7c;margin:8px 0;">大模型「重识别」返回的文本在与原文逐字对比前，先剥离与内容无关的格式字符（Markdown 标记、LaTeX 公式与命令），避免 **、$、\frac 之类被当成纠错项。默认关闭；开启后仅作用于重识别结果，不影响普通 OCR 流程。</p>
+      <label style="display:block;font-size:13px;margin:10px 0 6px;"><input type="checkbox" id="cfEnabled"> 启用校正格式清理（重识别结果对比前）</label>
+      <div style="display:grid;grid-template-columns:1fr;gap:6px;margin:6px 0 6px 22px;">
+        <label style="font-size:13px;"><input type="checkbox" id="cfStripMarkdown"> 去 Markdown 标记（**粗体**、# 标题、- 列表、`代码` 等，保留文字）</label>
+        <label style="font-size:13px;"><input type="checkbox" id="cfStripLatex"> 去 LaTeX 命令/环境标记（$…$、\frac{a}{b}、\textcircled{n} 等，保留公式内容）</label>
+        <label style="font-size:13px;"><input type="checkbox" id="cfRemoveFormula"> 整段移除 LaTeX 公式（连同公式内容一并删除，比上一项更激进）</label>
+      </div>
+      <h4 style="margin:16px 0 4px;">自定义清理规则</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">在上面的默认清理之后再按顺序执行（正则替换，作用于重识别返回文本）。用于补足默认规则未覆盖的格式残留。</p>
+      <div id="cfRulesList"></div>
+      <div class="rr-edit-grid" style="margin-top:8px;">
+        <label>规则名称 <input type="text" id="cfRuleName" placeholder="如：去行首圈码"></label>
+        <label>正则表达式 <input type="text" id="cfRulePattern" placeholder="如：^[①-⑳]\s*"></label>
+        <label>标志 <input type="text" id="cfRuleFlags" placeholder="i m u（忽略留空）" title="可选：i 忽略大小写 / m 多行 / u Unicode"></label>
+        <label>替换为 <input type="text" id="cfRuleReplacement" placeholder="留空 = 删除匹配内容"></label>
+      </div>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center;">
+        <button type="button" id="cfRuleSaveBtn" class="primary">添加规则</button>
+        <button type="button" id="cfRuleCancelBtn" style="display:none;">取消编辑</button>
+      </div>
+      <h4 style="margin:16px 0 4px;">预览</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">粘贴一段模型返回的文本，实时查看按当前设置清理后的结果（仅预览，不保存、不落盘）。</p>
+      <textarea id="cfPreviewInput" rows="3" style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;resize:vertical;" placeholder="**加粗** 与 $\frac{1}{2}$ 与 \textcircled{1}"></textarea>
+      <textarea id="cfPreviewOut" rows="3" readonly style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;margin-top:6px;background:#f7f9fc;resize:vertical;"></textarea>
     </div>
   </div>
   <button type="button" id="closeSettings" class="primary" style="margin-top:12px;">关闭</button>
@@ -869,6 +1539,31 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
     <button type="button" id="formatRuleNewBtn" class="primary">新建规则</button>
     <button type="button" id="formatRulesApplyAllBtn" title="按列表顺序执行全部规则；冲突格式（对齐/块标签互斥、remove 与其他）自动跳过">应用全部规则</button>
+  </div>
+</div></div>
+<div id="replaceRulesModalBg"><div class="modal" style="max-width:680px;">
+  <div class="search-head"><h3>替换规则</h3><button type="button" id="replaceRulesCloseBtn" class="x-btn" title="关闭" aria-label="关闭">✕</button></div>
+  <p style="font-size:12px;color:#5a6b7c;margin-top:0;">把带保留组的正则替换保存为规则，一键应用到当前页或全部页面。规则与「替换当前/全部替换」使用相同的保留组语义：勾选保留的捕获组原样保留，只替换其余部分。</p>
+  <div id="rrList"></div>
+  <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
+    <button type="button" id="rrNewBtn" class="primary">新建规则</button>
+  </div>
+</div></div>
+<div id="rrEditModalBg"><div class="modal" style="max-width:640px;">
+  <div class="search-head"><h3 id="rrEditTitle">新建替换规则</h3><button type="button" id="rrEditCloseBtn" class="x-btn" title="关闭" aria-label="关闭">✕</button></div>
+  <div class="rr-edit-grid">
+    <label>规则名称 <input type="text" id="rrName" placeholder="如：章标题去圈码"></label>
+    <label>正则表达式 <input type="text" id="rrPattern" placeholder="/第([一二三四五六七八九十百千]+)章/ 或 第([一二三四五六七八九十百千]+)章"></label>
+    <label>标志 <input type="text" id="rrFlags" placeholder="i m s u（忽略留空）" title="可选：i 忽略大小写 / m 多行 / s 点号匹配换行 / u Unicode"></label>
+    <label>替换为 <input type="text" id="rrReplacement" placeholder="如：$1 章（$1 引用捕获组）"></label>
+  </div>
+  <div class="kg-row" id="rrKeepGroupsRow" title="捕获组原样保留，只替换其余部分；组0=整段匹配全部保留">
+    <span class="kg-hint">保留组</span>
+    <div class="kg-chips" id="rrKeepChips"></div>
+  </div>
+  <div style="margin-top:12px;display:flex;justify-content:flex-end;gap:8px;">
+    <button type="button" id="rrEditCancelBtn">取消</button>
+    <button type="button" id="rrEditSaveBtn" class="primary">保存规则</button>
   </div>
 </div></div>
 <div id="frRuleModalBg"><div class="modal" style="max-width:760px;">
@@ -958,6 +1653,11 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
     <button type="button" class="img-pop-btn" data-img-op="size" data-img-val="w50">50%</button>
     <button type="button" class="img-pop-btn" data-img-op="size" data-img-val="w75">75%</button>
     <button type="button" class="img-pop-btn" data-img-op="size" data-img-val="w100">100%</button>
+    <!-- 自定义宽度（2026-10）：整数百分比 1-100，写入 img 的行内 style="width:NN%"
+         （与五个固定档位互斥，见 ui/app.js 的 size / size-custom 分支） -->
+    <input type="number" id="imgCustomW" min="1" max="100" step="1" placeholder="自定义 1-100"
+           aria-label="自定义图片宽度（1-100 百分比）" title="输入 1-100 的整数百分比宽度，按回车或点「应用」生效（与五个固定档位互斥）">
+    <button type="button" class="img-pop-btn" data-img-op="size-custom" title="按输入值设置图片宽度（1-100 整数百分比）">应用</button>
   </div>
   <div id="imgPosRow" style="display:flex;flex-wrap:wrap;gap:4px;">
     <span style="width:100%;font-size:12px;color:#666;">位置</span>
@@ -973,6 +1673,56 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   </div>
   <div style="display:flex;gap:4px;margin-top:2px;">
     <button type="button" class="img-pop-btn" data-img-op="delete" style="flex:1;color:#c0392b;">删除</button>
+  </div>
+</div>
+<!-- 表格操作条（2026-10 增强）：光标进入表格单元格时弹出。快捷项=常用操作；
+     「更多 ▾」菜单与表格内右键菜单同源（插入/移动行列、垂直对齐、表头、均分列宽、重置尺寸）。 -->
+<div id="tblBar" style="display:none;" aria-label="表格操作">
+  <button type="button" data-tbl-op="addrow" title="下方插入一行">加行</button>
+  <button type="button" data-tbl-op="addcol" title="右侧插入一列">加列</button>
+  <button type="button" data-tbl-op="merge" title="合并选中的多个单元格（在表格内拖选，或按住 Shift 点选）">合并</button>
+  <button type="button" data-tbl-op="split" title="拆分当前已合并的单元格">拆分</button>
+  <button type="button" data-tbl-op="colwidth" title="设置当前列宽（百分比）">列宽</button>
+  <button type="button" data-tbl-op="rowheight" title="设置当前行高">行高</button>
+  <span class="tbl-bar-sep"></span>
+  <button type="button" data-tbl-op="alignleft" data-tbl-align="left" title="单元格左对齐">左</button>
+  <button type="button" data-tbl-op="aligncenter" data-tbl-align="center" title="单元格居中">中</button>
+  <button type="button" data-tbl-op="alignright" data-tbl-align="right" title="单元格右对齐">右</button>
+  <span class="tbl-bar-sep"></span>
+  <button type="button" data-tbl-op="more" title="更多表格操作（插入/移动行列、垂直对齐、表头、均分列宽…）">更多 ▾</button>
+  <button type="button" data-tbl-op="deltable" class="danger" title="删除整个表格">删除表格</button>
+</div>
+<!-- 表格「更多」菜单：与表格内右键菜单同源（JS 打开并填充） -->
+<div id="tblMenu" style="display:none;" role="menu" aria-label="表格菜单"></div>
+<!-- 表格列/行尺寸拖拽手柄层：覆盖在表格上；层本身 pointer-events:none，仅手柄可拖 -->
+<div id="tblResizeLayer" aria-hidden="true"></div>
+<!-- 单元格/行列尺寸弹窗（2026-10）：列宽(%)、行高(数值+单位) -->
+<div id="tblSizeModalBg" class="modal-bg" style="display:none;">
+  <div class="modal" style="max-width:420px;">
+    <div class="search-head"><h3>单元格尺寸</h3><button type="button" id="tblSizeCancel" class="x-btn" title="关闭" aria-label="关闭">✕</button></div>
+    <p id="tblSizeHint" style="font-size:12px;color:var(--text-muted);margin:6px 0 0;"></p>
+    <div class="tbl-size-grid">
+      <label for="tblSizeColWidth">列宽</label>
+      <span><input type="number" id="tblSizeColWidth" min="1" max="100" step="1" placeholder="留空不改"> <span style="color:#889">%</span></span>
+      <label for="tblSizeRowHeight">行高</label>
+      <span><input type="number" id="tblSizeRowHeight" min="1" max="2000" step="1" placeholder="留空不改"> <select id="tblSizeRowUnit"><option value="em">em</option><option value="px">px</option></select></span>
+    </div>
+    <div class="export-actions">
+      <button type="button" id="tblSizeCancelBtn">取消</button>
+      <button type="button" id="tblSizeApply" class="primary">应用</button>
+    </div>
+  </div>
+</div>
+<!-- 清理预览模态框（2026-10-16）：展示清理统计报告，确认后应用 -->
+<div id="cleanPreviewBg" class="modal-bg" style="display:none;">
+  <div class="modal" style="max-width:640px;max-height:80vh;overflow:auto;">
+    <div class="search-head"><h3>清理预览</h3><button type="button" id="cleanPreviewCancel" class="x-btn" title="关闭" aria-label="关闭">✕</button></div>
+    <p id="cleanPreviewSummary" style="font-size:13px;color:#33414f;font-weight:600;margin:8px 0;"></p>
+    <div id="cleanPreviewList" style="font-size:12px;color:#5a6b7c;line-height:1.8;max-height:40vh;overflow:auto;"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;">
+      <button type="button" id="cleanPreviewCancelBtn">取消</button>
+      <button type="button" id="cleanPreviewApply" class="primary">应用清理</button>
+    </div>
   </div>
 </div>
 <div id="toast" aria-hidden="true"></div>

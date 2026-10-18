@@ -962,10 +962,20 @@ const clone = range.cloneRange();
   }
 
   // ---------- 搜索 / 替换（当前章范围） ----------
-  // searchResults 为当前结果列表（上限 200 条），searchCurrent 为当前选中序号。
+  // searchResults 为当前结果列表（上限 = ui_settings.search_max_results，默认 200 条，可
+  // 在矫正界面设置-界面修改；经 /api/ui_settings 读取），searchCurrent 为当前选中序号。
   // 高亮为视图层（<mark class="ptoe-search">），不进影子数组——同步写回时剥离。
   let searchResults = [];
   let searchCurrent = -1;
+  let searchMaxResults = 200; // 搜索结果列表显示上限（10-1000，默认 200；服务端持久化）
+  // 拉取搜索结果上限（打开搜索弹窗时刷新：矫正界面改设置后无需重启编辑器即生效）
+  async function refreshSearchMaxResults() {
+    try {
+      const res = await fetchJSON('/api/ui_settings');
+      const v = res && res.ok && res.ui_settings ? parseInt(res.ui_settings.search_max_results, 10) : NaN;
+      if (isFinite(v)) searchMaxResults = Math.max(10, Math.min(1000, v));
+    } catch (e) { /* 保留默认 200：设置读取失败不影响搜索 */ }
+  }
   let _searchHighlightQuery = '';
   let _pendingSearchIdx = -1; // 从右键菜单打开时锁定的章（否则跟随当前章）
   let searchModalOpen = false;
@@ -1017,6 +1027,7 @@ const clone = range.cloneRange();
   }
   function openSearchModal(pinIdx) {
     searchModalOpen = true;
+    refreshSearchMaxResults(); // 打开时刷新上限设置（失败保留现值，非阻塞）
     // 打开时锁定搜索章（右键菜单显式锁定；工具栏打开则取「当前章」快照）。
     // 不能在 searchPages/replaceAll 时再解析 currentIdx()——打开后焦点已移到
     // searchInput，选区/焦点信号失效，会退回错章（2026-09 修复）。
@@ -1042,7 +1053,7 @@ const clone = range.cloneRange();
     catch (e) { toast('正则表达式无效：' + e.message, 'fail'); return; }
     const i = (_pendingSearchIdx >= 0 && _pendingSearchIdx < articles.length) ? _pendingSearchIdx : currentIdx();
     const text = pageText(i);
-    const CONTEXT = 40, MAX = 200;
+    const CONTEXT = 40, MAX = searchMaxResults; // 上限由设置（ui_settings.search_max_results）配置
     const results = [];
     let total = 0;
     re.lastIndex = 0;
@@ -1646,6 +1657,7 @@ const clone = range.cloneRange();
 
   // ---------- 初始化 ----------
   (async function init() {
+    refreshSearchMaxResults(); // 搜索结果上限设置（非阻塞，失败保留默认 200）
     try {
       const res = await fetchJSON('/api/book');
       if (!res || res.ok === false) throw new Error((res && res.error) || 'book 接口返回失败');
