@@ -127,10 +127,12 @@ POPUP_RULE_COUNT_MAX = 10
 UNDO_DEPTH_DEFAULT = 100
 UNDO_DEPTH_CHOICES = (50, 100, 200, 500)
 # 搜索结果列表显示上限（矫正界面 + EPUB 编辑器 ui_settings.search_max_results；2026-10-18）：
-# 搜索仍统计真实总数，超出上限只存储/渲染前 N 条（列表 DOM 非虚拟化，过大拖慢渲染）。
+# 搜索仍统计真实总数，超出上限只存储前 N 条。结果列表已改「虚拟滚动」（只渲染视口内的
+# 行，见 correctmanage 的 #searchList / ui/app.js 的 _srRenderWindow），故上限放宽到
+# 1,000,000 也不会因一次建海量 DOM 而卡死（2026-10-19）。
 SEARCH_MAX_RESULTS_DEFAULT = 200
 SEARCH_MAX_RESULTS_MIN = 10
-SEARCH_MAX_RESULTS_MAX = 1000
+SEARCH_MAX_RESULTS_MAX = 1000000
 # 文字页面行号栏尺寸档位（矫正界面 ui_settings.line_num_size；2026-10）：
 # 控制行号字号与左侧留白/数字-正文间距。默认大（large）。
 LINE_NUM_SIZE_DEFAULT = "large"
@@ -144,19 +146,25 @@ CLEAN_SETTINGS_DEFAULTS = {
     "clean_html_tags": True,
     "clean_paragraphs": False,
     "clean_digit_punct": True,
+    # clean_blank_lines：导出时清理空白行（空段落 / 仅空白、<br>、&nbsp;、全角空格的段落），
+    # 默认关（保守，不改变既有导出的换行密度）。2026-10 新增，作用于 TXT/MD/DOCX/EPUB
+    # 的导出阶段（导出前删除空白段落），与 clean_paragraphs（段合并）相互独立。
+    "clean_blank_lines": False,
 }
 # 符号映射表默认值（ui_settings.clean_symbol_map；2026-10）：
 # 用户可自定义「符号归一」步骤的半角→全角映射，如保留 -- 不转 ——。
 CLEAN_SYMBOL_MAP_DEFAULT = [["[", "【"], ["]", "】"], ["--", "——"], ["~", "～"]]
 _CLEAN_SYMBOL_MAP_MAX_ITEMS = 32
-# 数字标点映射表默认值（ui_settings.clean_digit_punct_map；2026-10）：
-# 数字紧跟的中文标点 → 英文（1。2 → 1.2、1，2 → 1,2、1。 → 1.）；仅单字符源生效。
+# 数字标点映射表默认值（ui_settings.clean_digit_punct_map；2026-10，2026-10-18 新增 ．→ .）：
+# 数字/字母紧跟的中文标点 → 英文（1。2 → 1.2、H，W → H,W、1。 → 1.）；仅单字符源生效。
+# 该开关（clean_digit_punct）同时控制数字间/单字母间空格清理（1 2 → 12、M a r x → Marx）。
 CLEAN_DIGIT_PUNCT_MAP_DEFAULT = [
     ["。", "."],
     ["，", ","],
     ["、", ","],
     ["：", ":"],
     ["；", ";"],
+    ["．", "."],
 ]
 _CLEAN_DIGIT_PUNCT_MAP_MAX_ITEMS = 32
 
@@ -465,11 +473,26 @@ DEFAULT_CONFIG = {
         "clean_md_tags": True,
         "clean_html_tags": True,
         "clean_paragraphs": False,
+        # clean_blank_lines：导出时清理空白行（空段落 / 仅空白、<br>、&nbsp;、全角空格），
+        # 默认关。作用在导出阶段（TXT/MD/DOCX/EPUB），与 clean_paragraphs（相邻短段合并）独立。
+        "clean_blank_lines": False,
         "clean_symbol_map": CLEAN_SYMBOL_MAP_DEFAULT,
-        # clean_digit_punct：数字里夹的中文标点换英文（1。2→1.2 / 1，2→1,2 / 1。→1.），默认开；
+        # clean_digit_punct：数字/字母里夹的中文标点换英文（1。2→1.2 / H，W→H,W / 1。→1.），
+        #   并清理数字间/单字母间空格（1 2→12、M a r x→Marx，英文短语保留），默认开
+        #   （2026-10-18 扩展，见 stringmanage.normalize_digit_punct / clean_alnum_spaces）；
         # clean_digit_punct_map：该规则的自定义映射表（源必须单字符），可在设置面板修改。
         "clean_digit_punct": True,
         "clean_digit_punct_map": CLEAN_DIGIT_PUNCT_MAP_DEFAULT,
+        # 表格内浮层菜单开关（2026-10，默认全部关）：控制鼠标操作落在表格内时是否弹出
+        # 对应浮层；只影响表格范围，表格外行为不变。三个选项独立控制：
+        # tbl_popup_menu：表格内选中文字时是否弹「选中文字快捷菜单」（#popup）；
+        # tbl_ctx_menu：表格内右击时是否弹「右键菜单」（#contextMenu，页级操作）；
+        # tbl_tbl_menu：表格内右击时是否弹「表格菜单」（#tblMenu，加行/加列等；
+        #   表格操作条「更多 ▾」按钮为显式点击，不受此开关影响，仍可打开表格菜单）。
+        # 全部关闭时表格内右击回退浏览器默认菜单（复制/粘贴）。
+        "tbl_popup_menu": False,
+        "tbl_ctx_menu": False,
+        "tbl_tbl_menu": False,
     },
     # 图片预处理（2026-08，OpenCV）：PDF 分割图片时启用，提高 OCR 识别率。
     # enabled 开关；gray 灰度 / denoise 中值去噪 / sharpen 锐化 / binarize 自适应二值化；
@@ -1051,7 +1074,7 @@ def set_ui_settings(ui: dict) -> dict:
             v = UNDO_DEPTH_DEFAULT
         clean["undo_depth"] = v if v in UNDO_DEPTH_CHOICES else UNDO_DEPTH_DEFAULT
     if "search_max_results" in ui:
-        # 搜索结果列表显示上限：10-1000 的整数，非数值/越界按既有数值键口径 clamp（默认 200）
+        # 搜索结果列表显示上限：10-1000000 的整数，非数值/越界按既有数值键口径 clamp（默认 200）
         try:
             v = int(ui["search_max_results"])
         except (TypeError, ValueError):

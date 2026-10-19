@@ -55,6 +55,32 @@ class TestTableRefactor(unittest.TestCase):
         self.assertIn("function _tblInOwnUI(el) {", self.js)
         self.assertIn("if (_tblInOwnUI(e.target)) return;", self.js)
 
+    def test_align_grid_popup_and_range_targets(self):
+        # 3×3 对齐九宫格（2026-10）：一次设置水平+垂直；有跨格选区时作用于整个选区
+        self.assertIn("let _tblAlignGridEl = null;", self.js)
+        for fn in ("_ensureTblAlignGrid", "_tblAlignGridOpen", "_tblAlignGridClose",
+                   "_tblSyncAlignGridActive", "_tblTargetCells", "_tblVAlignOf",
+                   "_tblVAlignClassOf"):
+            self.assertIn("function %s(" % fn, self.js, "缺函数 " + fn)
+        self.assertIn("_tblDoOp('aligngrid:' + b.dataset.tblAgH + ':' + b.dataset.tblAgV);", self.js)
+        self.assertIn("op === 'aligngrid'", self.js)
+        # 操作条「对齐 ▾」按钮 + 九宫格容器，且九宫格层级高于「更多」菜单
+        self.assertIn('data-tbl-op="aligngrid"', self.cm)
+        self.assertIn('id="tblAlignGrid"', self.cm)
+        m_grid = re.search(r"#tblAlignGrid\{position:fixed;z-index:(\d+)", self.cm)
+        m_menu = re.search(r"#tblMenu\{position:fixed;z-index:(\d+)", self.cm)
+        self.assertIsNotNone(m_grid, "未找到 #tblAlignGrid z-index")
+        self.assertIsNotNone(m_menu, "未找到 #tblMenu z-index")
+        self.assertGreater(int(m_grid.group(1)), int(m_menu.group(1)),
+                           "九宫格层级须高于「更多」菜单")
+
+    def test_table_rows_participate_in_line_numbers(self):
+        # 表格行也显示行号（连续编号）：CSS 计数器给 tr 计数，命令行口径一致
+        self.assertIn(".editable > table tr{counter-increment:ptoe-ln;}", self.cm)
+        self.assertIn("c.querySelectorAll('tr')", self.js)
+        self.assertIn("const tr = n.closest('tr');", self.js)
+
+
     # ---- B. 尺寸拖拽：快照 + 增量 ----
     def test_resize_helpers_exist(self):
         self.assertIn("function _tblSnapshotColPcts(table) {", self.js)
@@ -81,10 +107,21 @@ class TestTableRefactor(unittest.TestCase):
         self.assertIn("const GAP = 8;", self.js)
 
     def test_clicking_floating_layers_does_not_close_each_other(self):
-        # 点击 操作条/更多菜单/选中菜单 任一都不应关闭表格操作条
-        self.assertRegex(
+        # 点击 操作条/更多菜单/对齐九宫格/选中菜单 任一都不应关闭表格操作条。
+        # 2026-10 修复：守卫原先逐条列举 #tblBar/#tblMenu/#popup，漏了新上线的
+        # #tblAlignGrid —— 点九宫格选项时 mousedown 先触发 hideTblBar() 把 _tblKey
+        # 清空，随后 click 的 _tblDoOp 在入口守卫处静默返回，9 个位置全部「点了没反应」。
+        # 改为统一走 _tblInOwnUI（单一事实源），以后每加一个表格浮层都不会再漏。
+        self.assertIn(
+            "if (_tblKey && !_tblInOwnUI(e.target) && !e.target.closest('.editable td,.editable th')) hideTblBar();",
             self.js,
-            r"!e\.target\.closest\('#tblBar'\)[\s\S]{0,160}!e\.target\.closest\('#tblMenu'\)[\s\S]{0,160}!e\.target\.closest\('#popup'\)",
+            "「点击浮层外 → 收起操作条」守卫未覆盖全部表格浮层（九宫格/手柄层/尺寸弹窗）",
+        )
+        # _tblInOwnUI 的白名单必须含 #tblAlignGrid（否则点九宫格仍会误关操作条）
+        self.assertIn(
+            "'#tblBar,#tblMenu,#tblAlignGrid,#tblResizeLayer,#tblSizeModalBg,#popup'",
+            self.js,
+            "_tblInOwnUI 白名单缺 #tblAlignGrid",
         )
 
     # ---- D. 残表修复 ----
@@ -370,9 +407,122 @@ class TestTableDragLeftButtonOnly(unittest.TestCase):
 
     def test_cell_range_drag_requires_left_button(self):
         body = self._slice(
-            "if (mdMode || !e.target || !e.target.closest) return;", "#tblBar,#tblMenu"
+            "if (mdMode || !e.target || !e.target.closest) return;", "const hit = _tblCellOfNode(e.target);"
         )
         self.assertIn("if (e.button !== 0) return;", body, "单元格拖选 mousedown 未过滤按键")
+        # 自家浮层（含对齐九宫格）不起手拖选：否则点九宫格选项会顺手把多格矩形
+        # 选区（_tblSel）清空，对齐就只作用于光标那一格而非整个选区。
+        self.assertIn("if (_tblInOwnUI(e.target)) return;", body,
+                      "单元格拖选未排除自家浮层（点九宫格会清空多格选区）")
+
+
+class TestTableNoborderAndColumnsUi(unittest.TestCase):
+    """无边框表格 + 分栏 + 表格内浮层菜单开关（2026-10）静态契约。
+
+    锁定四条链路：
+    A. 无边框：表格菜单开关 → class="ptoe-noborder" → 编辑 CSS / 保存白名单 /
+       EPUB CSS / DOCX 边框同步；
+    B. 分栏：工具栏「分栏」按钮 → applyOp('columns') → convertSelectionToColumns，
+       表格菜单「表格转段落」可还原；
+    C. 表格内浮层菜单：设置弹窗三个复选框 → ui_settings 三键（默认关）→
+       选中菜单 / 右键菜单 / 表格菜单触发点门控（只影响表格）；
+    D. 两处 HTML（correctmanage._UI_HTML 与 ui_full.html 副本）同步。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = _read(os.path.join("ui", "app.js"))
+        cls.cm = _read("correctmanage.py")
+        cls.html = _read("ui_full.html")
+        cls.cfg = _read("configmanage.py")
+        cls.hm = _read("htmlmanage.py")
+
+    def test_noborder_toggle_frontend(self):
+        self.assertIn("const TBL_NOBORDER_CLASS = 'ptoe-noborder'", self.js)
+        self.assertIn("function _tblToggleNoborder(", self.js)
+        self.assertIn("function _tblHasNoborder(", self.js)
+        # 菜单项 + 激活态 + 分派
+        self.assertIn("{ op: 'noborder', label: '不显示边框' }", self.js)
+        self.assertIn("it.op === 'noborder' && _tblHasNoborder(_tblKey.table)", self.js)
+        self.assertIn("op === 'noborder'", self.js)
+        # 两处 HTML 的编辑区 CSS 同步（勿单边改动）
+        for name, html in (("correctmanage", self.cm), ("ui_full", self.html)):
+            self.assertIn(
+                ".editable table.ptoe-noborder th,.editable table.ptoe-noborder td{border:none;}",
+                html,
+                "%s 编辑区无边框 CSS 缺失" % name,
+            )
+
+    def test_noborder_backend(self):
+        # 保存白名单（表格级 class 只放行 ptoe-noborder）
+        self.assertIn('TBL_TABLE_CLASSES = ("ptoe-noborder",)', self.cm)
+        self.assertIn('_tbl_table_attrs', self.cm)
+        # EPUB CSS
+        self.assertIn("table.ptoe-noborder th, table.ptoe-noborder td {", self.hm)
+        # DOCX：六向 none + 调用点传 noborder
+        self.assertIn("noborder: bool = False", self.cm)
+        self.assertIn('noborder=bool(block.get("noborder"))', self.cm)
+        self.assertIn('self.tbl_noborder = "ptoe-noborder" in str(dict(attrs).get("class") or "").split()', self.cm)
+
+    def test_columns_entry_and_reversal(self):
+        # 工具栏「分栏」按钮：两处 HTML 同步 + data-op 走通用绑定
+        for name, html in (("correctmanage", self.cm), ("ui_full", self.html)):
+            self.assertRegex(
+                html, r'id="colsBtn"[^>]*data-op="columns"', "%s 分栏按钮" % name
+            )
+        self.assertIn("if (op === 'columns') { convertSelectionToColumns(); return; }", self.js)
+        self.assertIn("function convertSelectionToColumns()", self.js)
+        self.assertIn("function buildColumnsTable(", self.js)
+        # 分栏表 = 无边框 + fixed + 左窄右宽
+        self.assertIn("const COLS_LEFT_PCT = 25;", self.js)
+        self.assertIn("const COLS_RIGHT_PCT = 75;", self.js)
+        self.assertIn("table.className = TBL_NOBORDER_CLASS;", self.js)
+        # 2026-10 修复：左栏垂直居中走 ptoe-vmid class；inline vertical-align 会压过
+        # 对齐 class（顶端/底端永不生效），且九宫格只认 class → 恒显左上。
+        self.assertIn("ltd.classList.add('ptoe-vmid');", self.js)
+        self.assertNotIn("ltd.style.verticalAlign = 'middle';", self.js)
+        # 还原：表格菜单「表格转段落」
+        self.assertIn("{ op: 'uncolumn', label: '表格转段落' }", self.js)
+        self.assertIn("function _tblTableToParagraphs()", self.js)
+        self.assertIn("op === 'uncolumn'", self.js)
+
+    def test_in_table_menu_settings(self):
+        # 设置弹窗三个复选框（两处 HTML 同步）
+        for name, html in (("correctmanage", self.cm), ("ui_full", self.html)):
+            for chk in ("tblPopupMenuChk", "tblCtxMenuChk", "tblTblMenuChk"):
+                self.assertIn('id="%s"' % chk, html, "%s 缺 %s" % (name, chk))
+        # 前端默认值 + 持久化镜像
+        for key in ("tbl_popup_menu", "tbl_ctx_menu", "tbl_tbl_menu"):
+            self.assertIn("%s: false" % key, self.js)
+            self.assertIn("'ptoe_%s'" % key, self.js)
+        # 触发点门控：选中菜单 / 表格菜单 / 通用右键菜单（独立控制，只影响表格）
+        self.assertIn("_selectionTouchesTable(range, sel) && !uiBool('tbl_popup_menu', false)", self.js)
+        self.assertIn("const wantTblMenu = uiBool('tbl_tbl_menu', false);", self.js)
+        self.assertIn("const wantCtxMenu = uiBool('tbl_ctx_menu', false);", self.js)
+        # 判定函数存在
+        self.assertIn("function _selectionTouchesTable(", self.js)
+        # 后端：GET 合并 + POST 布尔校验
+        for key in ("tbl_popup_menu", "tbl_ctx_menu", "tbl_tbl_menu"):
+            self.assertIn('"%s": False' % key, self.cfg)
+            self.assertIn('"%s"' % key, self.cm)
+        self.assertIn('for _tk in ("tbl_popup_menu", "tbl_ctx_menu", "tbl_tbl_menu"):', self.cm)
+
+
+    def test_drag_paragraph_into_cell_preserves_format(self):
+        # 2026-10-19：整段（p/div/h1-6）拖进表格单元格时，浏览器原生拖放会清掉块的
+        # class/data-* → 段落设的「引用」等格式落格后显示成正文。前端自行接管：
+        # dragstart 记录整块 HTML，drop 落到单元格时按原样插入。
+        self.assertIn("let _dragBlkHtml = null;", self.js)
+        self.assertIn("let _dragBlkNodes = null;", self.js)
+        self.assertIn("function _dragWholeBlocks(ed) {", self.js)
+        self.assertIn("e.dataTransfer.setData('text/html', _dragBlkHtml);", self.js)
+        # 只接管「落进表格单元格」的场景，其余落点交回原生拖放
+        self.assertIn("const cell = nodeEl && nodeEl.closest ? nodeEl.closest('td,th') : null;", self.js)
+        self.assertIn("if (!cell || !dstEd.contains(cell)) return;", self.js)
+        self.assertIn("range.createContextualFragment(_dragBlkHtml)", self.js)
+        self.assertIn("histRun('拖入表格', pagesArr, function () {", self.js)
+        # dragstart/drop/dragend 都要清状态，避免残留影响下一次拖拽
+        self.assertEqual(self.js.count("_dragBlkHtml = null;"), 4)
 
 
 if __name__ == "__main__":

@@ -668,7 +668,7 @@ class _EpubEditHandler(BaseHTTPRequestHandler):
         """GET /api/ui_settings：返回编辑器关心的界面偏好（config.json 顶层 ui_settings）。
 
         只读（设置入口在矫正界面设置-界面），EPUB 编辑器章内搜索读取
-        search_max_results（结果列表显示上限，10-1000，默认 200），与矫正界面
+        search_max_results（结果列表显示上限，10-1000000，默认 200），与矫正界面
         全局搜索共用同一份配置。缺失/异常一律回退默认，不因配置读取失败而中断。"""
         max_results = 200
         try:

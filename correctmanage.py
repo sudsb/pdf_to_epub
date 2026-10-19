@@ -120,6 +120,9 @@ _NOTE_CLASS = "ptoe-note"
 # 纯样式承载类（无行内语义），须随保存/导出落盘；漏进 _block_classes/_block_class_html
 # 会被 sanitize 静默剥掉，症状为「保存后题注样式丢失」（本项目已有同型 bug）。
 _CAPTION_CLASS = "ptoe-caption"
+# 表格级保留 class（2026-10 无边框表格）：表格菜单「不显示边框」写入的
+# ptoe-noborder（分栏/批注版式）。表格级 class 白名单——不在表内的 class 一律丢弃。
+TBL_TABLE_CLASSES = ("ptoe-noborder",)
 
 
 _ALIGN_CLASSES = {"ptoe-align-center", "ptoe-align-left", "ptoe-align-right"}
@@ -1124,6 +1127,28 @@ def diff_reocr_texts(current: str, new_text: str) -> list:
     return out
 
 
+def _table_open_attrs(d: dict) -> str:
+    """表格级保留属性串（无边框 class + 固定布局 style）；无存活项返回 ""。
+
+    单一事实来源：``<table>`` 的两处重建（``_Sanitizer.handle_starttag`` 与
+    ``apply_markers`` 块流）都调用它，口径一致——class 白名单 ``TBL_TABLE_CLASSES``
+    （分栏/批注版式的 ``ptoe-noborder``）+ ``rulemanage.normalize_table_style``
+    （只认 ``table-layout:fixed``）。2026-10 修复：此前 apply_markers 用
+    ``_block_class_html`` 重建表标签，白名单不含 ``ptoe-noborder`` 也不带 style，
+    导出 EPUB 的 ``<table>`` 丢掉无边框 class → 分栏表格显示框线。
+    """
+    tcls = [c for c in str(d.get("class") or "").split() if c in TBL_TABLE_CLASSES]
+    tstyle = rulemanage.normalize_table_style(str(d.get("style") or ""))
+    return (f' class="{" ".join(tcls)}"' if tcls else "") + (
+        f' style="{tstyle}"' if tstyle else ""
+    )
+
+
+def _table_open_attrs_str(attrs: str) -> str:
+    """``<table …>`` 属性**字符串** → 表格级保留属性串（见 ``_table_open_attrs``）。"""
+    return _table_open_attrs(dict(re.findall(r'([\w:-]+)\s*=\s*"([^"]*)"', attrs or "")))
+
+
 def _block_class_html(attrs: str) -> str:
     """从块标签属性中提取应保留的 class（ptoe-note + 对齐类 + 换页 + 图片模式 + 题注 + 分隔线），返回 class 属性。"""
     m = re.search(r'class="([^"]*)"', attrs)
@@ -1358,6 +1383,9 @@ class _Sanitizer(HTMLParser):
         self._cell_attrs: list[str] = []  # 当前单元格保留的 colspan/rowspan 属性串
         self._cell_buf: list[str] = []  # 单元格行内内容缓冲
         self._cell_stack: list[tuple[str, str]] = []  # 单元格内未闭合行内标签
+        # 单元格内未闭合的块级（段落）深度（2026-10）：单元格内 p/div/hN 转成
+        # <p>…</p> 保留段落边界，不再整段拍平（否则同一格内多段会在导出后并成一段）
+        self._cell_block_depth = 0
         # 表格级保留属性（2026-10 列宽按比例生效）：目前只可能携带 style="table-layout:fixed"
         self._tbl_table_attrs = ""
 
@@ -1373,6 +1401,10 @@ class _Sanitizer(HTMLParser):
             return
         if self._tbl_row is None:
             self._tbl_row = []
+        # 单元格内未闭合的段落（<p>）先收尾，保证 <td><p>…</p></td> 结构合法
+        if self._cell_block_depth:
+            self._cell_buf.append("</p>" * self._cell_block_depth)
+            self._cell_block_depth = 0
         closes = "".join(
             f"</{t}>" for t, _ in reversed(self._cell_stack) if t != "__skip_mark__"
         )
@@ -1494,10 +1526,11 @@ class _Sanitizer(HTMLParser):
             self._tbl_body = []
             self._tbl_row = None
             self._cell_open = False
-            # 表格级保留属性（2026-10）：只认 style="table-layout:fixed"
-            # （用户拖拽列宽按比例精确生效所需，见 rulemanage.normalize_table_style）
-            _tstyle = rulemanage.normalize_table_style(dict(attrs).get("style") or "")
-            self._tbl_table_attrs = f' style="{_tstyle}"' if _tstyle else ""
+            # 表格级保留属性（2026-10）：class 白名单（TBL_TABLE_CLASSES，无边框表格
+            # ptoe-noborder）+ style="table-layout:fixed"（用户拖拽列宽按比例精确生效
+            # 所需，见 rulemanage.normalize_table_style）。其余 class/style 一律丢弃。
+            # 与 apply_markers 共用 _table_open_attrs（单一事实来源，防口径漂移）。
+            self._tbl_table_attrs = _table_open_attrs(dict(attrs))
             return
         if self._tbl_depth:
             # 表格结构标签：只作结构累积（thead/tbody/tfoot/tr/th/td）
@@ -1548,10 +1581,28 @@ class _Sanitizer(HTMLParser):
                 self._cell_attrs = cell_attrs
                 self._cell_buf = []
                 self._cell_stack = []
+                self._cell_block_depth = 0
                 return
             if tag in ("p", "div") or _BLOCK_RE.fullmatch(tag):
-                # 单元格内块级标签：丢弃标签、内容并入文本（保持行内）
                 if self._cell_open:
+                    # 单元格内块级标签 → 段落边界：转成 <p>…</p> 保留段落结构
+                    # （2026-10 修复：此前直接丢弃标签，导致同一格内多段被并成一段，
+                    #  也与「段落标记合并前后段」的分栏语义冲突）
+                    # 2026-10-19 修复：段落级 class（引用/注释/对齐…）与「段落设置」
+                    # data-* 必须随开标签保留。此前只输出裸 <p>，于是表格单元格里的
+                    # 引用段保存/导出后降级为正文（界面显示引用、导出变正文），
+                    # 段落缩进/行距等设置也一并丢失。白名单与表外块级共用同一套
+                    # helper，防口径漂移（单元格内会被降级为 <p>，标题级语义不保留）。
+                    if self._cell_block_depth == 0:
+                        cls = _block_classes(attrs)
+                        dattr = _block_data_attrs(attrs)
+                        open_p = "<p"
+                        if cls:
+                            open_p += f' class="{" ".join(cls)}"'
+                        for k, v in dattr:
+                            open_p += f' {k}="{_html.escape(v, quote=True)}"'
+                        self._cell_buf.append(open_p + ">")
+                    self._cell_block_depth += 1
                     return
                 # 表格结构层的块级标签：视为表格非正常结束，落入正常块级逻辑
                 self._tbl_finish_table()
@@ -1733,8 +1784,12 @@ class _Sanitizer(HTMLParser):
                 self._tbl_finish_cell()
                 return
             if tag in ("p", "div") or _BLOCK_RE.fullmatch(tag):
-                # 单元格内块级闭合标签丢弃
                 if self._cell_open:
+                    # 单元格内块级闭合 → 收一段（与 handle_starttag 的 <p> 配对）
+                    if self._cell_block_depth > 0:
+                        self._cell_block_depth -= 1
+                        if self._cell_block_depth == 0:
+                            self._cell_buf.append("</p>")
                     return
                 # 表格结构层的块级闭合：视为表格非正常结束，落入正常闭合逻辑
                 self._tbl_finish_table()
@@ -3298,11 +3353,17 @@ def _clean_blocks(
 
         _normalize_symbols_extended = _nse
     _normalize_digit_punct = None
+    _clean_alnum_spaces = None
     if digit_punct_pairs:
-        # 数字标点归一（2026-10）：1。2 → 1.2、1，2 → 1,2、1。 → 1.；表由调用方给
+        # 数字/字母里的中文标点 → 英文（2026-10「数字标点归一"}）：放在标点/符号归一之后，
+        # 用户自定义映射表拥有最终解释权（如 1。2 → 1.2、1，2 → 1,2、1。 → 1.）。
+        # 2026-10-18 扩展：字母间标点（H，W → H,W）+ 行内空格容忍（1 。2 → 1.2）；
+        # 随后清理数字间/单字母间空格（1 2 → 12、M a r x → Marx，英文短语保留）。
         from stringmanage import normalize_digit_punct as _ndp
+        from stringmanage import clean_alnum_spaces as _cas
 
         _normalize_digit_punct = _ndp
+        _clean_alnum_spaces = _cas
     for open_tag, toks in blocks:
         if open_tag == _TABLE_BLOCK:
             continue  # 表格：逐字节透传，不做任何文本处理
@@ -3339,10 +3400,14 @@ def _clean_blocks(
             t2 = _BRACKET_DIGIT_RE.sub("〔\\1〕", t2)
             if stats is not None and t2 != before_b:
                 stats["symbols"] += _char_delta(before_b, t2)
-            # 数字里的中文标点 → 英文（2026-10「数字标点归一」）：放在标点/符号归一之后，
+            # 数字/字母里的中文标点 → 英文（2026-10「数字标点归一"}）：放在标点/符号归一之后，
             # 用户自定义映射表拥有最终解释权（如 1。2 → 1.2、1，2 → 1,2、1。 → 1.）。
+            # 2026-10-18：字母间标点（H，W → H,W）+ 行内空格容忍（1 。2 → 1.2）；
+            # 随后清理数字间/单字母间空格（1 2 → 12、M a r x → Marx，英文短语保留）。
             if _normalize_digit_punct is not None:
                 nd = _normalize_digit_punct(t2, digit_punct_pairs)
+                if _clean_alnum_spaces is not None:
+                    nd = _clean_alnum_spaces(nd)
                 if stats is not None:
                     stats["punct"] += _char_delta(t2, nd)
                 t2 = nd
@@ -3440,6 +3505,10 @@ def _clean_pages(items: list, clean_kw: dict) -> list:
     if not valid:
         return []
 
+    # clean_blank_lines 是导出专用开关（clean_page_html 无此参数），调用方若整体
+    # 传入 get_clean_settings() 需在此剔除，避免 **clean_kw 触发 TypeError。
+    clean_kw = {k: v for k, v in clean_kw.items() if k != "clean_blank_lines"}
+
     def one(pn_html):
         n, html = pn_html
         out, st = clean_page_html(html, with_stats=True, **clean_kw)
@@ -3517,6 +3586,8 @@ def clean_history_pages(
         clean_kw = dict(get_clean_settings())
         clean_kw["symbol_map"] = get_clean_symbol_map()
         clean_kw["digit_punct_map"] = get_clean_digit_punct_map()
+    # clean_blank_lines 是导出专用开关（clean_page_html 无此参数），此处剔除
+    clean_kw = {k: v for k, v in clean_kw.items() if k != "clean_blank_lines"}
     sel = {int(p) for p in pages} if pages else None
     cleaned = 0
     touched: list[int] = []
@@ -3839,6 +3910,338 @@ def _split_segments(
     return segments, trailing
 
 
+# ---------------------------------------------------------------------------
+# 分栏（ptoe-noborder 无边框表格）导出增强（2026-10）
+# ---------------------------------------------------------------------------
+# 分栏 = 无边框两列表：左 25% 旁注 / 右 75% 正文，每格一段（见 ui/app.js
+# convertSelectionToColumns）。导出时需要：
+#   （1）单元格内多段保留（不再被并成一段）；
+#   （2）单元格内段落标记（join）把标记前后两段合为一个整段；
+#   （3）一篇文章里连续的多个分栏自动并为一张表（中间的纯段落标记段视为桥接）。
+_CELL_PARA_TAG_RE = re.compile(r"</?(p|div|h[1-6])\b[^>]*>", re.IGNORECASE)
+# 单元格段落开标签（捕获属性串）：段落级 class（引用/注释/对齐…）与「段落设置」
+# data-* 需在并段/跨表桥接重建 <p> 时逐段保留，否则表格里的引用/缩进导出后被清成正文。
+_CELL_PARA_OPEN_RE = re.compile(r"<(p|div|h[1-6])\b([^>]*)>", re.IGNORECASE)
+_CELL_INNER_RE = re.compile(r"(<(td|th)\b[^>]*>)(.*?)(</\2>)", re.DOTALL | re.IGNORECASE)
+_TABLE_OPEN_RE = re.compile(r"<table\b[^>]*>", re.IGNORECASE)
+_TABLE_CLOSE_RE = re.compile(r"</table>", re.IGNORECASE)
+_TBODY_INNER_RE = re.compile(r"<tbody\b[^>]*>(.*)</tbody>", re.DOTALL | re.IGNORECASE)
+_THEAD_RE = re.compile(r"<thead\b[^>]*>.*?</thead>", re.DOTALL | re.IGNORECASE)
+# 无边框分栏表的整元素（TXT/MD/DOCX 导出前置处理用；EPUB 走 apply_markers 块级等价实现）
+_TABLE_ELEM_NOBORDER_RE = re.compile(
+    r'<table\b[^>]*\bclass="[^"]*\bptoe-noborder\b[^"]*"[^>]*>.*?</table\s*>',
+    re.DOTALL | re.IGNORECASE,
+)
+# 仅含段落标记（join）的桥接段：标签间除空白/标记 span 外无其它内容
+_MARKER_ONLY_PARA_RE = re.compile(
+    r'<p\b[^>]*>(?:\s*<span\b[^>]*data-ptoe-marker[^>]*>\s*</span\s*>\s*)*</p\s*>',
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _cell_para_tokens(cell_html: str) -> list[list[tuple[str, str]]]:
+    """把单元格内容拆成「段落 token 流」：每段 = [('attrs', 属性串) | ('text', html)
+    | ('join'|'marker', '')]。
+
+    段落边界 = 块级标签（<p>/<div>/<h1-6>）；无块级包裹的裸文本也算一段。
+    标记 span（data-ptoe-marker）从其位置移除，类型作为 token 保留在所在段落中
+    ——段外的标记挂到下一段段首（桥接段），供合并时判断前/后向合并方向。
+    段首的 ('attrs', 属性串) 记录该段的 class/data-* （白名单过滤后）：重建 <p>
+    时必须回填，否则表格单元格里的引用/注释/段落设置在导出后降级为正文。
+    """
+    paras: list[list[tuple[str, str]]] = []
+    cur: list[tuple[str, str]] | None = None
+    pending: list[tuple[str, str]] = []
+    in_para = False
+
+    def close_para() -> None:
+        nonlocal cur
+        if cur is not None:
+            paras.append(cur)
+        cur = None
+
+    for tok in _TOKEN_RE.split(cell_html):
+        if not tok:
+            continue
+        m = _MARKER_SPAN_RE.fullmatch(tok)
+        if m:
+            mt = "join" if m.group(1) == "join" else "marker"
+            if cur is not None:
+                cur.append((mt, ""))
+            else:
+                pending.append((mt, ""))
+            continue
+        if _CELL_PARA_TAG_RE.fullmatch(tok):
+            if tok.startswith("</"):
+                if in_para:
+                    close_para()
+                    in_para = False
+            else:
+                if cur is not None:  # 前一个块（裸文本/嵌套块）先收尾
+                    close_para()
+                in_para = True
+                cur = pending
+                pending = []
+                om = _CELL_PARA_OPEN_RE.fullmatch(tok)
+                raw_attrs = (om.group(2) if om else "") or ""
+                # 段落级 class + 段落设置 data-* 白名单过滤（与表外块级同一套 helper）
+                cur.append(
+                    (
+                        "attrs",
+                        _block_class_html(raw_attrs)
+                        + _block_indent_attr_html(raw_attrs),
+                    )
+                )
+            continue
+        if cur is None:
+            cur = pending
+            pending = []
+        cur.append(("text", tok))
+    close_para()
+    if pending:
+        paras.append(pending)
+    return paras
+
+
+def _cell_paragraph_items(cell_html: str) -> list[tuple[str, str]]:
+    """单元格的 (段落属性串, 段落 HTML) 列表（标记全部丢弃）。
+
+    属性串用于跨表桥接重建 <p>（保留首段格式），见 ``_cell_para_tokens``。
+    """
+    out: list[tuple[str, str]] = []
+    for toks in _cell_para_tokens(cell_html):
+        attrs = ""
+        for k, h in toks:
+            if k == "attrs":
+                attrs = h
+                break
+        text = "".join(h for k, h in toks if k == "text").strip()
+        if text:
+            out.append((attrs, text))
+    return out
+
+
+def _cell_paragraph_texts(cell_html: str) -> list[str]:
+    """单元格的段落纯文本列表（标记全部丢弃，用于跨表桥接取首/末段）。"""
+    return [text for _attrs, text in _cell_paragraph_items(cell_html)]
+
+
+def _apply_markers_in_cell(cell_html: str) -> str:
+    """单元格内段落标记处理：join 把标记前后两段合为一个整段（<p>）。
+
+    - 段首 join / 前段段尾 join → 与上一段合并；
+    - 段尾 join → 与下一段合并；
+    - 段中 join → 标记处拼接（同段内即删标记）；
+    - 纯标记段（无文本）→ 把前后两段连起来（桥接）。
+    其余标记（full/chapter/page/note）在单元格内无法表达，一并丢弃。
+    无标记时原样返回（不引入多余的 <p> 包装）。
+    """
+    if "data-ptoe-marker" not in cell_html:
+        return cell_html
+    out: list[list[str]] = []  # 每项 [段落属性串, 段落 HTML]——合并时保留前一段属性
+    merge_prev = False
+    for toks in _cell_para_tokens(cell_html):
+        attrs = ""
+        for k, h in toks:
+            if k == "attrs":
+                attrs = h
+                break
+        idxs = [i for i, (k, h) in enumerate(toks) if k == "text" and h.strip()]
+        if not idxs:
+            if any(k == "join" for k, _ in toks):
+                merge_prev = True
+            continue
+        content = "".join(h for k, h in toks if k == "text").strip()
+        lead = any(k == "join" for k, _ in toks[: idxs[0]])
+        tail = any(k == "join" for k, _ in toks[idxs[-1] + 1:])
+        if (lead or merge_prev) and out:
+            out[-1][1] += content  # 合并进上一段：保留上一段（前段）的格式
+        elif content:
+            out.append([attrs, content])
+        merge_prev = tail
+    return "".join(f"<p{a}>{c}</p>" for a, c in out)
+
+
+def _apply_markers_in_table(table_html: str) -> str:
+    """对整张表格的每个单元格施加段落标记处理；表内其它位置残留标记一并丢弃。"""
+    if "data-ptoe-marker" not in table_html:
+        return table_html
+
+    def repl(m: "re.Match[str]") -> str:
+        return m.group(1) + _apply_markers_in_cell(m.group(3)) + m.group(4)
+
+    return _MARKER_SPAN_RE.sub("", _CELL_INNER_RE.sub(repl, table_html))
+
+
+def _table_rows_inner(tbl: str) -> str:
+    """取表格的行内容（tbody 内层；无 tbody 则退回 table 内层并去掉 thead）。"""
+    m = _TBODY_INNER_RE.search(tbl)
+    if m:
+        return m.group(1)
+    inner = _TABLE_OPEN_RE.sub("", tbl, count=1)
+    close = _TABLE_CLOSE_RE.search(inner)
+    if close:
+        inner = inner[: close.start()]
+    return _THEAD_RE.sub("", inner)
+
+
+def _join_last_first_cell(rows1: str, rows2: str) -> tuple[str, str]:
+    """把前表最后一格的末段与后表第一格的首段拼接为一段（段落标记跨表桥接）。"""
+    c1 = list(_CELL_INNER_RE.finditer(rows1))
+    c2 = list(_CELL_INNER_RE.finditer(rows2))
+    if not c1 or not c2:
+        return rows1, rows2
+    last1, first2 = c1[-1], c2[0]
+    p1 = _cell_paragraph_items(last1.group(3))
+    p2 = _cell_paragraph_items(first2.group(3))
+    if not p1 or not p2:
+        return rows1, rows2
+    a1, t1 = p1[-1]
+    _a2, t2 = p2[0]
+    tail = t1 + t2
+    # 合并段保留前表末段的格式（与表内 join 合并语义一致）
+    new1 = "".join(f"<p{a}>{t}</p>" for a, t in p1[:-1]) + f"<p{a1}>{tail}</p>"
+    new2 = "".join(f"<p{a}>{t}</p>" for a, t in p2[1:])
+    rows1 = rows1[: last1.start(3)] + new1 + rows1[last1.end(3):]
+    rows2 = rows2[: first2.start(3)] + new2 + rows2[first2.end(3):]
+    return rows1, rows2
+
+
+def _merge_two_column_tables(t1: str, t2: str, *, join_cells: bool = False) -> str:
+    """把两张无边框分栏表的**内层**（tbody…）并成一份。join_cells=True 时把跨表前后两段合一。
+
+    入参是表格块的 html 内层（不含 <table>/</table>，由 apply_markers 的块解析器
+    剥离、render_block 再包回），所以这里只返回内层。
+    """
+    head = _THEAD_RE.search(t1)
+    rows1 = _table_rows_inner(t1)
+    rows2 = _table_rows_inner(t2)
+    if join_cells:
+        rows1, rows2 = _join_last_first_cell(rows1, rows2)
+    return (head.group(0) if head else "") + f"<tbody>{rows1}{rows2}</tbody>"
+
+
+def _merge_noborder_tables(t1: str, t2: str, *, join_cells: bool = False) -> str:
+    """把两张完整的无边框分栏 <table> 元素并成一张（返回完整表格元素）。
+
+    join_cells=True 时把跨表的前表末格末段与后表首格首段拼成一段（段落标记桥接）。
+    """
+    open_m = _TABLE_OPEN_RE.match(t1)
+    if not open_m:
+        return t1
+    head = _THEAD_RE.search(t1)
+    rows1 = _table_rows_inner(t1)
+    rows2 = _table_rows_inner(t2)
+    if join_cells:
+        rows1, rows2 = _join_last_first_cell(rows1, rows2)
+    return (
+        open_m.group(0)
+        + (head.group(0) if head else "")
+        + f"<tbody>{rows1}{rows2}</tbody></table>"
+    )
+
+
+def _resolve_noborder_tables(html: str) -> str:
+    """TXT/MD/DOCX 导出前置处理（EPUB 走 apply_markers 的块级等价实现）。
+
+    1. 逐表施加单元格内段落标记（join）合并（``_apply_markers_in_table``）；
+    2. 把连续的无边框分栏 <table> 并为一张——中间只隔一个「纯段落标记段」时
+       视为跨表桥接（首尾两段合一），紧邻或仅空白相隔则直接并表。
+    与 2026-10 需求「一篇文章多个连续分栏自动合并 + 标记前后两段合一」一致。
+    """
+    html = str(html or "")
+    if "<table" not in html.lower():
+        return html
+    # 1) 表内标记（跨表桥接段在表外，此步不碰）
+    html = re.sub(
+        r"(<table\b[^>]*>)(.*?)(</table\s*>)",
+        lambda m: m.group(1) + _apply_markers_in_table(m.group(2)) + m.group(3),
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    # 2) 连续无边框分栏表合并
+    matches = list(_TABLE_ELEM_NOBORDER_RE.finditer(html))
+    if len(matches) < 2:
+        return html
+    out: list[str] = []
+    cur_tbl: str | None = None
+    prev_end = 0
+    for m in matches:
+        if cur_tbl is None:
+            out.append(html[: m.start()])
+            cur_tbl = m.group(0)
+        else:
+            gap = html[prev_end : m.start()]
+            if gap.strip() == "":
+                cur_tbl = _merge_noborder_tables(cur_tbl, m.group(0), join_cells=False)
+            elif _MARKER_ONLY_PARA_RE.fullmatch(gap.strip()):
+                cur_tbl = _merge_noborder_tables(cur_tbl, m.group(0), join_cells=True)
+            else:
+                out.append(cur_tbl)
+                out.append(gap)
+                cur_tbl = m.group(0)
+        prev_end = m.end()
+    out.append(cur_tbl or "")
+    out.append(html[prev_end:])
+    return "".join(out)
+
+
+def _is_column_table_item(item: dict[str, Any]) -> bool:
+    """是否为无边框分栏表格块（只有它参与连续合并）。"""
+    return item.get("kind") == "table" and "ptoe-noborder" in (item.get("attrs") or "")
+
+
+def _is_pure_join_marker_item(item: dict[str, Any]) -> bool:
+    """是否为「仅含段落标记（join）」的段落块（连续分栏之间的桥接段）。"""
+    if item.get("kind") == "table":
+        return False
+    if any(html.strip() for html, _m in item.get("segments") or []):
+        return False
+    markers = [t for _h, ms in item.get("segments") or [] for t, _l in ms]
+    markers += [t for t, _l in item.get("trailing") or []]
+    return bool(markers) and all(t == "join" for t in markers)
+
+
+def _coalesce_column_tables(
+    parsed: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """合并连续的无边框分栏表（含中间仅含 join 的桥接段）。
+
+    多个分栏在文章里连续出现时，导出应呈现为一张连续分栏表（否则每张表之间会
+    出现额外间距/断线）。桥接段的 join 语义：把前表最后一格的末段与后表第一格
+    的首段并为一个整段（见 _join_last_first_cell）。
+    """
+    out: list[dict[str, Any]] = []
+    i, n = 0, len(parsed)
+    while i < n:
+        item = parsed[i]
+        if not _is_column_table_item(item):
+            out.append(item)
+            i += 1
+            continue
+        html = item["segments"][0][0] if item["segments"] else ""
+        j = i + 1
+        while j < n:
+            nxt = parsed[j]
+            if _is_column_table_item(nxt):
+                html = _merge_two_column_tables(html, nxt["segments"][0][0])
+                j += 1
+            elif (
+                _is_pure_join_marker_item(nxt)
+                and j + 1 < n
+                and _is_column_table_item(parsed[j + 1])
+            ):
+                html = _merge_two_column_tables(
+                    html, parsed[j + 1]["segments"][0][0], join_cells=True
+                )
+                j += 2
+            else:
+                break
+        out.append({**item, "segments": [(html, [])]})
+        i = j
+    return out
+
+
 def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
     """提取矫正文本中的章节/段落标记，生成文章结构。
 
@@ -3871,6 +4274,9 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
     没有标记时返回单篇文章（等价于把所有 <p> 顺序拼接）。
     """
     # 1) 全书按页解析为块流（跨页连续处理，段落标记可跨页合并）
+    #    表格整表原子累积：进入 <table> 后其内部的 <p>/<div>/<hN>（单元格段落）
+    #    不再被当作块边界切分（2026-10：单元格现在会保留 <p>，若不整表原子化，
+    #    表内段落标签会把表格切碎 → 结构错乱）。
     blocks: list[dict[str, Any]] = []
     for p in sorted(pages, key=lambda x: x["page"]):
         text = p.get("text") or ""
@@ -3878,11 +4284,31 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
         note = False  # 当前块是否为注释（class="ptoe-note"）
         attrs = ""  # 当前块保留的 class 属性（对齐等）
         cur: list[str] = []
+        tbl_depth = 0  # >0 = 正在累积表格块
         for tok in _TOKEN_RE.split(text):
             if not tok:
                 continue
             m = _BLOCK_TAG_RE.fullmatch(tok)
-            if m:
+            if not m:
+                cur.append(tok)
+                continue
+            tag = m.group(1).lower()
+            closing = tok.startswith("</")
+            if tbl_depth:
+                if tag == "table":
+                    tbl_depth += -1 if closing else 1
+                    if tbl_depth == 0:
+                        blocks.append(
+                            {"kind": "table", "html": "".join(cur), "note": False,
+                             "attrs": attrs}
+                        )
+                        cur = []
+                        kind = None
+                        attrs = ""
+                        continue
+                cur.append(tok)  # 表格内层（含单元格内的 <p> 等）原样累积
+                continue
+            if tag == "table" and not closing:
                 if kind:
                     blocks.append(
                         {
@@ -3893,23 +4319,36 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
                         }
                     )
                     cur = []
-                    kind = None
                     note = False
-                    attrs = ""
-                if not tok.startswith("</"):
-                    tag = m.group(1).lower()
-                    # div 一律按 <p> 处理（与 sanitize_html 一致）：块流只产出
-                    # <p>/<h1-6>，不会出现 <p><div>…</div></p> 非法嵌套；
-                    # 注释段落（ptoe-note）在 div 上同样能被正确识别。
-                    kind = "p" if tag == "div" else tag
-                    tag_attrs = m.group(2) or ""
-                    note = _NOTE_CLASS in tag_attrs
-                    # class + 段落设置 data-* 都要留：data-* 是 htmlmanage
-                    # _indent_style_attrs 转内联缩进/间距的唯一来源，剥掉则导出
-                    # EPUB 退回默认顶格（见 _block_indent_attr_html 注释）
-                    attrs = _block_class_html(tag_attrs) + _block_indent_attr_html(tag_attrs)
+                kind = "table"
+                tbl_depth = 1
+                attrs = _table_open_attrs_str(m.group(2) or "")
                 continue
-            cur.append(tok)
+            if kind:
+                blocks.append(
+                    {
+                        "kind": kind,
+                        "html": "".join(cur),
+                        "note": note,
+                        "attrs": attrs,
+                    }
+                )
+                cur = []
+                kind = None
+                note = False
+                attrs = ""
+            if not closing:
+                # div 一律按 <p> 处理（与 sanitize_html 一致）：块流只产出
+                # <p>/<h1-6>，不会出现 <p><div>…</div></p> 非法嵌套；
+                # 注释段落（ptoe-note）在 div 上同样能被正确识别。
+                kind = "p" if tag == "div" else tag
+                tag_attrs = m.group(2) or ""
+                note = _NOTE_CLASS in tag_attrs
+                # class + 段落设置 data-* 都要留：data-* 是 htmlmanage
+                # _indent_style_attrs 转内联缩进/间距的唯一来源，剥掉则导出
+                # EPUB 退回默认顶格（见 _block_indent_attr_html 注释）。
+                attrs = _block_class_html(tag_attrs) + _block_indent_attr_html(tag_attrs)
+            continue
         if kind or cur:
             blocks.append(
                 {
@@ -3924,20 +4363,13 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
     parsed: list[dict[str, Any]] = []
     for b in blocks:
         if b["kind"] == "table":
-            # 表格是**原子块**：整表作单个内容段原样透传，不切段、不参与合并。
-            # 不能走 _split_segments，两个原因：
-            #   1) 它的空内容门是「剥标签后无文字且不含 <img> 就丢段」——纯图片表
-            #      靠 <img> 侥幸存活，但空表/只有标记的表会被静默丢弃；
-            #   2) 它会在标记处切段并跨段重开行内标签，表格结构会被切成多段，
-            #      每段再各裹一层 <table> → 表格结构彻底碎掉。
-            # 同样不进 _merge_paragraph（_RENDERED_BLOCK_RE 只认 p/div，表格本
-            # 就不可合并）；push_content 的 `kind == "p"` 闸门同样天然拦下它。
-            #
-            # 表内的标记 span 只能丢弃：full/chapter/page/join 都无法在表内部表达
-            # （表内插不进文章或段落边界），与 _split_segments 消费标记的既有语义
-            # 一致（标记 span 及其 label 文本都不进正文）；表**前后**的标记不受
-            # 影响，照常作用于相邻段落。
-            segments = [(_MARKER_SPAN_RE.sub("", b["html"]), [])]
+            # 表格是**原子块**：整表作单个内容段，不按表内标记切段、不参与段落
+            # 合并（_split_segments 会把表格结构切碎 → 每段各裹一层 <table>）。
+            # 但单元格**内部**的段落标记仍需处理（2026-10）：join 把标记前后两段
+            # 合为一个整段；full/chapter/page/note 在单元格内无法表达，丢弃。
+            # 连续分栏表的合并见 _coalesce_column_tables（对所有表格块生效）。
+            # push_content 的 `kind == "p"` 闸门天然让表格不进 _merge_paragraph。
+            segments = [(_apply_markers_in_table(b["html"]), [])]
             trailing: list[tuple[str, str]] = []
         else:
             segments, trailing = _split_segments(b["html"])
@@ -3950,6 +4382,9 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
                 "trailing": trailing,
             }
         )
+
+    # 连续的无边框分栏表合并为一张（含中间仅含 join 的桥接段，2026-10）
+    parsed = _coalesce_column_tables(parsed)
 
     # 注释段落（class="ptoe-note"）按文档顺序收集；段落标记（join）合并相邻注释
     annotations: list[str] = []
@@ -5726,6 +6161,27 @@ def _cell_align(attrs: list[tuple[str, str | None]]) -> str:
     return ""
 
 
+# 垂直对齐类 → 规范值（""|"top"|"middle"|"bottom"）。与前端 _tblVAlign 的
+# {top:ptoe-vtop, middle:ptoe-vmid, bottom:ptoe-vbot} 一一对应。
+_CELL_VALIGN_VALUES = {"ptoe-vtop": "top", "ptoe-vmid": "middle", "ptoe-vbot": "bottom"}
+# 规范垂直对齐 → OOXML w:vAlign 取值（middle 在 OOXML 里叫 center）。
+_DOCX_VALIGN = {"top": "top", "middle": "center", "bottom": "bottom"}
+
+
+def _cell_valign(attrs: list[tuple[str, str | None]]) -> str:
+    """从 td/th 标签 attrs 提取垂直对齐类 → ""|"top"|"middle"|"bottom"。
+
+    与 _cell_align 同策略：只认矫正界面产出的 ptoe-v* 三种值，其余忽略。
+    """
+    for k, v in attrs:
+        if k == "class":
+            for c in (v or "").split():
+                if c in _CELL_VALIGN_VALUES:
+                    return _CELL_VALIGN_VALUES[c]
+            break
+    return ""
+
+
 def _html_to_rich_blocks(html: str) -> list[dict]:
     """已清洗 HTML → 富文本块列表，供 TXT/DOCX/MD 导出（保留格式信息）。
 
@@ -5790,9 +6246,17 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             self.tbl_cell_open = False
             self.tbl_cell: list[str] = []
             self.tbl_cell_align = ""  # 当前单元格对齐（""|"left"|"center"|"right"）
+            # 垂直对齐（2026-10）：「对齐 ▾」九宫格产出的 ptoe-v* 类，
+            # 与 algn 同维并行（valgn），供 DOCX 输出 w:vAlign（EPUB 走原 HTML+CSS）。
+            self.tbl_row_valign: list[str] | None = None
+            self.tbl_cell_valign = ""  # 当前单元格垂直对齐（""|"top"|"middle"|"bottom"）
+            self.tbl_valign_head: list[list[str]] = []  # thead 行垂直对齐（并行 tbl_head）
+            self.tbl_valign_body: list[list[str]] = []  # tbody 行垂直对齐（并行 tbl_body）
             self.tbl_cell_stack: list[str] = []  # 单元格内未闭合标签（"__marker__" = 内容剥除）
             self.tbl_raw: list[str] = []  # 表格原始 HTML（防御：含 colspan/rowspan 时 MD raw 透传）
             self.tbl_has_span = False  # 是否出现过 colspan/rowspan
+            # 无边框表格（2026-10）：<table class="ptoe-noborder"> → DOCX 输出无边框
+            self.tbl_noborder = False
             self.tbl_align_head: list[list[str]] = []  # thead 行对齐（并行 tbl_head）
             self.tbl_align_body: list[list[str]] = []  # tbody 行对齐（并行 tbl_body）
             # 图文混合（2026-10）：源段落序号（同一 <p> 内被图片切开的多块共用
@@ -5809,11 +6273,15 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                 self.tbl_row = []
             if self.tbl_row_align is None:
                 self.tbl_row_align = []
+            if self.tbl_row_valign is None:
+                self.tbl_row_valign = []
             self.tbl_row.append("".join(self.tbl_cell))
             self.tbl_row_align.append(self.tbl_cell_align)
+            self.tbl_row_valign.append(self.tbl_cell_valign)
             self.tbl_cell_open = False
             self.tbl_cell = []
             self.tbl_cell_align = ""
+            self.tbl_cell_valign = ""
 
         def _tbl_row_end(self) -> None:
             self._tbl_cell_end()
@@ -5824,11 +6292,15 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                 (self.tbl_align_head if self.tbl_in_thead else self.tbl_align_body).append(
                     self.tbl_row_align or []
                 )
+                (self.tbl_valign_head if self.tbl_in_thead else self.tbl_valign_body).append(
+                    self.tbl_row_valign or []
+                )
                 self.tbl_row = None
                 self.tbl_row_align = None
+                self.tbl_row_valign = None
 
         def _tbl_table_end(self) -> None:
-            """表格结束：产出 {"kind":"table","header","rows","algn"} 块（可选 raw/has_span）。"""
+            """表格结束：产出 {"kind":"table","header","rows","algn"} 块（可选 raw/has_span/noborder）。"""
             if not self.tbl_depth:
                 return
             self._tbl_row_end()
@@ -5841,8 +6313,14 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                     # raw 恒附带：单元格对齐同列不一致时 MD 导出也要整块透传
                     "raw": "".join(self.tbl_raw),
                 }
+                # valgn 仅在确实有垂直对齐时附带，保持旧块形状（无该键）不变
+                valgn = self.tbl_valign_head + self.tbl_valign_body
+                if any(any(v for v in row) for row in valgn):
+                    block["valgn"] = valgn
                 if self.tbl_has_span:
                     block["has_span"] = True
+                if self.tbl_noborder:
+                    block["noborder"] = True
                 self.blocks.append(block)
             self.tbl_depth = 0
             self.tbl_skip = 0
@@ -5852,10 +6330,14 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             self.tbl_body = []
             self.tbl_align_head = []
             self.tbl_align_body = []
+            self.tbl_valign_head = []
+            self.tbl_valign_body = []
             self.tbl_row = None
             self.tbl_row_align = None
+            self.tbl_row_valign = None
             self.tbl_raw = []
             self.tbl_has_span = False
+            self.tbl_noborder = False
 
         def _flags(self) -> dict:
             """返回当前栈状态对应的行内格式标志字典。"""
@@ -6070,14 +6552,20 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                 self.tbl_body = []
                 self.tbl_align_head = []
                 self.tbl_align_body = []
+                self.tbl_valign_head = []
+                self.tbl_valign_body = []
                 self.tbl_row = None
                 self.tbl_row_align = None
+                self.tbl_row_valign = None
                 self.tbl_cell_open = False
                 self.tbl_cell = []
                 self.tbl_cell_align = ""
+                self.tbl_cell_valign = ""
                 self.tbl_cell_stack = []
                 self.tbl_raw = [self.get_starttag_text() or "<table>"]
                 self.tbl_has_span = False
+                # 无边框表格（2026-10）：class 白名单只认 ptoe-noborder（与 _Sanitizer 同口径）
+                self.tbl_noborder = "ptoe-noborder" in str(dict(attrs).get("class") or "").split()
                 return
             if self.tbl_skip:
                 if tag == "table":
@@ -6099,6 +6587,7 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                     self._tbl_row_end()
                     self.tbl_row = []
                     self.tbl_row_align = []
+                    self.tbl_row_valign = []
                     return
                 if tag in ("th", "td"):
                     self._tbl_cell_end()
@@ -6110,6 +6599,7 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                     self.tbl_cell_open = True
                     self.tbl_cell = []
                     self.tbl_cell_align = _cell_align(attrs)
+                    self.tbl_cell_valign = _cell_valign(attrs)
                     self.tbl_cell_stack = []
                     return
                 if tag == "br":
@@ -6290,7 +6780,7 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             )
 
     parser = _Parser()
-    parser.feed(str(html or ""))
+    parser.feed(_resolve_noborder_tables(str(html or "")))
     parser.close()
     parser._tbl_table_end()
     parser._flush()
@@ -6506,38 +6996,58 @@ def _docx_escape(text: str) -> str:
 
 
 def _cell_plain_text(inner: str) -> str:
-    """表格单元格 inner HTML → 纯文本（<br> → 换行，其余标签剥除）。
+    """表格单元格 inner HTML → 纯文本（<br> → 换行，块级段落 → 换行，其余标签剥除）。
 
     供 TXT/DOCX 表格导出使用；实体已在 HTMLParser convert_charrefs 阶段解码，
     此处只需还原解析器「no-op 重转义」产生的 &lt;/&gt;/&amp;。
+
+    2026-10：单元格内多个段落（<p>/<div>/<h1-6>）此前被并成一行，
+    现按段边界输出换行——DOCX 转 <w:br/>、TXT 保留换行，段落不再粘合。
     """
     s = str(inner or "")
     s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
+    s = re.sub(r"</(?:p|div|h[1-6])\s*>", "\n", s, flags=re.I)
+    s = re.sub(r"<(?:p|div|h[1-6])\b[^>]*>", "", s, flags=re.I)
     s = re.sub(r"<[^>]*>", "", s)
     s = s.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
-    return s
+    return s.strip("\n")
 
 
 def _md_cell_text(inner: str) -> str:
-    """表格单元格 inner HTML → Markdown 单元格文本（加粗/斜体转 * 记号，其余剥标签）。"""
+    """表格单元格 inner HTML → Markdown 单元格文本（加粗/斜体转 * 记号，其余剥标签）。
+
+    2026-10：单元格内段落边界转为空格（Markdown 表格单元格不能含裸换行，
+    否则表格结构被破坏），避免多段粘合成一行。
+    """
     s = str(inner or "")
     s = re.sub(r"<br\s*/?>", " ", s, flags=re.I)
+    s = re.sub(r"</(?:p|div|h[1-6])\s*>", " ", s, flags=re.I)
+    s = re.sub(r"<(?:p|div|h[1-6])\b[^>]*>", "", s, flags=re.I)
     s = re.sub(r"</?(?:strong|b)\s*>", "**", s, flags=re.I)
     s = re.sub(r"</?(?:em|i)\s*>", "*", s, flags=re.I)
     s = re.sub(r"<[^>]*>", "", s)
     s = s.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
-    return s
+    return s.strip()
 
 
 def _build_docx_table(
     rows: list[list[str]],
     header: bool,
     algn: list[list[str]] | None = None,
+    noborder: bool = False,
+    valgn: list[list[str]] | None = None,
 ) -> str:
     """富文本表格块 → OOXML <w:tbl>（单线边框 4 边 + 内横/竖线；表头行加粗）。
 
     algn：与 rows 同维的二维数组（单元格对齐 ""|"left"|"center"|"right"）；
     对齐为 center/right 时单元格段落输出 <w:jc>（left/空 不输出，与块段落一致）。
+
+    valgn（2026-10）：与 rows 同维的二维数组（单元格垂直对齐
+    ""|"top"|"middle"|"bottom"）；非空时单元格 tcPr 输出 <w:vAlign>
+    （middle → center），与矫正界面「对齐 ▾」九宫格及 EPUB CSS 一致。
+
+    noborder（2026-10）：表格 HTML 带 class="ptoe-noborder"（表格菜单「不显示
+    边框」，分栏/批注版式）时输出六向 w:val="none" 边框，与 EPUB 导出一致。
 
     单元格内行内格式的**显式作用域**（2026-09-27）：本实现对每个单元格取纯文本
     （_cell_plain_text）后整体输出，故单元格内的加粗/斜体/字符样式（span style 的
@@ -6550,22 +7060,31 @@ def _build_docx_table(
         return "<w:p/>"
     row_count = len(rows)
     col_count = max((len(r) for r in rows), default=0)
+    if noborder:
+        # 无边框：六向 w:val="none"（阅读器/Word 均不画线）
+        border_decls = "".join(
+            f'<w:{side} w:val="none" w:sz="0" w:space="0" w:color="auto"/>'
+            for side in ("top", "left", "bottom", "right", "insideH", "insideV")
+        )
+    else:
+        border_decls = (
+            '<w:top w:val="single" w:sz="4" w:space="0" w:color="999999"/>'
+            '<w:left w:val="single" w:sz="4" w:space="0" w:color="999999"/>'
+            '<w:bottom w:val="single" w:sz="4" w:space="0" w:color="999999"/>'
+            '<w:right w:val="single" w:sz="4" w:space="0" w:color="999999"/>'
+            '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="999999"/>'
+            '<w:insideV w:val="single" w:sz="4" w:space="0" w:color="999999"/>'
+        )
     xml: list[str] = [
         "<w:tbl><w:tblPr>",
         '<w:tblW w:w="0" w:type="auto"/>',
-        "<w:tblBorders>",
-        '<w:top w:val="single" w:sz="4" w:space="0" w:color="999999"/>',
-        '<w:left w:val="single" w:sz="4" w:space="0" w:color="999999"/>',
-        '<w:bottom w:val="single" w:sz="4" w:space="0" w:color="999999"/>',
-        '<w:right w:val="single" w:sz="4" w:space="0" w:color="999999"/>',
-        '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="999999"/>',
-        '<w:insideV w:val="single" w:sz="4" w:space="0" w:color="999999"/>',
-        "</w:tblBorders></w:tblPr>",
+        f"<w:tblBorders>{border_decls}</w:tblBorders></w:tblPr>",
     ]
     for ri, row in enumerate(rows):
         xml.append("<w:tr>")
         bold = bool(header) and ri == 0
         row_align = (algn[ri] if algn and ri < len(algn) else None) or []
+        row_valign = (valgn[ri] if valgn and ri < len(valgn) else None) or []
         for ci, cell in enumerate(row):
             text = _cell_plain_text(cell)
             t = _docx_escape(text).replace(
@@ -6574,8 +7093,10 @@ def _build_docx_table(
             rpr = "<w:rPr><w:b/></w:rPr>" if bold else "<w:rPr/>"
             a = row_align[ci] if ci < len(row_align) else ""
             jc = f'<w:pPr><w:jc w:val="{a}"/></w:pPr>' if a in ("center", "right") else ""
+            va_val = _DOCX_VALIGN.get(row_valign[ci] if ci < len(row_valign) else "", "")
+            vxml = f'<w:vAlign w:val="{va_val}"/>' if va_val else ""
             xml.append(
-                "<w:tc><w:tcPr><w:tcW w:w=\"0\" w:type=\"auto\"/></w:tcPr>"
+                "<w:tc><w:tcPr><w:tcW w:w=\"0\" w:type=\"auto\"/>" + vxml + "</w:tcPr>"
                 f"<w:p>{jc}<w:r>{rpr}<w:t xml:space=\"preserve\">{t}</w:t></w:r></w:p></w:tc>"
             )
         xml.append("</w:tr>")
@@ -6664,12 +7185,14 @@ def _build_docx(blocks: list[Any], path: str) -> None:
 
         if block["kind"] == "table":
             # 表格 → OOXML <w:tbl>（单线边框；表头行加粗；跨列/跨行防御性拍平；
-            # 单元格对齐 algn → w:jc）
+            # 单元格对齐 algn → w:jc；class="ptoe-noborder" → 无边框，2026-10）
             parts.append(
                 _build_docx_table(
                     block.get("rows") or [],
                     bool(block.get("header")),
                     block.get("algn"),
+                    noborder=bool(block.get("noborder")),
+                    valgn=block.get("valgn"),
                 )
             )
             continue
@@ -7166,6 +7689,75 @@ def _txt_spacing(v: Any) -> int:
         return 0
 
 
+_BLANK_PARA_RE = re.compile(
+    r"<(p|div)\b[^>]*>(?:"
+    r"\s|&nbsp;|&#160;|&emsp;|&ensp;|&#8194;|&#8195;|&#12288;|<br\s*/?>"
+    r")*</\1>",
+    re.IGNORECASE,
+)
+
+_BLANK_LINE_RUN_RE = re.compile(r"(?:\r?\n[ \t]*){2,}")
+
+
+def export_clean_blank_lines_enabled() -> bool:
+    """「导出时清理空白行」开关（设置界面 → 智能清理规则）。
+
+    读 ui_settings.clean_blank_lines（默认 False）。开启后，导出（txt/md/docx/epub）
+    会删掉纯空白的段落、把连续空行压缩为一个；关闭则原样保留空白换行。
+    """
+    try:
+        from configmanage import get_clean_settings
+
+        return bool(get_clean_settings().get("clean_blank_lines"))
+    except Exception:
+        return False
+
+
+def _strip_blank_paragraphs(html: str) -> str:
+    """删掉纯空白的 <p>/<div> 块（EPUB 导出用，配合「清理空白行」开关）。
+
+    表格内部（<td>/<th> 之间）的空白段落**保留**——分栏/批注版式里那可能是有意
+    的留白空行；只清理表格外的顶层空段。按顶层 <table>…</table> 切分逐段替换，
+    表内原样透传（表格不嵌套，取开标签后第一个 </table> 配对）。
+    """
+    s = str(html or "")
+    if not s:
+        return s
+    out: list[str] = []
+    pos = 0
+    for m in _TABLE_OPEN_RE.finditer(s):
+        close = _TABLE_CLOSE_RE.search(s, m.end())
+        if not close:
+            break
+        out.append(_BLANK_PARA_RE.sub("", s[pos : m.start()]))
+        out.append(s[m.start() : close.end()])
+        pos = close.end()
+    out.append(_BLANK_PARA_RE.sub("", s[pos:]))
+    return "".join(out)
+
+
+def _drop_blank_blocks(blocks: list[dict]) -> list[dict]:
+    """去掉纯空白文本的段落块（txt/md/docx 导出用，配合「清理空白行」开关）。
+
+    表格块、图片块、分隔线块与题注块保留（题注即使文本为空也代表版式元素）；
+    _html_to_rich_blocks 本身已不产出空文本块，这里是防御性兜底。
+    """
+    out: list[dict] = []
+    for b in blocks or []:
+        if b.get("kind") == "p" and not "".join(
+            r.get("text") or "" for r in (b.get("runs") or [])
+        ).strip():
+            continue
+        out.append(b)
+    return out
+
+
+def _collapse_blank_lines(text: str) -> str:
+    """把连续空行压缩为一个、去掉首尾空白行（txt 导出用，配合「清理空白行」开关）。"""
+    s = _BLANK_LINE_RUN_RE.sub("\n\n", str(text or ""))
+    return s.strip("\n")
+
+
 def export_content_to_file(
     items: list[dict], fmt: str, out_path: str, title: str = "矫正导出"
 ) -> str:
@@ -7187,6 +7779,11 @@ def export_content_to_file(
         html_text = transform_note_labels(str(item.get("html") or ""))
         blocks.extend(_html_to_rich_blocks(html_text))
     blocks = _apply_join_marks(blocks)
+    # 「清理空白行」（设置界面 → 智能清理规则，默认关）：开启时删纯空白段落、
+    # 压缩连续空行；关闭则导出原样保留空白换行。
+    _clean_blank = export_clean_blank_lines_enabled()
+    if _clean_blank:
+        blocks = _drop_blank_blocks(blocks)
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     if fmt == "txt":
@@ -7222,8 +7819,10 @@ def export_content_to_file(
                 line = line + "\n" * spa
             return line
 
-        text = "\n\n".join(_txt_line(b) for b in blocks) + "\n"
-        out.write_text(text, encoding=_TXT_ENCODING)
+        text = "\n\n".join(_txt_line(b) for b in blocks)
+        if _clean_blank:
+            text = _collapse_blank_lines(text)
+        out.write_text(text + "\n", encoding=_TXT_ENCODING)
     elif fmt == "md":
         # Markdown 导出：与前端 htmlToMd 规则一致（见 _build_md）
         _build_md(blocks, str(out))
@@ -7244,6 +7843,10 @@ def export_content_to_file(
                 {"page": p["page"], "text": sanitize_html(str(p["html"] or ""))}
                 for p in items
             ]
+            if _clean_blank:
+                # 删表格外的空白段落（表内保留，见 _strip_blank_paragraphs）
+                for _it in src_items:
+                    _it["text"] = _strip_blank_paragraphs(_it["text"])
             articles = apply_markers(src_items)
             structured = {
                 "articles": articles,
@@ -7859,7 +8462,12 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "clean_html_tags": True,
                     "clean_paragraphs": False,
                     "clean_digit_punct": True,
+                    # 导出时清理空白行（2026-10）：默认关；只作用于导出
+                    "clean_blank_lines": False,
                     "proofread_auto_jump": True,
+                    "tbl_popup_menu": False,
+                    "tbl_ctx_menu": False,
+                    "tbl_tbl_menu": False,
                 })
                 merged = {
                     "tip_delay": stored.get("tip_delay", defaults["tip_delay"]),
@@ -7886,7 +8494,13 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "clean_symbol_map": stored.get("clean_symbol_map", defaults.get("clean_symbol_map", CLEAN_SYMBOL_MAP_DEFAULT)),
                     "clean_digit_punct": bool(stored.get("clean_digit_punct", defaults.get("clean_digit_punct", True))),
                     "clean_digit_punct_map": stored.get("clean_digit_punct_map", defaults.get("clean_digit_punct_map", CLEAN_DIGIT_PUNCT_MAP_DEFAULT)),
+                    # 导出时清理空白行（2026-10）：默认关；只作用于导出
+                    "clean_blank_lines": bool(stored.get("clean_blank_lines", defaults.get("clean_blank_lines", False))),
                     "proofread_auto_jump": bool(stored.get("proofread_auto_jump", defaults.get("proofread_auto_jump", True))),
+                    # 表格内浮层菜单开关（2026-10）：只影响表格范围，默认全关
+                    "tbl_popup_menu": bool(stored.get("tbl_popup_menu", defaults.get("tbl_popup_menu", False))),
+                    "tbl_ctx_menu": bool(stored.get("tbl_ctx_menu", defaults.get("tbl_ctx_menu", False))),
+                    "tbl_tbl_menu": bool(stored.get("tbl_tbl_menu", defaults.get("tbl_tbl_menu", False))),
                 }
                 self._send(
                     200,
@@ -8008,6 +8622,14 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     self._send(400, self._json({"ok": False, "error": "proofread_auto_jump 必须是布尔值"}), "application/json; charset=utf-8")
                     return
                 clean["proofread_auto_jump"] = v
+            # 表格内浮层菜单开关（2026-10）：三个独立布尔键，非法 → 400 不落盘
+            for _tk in ("tbl_popup_menu", "tbl_ctx_menu", "tbl_tbl_menu"):
+                if _tk in ui:
+                    v = ui[_tk]
+                    if not isinstance(v, bool):
+                        self._send(400, self._json({"ok": False, "error": f"{_tk} 必须是布尔值"}), "application/json; charset=utf-8")
+                        return
+                    clean[_tk] = v
             if "undo_depth" in ui:
                 v = ui["undo_depth"]
                 if not (isinstance(v, int) and not isinstance(v, bool) and v in UNDO_DEPTH_CHOICES):
@@ -8048,6 +8670,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 "clean_html_tags",
                 "clean_paragraphs",
                 "brush_merge_on_leave",
+                "clean_blank_lines",
             ):
                 if _clean_key in ui:
                     v = ui[_clean_key]
@@ -11414,6 +12037,22 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
   -webkit-user-select:none;user-select:none;pointer-events:none;
   width:var(--ln-numw,22px);text-align:right;
 }
+/* 表格行行号（2026-10）：插入的表格每行也占一个行号，与段落共用 ptoe-ln 计数器 →
+   编号连续。只给「.editable 直属表格」的行计数/编号（与只数直属 p/div/h 同口径）；
+   行号挂在首格 td/th 上再用绝对定位摆到左侧行号栏（比挂在 tr 上更稳）。命令行寻址
+   _cmdLineBlocks 同样把每个 tr 计为一行，保证显示行号与命令行行号 1:1。 */
+#pages.ptoe-line-num .editable > table tr{counter-increment:ptoe-ln;}
+#pages.ptoe-line-num .editable > table tr > td:first-child,
+#pages.ptoe-line-num .editable > table tr > th:first-child{position:relative;}
+#pages.ptoe-line-num .editable > table tr > td:first-child::after,
+#pages.ptoe-line-num .editable > table tr > th:first-child::after{
+  content:counter(ptoe-ln);
+  position:absolute;left:calc(-1 * (var(--ln-numw,22px) + var(--ln-gap,16px)));top:0;
+  font-size:var(--ln-font,12px);line-height:1.7;color:#8b98a6;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  -webkit-user-select:none;user-select:none;pointer-events:none;
+  width:var(--ln-numw,22px);text-align:right;
+}
 /* 光标所在行高亮（2026-10）：选区锚点所在块加 .ptoe-cur-line。用 background-image 叠加
    浅蓝底（保留标题块自身的级别底色）。2026-10 调整：去掉原先压在首列文字上的不透明
    左侧竖条（inset 3px accent），改为「行号本身变色加粗 + 更淡的整行底色」——竖条会盖住
@@ -11422,7 +12061,19 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
   background-image:linear-gradient(rgba(59,111,255,.09),rgba(59,111,255,.09));}
 #pages.ptoe-line-num .editable > .ptoe-cur-line::after{
   color:var(--accent,#316dca);font-weight:700;}
+/* 表格行处于当前行：行号变色加粗 + 首格淡蓝底（tr 上铺底不稳妥，落在首格） */
+#pages.ptoe-line-num .editable > table tr.ptoe-cur-line > td:first-child::after,
+#pages.ptoe-line-num .editable > table tr.ptoe-cur-line > th:first-child::after{
+  color:var(--accent,#316dca);font-weight:700;}
+#pages.ptoe-line-num .editable > table tr.ptoe-cur-line > td:first-child{
+  background-image:linear-gradient(rgba(59,111,255,.09),rgba(59,111,255,.09));}
 .ptoe-align-left{text-align:left;} .ptoe-align-center{text-align:center;} .ptoe-align-right{text-align:right;}
+/* 2026-10 修复：单元格对齐类必须用 .editable th/td 级选择器（特异性 0,2,1），否则被
+   下方 .editable th,.editable td{text-align:left}（0,1,1）压过 —— 表格里设「居中/居右」
+   看不到效果（用户反馈「对齐设置后不生效」）。与 htmlmanage 导出 CSS 同契约，勿单边改动。 */
+.editable th.ptoe-align-left,.editable td.ptoe-align-left{text-align:left;}
+.editable th.ptoe-align-center,.editable td.ptoe-align-center{text-align:center;}
+.editable th.ptoe-align-right,.editable td.ptoe-align-right{text-align:right;}
 /* 2026-09-24：行内对齐 span（部分选区包裹 <span class="ptoe-align-*">…</span>），
    与 EPUB 导出 CSS（htmlmanage 同规则，含 th/td 兼容）保持一致 */
 .editable span.ptoe-align-left{display:block;text-align:left;}
@@ -11566,6 +12217,11 @@ body.paint-mode{cursor:copy;}
 .editable th,.editable td{border:1px solid var(--border);padding:.3em .6em;text-align:left;vertical-align:top;min-width:3em;}
 .editable th{font-weight:bold;text-align:center;background:#f2f5fa;}
 .dark .editable th{background:var(--bg-hover);}
+/* 无边框表格（2026-10）：表格菜单「不显示边框」给 <table> 加 class="ptoe-noborder"。
+   分栏/批注版式（左窄栏批注 + 右宽栏正文）用它隐藏全部框线；保存白名单只放行
+   该 class，EPUB（htmlmanage）/DOCX 导出按同一 class 输出无边框（勿单边改动）。 */
+.editable table.ptoe-noborder th,.editable table.ptoe-noborder td{border:none;}
+.editable table.ptoe-noborder th{background:transparent;}
 /* 表格操作条（2026-09）：光标进入表格单元格时由 JS 定位并显示；
    加行/删行/加列/删列/对齐/删除表格；对齐按钮按当前单元格 class 高亮 */
 #tblBar{position:fixed;z-index:64;display:none;flex-wrap:wrap;gap:2px;align-items:center;padding:4px 6px;background:rgba(255,255,255,.94);border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.18);}
@@ -11587,7 +12243,10 @@ body.paint-mode{cursor:copy;}
 .editable td.ptoe-vtop,.editable th.ptoe-vtop{vertical-align:top;}
 .editable td.ptoe-vmid,.editable th.ptoe-vmid{vertical-align:middle;}
 .editable td.ptoe-vbot,.editable th.ptoe-vbot{vertical-align:bottom;}
-.page-row.ptoe-has-table .editable{height:auto;min-height:0;}
+/* 2026-10 修订：含表格的行不再被撑高——用户要求「页高与图片等高、内容在页内滚动」。
+   旧规则把行高交给表格内容（height:auto / min-height:0），会让行比左侧图片高一截且
+   不出现滚动条，已移除：.editable 恢复 height:0 / min-height:100%（= 行高 = 图片高），
+   超出部分由 overflow-y:auto 内部滚动。 */
 .editable td.ptoe-cell-sel,.editable th.ptoe-cell-sel{outline:2px solid var(--accent,#316dca);outline-offset:-2px;background:rgba(49,109,202,.12);}
 #tblResizeLayer{position:fixed;z-index:63;display:none;pointer-events:none;}
 #tblResizeLayer .tbl-col-h{position:absolute;width:9px;cursor:col-resize;pointer-events:auto;}
@@ -11607,6 +12266,30 @@ body.paint-mode{cursor:copy;}
 .dark #tblMenu button{color:#ddd;}
 .dark #tblMenu button:hover{background:#2e3746;}
 .dark #tblMenu .tbl-menu-sep{background:#3a4150;}
+/* 单元格对齐九宫格（2026-10）：Word 式「上下 × 左右」。3×3 按钮，每个按钮用三条线
+   的摆放位置直观示意对齐方向；data-tbl-ag-h=left|center|right，data-tbl-ag-v=top|middle|bottom。 */
+#tblAlignGrid{position:fixed;z-index:72;background:#fff;border:1px solid #ddd;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.15);padding:6px;display:none;}
+#tblAlignGrid .tbl-ag-title{padding:0 2px 5px;font-size:11px;color:var(--text-muted);}
+#tblAlignGrid .tbl-ag-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:3px;}
+#tblAlignGrid .tbl-ag-cell{display:flex;width:34px;height:34px;padding:3px;background:#fafbfc;border:1px solid #e4e8ee;border-radius:5px;cursor:pointer;color:#5a6672;}
+#tblAlignGrid .tbl-ag-cell:hover{background:#eef3fb;border-color:var(--accent);color:var(--accent);}
+#tblAlignGrid .tbl-ag-cell.active{background:#e0eaff;border-color:var(--accent);color:var(--accent);}
+#tblAlignGrid .tbl-ag-lines{display:flex;flex-direction:column;justify-content:space-between;width:22px;height:16px;flex:0 0 auto;}
+#tblAlignGrid .tbl-ag-lines i{display:block;height:2px;border-radius:1px;background:currentColor;opacity:.85;}
+#tblAlignGrid .tbl-ag-lines i:nth-child(1){width:100%;}
+#tblAlignGrid .tbl-ag-lines i:nth-child(2){width:66%;}
+#tblAlignGrid .tbl-ag-lines i:nth-child(3){width:100%;}
+/* 水平：用按钮的 justify-content 摆放线条块；垂直：用 align-items 摆放（顶/中/底可见位移） */
+#tblAlignGrid .tbl-ag-cell[data-tbl-ag-h="left"]{justify-content:flex-start;}
+#tblAlignGrid .tbl-ag-cell[data-tbl-ag-h="center"]{justify-content:center;}
+#tblAlignGrid .tbl-ag-cell[data-tbl-ag-h="right"]{justify-content:flex-end;}
+#tblAlignGrid .tbl-ag-cell[data-tbl-ag-v="top"]{align-items:flex-start;}
+#tblAlignGrid .tbl-ag-cell[data-tbl-ag-v="middle"]{align-items:center;}
+#tblAlignGrid .tbl-ag-cell[data-tbl-ag-v="bottom"]{align-items:flex-end;}
+.dark #tblAlignGrid{background:#232a35;border-color:#3a4150;}
+.dark #tblAlignGrid .tbl-ag-cell{background:#1b212b;border-color:#3a4150;color:#b7c0cc;}
+.dark #tblAlignGrid .tbl-ag-cell:hover{background:#2e3746;color:#8fb4ff;}
+.dark #tblAlignGrid .tbl-ag-cell.active{background:#2a3a5c;color:#8fb4ff;}
 #tblSizeModalBg{position:fixed;inset:0;z-index:67;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
 .tbl-size-grid{display:grid;grid-template-columns:auto 1fr;gap:8px 12px;margin:10px 0;font-size:13px;align-items:center;}
 .tbl-size-grid input[type="number"]{width:92px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;}
@@ -11666,11 +12349,11 @@ body.paint-mode{cursor:copy;}
 #searchPos{font-size:12px;color:#5a6b7c;min-width:70px;text-align:center;}
 #searchList{max-height:45vh;overflow:auto;border:1px solid var(--border);border-radius:6px;padding:6px;background:#fafbfc;font-size:12px;}
 .sr-head{display:flex;align-items:center;gap:8px;padding:2px 0 6px;color:#5a6b7c;font-weight:600;}
-.sr-item{padding:6px 8px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px;cursor:pointer;background:#fff;}
+.sr-item{height:44px;box-sizing:border-box;overflow:hidden;padding:4px 8px;border:1px solid var(--border);border-radius:6px;margin:0 0 6px;cursor:pointer;background:#fff;}
 .sr-item:hover{border-color:var(--accent);background:#f2f7ff;}
 .sr-item.current{border-color:var(--accent);background:#eaf2ff;box-shadow:0 0 0 1px var(--accent);}
-.sr-page{font-size:11px;color:#5a6b7c;margin-bottom:2px;}
-.sr-ctx{color:#33414f;line-height:1.5;word-break:break-all;}
+.sr-page{font-size:11px;color:#5a6b7c;margin-bottom:1px;line-height:1.3;}
+.sr-ctx{color:#33414f;line-height:1.5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .sr-ctx mark{background:#ffe08a;color:#5c4000;border-radius:2px;padding:0 2px;}
 .sr-empty{color:#8a97a6;padding:6px 2px;}
 /* 2026-09：搜索范围分段按钮 + 保留组 chips + 替换规则列表 */
@@ -11899,6 +12582,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
           <button type="button" class="tb-btn" id="tableBtn" role="menuitem" onmousedown="event.preventDefault()" title="插入表格：在光标处插入空表格，行/列数与是否带表头可设（Ctrl+Alt+T）" aria-label="插入表格">插入表格</button>
           <button type="button" class="tb-btn" id="tableConvertBtn" role="menuitem" data-op="table" onmousedown="event.preventDefault()" title="转成表格：把选中的文字转成原生表格（支持 Markdown 管道表 / 画框表 / 空格对齐列；手动档，不要求分隔行）" aria-label="转成表格">转成表格</button>
           <button type="button" class="tb-btn" id="tableToTextBtn" role="menuitem" data-op="table2text" onmousedown="event.preventDefault()" title="表格转文本：把光标所在表格还原成 Markdown 管道文字（光标不在表格内则转当前页全部表格；可再用「转成表格」转回）" aria-label="表格转文本">表格转文本</button>
+          <button type="button" class="tb-btn" id="colsBtn" role="menuitem" data-op="columns" onmousedown="event.preventDefault()" title="分栏：选中段落两两转成无边框两列表（第1段→左栏、第2段→右栏，落单段放右栏），无选区时在光标处插入空白分栏行。左栏批注垂直居中；中间分栏宽度可在表格内拖拽或用「设置列宽」调整（表格菜单「表格转段落」可还原）" aria-label="分栏">分栏</button>
         </div>
       </div>
     </div>
@@ -12445,7 +13129,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       </label>
       <h4 style="margin:16px 0 4px;">搜索结果</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">搜索/替换弹窗结果列表最多显示的条数（10-1000，默认 200）。匹配总数始终完整统计并显示，超出上限时提示「仅显示前 N 条」；列表非虚拟渲染，设得越大滚动越可能卡顿。EPUB 编辑器的章内搜索读取同一设置。</p>
-      <label style="font-size:13px;">显示上限（条） <input type="number" id="searchMaxResultsInput" min="10" max="1000" step="10" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
+      <label style="font-size:13px;">显示上限（条） <input type="number" id="searchMaxResultsInput" min="10" max="1000000" step="10" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
       <h4 style="margin:16px 0 4px;">文字页面行号</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">在虚拟列表各页的文字左侧显示行号（每页从 1 重新计起，与原书页码无关）。行号供命令行按行号寻址使用（Ctrl+; 打开命令行，例如 7,10merge 合并第 7-10 行）。纯视图层，不写入保存内容，也不影响导出。</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
@@ -12464,6 +13148,20 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
         <input type="checkbox" id="textJustifyToggle" style="width:16px;height:16px;">
         正文两端对齐
+      </label>
+      <h4 style="margin:16px 0 4px;">表格内浮层菜单</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">控制鼠标操作落在表格内时是否弹出对应浮层，三项独立控制，只影响表格范围（表格外不受影响）。默认全部关闭：表格内选中文字 / 右击不再弹出菜单，仅保留表格操作条；右击三项全关时回退浏览器默认菜单（复制 / 粘贴）。</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
+        <input type="checkbox" id="tblPopupMenuChk" style="width:16px;height:16px;">
+        表格内显示选中文字菜单（选中文字时弹出的快捷操作菜单）
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="tblCtxMenuChk" style="width:16px;height:16px;">
+        表格内显示右键菜单（右击弹出的页级操作菜单）
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="tblTblMenuChk" style="width:16px;height:16px;">
+        表格内右击显示表格菜单（加行 / 加列 / 合并等；操作条「更多 ▾」不受影响）
       </label>
       <h4 style="margin:16px 0 4px;">智能清理规则</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">「智能清理」按钮各步骤的启用开关。仅作用于清理结果，不影响未清理内容；关闭某步即清理时跳过该步。</p>
@@ -12494,9 +13192,14 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：&lt;p&gt;未完&lt;/p&gt;&lt;p&gt;待续&lt;/p&gt; → &lt;p&gt;未完待续&lt;/p&gt;</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
         <input type="checkbox" id="cleanDigitPunctChk" style="width:16px;height:16px;">
-        数字标点归一（数字紧跟的中文标点 → 英文）
+        数字/字母标点归一（数字、字母间的中文标点 → 英文，含空格容忍；并清理数字间/单字母间空格）
       </label>
       <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：1。2 → 1.2，1，2 → 1,2，1。 → 1.；映射表可在下方自定义</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="cleanBlankLinesChk" style="width:16px;height:16px;">
+        导出时清理空白行（删掉空段落、连续空行合并为一个，默认关闭）
+      </label>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">仅作用于导出（txt / md / docx / epub），不影响编辑区内容与「智能清理」结果。</p>
       <div style="margin-top:12px;padding:8px;background:#f8f9fa;border-radius:4px;">
         <p style="font-size:12px;color:#5a6b7c;margin:0 0 4px;">实时预览（输入文本查看清理效果）</p>
         <textarea id="cleanPreviewInput" rows="2" style="width:100%;box-sizing:border-box;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;resize:vertical;" placeholder="输入文本查看清理效果..."></textarea>
@@ -12761,12 +13464,15 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   <button type="button" data-tbl-op="alignleft" data-tbl-align="left" title="单元格左对齐">左</button>
   <button type="button" data-tbl-op="aligncenter" data-tbl-align="center" title="单元格居中">中</button>
   <button type="button" data-tbl-op="alignright" data-tbl-align="right" title="单元格右对齐">右</button>
+  <button type="button" data-tbl-op="aligngrid" title="单元格对齐（上下 × 左右，Word 式九宫格）">对齐 ▾</button>
   <span class="tbl-bar-sep"></span>
   <button type="button" data-tbl-op="more" title="更多表格操作（插入/移动行列、垂直对齐、表头、均分列宽…）">更多 ▾</button>
   <button type="button" data-tbl-op="deltable" class="danger" title="删除整个表格">删除表格</button>
 </div>
 <!-- 表格「更多」菜单：与表格内右键菜单同源（JS 打开并填充） -->
 <div id="tblMenu" style="display:none;" role="menu" aria-label="表格菜单"></div>
+<!-- 表格对齐九宫格（2026-10）：Word 式「上下 × 左右」单元格对齐（JS 构建 9 个按钮） -->
+<div id="tblAlignGrid" style="display:none;" role="menu" aria-label="单元格对齐"></div>
 <!-- 表格列/行尺寸拖拽手柄层：覆盖在表格上；层本身 pointer-events:none，仅手柄可拖 -->
 <div id="tblResizeLayer" aria-hidden="true"></div>
 <!-- 单元格/行列尺寸弹窗（2026-10）：列宽(%)、行高(数值+单位) -->

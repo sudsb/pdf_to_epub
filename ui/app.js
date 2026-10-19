@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 const BUFFER = 15, GAP = 12;
 // 内存换平滑（2026-08）：滚动方向前方额外预挂载 PRELOAD 行，图片提前加载、行高提前稳定——
 // 滚到那里时高度已测量，滚动中几乎不再触发补偿（减少跳变诱因）。代价：常驻 DOM/预览图内存略增（可接受）。
@@ -191,13 +191,14 @@ function undoLimit() {
   const v = parseInt(uiv('undo_depth', 100), 10);
   return UNDO_DEPTH_CHOICES.indexOf(v) >= 0 ? v : 100;
 }
-// 搜索结果列表显示上限（10-1000，默认 200；设置-界面可改；服务端持久化 config.json
+// 搜索结果列表显示上限（10-1000000，默认 200；设置-界面可改；服务端持久化 config.json
 // ui_settings.search_max_results，与 EPUB 编辑器章内搜索共用同一设置）。超出的匹配
-// 仍统计真实总数，只是不渲染进列表（列表 DOM 非虚拟化，过大拖慢渲染）。
+// 仍统计真实总数，只是不存储进列表（列表改为虚拟滚动，只渲染视口内的行，故上限可放宽
+// 到 1,000,000 而不卡死；见 renderSearchResults / _srRenderWindow）。
 function searchMaxResults() {
   const v = parseInt(uiv('search_max_results', 200), 10);
   if (!isFinite(v)) return 200;
-  return Math.max(10, Math.min(1000, v));
+  return Math.max(10, Math.min(1000000, v));
 }
 
 // 设置「界面」页偏好：服务端持久化到 config.json（/api/ui_settings）。
@@ -213,9 +214,16 @@ const UI_SETTINGS_DEFAULTS = { tip_delay: 600, err_hover_delay: 1500, brush_merg
   line_num_size: 'large', text_justify: true,
   clean_punctuation: true, clean_symbols: true, clean_md_tags: true, clean_html_tags: true, clean_paragraphs: false,
   clean_digit_punct: true,
+  // 导出时清理空白行（2026-10）：删空段落、连续空行合并为一个；仅作用于导出，默认关。
+  clean_blank_lines: false,
   clean_symbol_map: [['[','【'],[']','】'],['--','——'],['~','～']],
-  // 数字标点归一（2026-10-18）：数字紧跟的中文标点 → 英文；设置里可自定义（仅单字符源）
-  clean_digit_punct_map: [['。','.'],['，',','],['、',','],['：',':'],['；',';']] };
+  // 数字/字母标点归一（2026-10-18）：数字、字母间的中文标点 → 英文（含行内空格容忍 + 数字间/单字母间空格清理）；设置里可自定义（仅单字符源）
+  clean_digit_punct_map: [['。','.'],['，',','],['、',','],['：',':'],['；',';']],
+  // 表格内浮层菜单开关（2026-10，默认全关，只影响表格范围）：表格内选中文字/右击时
+  // 是否弹出对应菜单。与后端 configmanage DEFAULT_CONFIG["ui_settings"] 同名键对应。
+  tbl_popup_menu: false,
+  tbl_ctx_menu: false,
+  tbl_tbl_menu: false };
 let uiSettings = null; // 服务端加载前为 null → 读 localStorage 兜底；加载后为完整对象
 // 自动表格转换开关（config.json 顶层 table_convert）：应用纠错后是否补跑「文字表格 →
 // 原生表格」自动转换；由 /api/config 载入时同步，默认与后端默认一致（开）。
@@ -276,6 +284,12 @@ async function loadUiSettingsFromServer() {
       if (lns) lns.value = uis('line_num_size', 'large');
       const tj = document.getElementById('textJustifyToggle');
       if (tj) tj.checked = !!uiBool('text_justify', true);
+      const tpm = document.getElementById('tblPopupMenuChk');
+      if (tpm) tpm.checked = !!uiBool('tbl_popup_menu', false);
+      const tcm = document.getElementById('tblCtxMenuChk');
+      if (tcm) tcm.checked = !!uiBool('tbl_ctx_menu', false);
+      const ttm = document.getElementById('tblTblMenuChk');
+      if (ttm) ttm.checked = !!uiBool('tbl_tbl_menu', false);
       const cp = document.getElementById('cleanPunctuationChk');
       if (cp) cp.checked = !!uiBool('clean_punctuation', true);
       const cs = document.getElementById('cleanSymbolsChk');
@@ -288,6 +302,8 @@ async function loadUiSettingsFromServer() {
       if (cpa) cpa.checked = !!uiBool('clean_paragraphs', false);
       const cdp = document.getElementById('cleanDigitPunctChk');
       if (cdp) cdp.checked = !!uiBool('clean_digit_punct', true);
+      const cbl = document.getElementById('cleanBlankLinesChk');
+      if (cbl) cbl.checked = !!uiBool('clean_blank_lines', false);
       const sme = document.getElementById('cleanSymbolMapEditor');
       if (sme) sme.value = formatSymbolMap(uiSettings.clean_symbol_map || UI_SETTINGS_DEFAULTS.clean_symbol_map);
       const dpe = document.getElementById('cleanDigitPunctMapEditor');
@@ -327,10 +343,16 @@ function saveUIMirror() {
     localStorage.setItem('ptoe_clean_paragraphs', uiSettings.clean_paragraphs ? '1' : '0');
     // 数字标点归一（2026-10-18）：'1'/'0'（uiBool 读 'ptoe_'+key）
     localStorage.setItem('ptoe_clean_digit_punct', uiSettings.clean_digit_punct ? '1' : '0');
+    // 导出时清理空白行（2026-10）：'1'/'0'（uiBool 读 'ptoe_'+key）
+    localStorage.setItem('ptoe_clean_blank_lines', uiSettings.clean_blank_lines ? '1' : '0');
     // 符号映射表（2026-10-16）：JSON 数组
     localStorage.setItem('ptoe_clean_symbol_map', JSON.stringify(uiSettings.clean_symbol_map || UI_SETTINGS_DEFAULTS.clean_symbol_map));
     // 数字标点映射表（2026-10-18）：JSON 数组
     localStorage.setItem('ptoe_clean_digit_punct_map', JSON.stringify(uiSettings.clean_digit_punct_map || UI_SETTINGS_DEFAULTS.clean_digit_punct_map));
+    // 表格内浮层菜单开关（2026-10）：'1'/'0'（uiBool 读 'ptoe_'+key）
+    localStorage.setItem('ptoe_tbl_popup_menu', uiSettings.tbl_popup_menu ? '1' : '0');
+    localStorage.setItem('ptoe_tbl_ctx_menu', uiSettings.tbl_ctx_menu ? '1' : '0');
+    localStorage.setItem('ptoe_tbl_tbl_menu', uiSettings.tbl_tbl_menu ? '1' : '0');
   } catch (e) {}
 }
 function saveUiSettings() {
@@ -1855,6 +1877,122 @@ function convertSelectionToTable() {
     showToast('已转换为表格', 'ok');
   }).catch(function (e) { showToast('转换失败：' + e, 'fail'); });
 }
+
+// ---------- 分栏（2026-10）：无边框两列表格承载「左一段右一段」版式 ----------
+// 分栏 = <table class="ptoe-noborder" style="table-layout:fixed"> 两列表：左栏 25%
+// （批注/旁注，垂直居中）+ 右栏 75%（正文），无表头。中间分栏宽度用既有「设置列宽…」
+// 弹窗或列宽拖拽手柄调整；保存白名单放行 ptoe-noborder，EPUB/DOCX 按无边框表格导出。
+const COLS_LEFT_PCT = 25;
+const COLS_RIGHT_PCT = 75;
+// 构建分栏表格 DOM。rowsData: [{ left: html, right: html }]（空串 → 空单元格）。
+function buildColumnsTable(rowsData) {
+  const table = document.createElement('table');
+  table.className = TBL_NOBORDER_CLASS;
+  table.style.tableLayout = 'fixed';
+  const tbody = document.createElement('tbody');
+  (rowsData && rowsData.length ? rowsData : [{ left: '', right: '' }]).forEach(function (rd) {
+    const tr = document.createElement('tr');
+    const ltd = document.createElement('td');
+    ltd.style.width = COLS_LEFT_PCT + '%';
+    // 2026-10 修复：垂直居中改用 ptoe-vmid class（勿写 inline vertical-align）——
+    // inline 优先级高于 class，会让「顶端/底端对齐」永远看不到效果，且九宫格只认 class
+    // （_tblVAlignOf）→ 左栏明明居中，重开对齐却恒显「左上」。
+    ltd.classList.add('ptoe-vmid');
+    ltd.innerHTML = rd.left || '';
+    const rtd = document.createElement('td');
+    rtd.style.width = COLS_RIGHT_PCT + '%';
+    rtd.innerHTML = rd.right || '';
+    tr.appendChild(ltd);
+    tr.appendChild(rtd);
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  return table;
+}
+// 「分栏」入口：选区跨 ≥1 个段落 → 两两配对转为一张无边框两列表（第1段→左栏、
+// 第2段→右栏，依此类推；落单的最后一段放右栏、左栏留空）；光标无选区 → 在光标处
+// 插入一行空白分栏行。对「左批注右正文」版式：选中 [批注段, 正文段]（按此顺序）。
+function convertSelectionToColumns() {
+  if (mdMode) { showToast('Markdown 模式不支持分栏', 'warn'); return; }
+  const ed = currentEditable();
+  if (!ed) { showToast('请先点击某一页正文', 'warn'); return; }
+  const row = ed.closest('.page-row');
+  const i = row ? Number(row.dataset.i) : -1;
+  const sel = window.getSelection();
+  const range = (sel && sel.rangeCount > 0) ? sel.getRangeAt(0) : null;
+  if (!range || range.collapsed) {
+    // 无选区：光标处插入一行空白分栏行（表格嵌套防护与「插入表格」同口径）
+    if (caretInTable(ed) || rangeInTable(_tblCaretRange, ed)) {
+      showToast('光标在表格内：请先移出表格（点表格外的正文）再插入分栏', 'warn');
+      return;
+    }
+    const table = buildColumnsTable([{ left: '', right: '' }]);
+    const before = histBegin('插入分栏', [i]);
+    ed.focus();
+    inDiscreteOp = true;
+    try {
+      withScrollStable(function () {
+        // 恢复插入点：最近一次在 .editable 内的选区/光标；失效则落到编辑区末尾
+        const restored = _restoreEditableRange(_lastEditableRange);
+        if (!restored) {
+          const r = document.createRange();
+          r.selectNodeContents(ed);
+          r.collapse(false);
+          const s2 = window.getSelection();
+          s2.removeAllRanges();
+          try { s2.addRange(r); } catch (e2) { /* 极端情况忽略 */ }
+        }
+        if (!document.execCommand('insertHTML', false, table.outerHTML)) {
+          ed.appendChild(table);
+        }
+      });
+    } finally { inDiscreteOp = false; }
+    syncContent(ed); markDirty(i); scheduleRemeasure(i);
+    histEnd(before, '插入分栏');
+    showToast('已插入分栏行（左右栏内容直接输入；分栏宽度可在表格内拖拽调整）', 'ok');
+    return;
+  }
+  if (!ed.contains(range.commonAncestorContainer)) { showToast('请先选中本页要分栏的段落', 'warn'); return; }
+  // 选区 → 块集合（与「合并段落」同一套边界解析）
+  const startNode = range.startContainer.nodeType === 3 ? range.startContainer.parentElement : range.startContainer;
+  const endNode = range.endContainer.nodeType === 3 ? range.endContainer.parentElement : range.endContainer;
+  let startBlock = (startNode && startNode.closest) ? (startNode.closest('p,div,h1,h2,h3,h4,h5,h6') || null) : null;
+  let endBlock = (endNode && endNode.closest) ? (endNode.closest('p,div,h1,h2,h3,h4,h5,h6') || null) : null;
+  if (startBlock === ed) startBlock = null;
+  if (endBlock === ed) endBlock = null;
+  const blocks = _blocksBetween(ed, startBlock, endBlock);
+  if (!blocks.length) { showToast('请先选中要分栏的段落', 'warn'); return; }
+  for (let k = 0; k < blocks.length; k++) {
+    if (blocks[k].closest && blocks[k].closest('td,th')) {
+      showToast('选区含表格内文字：请在表格外选中段落后再分栏', 'warn');
+      return;
+    }
+  }
+  // 选区中间夹着整张表格 → 保守拒绝（表格不参与配对，避免结构错位）
+  let n = blocks[0];
+  while (n && n !== blocks[blocks.length - 1]) {
+    if (n.tagName === 'TABLE') { showToast('选区中间包含表格：请避开表格分段选中后再分栏', 'warn'); return; }
+    n = n.nextElementSibling;
+  }
+  histRun('分栏', [i], function () {
+    const rowsData = [];
+    for (let k = 0; k < blocks.length; k += 2) {
+      if (k + 1 < blocks.length) {
+        rowsData.push({ left: blocks[k].innerHTML, right: blocks[k + 1].innerHTML });
+      } else {
+        rowsData.push({ left: '', right: blocks[k].innerHTML }); // 落单段放右栏
+      }
+    }
+    const table = buildColumnsTable(rowsData);
+    blocks[0].parentNode.insertBefore(table, blocks[0]);
+    for (let k = 0; k < blocks.length; k++) {
+      if (blocks[k] && blocks[k].parentNode) blocks[k].parentNode.removeChild(blocks[k]);
+    }
+    syncContent(ed);
+    if (row) { markDirty(i); scheduleRemeasure(i); }
+  });
+  showToast('已转为分栏（每2段一行：第1段左栏、第2段右栏，落单段放右栏）', 'ok');
+}
 // 「表格转文本」（2026-10）：把光标所在表格（光标不在表格内则当前页全部表格）交给
 // 服务端 /api/table_to_text 还原成 Markdown 管道文字，就地替换为纯文本行。手动操作，
 // 与自动转换开关无关；事后可用「转成表格」再转回原生表格（幂等往返）。
@@ -1976,6 +2114,48 @@ function _tblAlignOf(cell) {
   if (cell.classList.contains('ptoe-align-right')) return 'right';
   return '';
 }
+// 垂直对齐 class 读取（""|top|middle|bottom）；与 CSS .ptoe-vtop/vmid/vbot 契约一致。
+// 只认 class —— 供「再点同向 = 取消」判定：旧内容的 inline vertical-align 不算已设置，
+// 否则对分栏旧单元格点一次「中」会既清 inline 又判成取消，反而跳到顶端。
+function _tblVAlignClassOf(cell) {
+  if (!cell || !cell.classList) return '';
+  if (cell.classList.contains('ptoe-vtop')) return 'top';
+  if (cell.classList.contains('ptoe-vmid')) return 'middle';
+  if (cell.classList.contains('ptoe-vbot')) return 'bottom';
+  return '';
+}
+function _tblVAlignOf(cell) {
+  const cls = _tblVAlignClassOf(cell);
+  if (cls) return cls;
+  // 2026-10 兼容旧内容：分栏左栏/尺寸弹窗曾把垂直对齐写成 inline vertical-align
+  // （保存白名单放行该属性）。这里一并识别，否则九宫格恒显「左上」，用户以为设置没生效。
+  const v = String((cell && cell.style && cell.style.verticalAlign) || '').toLowerCase();
+  if (v === 'top') return 'top';
+  if (v === 'middle') return 'middle';
+  if (v === 'bottom') return 'bottom';
+  return '';
+}
+// 对齐/垂直对齐的作用目标：有跨格矩形选区（拖选或 Shift 点选）时作用于整个选区，
+// 否则只作用于光标所在单元格。与「合并」等结构操作同一选区来源（_tblSel）。
+function _tblTargetCells() {
+  if (!_tblKey) return [];
+  const table = _tblKey.table, cell = _tblKey.cell;
+  if (table && cell && _tblSel && _tblSel.table === table) {
+    const rect = _tblRectOfSel(_tblSel);
+    if (rect.r0 !== rect.r1 || rect.c0 !== rect.c1) {
+      const grid = _tblGrid(table);
+      const out = [];
+      for (let r = rect.r0; r <= rect.r1; r++) {
+        for (let c = rect.c0; c <= rect.c1; c++) {
+          const e = grid[r] && grid[r][c];
+          if (e && e.cell && out.indexOf(e.cell) < 0) out.push(e.cell);
+        }
+      }
+      if (out.length) return out;
+    }
+  }
+  return cell ? [cell] : [];
+}
 
 function showTblBar() {
   if (mdMode) return; // Markdown 源码模式无真实表格节点
@@ -2005,23 +2185,31 @@ function hideTblBar() {
   // （2026-10 修复；应用既有滚动处理器会调用本函数）。
   _tblHideResizeLayer();
   _tblMenuClose();
+  _tblAlignGridClose();
   _tblKey = null;
   _tblBarVisible = false;
 }
 // 对齐按钮高亮当前生效方向（只认 ptoe-align-* 三类，与后端契约一致）
 function _tblSyncAlignActive() {
   if (!tblBar || !_tblKey) return;
-  const cur = _tblAlignOf(_tblKey.cell);
+  const cell = _tblKey.cell;
+  const cur = _tblAlignOf(cell);
   tblBar.querySelectorAll('[data-tbl-align]').forEach(function (b) {
     b.classList.toggle('active', b.dataset.tblAlign === cur);
   });
+  // 「对齐 ▾」按钮：任一方向生效（含非默认垂直对齐）即高亮
+  const vcur = _tblVAlignOf(cell);
+  const gbtn = tblBar.querySelector('[data-tbl-op="aligngrid"]');
+  if (gbtn) gbtn.classList.toggle('active', !!cur || !!vcur);
+  // 九宫格若已打开，同步高亮当前组合（默认 水平左 + 垂直顶，与 CSS 默认一致）
+  _tblSyncAlignGridActive(cur || 'left', vcur || 'top');
 }
 // 焦点是否落在自家浮层（操作条/更多菜单/选中菜单/尺寸弹窗/手柄层）。
 // 这些浮层的按钮 mousedown 已 preventDefault 保住编辑区选区；此处再兜底，
 // 避免部分浏览器仍塌陷选区后 _tblSyncVisibility 把 _tblKey 清空（见操作条按钮
 // 「点了没反应」的根因）。
 function _tblInOwnUI(el) {
-  return !!(el && el.closest && el.closest('#tblBar,#tblMenu,#tblResizeLayer,#tblSizeModalBg,#popup'));
+  return !!(el && el.closest && el.closest('#tblBar,#tblMenu,#tblAlignGrid,#tblResizeLayer,#tblSizeModalBg,#popup'));
 }
 // 光标状态变更（点击/键盘移动/选区变化）→ 进入单元格显示、离开隐藏
 function _tblSyncVisibility() {
@@ -2061,10 +2249,14 @@ function _tblAddRow() { _tblInsertRow('below'); }
 function _tblAddCol() { _tblInsertCol('right'); }
 function _tblAlign(align) {
   if (!_tblKey) return;
-  const cell = _tblKey.cell;
-  const cur = _tblAlignOf(cell);
-  ['ptoe-align-left', 'ptoe-align-center', 'ptoe-align-right'].forEach((c) => cell.classList.remove(c));
-  if (cur !== align) cell.classList.add('ptoe-align-' + align); // 点当前已生效方向 = 取消
+  const cells = _tblTargetCells();
+  if (!cells.length) return;
+  // 仅单格时「点当前已生效方向 = 取消」；多格选区一律设为指定方向
+  const toggleOff = cells.length === 1 && _tblAlignOf(cells[0]) === align;
+  cells.forEach(function (cell) {
+    cell.classList.remove('ptoe-align-left', 'ptoe-align-center', 'ptoe-align-right');
+    if (!toggleOff) cell.classList.add('ptoe-align-' + align);
+  });
   _tblSyncAlignActive();
 }
 function _tblDelTable() {
@@ -2103,6 +2295,7 @@ if (tblBar) tblBar.addEventListener('mousedown', function (e) { e.preventDefault
 const TBL_MAX_R = 200, TBL_MAX_C = 50;
 let _tblSel = null;            // {table, anchor:{r,c}, focus:{r,c}} 单元格矩形选区
 let _tblMenuEl = null;         // 「更多」/右键菜单节点
+let _tblAlignGridEl = null;    // 单元格对齐九宫格节点
 let _tblResizeLayer = null;    // 列/行拖拽手柄层
 let _tblResizeFor = null;      // 手柄层当前对应的 table（避免 selectionchange 反复重建）
 let _tblSizeModal = null;      // 尺寸弹窗
@@ -2196,7 +2389,9 @@ function _tblPaintSel() {
 document.addEventListener('mousedown', function (e) {
   if (mdMode || !e.target || !e.target.closest) return;
   if (e.button !== 0) return; // 只认左键起手拖选单元格（中键/右键不参与）
-  if (e.target.closest('#tblBar,#tblMenu,#tblResizeLayer,#tblSizeModalBg')) return;
+  // 自家浮层（操作条/更多菜单/对齐九宫格/手柄层/尺寸弹窗/选中菜单）不起手拖选——
+  // 否则点九宫格选项会顺手把多格矩形选区（_tblSel）清空，对齐就只作用于光标那一格。
+  if (_tblInOwnUI(e.target)) return;
   const hit = _tblCellOfNode(e.target);
   if (!hit) { if (_tblSel) { _tblSel = null; _tblClearSelPaint(); } return; }
   const p = _tblPosOfCell(hit.table, hit.cell);
@@ -2551,6 +2746,44 @@ function _tblToggleHeader() {
   showTblBar();
 }
 
+// ---- 无边框（2026-10）：按表格切换 class="ptoe-noborder" ----
+// 编辑视图由 .editable table.ptoe-noborder CSS 去边框；保存时 _Sanitizer 只
+// 白名单放行这一个表格级 class；EPUB/DOCX 导出按该 class 输出无边框样式。
+const TBL_NOBORDER_CLASS = 'ptoe-noborder';
+function _tblToggleNoborder(table) {
+  if (!table) return;
+  table.classList.toggle(TBL_NOBORDER_CLASS);
+}
+function _tblHasNoborder(table) {
+  return !!(table && table.classList && table.classList.contains(TBL_NOBORDER_CLASS));
+}
+
+// 「表格转段落」（2026-10）：逐行逐格还原成段落（每个非空单元格 → 一段，按行内
+// 从左到右）。主要用途是撤销「分栏」（无边框两列表 → 左右两段）；对普通表格同样
+// 可用。空单元格跳过；清空整页后补空段落防行高塌陷（与 _tblDelTable 同口径）。
+function _tblTableToParagraphs() {
+  if (!_tblKey || !_tblKey.table) return;
+  const table = _tblKey.table;
+  const ed = _tblKey.ed;
+  const frag = document.createDocumentFragment();
+  Array.prototype.slice.call(table.querySelectorAll('tr')).forEach(function (tr) {
+    Array.prototype.slice.call(tr.querySelectorAll('td,th')).forEach(function (cell) {
+      if (!/[^\s\u00a0]/.test(cell.textContent || '')) return;
+      const p = document.createElement('p');
+      p.innerHTML = cell.innerHTML;
+      frag.appendChild(p);
+    });
+  });
+  if (!frag.childNodes.length) return;
+  if (table.parentNode) table.parentNode.insertBefore(frag, table);
+  if (table.parentNode) table.parentNode.removeChild(table);
+  if (!/[^\s]/.test(ed.textContent)) {
+    const p = document.createElement('p');
+    p.appendChild(document.createElement('br'));
+    ed.appendChild(p);
+  }
+}
+
 // ---- 尺寸：列宽 / 行高 / 均分 / 重置 ----
 function _tblEnsureFixed(table, on) {
   table.style.tableLayout = on ? 'fixed' : '';
@@ -2656,13 +2889,24 @@ function _tblResetSizes(table) {
 }
 function _tblVAlign(dir) {
   if (!_tblKey) return;
-  const cell = _tblKey.cell;
   const map = { top: 'ptoe-vtop', middle: 'ptoe-vmid', bottom: 'ptoe-vbot' };
   const cls = map[dir];
-  let cur = '';
-  Object.keys(map).forEach(function (k) { if (cell.classList.contains(map[k])) cur = map[k]; });
-  Object.keys(map).forEach(function (k) { cell.classList.remove(map[k]); });
-  if (cur !== cls) cell.classList.add(cls); // 点当前生效值 = 取消
+  const cells = _tblTargetCells();
+  if (!cells.length) return;
+  // 仅单格时「点当前已生效值 = 取消」；多格选区一律设为指定方向。
+  // 判定只认 class（见 _tblVAlignClassOf）：旧内容的 inline 垂直对齐不算已设置。
+  const toggleOff = cells.length === 1 && _tblVAlignClassOf(cells[0]) === dir;
+  cells.forEach(function (cell) {
+    Object.keys(map).forEach(function (k) { cell.classList.remove(map[k]); });
+    // 2026-10 修复：清掉遗留的 inline vertical-align（旧分栏/尺寸弹窗写入）。inline
+    // 优先级高于 class，不清除则顶端/底端对齐永远压不过它 → 「设置后不生效」。
+    if (cell.style && cell.style.verticalAlign) {
+      cell.style.verticalAlign = '';
+      if (!cell.getAttribute('style')) cell.removeAttribute('style');
+    }
+    if (!toggleOff) cell.classList.add(cls);
+  });
+  _tblSyncAlignActive();
 }
 
 // ---- 尺寸拖拽手柄层（列/行边界） ----
@@ -2798,11 +3042,13 @@ const TBL_MENU_ITEMS = [
   { op: 'distribute', label: '均分列宽' },
   { op: 'reset', label: '重置尺寸' },
   { op: 'repair', label: '修复缺失单元格' },
+  { op: 'uncolumn', label: '表格转段落' },
   { sep: true },
   { head: '对齐与表头' },
   { op: 'valigntop', label: '垂直：顶' },
   { op: 'valignmiddle', label: '垂直：居中' },
   { op: 'valignbottom', label: '垂直：底' },
+  { op: 'noborder', label: '不显示边框' },
   { op: 'header', label: '首行设为/取消表头' },
   { sep: true },
   { op: 'deltable', label: '删除表格', danger: true }
@@ -2822,6 +3068,7 @@ function _ensureTblMenu() {
 }
 function _tblMenuOpen(x, y) {
   if (!_tblKey || !_tblKey.table) return;
+  _tblAlignGridClose(); // 两个浮层互斥（九宫格与「更多」菜单）
   const cell = _tblKey.cell;
   const el = _ensureTblMenu();
   el.innerHTML = '';
@@ -2846,9 +3093,11 @@ function _tblMenuOpen(x, y) {
     b.textContent = it.label;
     if (it.danger) b.className = 'danger';
     if (vmap[it.op] && cell && cell.classList.contains(vmap[it.op])) b.classList.add('active');
+    if (it.op === 'noborder' && _tblHasNoborder(_tblKey.table)) b.classList.add('active');
     if (it.op === 'valigntop') b.title = '单元格内容顶部对齐';
     if (it.op === 'valignmiddle') b.title = '单元格内容垂直居中';
     if (it.op === 'valignbottom') b.title = '单元格内容底部对齐';
+    if (it.op === 'noborder') b.title = '不显示本表格的边框（导出 EPUB/DOCX 同样无边框；再点一次恢复）';
     el.appendChild(b);
   });
   el.style.display = 'block';
@@ -2863,19 +3112,104 @@ document.addEventListener('contextmenu', function (e) {
   if (e.target.closest('#tblMenu')) return;
   const hit = _tblCellOfNode(e.target);
   if (!hit) return;
+  // 表格内浮层菜单开关（2026-10）：右击落在表格内时按设置决定弹哪些菜单。
+  // 表格菜单关 + 右键菜单关 → 不拦截，回退浏览器默认菜单（复制/粘贴）。
+  const wantTblMenu = uiBool('tbl_tbl_menu', false);
+  const wantCtxMenu = uiBool('tbl_ctx_menu', false);
+  if (!wantTblMenu && !wantCtxMenu) return;
   e.preventDefault();
   const row = hit.cell.closest('.page-row');
   const ed = hit.cell.closest('.editable');
   _tblKey = { i: row ? Number(row.dataset.i) : -1, cell: hit.cell, table: hit.table, ed: ed };
   showTblBar();
   _tblShowResizeLayer();
-  _tblMenuOpen(e.clientX, e.clientY);
+  if (wantTblMenu) _tblMenuOpen(e.clientX, e.clientY);
 });
 document.addEventListener('mousedown', function (e) {
   if (_tblMenuEl && _tblMenuEl.style.display === 'block') {
     if (!(e.target.closest && e.target.closest('#tblMenu'))) _tblMenuClose();
   }
+  if (_tblAlignGridEl && _tblAlignGridEl.style.display === 'block') {
+    // 操作条按钮自身负责开关（#tblBar 除外），点击别处收起
+    if (!(e.target.closest && e.target.closest('#tblAlignGrid,#tblBar'))) _tblAlignGridClose();
+  }
 }, true);
+
+// ---- 单元格对齐九宫格（2026-10）：Word 式「上下 × 左右」 ----
+// 3×3 按钮，一次设置「水平 + 垂直」两个方向。作用于当前单元格；存在多格矩形
+// 选区时作用于整个选区。导出契约：水平走 ptoe-align-*（EPUB CSS + DOCX w:jc），
+// 垂直走 ptoe-v*（EPUB CSS + DOCX w:vAlign），与界面显示一致。
+const TBL_AG_ROWS = [
+  { v: 'top', label: '顶端' },
+  { v: 'middle', label: '垂直居中' },
+  { v: 'bottom', label: '底端' }
+];
+const TBL_AG_COLS = [
+  { h: 'left', label: '左对齐' },
+  { h: 'center', label: '水平居中' },
+  { h: 'right', label: '右对齐' }
+];
+function _ensureTblAlignGrid() {
+  if (_tblAlignGridEl) return _tblAlignGridEl;
+  const el = document.getElementById('tblAlignGrid') || document.createElement('div');
+  if (!el.id) { el.id = 'tblAlignGrid'; document.body.appendChild(el); }
+  if (!el.childNodes.length) {
+    const title = document.createElement('div');
+    title.className = 'tbl-ag-title';
+    title.textContent = '单元格对齐';
+    el.appendChild(title);
+    const grid = document.createElement('div');
+    grid.className = 'tbl-ag-grid';
+    TBL_AG_ROWS.forEach(function (row) {
+      TBL_AG_COLS.forEach(function (col) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'tbl-ag-cell';
+        b.dataset.tblAgH = col.h;
+        b.dataset.tblAgV = row.v;
+        b.title = row.label + '，' + col.label;
+        const lines = document.createElement('span');
+        lines.className = 'tbl-ag-lines';
+        for (let k = 0; k < 3; k++) lines.appendChild(document.createElement('i'));
+        b.appendChild(lines);
+        grid.appendChild(b);
+      });
+    });
+    el.appendChild(grid);
+  }
+  el.addEventListener('click', function (e) {
+    const b = e.target.closest ? e.target.closest('[data-tbl-ag-h]') : null;
+    if (!b) return;
+    _tblDoOp('aligngrid:' + b.dataset.tblAgH + ':' + b.dataset.tblAgV);
+  });
+  // 与操作条/「更多」菜单同理：保住编辑区选区，避免点按钮时 _tblKey 被误清
+  el.addEventListener('mousedown', function (e) { e.preventDefault(); });
+  _tblAlignGridEl = el;
+  return el;
+}
+// 高亮九宫格中与 (h,v) 匹配的按钮（仅在浮层已构建后生效）
+function _tblSyncAlignGridActive(h, v) {
+  if (!_tblAlignGridEl) return;
+  _tblAlignGridEl.querySelectorAll('[data-tbl-ag-h]').forEach(function (b) {
+    b.classList.toggle('active', b.dataset.tblAgH === h && b.dataset.tblAgV === v);
+  });
+}
+function _tblAlignGridOpen(x, y) {
+  if (!_tblKey || !_tblKey.table) return;
+  const el = _ensureTblAlignGrid();
+  _tblSyncAlignGridActive(_tblAlignOf(_tblKey.cell) || 'left', _tblVAlignOf(_tblKey.cell) || 'top');
+  el.style.display = 'block';
+  const w = el.offsetWidth, hgt = el.offsetHeight;
+  let left = x;
+  let top = y;
+  if (left + w > window.innerWidth - 8) left = Math.max(8, window.innerWidth - w - 8);
+  if (top + hgt > window.innerHeight - 8) top = Math.max(8, y - hgt);
+  el.style.left = left + 'px';
+  el.style.top = top + 'px';
+}
+function _tblAlignGridClose() {
+  if (_tblAlignGridEl) _tblAlignGridEl.style.display = 'none';
+}
 
 // ---- 尺寸弹窗 ----
 function _ensureTblSizeModal() {
@@ -2964,10 +3298,28 @@ function _tblDoOp(op) {
   const i = _tblKey.i;
   const run = function (label, fn) { _tblOperate(label, fn, i); };
   _tblMenuClose();
+  // 九宫格：开关由自身按钮控制（保留打开态），其余操作/换格前一律先收起
+  const isAgToggle = op === 'aligngrid';
+  if (!isAgToggle) _tblAlignGridClose();
   if (op === 'more') {
     const btn = (tblBar && tblBar.querySelector('[data-tbl-op="more"]')) || tblBar;
     const r = btn ? btn.getBoundingClientRect() : { left: 40, bottom: 80 };
     _tblMenuOpen(r.left, r.bottom + 4);
+    return;
+  }
+  if (op === 'aligngrid') {
+    // 再点一次「对齐 ▾」收起，否则在按钮下方展开九宫格
+    if (_tblAlignGridEl && _tblAlignGridEl.style.display === 'block') { _tblAlignGridClose(); return; }
+    const gb = (tblBar && tblBar.querySelector('[data-tbl-op="aligngrid"]')) || tblBar;
+    const gr = gb ? gb.getBoundingClientRect() : { left: 40, bottom: 80 };
+    _tblAlignGridOpen(gr.left, gr.bottom + 4);
+    return;
+  }
+  if (op.indexOf('aligngrid:') === 0) {
+    // 九宫格单元格：一次同时设置水平 + 垂直（作用于当前单元格/多格选区）
+    const agParts = op.split(':');
+    run('表格-对齐', function () { _tblAlign(agParts[1]); _tblVAlign(agParts[2]); });
+    _tblRepositionBar();
     return;
   }
   if (op === 'colwidth') { _tblOpenSizeDialog('col'); return; }
@@ -2999,6 +3351,11 @@ function _tblDoOp(op) {
   else if (op === 'valignmiddle') { run('表格-垂直对齐', function () { _tblVAlign('middle'); }); }
   else if (op === 'valignbottom') { run('表格-垂直对齐', function () { _tblVAlign('bottom'); }); }
   else if (op === 'header') { run('表格-表头', _tblToggleHeader); }
+  else if (op === 'noborder') {
+    run('表格-无边框', function () { _tblToggleNoborder(_tblKey.table); });
+    showToast(_tblHasNoborder(_tblKey.table) ? '本表格已不显示边框' : '本表格已恢复显示边框', 'info');
+  }
+  else if (op === 'uncolumn') { run('表格-转段落', _tblTableToParagraphs); }
   else if (op === 'alignleft' || op === 'aligncenter' || op === 'alignright') {
     run('表格-对齐', function () { _tblAlign(op.slice(5)); });
   }
@@ -3256,22 +3613,116 @@ function openCrop(row, i) {
 // 原生 contenteditable 拖放 <img> 会把 base64 src 作为可见文本插入，或把裸 <img>
 // 拖出 <p class="ptoe-img-full ptoe-img-center"> 包裹（丢失全画幅/局部 class）。
 // 这里在文档级接管拖拽：dragstart 记录被拖块，drop 时按落点插入克隆并移除原块。
+//
+// 2026-10-19 追加：整段（p/div/h1-6）拖进表格单元格时，浏览器原生拖放会把块的
+// class/data-* 属性清掉——段落原本设的「引用」等格式落格后显示成正文。这里同样在
+// dragstart 记录整块 HTML，drop 落到单元格时按原样插入（保留格式），其余落点仍走
+// 原生拖放（不改正文区既有的段落拖动行为）。
 let _dragImgBlock = null; // 被拖的整块（带 class 的 <p> 包裹，无包裹时为裸 <img>）
 let _dragImgEd = null;    // 被拖块所在的编辑区
+let _dragBlkHtml = null;  // 被拖的整段 HTML（保留 class/data-*）
+let _dragBlkNodes = null; // 被拖的整段节点（同文档移动时删除原块）
+let _dragBlkEd = null;    // 整段来源编辑区
+// 选区是否正好覆盖一个/多个完整块（p/div/h1-6）：是则返回同级块数组，否则 null。
+// 只接管「整段」拖拽；部分选区（普通文字拖动）交回浏览器原生处理。
+function _dragWholeBlocks(ed) {
+  if (!ed) return null;
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+  const range = sel.getRangeAt(0);
+  if (!ed.contains(range.commonAncestorContainer)) return null;
+  const sEl = range.startContainer.nodeType === 3 ? range.startContainer.parentElement : range.startContainer;
+  const eEl = range.endContainer.nodeType === 3 ? range.endContainer.parentElement : range.endContainer;
+  const sB = sEl && sEl.closest ? sEl.closest('p,div,h1,h2,h3,h4,h5,h6') : null;
+  const eB = eEl && eEl.closest ? eEl.closest('p,div,h1,h2,h3,h4,h5,h6') : null;
+  if (!sB || sB === ed || !ed.contains(sB)) return null;
+  if (!eB || eB === ed || !ed.contains(eB)) return null;
+  const sw = document.createRange(); sw.selectNodeContents(sB);
+  const ew = document.createRange(); ew.selectNodeContents(eB);
+  // 选区两端须贴齐块边界，才算「整块拖动」（否则是部分文字）
+  if (range.compareBoundaryPoints(Range.START_TO_START, sw) > 0) return null;
+  if (range.compareBoundaryPoints(Range.END_TO_END, ew) < 0) return null;
+  const blocks = _blocksBetween(ed, sB, eB);
+  return (blocks && blocks.length) ? blocks : null;
+}
 document.addEventListener('dragstart', function (e) {
   // 每次拖拽先清空旧状态（上次拖拽被取消时 drop 不会触发）
   _dragImgBlock = null;
   _dragImgEd = null;
+  _dragBlkHtml = null;
+  _dragBlkNodes = null;
+  _dragBlkEd = null;
   const t = e.target;
-  if (!t || t.tagName !== 'IMG' || !t.closest('.editable')) return;
-  _dragImgBlock = t.closest('p.ptoe-img-full, p.ptoe-img-fit') || t;
-  _dragImgEd = t.closest('.editable');
-  e.dataTransfer.effectAllowed = 'move';
-  e.dataTransfer.setData('text/plain', t.src); // 非空数据才能启动拖拽（勿 preventDefault）
+  if (!t || !t.closest) return;
+  const ed = t.closest('.editable');
+  if (t.tagName === 'IMG' && ed) {
+    _dragImgBlock = t.closest('p.ptoe-img-full, p.ptoe-img-fit') || t;
+    _dragImgEd = ed;
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', t.src); // 非空数据才能启动拖拽（勿 preventDefault）
+    return;
+  }
+  if (!ed) return;
+  const blocks = _dragWholeBlocks(ed);
+  if (!blocks) return;
+  _dragBlkNodes = blocks;
+  _dragBlkEd = ed;
+  _dragBlkHtml = blocks.map(function (b) { return b.outerHTML; }).join('');
+  try {
+    e.dataTransfer.setData('text/html', _dragBlkHtml);
+    e.dataTransfer.setData('text/plain', blocks.map(function (b) { return b.textContent; }).join('\n'));
+  } catch (err) { /* dataTransfer 只读环境忽略：仍按 _dragBlkHtml 自行插入 */ }
 });
 document.addEventListener('dragover', function (e) {
   if (_dragImgBlock) e.preventDefault(); // 允许放置
 });
+// 整段拖进表格单元格：自行插入（保留段落格式），否则交回原生拖放。
+document.addEventListener('drop', function (e) {
+  if (!_dragBlkHtml) return;
+  try {
+    const dstEd = e.target.closest ? e.target.closest('.editable') : null;
+    if (!dstEd) return; // 落点在编辑区外 → 原生处理（如拖出到别的应用）
+    const range = document.caretRangeFromPoint ? document.caretRangeFromPoint(e.clientX, e.clientY) : null;
+    if (!range) return;
+    const node = range.startContainer;
+    const nodeEl = node ? (node.nodeType === 3 ? node.parentNode : node) : null;
+    const cell = nodeEl && nodeEl.closest ? nodeEl.closest('td,th') : null;
+    if (!cell || !dstEd.contains(cell)) return; // 只接管「拖进表格单元格」，其余走原生
+    e.preventDefault();
+    const srcEd = _dragBlkEd;
+    const srcNodes = _dragBlkNodes || [];
+    const srcRow = srcEd ? srcEd.closest('.page-row') : null;
+    const dstRow = dstEd.closest('.page-row');
+    const iSrc = srcRow ? Number(srcRow.dataset.i) : -1;
+    const iDst = dstRow ? Number(dstRow.dataset.i) : -1;
+    const pagesArr = (iSrc >= 0 && iDst >= 0 && iSrc !== iDst) ? [iSrc, iDst]
+      : (iSrc >= 0 ? [iSrc] : (iDst >= 0 ? [iDst] : []));
+    histRun('拖入表格', pagesArr, function () {
+      // 落点在原块内部 → 视为未移动（no-op）
+      for (const n of srcNodes) { if (n === nodeEl || n.contains(nodeEl)) return; }
+      const frag = range.createContextualFragment(_dragBlkHtml);
+      const inCellBlock = nodeEl.closest ? nodeEl.closest('p,div,h1,h2,h3,h4,h5,h6') : null;
+      if (inCellBlock && inCellBlock !== cell && cell.contains(inCellBlock)) {
+        // 落点在某段内 → 插到该段之后（避免段内嵌段）
+        inCellBlock.parentNode.insertBefore(frag, inCellBlock.nextSibling);
+      } else {
+        range.insertNode(frag);
+      }
+      // 同文档移动：删除原块
+      for (const n of srcNodes) if (n.parentNode) n.parentNode.removeChild(n);
+      syncContent(dstEd);
+      if (srcEd && srcEd !== dstEd) syncContent(srcEd);
+    });
+    const affected = new Set();
+    if (iSrc >= 0) affected.add(iSrc);
+    if (iDst >= 0) affected.add(iDst);
+    for (const idx of affected) { markDirty(idx); scheduleRemeasure(idx); }
+  } finally {
+    _dragBlkHtml = null;
+    _dragBlkNodes = null;
+    _dragBlkEd = null;
+  }
+}, true);
 document.addEventListener('drop', function (e) {
   if (!_dragImgBlock) return;
   e.preventDefault(); // 阻止浏览器把 base64 src 作为文本插入
@@ -3328,6 +3779,9 @@ document.addEventListener('drop', function (e) {
 document.addEventListener('dragend', function () {
   _dragImgBlock = null;
   _dragImgEd = null;
+  _dragBlkHtml = null;
+  _dragBlkNodes = null;
+  _dragBlkEd = null;
 });
 // 文字拖放落点脉冲（2026-10）：原生文字拖放行为不变，仅在落点块上播一次背景脉冲。
 // 图片拖放走上方专用路径（clone 已单独脉冲），这里跳过；OS 文件拖放不落在块内也不闪。
@@ -4684,6 +5138,8 @@ function applyOp(op) {
    if (op === 'table') { convertSelectionToTable(); return; }
    // 「表格转文本」（2026-10）：与「转成表格」互为反向（Markdown 管道文字 ⇄ 原生表格）。
    if (op === 'table2text') { convertTablesToText(); return; }
+   // 「分栏」（2026-10）：选中段落两两转无边框两列表 / 光标处插入空白分栏行。
+   if (op === 'columns') { convertSelectionToColumns(); return; }
    // 新增内联格式（2026-09）：下划线、删除线、字符边框、底纹、突显、上标、下标
    if (INLINE_CLASSES.includes('ptoe-' + op)) {
      applyInlineClass(ed, 'ptoe-' + op, {toggle:true});
@@ -5385,35 +5841,116 @@ function updateKeepChips() {
   for (let k = 1; k <= n; k++) chipBox.appendChild(mk('组' + k, k));
 }
 
+// ---------- 搜索结果列表：虚拟滚动（2026-10）----------
+// 显示上限提升到 1,000,000 后，逐条建 DOM 会在搜索阶段就卡死并占满内存。改为
+// 「窗口化渲染」：只为当前视口 ± 缓冲行建节点，用上下占位块撑出真实滚动高度；
+// 行距固定（见 CSS .sr-item height + margin-bottom），故滚动位置可精确换算，无需
+// 逐行测量。结果数组仍完整保留（供上一个/下一个、替换当前使用），计数显示真实总数。
+const SR_ROW_H = 50;      // 单行占位高度 = .sr-item height(44) + margin-bottom(6)
+const SR_OVERSCAN = 8;    // 视口上下各多渲染的行数（滚动时不留空白）
+const _srRAF = (typeof requestAnimationFrame === 'function')
+  ? requestAnimationFrame
+  : function (cb) { return setTimeout(cb, 16); };
+let _srFrom = -1, _srTo = -1;   // 当前已渲染窗口 [from, to)
+
+// 首次或结果清空后重建「上占位 + 内容层 + 下占位」三层结构
+function _srScaffold(list) {
+  const first = list.firstElementChild;
+  if (first && first.classList && first.classList.contains('sr-top')) return;
+  list.innerHTML = '';
+  const top = document.createElement('div'); top.className = 'sr-top';
+  const win = document.createElement('div'); win.className = 'sr-window';
+  const bot = document.createElement('div'); bot.className = 'sr-bot';
+  top.style.height = '0px'; bot.style.height = '0px';
+  list.appendChild(top); list.appendChild(win); list.appendChild(bot);
+  _srFrom = _srTo = -1;
+}
+
+function _srBuildItem(r, k) {
+  const item = document.createElement('div');
+  item.className = 'sr-item' + (k === searchCurrent ? ' current' : '');
+  item.dataset.srIndex = String(k);
+  item.innerHTML = '<div class="sr-page">' + (r.scopePage ? '本页' : '第 ' + r.page + ' 页') + '</div><div class="sr-ctx">' + r.ctx + '</div>';
+  item.addEventListener('click', function () {
+    searchCurrent = k;
+    updateSearchNav();
+    scrollToIndex(r.i);
+  });
+  return item;
+}
+
+function _srRenderWindow(force) {
+  const list = document.getElementById('searchList');
+  if (!list) return;
+  const win = list.querySelector('.sr-window');
+  if (!win) return; // 无结果时是 .sr-empty
+  const top = list.firstElementChild, bot = list.lastElementChild;
+  const n = searchResults.length;
+  const vh = list.clientHeight || 320;
+  const first = Math.max(0, Math.floor(list.scrollTop / SR_ROW_H) - SR_OVERSCAN);
+  const last = Math.min(n, Math.ceil((list.scrollTop + vh) / SR_ROW_H) + SR_OVERSCAN);
+  if (!force && first === _srFrom && last === _srTo) return; // 窗口未变：省掉重建
+  _srFrom = first; _srTo = last;
+  top.style.height = (first * SR_ROW_H) + 'px';
+  bot.style.height = ((n - last) * SR_ROW_H) + 'px';
+  const frag = document.createDocumentFragment();
+  for (let k = first; k < last; k++) frag.appendChild(_srBuildItem(searchResults[k], k));
+  win.innerHTML = '';
+  win.appendChild(frag);
+}
+
+function _srSyncCurrent() {
+  const win = document.querySelector('#searchList .sr-window');
+  if (!win) return;
+  for (let k = 0; k < win.children.length; k++) {
+    const item = win.children[k];
+    item.classList.toggle('current', Number(item.dataset.srIndex) === searchCurrent);
+  }
+}
+
+// 让当前选中项滚入视口（上一个/下一个、点击列表后调用）
+function _srScrollCurrentIntoView() {
+  const list = document.getElementById('searchList');
+  if (!list || searchCurrent < 0 || !searchResults.length) return;
+  if (!list.querySelector('.sr-window')) return;
+  const vh = list.clientHeight || 320;
+  const top = searchCurrent * SR_ROW_H;
+  if (top < list.scrollTop) list.scrollTop = top;
+  else if (top + SR_ROW_H > list.scrollTop + vh) list.scrollTop = top + SR_ROW_H - vh;
+  _srRenderWindow(true);
+}
+
+// 滚动/resize → rAF 合并后重算窗口（高频滚动不重复构建）
+(function () {
+  let raf = 0;
+  const schedule = function () {
+    if (raf) return;
+    raf = _srRAF(function () { raf = 0; _srRenderWindow(false); _srSyncCurrent(); });
+  };
+  const list = document.getElementById('searchList');
+  if (list) list.addEventListener('scroll', schedule, { passive: true });
+  window.addEventListener('resize', schedule);
+})();
+
 function updateSearchNav() {
   const pos = document.getElementById('searchPos');
   if (pos) pos.textContent = searchResults.length ? (searchCurrent + 1) + ' / ' + searchResults.length : '';
-  const list = document.getElementById('searchList');
-  if (list) {
-    for (let k = 0; k < list.children.length; k++) list.children[k].classList.toggle('current', k === searchCurrent);
-  }
+  _srScrollCurrentIntoView(); // 虚拟列表：滚动到当前项并刷新窗口
+  _srSyncCurrent();           // 同步窗口内 .current 高亮
 }
 
 function renderSearchResults(results, total, MAX) {
   const list = document.getElementById('searchList');
   const count = document.getElementById('srCount');
   count.textContent = '共 ' + total + ' 处匹配' + (total > MAX ? '，仅显示前 ' + MAX + ' 条' : '');
-  list.innerHTML = '';
   if (!results.length) {
     list.innerHTML = '<div class="sr-empty">未找到匹配内容</div>';
+    _srFrom = _srTo = -1;
     return;
   }
-  results.forEach(function (r, k) {
-    const item = document.createElement('div');
-    item.className = 'sr-item';
-    item.innerHTML = '<div class="sr-page">' + (r.scopePage ? '本页' : '第 ' + r.page + ' 页') + '</div><div class="sr-ctx">' + r.ctx + '</div>';
-    item.addEventListener('click', function () {
-      searchCurrent = k;
-      updateSearchNav();
-      scrollToIndex(r.i);
-    });
-    list.appendChild(item);
-  });
+  _srScaffold(list);
+  list.scrollTop = 0;
+  _srRenderWindow(true);
 }
 
 function searchPages() {
@@ -5780,10 +6317,8 @@ async function exportFile(fmt) {
 function gotoMatch(dir) {
   if (!searchResults.length) return;
   searchCurrent = (searchCurrent + dir + searchResults.length) % searchResults.length;
-  updateSearchNav();
+  updateSearchNav(); // 虚拟列表：内含「滚动到当前项」+ .current 高亮
   const cur = searchResults[searchCurrent];
-  const list = document.getElementById('searchList');
-  if (list.children[searchCurrent]) list.children[searchCurrent].scrollIntoView({ block: 'nearest' });
   scrollToIndex(cur.i);
 }
 function replaceCurrent() {
@@ -6493,6 +7028,9 @@ function openSearchModal() {
   // 2026-09：范围分段按钮与保留组 chips 随打开同步（可能已在设置里切过范围）
   document.querySelectorAll('.scope-btn').forEach(function (b) { b.classList.toggle('active', b.dataset.scope === searchScope); });
   updateKeepChips();
+  // 虚拟列表：弹窗隐藏时 clientHeight=0，打开后用真实可视高度重算窗口
+  _srRenderWindow(true);
+  _srSyncCurrent();
   document.getElementById('searchInput').focus();
 }
 function closeSearchModal() { document.getElementById('searchModalBg').style.display = 'none'; }
@@ -7469,7 +8007,26 @@ function maybeShowPopup() {
   const range = sel.getRangeAt(0);
   const ed = _editableFromSelection(range, sel);
   if (!ed) { hidePopup(); return; }
+  // 表格内浮层菜单开关（2026-10）：选区触及表格单元格时按设置决定是否弹出
+  // （设置-界面「表格内显示选中文字菜单」，默认关；只影响表格，表格外照常弹出）。
+  if (_selectionTouchesTable(range, sel) && !uiBool('tbl_popup_menu', false)) { hidePopup(); return; }
   showPopup(range);
+}
+// 选区是否触及 .editable 内的表格单元格（任一端点在单元格内即算）。
+// 供表格内浮层菜单开关判定；跨边界选区（段落拖到表格）也按表格内处理。
+function _selectionTouchesTable(range, sel) {
+  const nodes = [];
+  const push = (n) => { if (n) nodes.push(n.nodeType === 3 ? n.parentNode : n); };
+  if (range) {
+    push(range.commonAncestorContainer);
+    push(range.startContainer);
+    push(range.endContainer);
+  }
+  if (sel) { push(sel.anchorNode); push(sel.focusNode); }
+  for (const n of nodes) {
+    if (n && n.closest && n.closest('td,th') && n.closest('.editable')) return true;
+  }
+  return false;
 }
 document.addEventListener('mouseup', maybeShowPopup);
 document.addEventListener('keyup', (e) => { if (!e.isComposing && !e.ctrlKey && !e.metaKey && !e.altKey) maybeShowPopup(); });
@@ -8169,6 +8726,9 @@ ctxMenu.querySelectorAll('.ctx-sub').forEach(sub => {
 document.addEventListener('contextmenu', (e) => {
   const ed = e.target.closest('.editable');
   if (ed) {
+    // 表格内浮层菜单开关（2026-10）：右击落在表格内时，通用右键菜单按设置开关
+    // （默认关）；表格菜单由前一个 contextmenu 监听负责。两者都关时回退浏览器默认。
+    if (e.target.closest && e.target.closest('td,th') && !uiBool('tbl_ctx_menu', false)) return;
     e.preventDefault();
     hidePopup();
     suppressPopupUntil = performance.now() + 300;
@@ -10185,9 +10745,11 @@ document.addEventListener('mousedown', function (e) {
   // 点击图片弹窗外 → 关闭图片弹窗
   if (_imgKey && !e.target.closest('#imgPopup')) hideImgPopup();
   // 点击表格操作条外部（且不在表格单元格内——换格由 selectionchange 重建目标）→ 关闭操作条
-  // 点击表格操作条/更多菜单/选中菜单外部（且不在表格单元格内——换格由 selectionchange 重建目标）→ 关闭操作条。
-  // 三个浮层同源于表格场景，点击其任一都不应关闭操作条（否则点菜单项后操作条立即消失）。
-  if (_tblKey && !e.target.closest('#tblBar') && !e.target.closest('#tblMenu') && !e.target.closest('#popup') && !e.target.closest('.editable td,.editable th')) hideTblBar();
+  // 点击表格操作条/更多菜单/对齐九宫格/选中菜单外部（且不在表格单元格内——换格由 selectionchange 重建目标）→ 关闭操作条。
+  // 这些浮层同源于表格场景，点击其任一都不应关闭操作条（否则点菜单项/九宫格选项时 _tblKey 被清空，
+  // 后续 click 的 _tblDoOp 在入口守卫处静默返回 = 「点了没反应」，2026-10 九宫格上线时的根因）。
+  // 统一走 _tblInOwnUI（含 #tblAlignGrid/#tblResizeLayer/#tblSizeModalBg），避免每加一个浮层就漏一处。
+  if (_tblKey && !_tblInOwnUI(e.target) && !e.target.closest('.editable td,.editable th')) hideTblBar();
 });
 // 点击编辑区内的图片 → 弹出图片设置弹窗（行内图片可能没有 <p> 包裹，pEl 允许为 null）
 document.addEventListener('click', function (e) {
@@ -11869,6 +12431,13 @@ function openSettings() {
   if (lnsIn) lnsIn.value = uis('line_num_size', 'large');
   const tjIn = document.getElementById('textJustifyToggle');
   if (tjIn) tjIn.checked = !!uiBool('text_justify', true);
+  // 表格内浮层菜单开关（2026-10）：设置弹窗打开时同步三个勾选框
+  const tpmIn = document.getElementById('tblPopupMenuChk');
+  if (tpmIn) tpmIn.checked = !!uiBool('tbl_popup_menu', false);
+  const tcmIn = document.getElementById('tblCtxMenuChk');
+  if (tcmIn) tcmIn.checked = !!uiBool('tbl_ctx_menu', false);
+  const ttmIn = document.getElementById('tblTblMenuChk');
+  if (ttmIn) ttmIn.checked = !!uiBool('tbl_tbl_menu', false);
   const cpIn = document.getElementById('cleanPunctuationChk');
   if (cpIn) cpIn.checked = !!uiBool('clean_punctuation', true);
   const csIn = document.getElementById('cleanSymbolsChk');
@@ -11881,6 +12450,8 @@ function openSettings() {
   if (cpaIn) cpaIn.checked = !!uiBool('clean_paragraphs', false);
   const cdpIn = document.getElementById('cleanDigitPunctChk');
   if (cdpIn) cdpIn.checked = !!uiBool('clean_digit_punct', true);
+  const cblIn = document.getElementById('cleanBlankLinesChk');
+  if (cblIn) cblIn.checked = !!uiBool('clean_blank_lines', false);
   // 同步符号映射表到编辑器（2026-10-16）
   const smeIn = document.getElementById('cleanSymbolMapEditor');
   if (smeIn) {
@@ -12288,8 +12859,9 @@ function ignoreErrShortcut() { if (errKey && !_inField()) { document.getElementB
 
 // ==================== 命令行（nvim 风格，2026-10） ====================
 // Ctrl+; 打开底栏命令输入；命令作用于**当前聚焦页面**（currentEditable()），无聚焦页面
-// 则不执行。行号 = 该页 .editable 的直属块（p/div/h1-6）顺序，从 1 起，与行号显示
-// （CSS 计数器，见 correctmanage 的 .ptoe-line-num）严格 1:1；表格等非块元素不参与编号。
+// 则不执行。行号 = 该页 .editable 的直属块（p/div/h1-6）顺序，从 1 起；插入的表格
+// 每个 tr 各占一行（2026-10），与行号显示（CSS 计数器，见 correctmanage 的
+// .ptoe-line-num）严格 1:1。
 //
 // 语法：[范围]命令 [参数]
 //   范围：N（单行）、N,M 或 N-M（闭区间）、%（整页）、.（光标所在行）；缺省 = 光标行。
@@ -12547,12 +13119,16 @@ function _cmdOpAliasMap() {
   return (_cmdAliasCache = m);
 }
 
-// 行 = .editable 的直属块，元素集合与行号 CSS（.editable > p/div/h1-6）完全一致
+// 行 = .editable 的直属块；元素集合与行号 CSS 完全一致：直属 p/div/h1-6 各一行，
+// 且直属表格的每个 tr 也各占一行（2026-10 起表格行参与连续编号，见 .ptoe-line-num）。
 function _cmdLineBlocks(ed) {
   const out = [];
   if (!ed) return out;
   for (const c of ed.children) {
-    if (/^(P|DIV|H[1-6])$/.test(c.tagName)) out.push(c);
+    if (/^(P|DIV|H[1-6])$/.test(c.tagName)) { out.push(c); continue; }
+    if (c.tagName === 'TABLE') {
+      for (const tr of c.querySelectorAll('tr')) out.push(tr);
+    }
   }
   return out;
 }
@@ -12564,13 +13140,17 @@ function _cmdRangeList(from, to) {
   return out;
 }
 
-// 选区锚点所在块（.editable 直属 p/div/h1-6）；选区可在正文时（焦点在命令行输入框）仍可定位
+// 选区锚点所在块（.editable 直属 p/div/h1-6，或所在表格行 tr）；选区可在正文时
+// （焦点在命令行输入框）仍可定位。表格内光标归属其 tr —— 与表格行占一行的行号口径一致。
 function _blockAtCaret(ed) {
   const sel = window.getSelection();
   if (!ed || !sel || !sel.rangeCount) return null;
   let n = sel.getRangeAt(0).startContainer;
   if (n && n.nodeType !== 1) n = n.parentElement;
-  const b = (n && n.closest) ? n.closest('p,div,h1,h2,h3,h4,h5,h6') : null;
+  if (!n || !n.closest) return null;
+  const tr = n.closest('tr');
+  if (tr && tr !== ed && ed.contains(tr)) return tr;
+  const b = n.closest('p,div,h1,h2,h3,h4,h5,h6');
   if (b && b !== ed && ed.contains(b)) return b;
   return null;
 }
@@ -14959,6 +15539,12 @@ document.getElementById('resetUiSettingsBtn').addEventListener('click', () => {
   if (lnsr) lnsr.value = UI_SETTINGS_DEFAULTS.line_num_size;
   const tjr = document.getElementById('textJustifyToggle');
   if (tjr) tjr.checked = !!UI_SETTINGS_DEFAULTS.text_justify;
+  const tpmr = document.getElementById('tblPopupMenuChk');
+  if (tpmr) tpmr.checked = !!UI_SETTINGS_DEFAULTS.tbl_popup_menu;
+  const tcmr = document.getElementById('tblCtxMenuChk');
+  if (tcmr) tcmr.checked = !!UI_SETTINGS_DEFAULTS.tbl_ctx_menu;
+  const ttmr = document.getElementById('tblTblMenuChk');
+  if (ttmr) ttmr.checked = !!UI_SETTINGS_DEFAULTS.tbl_tbl_menu;
   const cpr = document.getElementById('cleanPunctuationChk');
   if (cpr) cpr.checked = !!UI_SETTINGS_DEFAULTS.clean_punctuation;
   const csr = document.getElementById('cleanSymbolsChk');
@@ -14971,6 +15557,8 @@ document.getElementById('resetUiSettingsBtn').addEventListener('click', () => {
   if (cpar) cpar.checked = !!UI_SETTINGS_DEFAULTS.clean_paragraphs;
   const cdpr = document.getElementById('cleanDigitPunctChk');
   if (cdpr) cdpr.checked = !!UI_SETTINGS_DEFAULTS.clean_digit_punct;
+  const cblr = document.getElementById('cleanBlankLinesChk');
+  if (cblr) cblr.checked = !!UI_SETTINGS_DEFAULTS.clean_blank_lines;
   // 符号映射表恢复默认（2026-10-16）
   const smeR = document.getElementById('cleanSymbolMapEditor');
   if (smeR) smeR.value = formatSymbolMap(UI_SETTINGS_DEFAULTS.clean_symbol_map);
@@ -15100,6 +15688,18 @@ if (_textJustifyToggle) _textJustifyToggle.addEventListener('change', (e) => {
   if (uiSettings) { uiSettings.text_justify = e.target.checked; saveUiSettings(); }
   applyUiPrefs();
 });
+// 表格内浮层菜单开关（2026-10：服务端持久化 config.json ui_settings）
+// 触发点在 mouseup / keyup / contextmenu 监听里实时读 uiBool，无需额外 apply。
+[
+  ['tblPopupMenuChk', 'tbl_popup_menu'],
+  ['tblCtxMenuChk', 'tbl_ctx_menu'],
+  ['tblTblMenuChk', 'tbl_tbl_menu'],
+].forEach(([id, key]) => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', (e) => {
+    if (uiSettings) { uiSettings[key] = e.target.checked; saveUiSettings(); }
+  });
+});
 // 智能清理规则开关（2026-10：服务端持久化 config.json ui_settings）
 // 仅影响「智能清理」按钮（服务端 /api/clean 读取同一份配置），不改界面即时状态。
 [
@@ -15115,6 +15715,12 @@ if (_textJustifyToggle) _textJustifyToggle.addEventListener('change', (e) => {
     if (uiSettings) { uiSettings[key] = e.target.checked; saveUiSettings(); }
     runCleanPreview();
   });
+});
+// 导出时清理空白行（2026-10）：服务端持久化 config.json ui_settings；仅作用于导出
+// （txt/md/docx/epub），不改编辑区内容，也不影响「智能清理」结果 → 不触发 runCleanPreview。
+const _cleanBlankLinesChk = document.getElementById('cleanBlankLinesChk');
+if (_cleanBlankLinesChk) _cleanBlankLinesChk.addEventListener('change', (e) => {
+  if (uiSettings) { uiSettings.clean_blank_lines = e.target.checked; saveUiSettings(); }
 });
 // 清理预览模态框事件绑定（2026-10-16）
 document.getElementById('cleanPreviewApply').addEventListener('click', () => { hideTip(); applyCleanPreview(); });
@@ -15173,7 +15779,7 @@ if (_undoDepthInput) _undoDepthInput.addEventListener('change', (e) => {
 const _searchMaxResultsInput = document.getElementById('searchMaxResultsInput');
 if (_searchMaxResultsInput) _searchMaxResultsInput.addEventListener('change', (e) => {
   const v = parseInt(e.target.value, 10);
-  const n = isFinite(v) ? Math.max(10, Math.min(1000, v)) : 200;
+  const n = isFinite(v) ? Math.max(10, Math.min(1000000, v)) : 200;
   e.target.value = n;
   if (uiSettings) { uiSettings.search_max_results = n; saveUiSettings(); }
 });

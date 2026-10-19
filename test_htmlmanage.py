@@ -178,6 +178,17 @@ class TestCSSManagerStylesheet(unittest.TestCase):
         # 注释说明
         self.assertIn('顶格/缩进为手动段落格式', css)
 
+    def test_table_noborder_rule_exists(self):
+        """无边框表格（2026-10）：class="ptoe-noborder" 导出为无边框（分栏/批注版式）"""
+        cssm = htmlmanage.CSSManager()
+        css = cssm.generate_stylesheet()
+        self.assertIn('table.ptoe-noborder th, table.ptoe-noborder td {', css)
+        self.assertIn('border: none', css)
+        self.assertIn('table.ptoe-noborder th {', css)
+        self.assertIn('background: none', css)
+        # 注释说明
+        self.assertIn('无边框表格', css)
+
 
 class TestCitationItalicConfig(unittest.TestCase):
     """2026-09-22 修复：EPUB 导出 CSS 遵循 citationItalicEnabled 设置。
@@ -329,6 +340,70 @@ class TestHTMLConverterIntegration(unittest.TestCase):
         self.assertIn('text-indent: 0', css)
         self.assertIn('p.ptoe-indent {', css)
         self.assertIn('text-indent: 2em', css)
+
+
+class TestTableCellParagraphFormat(unittest.TestCase):
+    """表格单元格内段落的格式导出（2026-10-19）。
+
+    单元格里的 <p> 与表外同口径重建开标签：class 走白名单、段落设置 data-* 转
+    内联 style。此前表内 token 原样透传 → 单元格里设的引用/缩进在 EPUB 里与界面
+    显示不一致（界面显示引用、导出变正文 / 缩进丢失）。
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.converter = htmlmanage.HTMLConverter(output_dir=self.tmpdir)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_cell_citation_class_kept(self):
+        out = self.converter._render_fragment(
+            '<table><tbody><tr><td>'
+            '<p class="ptoe-citation">引用甲</p>'
+            "</td></tr></tbody></table>"
+        )
+        self.assertIn('<p class="ptoe-citation">引用甲</p>', out)
+
+    def test_cell_paragraph_indent_becomes_inline_style(self):
+        out = self.converter._render_fragment(
+            '<table><tbody><tr><td>'
+            '<p data-pl="2" data-ind="first">缩进段</p>'
+            "</td></tr></tbody></table>"
+        )
+        self.assertIn('style="margin-left:2em;text-indent:2em"', out)
+
+    def test_cell_paragraph_unknown_class_dropped(self):
+        out = self.converter._render_fragment(
+            '<table><tbody><tr><td><p class="evil">x</p></td></tr></tbody></table>'
+        )
+        self.assertIn("<td><p>x</p></td>", out)
+        self.assertNotIn("evil", out)
+
+    def test_cell_whitespace_and_cell_attrs_untouched(self):
+        # 表格结构与单元格属性/空白不受本次改动影响
+        src = (
+            '<table class="ptoe-noborder"><tbody><tr>'
+            '<td colspan="2"> 前 后 </td><td><p data-lh="1.8">行距</p></td>'
+            "</tr></tbody></table>"
+        )
+        out = self.converter._render_fragment(src)
+        self.assertIn('<td colspan="2"> 前 后 </td>', out)
+        self.assertIn('class="ptoe-noborder"', out)
+        self.assertIn('style="line-height:1.8"', out)
+        self.assertTrue(out.startswith("<table"))
+        self.assertTrue(out.endswith("</table>"))
+
+    def test_paragraph_outside_table_unchanged(self):
+        # 回归护栏：表外段落行为不变
+        out = self.converter._render_fragment(
+            '<p class="ptoe-citation" data-pl="2" data-ind="first">段落</p>'
+        )
+        self.assertEqual(
+            out,
+            '<p class="ptoe-citation" style="margin-left:2em;text-indent:2em">段落</p>',
+        )
 
 
 class TestHeadingCentering(unittest.TestCase):

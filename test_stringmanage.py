@@ -14,6 +14,7 @@ from stringmanage import (
     _normalize_punctuation_extended,
     _normalize_ellipsis,
     normalize_digit_punct,
+    clean_alnum_spaces,
     DIGIT_PUNCT_DEFAULT,
 )
 
@@ -416,19 +417,45 @@ class TestNormalizeDigitPunct(unittest.TestCase):
         self.assertEqual(normalize_digit_punct("1。2"), "1.2")
         self.assertEqual(normalize_digit_punct("1，2"), "1,2")
         self.assertEqual(normalize_digit_punct("1。"), "1.")
-        # 默认表其余项：、：；→ , : ;
+        # 默认表其余项：、：；→ , : ;（．→ . 为 2026-10-18 新增第 6 项）
         self.assertEqual(normalize_digit_punct("1、2"), "1,2")
         self.assertEqual(normalize_digit_punct("1：2"), "1:2")
         self.assertEqual(normalize_digit_punct("1；2"), "1;2")
-        self.assertEqual(len(DIGIT_PUNCT_DEFAULT), 5)
+        self.assertEqual(normalize_digit_punct("1．2"), "1.2")
+        self.assertEqual(len(DIGIT_PUNCT_DEFAULT), 6)
 
-    def test_only_after_digit(self):
-        # 非「数字紧跟」的中文标点一律不动（正文句末标点保持原样）
+    def test_letter_between(self):
+        # 字母间标点 → 英文（2026-10-18 新增，与数字同规则）
+        self.assertEqual(normalize_digit_punct("a。b"), "a.b")
+        self.assertEqual(normalize_digit_punct("H，W"), "H,W")
+        self.assertEqual(normalize_digit_punct("A、B"), "A,B")
+        self.assertEqual(normalize_digit_punct("X；Y"), "X;Y")
+        # 全角字母同样生效
+        self.assertEqual(normalize_digit_punct("Ａ。Ｂ"), "Ａ.Ｂ")
+        # 混合：字母-标点-数字 / 数字-标点-字母
+        self.assertEqual(normalize_digit_punct("1。A"), "1.A")
+        self.assertEqual(normalize_digit_punct("A。1"), "A.1")
+
+    def test_letter_end_protected(self):
+        # 字母收尾（中文句末）不适用收尾规则：保护「……标记为Z。」
+        self.assertEqual(normalize_digit_punct("标记为Z。"), "标记为Z。")
+        self.assertEqual(normalize_digit_punct("x。"), "x。")
+
+    def test_inline_ws_tolerated(self):
+        # 数字/字母与标点之间的行内空格一并吃掉（2026-10-18 新增）
+        self.assertEqual(normalize_digit_punct("1 。2"), "1.2")
+        self.assertEqual(normalize_digit_punct("1 。 2"), "1.2")
+        self.assertEqual(normalize_digit_punct("H ，W"), "H,W")
+        self.assertEqual(normalize_digit_punct("共 1 。 条"), "共 1. 条")
+        # 全角空格/不间断空格同样容忍
+        self.assertEqual(normalize_digit_punct("1　。2"), "1.2")
+        # 换行：行尾收尾为既有行为（数字后标点 + 行尾 → 替换，与 1。 同规则）
+        self.assertEqual(normalize_digit_punct("1。\n2"), "1.\n2")
+
+    def test_only_after_alnum(self):
+        # 非「字母/数字紧跟」的中文标点一律不动（正文句末标点保持原样）
         self.assertEqual(normalize_digit_punct("你好。"), "你好。")
-        self.assertEqual(normalize_digit_punct("a。b"), "a。b")
         self.assertEqual(normalize_digit_punct("。"), "。")
-        # 数字与标点之间有空格 → 不替换
-        self.assertEqual(normalize_digit_punct("1 。2"), "1 。2")
 
     def test_digit_then_cjk_prose_kept(self):
         # 数字后接中文正文：标点属正常中文标点，不替换（保底，2026-10-18 收窄）
@@ -457,6 +484,44 @@ class TestNormalizeDigitPunct(unittest.TestCase):
 
     def test_multiple_occurrences(self):
         self.assertEqual(normalize_digit_punct("1。2，3、4。"), "1.2,3,4.")
+
+
+class TestCleanAlnumSpaces(unittest.TestCase):
+    """clean_alnum_spaces：数字间/单字母间空格清理（2026-10-18 智能清理新规则）。
+
+    - 数字与数字之间的行内空格（半角/全角空格、制表符、不间断空格）一律删除；
+    - 「单个字母 空格 单个字母」连续串视为 OCR 拆字（M a r x → Marx）；
+      多字母单词间的空格保留（World Health 等正常英文短语不受影响）；
+    - 换行不参与（列表行间空格不合并）。
+    """
+
+    def test_digit_spaces(self):
+        self.assertEqual(clean_alnum_spaces("1 2"), "12")
+        self.assertEqual(clean_alnum_spaces("共 1 2 3 个"), "共 123 个")
+        self.assertEqual(clean_alnum_spaces("１　２"), "１２")
+        self.assertEqual(clean_alnum_spaces("1\t2"), "12")
+        # 数字与非数字之间不动
+        self.assertEqual(clean_alnum_spaces("第 1 章"), "第 1 章")
+        self.assertEqual(clean_alnum_spaces("1 a"), "1 a")
+        # 换行不动
+        self.assertEqual(clean_alnum_spaces("1\n2"), "1\n2")
+
+    def test_letter_runs(self):
+        self.assertEqual(clean_alnum_spaces("M a r x"), "Marx")
+        self.assertEqual(clean_alnum_spaces("U S A"), "USA")
+        self.assertEqual(clean_alnum_spaces("Ｍ ａ ｒ ｘ"), "Ｍａｒｘ")
+        # 正常英文短语保留（多字母单词间的空格不删）
+        self.assertEqual(
+            clean_alnum_spaces("World Health Organization"),
+            "World Health Organization",
+        )
+        self.assertEqual(clean_alnum_spaces("I am a man"), "I am a man")
+
+    def test_mixed_and_empty(self):
+        # 字母-数字边界（B 1）不在「字母与字母/数字与数字」范围内，空格保留
+        self.assertEqual(clean_alnum_spaces("A B 1 2"), "AB 12")
+        self.assertEqual(clean_alnum_spaces(""), "")
+        self.assertEqual(clean_alnum_spaces(None), "")
 
 
 if __name__ == "__main__":

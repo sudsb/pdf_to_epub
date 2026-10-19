@@ -341,6 +341,22 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
   -webkit-user-select:none;user-select:none;pointer-events:none;
   width:var(--ln-numw,22px);text-align:right;
 }
+/* 表格行行号（2026-10）：插入的表格每行也占一个行号，与段落共用 ptoe-ln 计数器 →
+   编号连续。只给「.editable 直属表格」的行计数/编号（与只数直属 p/div/h 同口径）；
+   行号挂在首格 td/th 上再用绝对定位摆到左侧行号栏（比挂在 tr 上更稳）。命令行寻址
+   _cmdLineBlocks 同样把每个 tr 计为一行，保证显示行号与命令行行号 1:1。 */
+#pages.ptoe-line-num .editable > table tr{counter-increment:ptoe-ln;}
+#pages.ptoe-line-num .editable > table tr > td:first-child,
+#pages.ptoe-line-num .editable > table tr > th:first-child{position:relative;}
+#pages.ptoe-line-num .editable > table tr > td:first-child::after,
+#pages.ptoe-line-num .editable > table tr > th:first-child::after{
+  content:counter(ptoe-ln);
+  position:absolute;left:calc(-1 * (var(--ln-numw,22px) + var(--ln-gap,16px)));top:0;
+  font-size:var(--ln-font,12px);line-height:1.7;color:#8b98a6;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  -webkit-user-select:none;user-select:none;pointer-events:none;
+  width:var(--ln-numw,22px);text-align:right;
+}
 /* 光标所在行高亮（2026-10）：选区锚点所在块加 .ptoe-cur-line。用 background-image 叠加
    浅蓝底（保留标题块自身的级别底色）。2026-10 调整：去掉原先压在首列文字上的不透明
    左侧竖条（inset 3px accent），改为「行号本身变色加粗 + 更淡的整行底色」——竖条会盖住
@@ -349,7 +365,19 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
   background-image:linear-gradient(rgba(59,111,255,.09),rgba(59,111,255,.09));}
 #pages.ptoe-line-num .editable > .ptoe-cur-line::after{
   color:var(--accent,#316dca);font-weight:700;}
+/* 表格行处于当前行：行号变色加粗 + 首格淡蓝底（tr 上铺底不稳妥，落在首格） */
+#pages.ptoe-line-num .editable > table tr.ptoe-cur-line > td:first-child::after,
+#pages.ptoe-line-num .editable > table tr.ptoe-cur-line > th:first-child::after{
+  color:var(--accent,#316dca);font-weight:700;}
+#pages.ptoe-line-num .editable > table tr.ptoe-cur-line > td:first-child{
+  background-image:linear-gradient(rgba(59,111,255,.09),rgba(59,111,255,.09));}
 .ptoe-align-left{text-align:left;} .ptoe-align-center{text-align:center;} .ptoe-align-right{text-align:right;}
+/* 2026-10 修复：单元格对齐类必须用 .editable th/td 级选择器（特异性 0,2,1），否则被
+   下方 .editable th,.editable td{text-align:left}（0,1,1）压过 —— 表格里设「居中/居右」
+   看不到效果（用户反馈「对齐设置后不生效」）。与 htmlmanage 导出 CSS 同契约，勿单边改动。 */
+.editable th.ptoe-align-left,.editable td.ptoe-align-left{text-align:left;}
+.editable th.ptoe-align-center,.editable td.ptoe-align-center{text-align:center;}
+.editable th.ptoe-align-right,.editable td.ptoe-align-right{text-align:right;}
 /* 2026-09-24：行内对齐 span（部分选区包裹 <span class="ptoe-align-*">…</span>），
    与 EPUB 导出 CSS（htmlmanage 同规则，含 th/td 兼容）保持一致 */
 .editable span.ptoe-align-left{display:block;text-align:left;}
@@ -493,6 +521,11 @@ body.paint-mode{cursor:copy;}
 .editable th,.editable td{border:1px solid var(--border);padding:.3em .6em;text-align:left;vertical-align:top;min-width:3em;}
 .editable th{font-weight:bold;text-align:center;background:#f2f5fa;}
 .dark .editable th{background:var(--bg-hover);}
+/* 无边框表格（2026-10）：表格菜单「不显示边框」给 <table> 加 class="ptoe-noborder"。
+   分栏/批注版式（左窄栏批注 + 右宽栏正文）用它隐藏全部框线；保存白名单只放行
+   该 class，EPUB（htmlmanage）/DOCX 导出按同一 class 输出无边框（勿单边改动）。 */
+.editable table.ptoe-noborder th,.editable table.ptoe-noborder td{border:none;}
+.editable table.ptoe-noborder th{background:transparent;}
 /* 表格操作条（2026-09）：光标进入表格单元格时由 JS 定位并显示；
    加行/删行/加列/删列/对齐/删除表格；对齐按钮按当前单元格 class 高亮 */
 #tblBar{position:fixed;z-index:64;display:none;flex-wrap:wrap;gap:2px;align-items:center;padding:4px 6px;background:rgba(255,255,255,.94);border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.18);}
@@ -514,7 +547,10 @@ body.paint-mode{cursor:copy;}
 .editable td.ptoe-vtop,.editable th.ptoe-vtop{vertical-align:top;}
 .editable td.ptoe-vmid,.editable th.ptoe-vmid{vertical-align:middle;}
 .editable td.ptoe-vbot,.editable th.ptoe-vbot{vertical-align:bottom;}
-.page-row.ptoe-has-table .editable{height:auto;min-height:0;}
+/* 2026-10 修订：含表格的行不再被撑高——用户要求「页高与图片等高、内容在页内滚动」。
+   旧规则把行高交给表格内容（height:auto / min-height:0），会让行比左侧图片高一截且
+   不出现滚动条，已移除：.editable 恢复 height:0 / min-height:100%（= 行高 = 图片高），
+   超出部分由 overflow-y:auto 内部滚动。 */
 .editable td.ptoe-cell-sel,.editable th.ptoe-cell-sel{outline:2px solid var(--accent,#316dca);outline-offset:-2px;background:rgba(49,109,202,.12);}
 #tblResizeLayer{position:fixed;z-index:63;display:none;pointer-events:none;}
 #tblResizeLayer .tbl-col-h{position:absolute;width:9px;cursor:col-resize;pointer-events:auto;}
@@ -534,6 +570,30 @@ body.paint-mode{cursor:copy;}
 .dark #tblMenu button{color:#ddd;}
 .dark #tblMenu button:hover{background:#2e3746;}
 .dark #tblMenu .tbl-menu-sep{background:#3a4150;}
+/* 单元格对齐九宫格（2026-10）：Word 式「上下 × 左右」。3×3 按钮，每个按钮用三条线
+   的摆放位置直观示意对齐方向；data-tbl-ag-h=left|center|right，data-tbl-ag-v=top|middle|bottom。 */
+#tblAlignGrid{position:fixed;z-index:72;background:#fff;border:1px solid #ddd;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.15);padding:6px;display:none;}
+#tblAlignGrid .tbl-ag-title{padding:0 2px 5px;font-size:11px;color:var(--text-muted);}
+#tblAlignGrid .tbl-ag-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:3px;}
+#tblAlignGrid .tbl-ag-cell{display:flex;width:34px;height:34px;padding:3px;background:#fafbfc;border:1px solid #e4e8ee;border-radius:5px;cursor:pointer;color:#5a6672;}
+#tblAlignGrid .tbl-ag-cell:hover{background:#eef3fb;border-color:var(--accent);color:var(--accent);}
+#tblAlignGrid .tbl-ag-cell.active{background:#e0eaff;border-color:var(--accent);color:var(--accent);}
+#tblAlignGrid .tbl-ag-lines{display:flex;flex-direction:column;justify-content:space-between;width:22px;height:16px;flex:0 0 auto;}
+#tblAlignGrid .tbl-ag-lines i{display:block;height:2px;border-radius:1px;background:currentColor;opacity:.85;}
+#tblAlignGrid .tbl-ag-lines i:nth-child(1){width:100%;}
+#tblAlignGrid .tbl-ag-lines i:nth-child(2){width:66%;}
+#tblAlignGrid .tbl-ag-lines i:nth-child(3){width:100%;}
+/* 水平：用按钮的 justify-content 摆放线条块；垂直：用 align-items 摆放（顶/中/底可见位移） */
+#tblAlignGrid .tbl-ag-cell[data-tbl-ag-h="left"]{justify-content:flex-start;}
+#tblAlignGrid .tbl-ag-cell[data-tbl-ag-h="center"]{justify-content:center;}
+#tblAlignGrid .tbl-ag-cell[data-tbl-ag-h="right"]{justify-content:flex-end;}
+#tblAlignGrid .tbl-ag-cell[data-tbl-ag-v="top"]{align-items:flex-start;}
+#tblAlignGrid .tbl-ag-cell[data-tbl-ag-v="middle"]{align-items:center;}
+#tblAlignGrid .tbl-ag-cell[data-tbl-ag-v="bottom"]{align-items:flex-end;}
+.dark #tblAlignGrid{background:#232a35;border-color:#3a4150;}
+.dark #tblAlignGrid .tbl-ag-cell{background:#1b212b;border-color:#3a4150;color:#b7c0cc;}
+.dark #tblAlignGrid .tbl-ag-cell:hover{background:#2e3746;color:#8fb4ff;}
+.dark #tblAlignGrid .tbl-ag-cell.active{background:#2a3a5c;color:#8fb4ff;}
 #tblSizeModalBg{position:fixed;inset:0;z-index:67;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
 .tbl-size-grid{display:grid;grid-template-columns:auto 1fr;gap:8px 12px;margin:10px 0;font-size:13px;align-items:center;}
 .tbl-size-grid input[type="number"]{width:92px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;}
@@ -593,11 +653,11 @@ body.paint-mode{cursor:copy;}
 #searchPos{font-size:12px;color:#5a6b7c;min-width:70px;text-align:center;}
 #searchList{max-height:45vh;overflow:auto;border:1px solid var(--border);border-radius:6px;padding:6px;background:#fafbfc;font-size:12px;}
 .sr-head{display:flex;align-items:center;gap:8px;padding:2px 0 6px;color:#5a6b7c;font-weight:600;}
-.sr-item{padding:6px 8px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px;cursor:pointer;background:#fff;}
+.sr-item{height:44px;box-sizing:border-box;overflow:hidden;padding:4px 8px;border:1px solid var(--border);border-radius:6px;margin:0 0 6px;cursor:pointer;background:#fff;}
 .sr-item:hover{border-color:var(--accent);background:#f2f7ff;}
 .sr-item.current{border-color:var(--accent);background:#eaf2ff;box-shadow:0 0 0 1px var(--accent);}
-.sr-page{font-size:11px;color:#5a6b7c;margin-bottom:2px;}
-.sr-ctx{color:#33414f;line-height:1.5;word-break:break-all;}
+.sr-page{font-size:11px;color:#5a6b7c;margin-bottom:1px;line-height:1.3;}
+.sr-ctx{color:#33414f;line-height:1.5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .sr-ctx mark{background:#ffe08a;color:#5c4000;border-radius:2px;padding:0 2px;}
 .sr-empty{color:#8a97a6;padding:6px 2px;}
 /* 2026-09：搜索范围分段按钮 + 保留组 chips + 替换规则列表 */
@@ -826,6 +886,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
           <button type="button" class="tb-btn" id="tableBtn" role="menuitem" onmousedown="event.preventDefault()" title="插入表格：在光标处插入空表格，行/列数与是否带表头可设（Ctrl+Alt+T）" aria-label="插入表格">插入表格</button>
           <button type="button" class="tb-btn" id="tableConvertBtn" role="menuitem" data-op="table" onmousedown="event.preventDefault()" title="转成表格：把选中的文字转成原生表格（支持 Markdown 管道表 / 画框表 / 空格对齐列；手动档，不要求分隔行）" aria-label="转成表格">转成表格</button>
           <button type="button" class="tb-btn" id="tableToTextBtn" role="menuitem" data-op="table2text" onmousedown="event.preventDefault()" title="表格转文本：把光标所在表格还原成 Markdown 管道文字（光标不在表格内则转当前页全部表格；可再用「转成表格」转回）" aria-label="表格转文本">表格转文本</button>
+          <button type="button" class="tb-btn" id="colsBtn" role="menuitem" data-op="columns" onmousedown="event.preventDefault()" title="分栏：选中段落两两转成无边框两列表（第1段→左栏、第2段→右栏，落单段放右栏），无选区时在光标处插入空白分栏行。左栏批注垂直居中；中间分栏宽度可在表格内拖拽或用「设置列宽」调整（表格菜单「表格转段落」可还原）" aria-label="分栏">分栏</button>
         </div>
       </div>
     </div>
@@ -1372,7 +1433,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       </label>
       <h4 style="margin:16px 0 4px;">搜索结果</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">搜索/替换弹窗结果列表最多显示的条数（10-1000，默认 200）。匹配总数始终完整统计并显示，超出上限时提示「仅显示前 N 条」；列表非虚拟渲染，设得越大滚动越可能卡顿。EPUB 编辑器的章内搜索读取同一设置。</p>
-      <label style="font-size:13px;">显示上限（条） <input type="number" id="searchMaxResultsInput" min="10" max="1000" step="10" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
+      <label style="font-size:13px;">显示上限（条） <input type="number" id="searchMaxResultsInput" min="10" max="1000000" step="10" style="width:70px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;"></label>
       <h4 style="margin:16px 0 4px;">文字页面行号</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">在虚拟列表各页的文字左侧显示行号（每页从 1 重新计起，与原书页码无关）。行号供命令行按行号寻址使用（Ctrl+; 打开命令行，例如 7,10merge 合并第 7-10 行）。纯视图层，不写入保存内容，也不影响导出。</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
@@ -1391,6 +1452,20 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
         <input type="checkbox" id="textJustifyToggle" style="width:16px;height:16px;">
         正文两端对齐
+      </label>
+      <h4 style="margin:16px 0 4px;">表格内浮层菜单</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">控制鼠标操作落在表格内时是否弹出对应浮层，三项独立控制，只影响表格范围（表格外不受影响）。默认全部关闭：表格内选中文字 / 右击不再弹出菜单，仅保留表格操作条；右击三项全关时回退浏览器默认菜单（复制 / 粘贴）。</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
+        <input type="checkbox" id="tblPopupMenuChk" style="width:16px;height:16px;">
+        表格内显示选中文字菜单（选中文字时弹出的快捷操作菜单）
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="tblCtxMenuChk" style="width:16px;height:16px;">
+        表格内显示右键菜单（右击弹出的页级操作菜单）
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="tblTblMenuChk" style="width:16px;height:16px;">
+        表格内右击显示表格菜单（加行 / 加列 / 合并等；操作条「更多 ▾」不受影响）
       </label>
       <h4 style="margin:16px 0 4px;">智能清理规则</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">「智能清理」按钮各步骤的启用开关。仅作用于清理结果，不影响未清理内容；关闭某步即清理时跳过该步。</p>
@@ -1421,9 +1496,14 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：&lt;p&gt;未完&lt;/p&gt;&lt;p&gt;待续&lt;/p&gt; → &lt;p&gt;未完待续&lt;/p&gt;</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
         <input type="checkbox" id="cleanDigitPunctChk" style="width:16px;height:16px;">
-        数字标点归一（数字紧跟的中文标点 → 英文）
+        数字/字母标点归一（数字、字母间的中文标点 → 英文，含空格容忍；并清理数字间/单字母间空格）
       </label>
       <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：1。2 → 1.2，1，2 → 1,2，1。 → 1.；映射表可在下方自定义</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="cleanBlankLinesChk" style="width:16px;height:16px;">
+        导出时清理空白行（删掉空段落、连续空行合并为一个，默认关闭）
+      </label>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">仅作用于导出（txt / md / docx / epub），不影响编辑区内容与「智能清理」结果。</p>
       <div style="margin-top:12px;padding:8px;background:#f8f9fa;border-radius:4px;">
         <p style="font-size:12px;color:#5a6b7c;margin:0 0 4px;">实时预览（输入文本查看清理效果）</p>
         <textarea id="cleanPreviewInput" rows="2" style="width:100%;box-sizing:border-box;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;resize:vertical;" placeholder="输入文本查看清理效果..."></textarea>
@@ -1688,12 +1768,15 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   <button type="button" data-tbl-op="alignleft" data-tbl-align="left" title="单元格左对齐">左</button>
   <button type="button" data-tbl-op="aligncenter" data-tbl-align="center" title="单元格居中">中</button>
   <button type="button" data-tbl-op="alignright" data-tbl-align="right" title="单元格右对齐">右</button>
+  <button type="button" data-tbl-op="aligngrid" title="单元格对齐（上下 × 左右，Word 式九宫格）">对齐 ▾</button>
   <span class="tbl-bar-sep"></span>
   <button type="button" data-tbl-op="more" title="更多表格操作（插入/移动行列、垂直对齐、表头、均分列宽…）">更多 ▾</button>
   <button type="button" data-tbl-op="deltable" class="danger" title="删除整个表格">删除表格</button>
 </div>
 <!-- 表格「更多」菜单：与表格内右键菜单同源（JS 打开并填充） -->
 <div id="tblMenu" style="display:none;" role="menu" aria-label="表格菜单"></div>
+<!-- 表格对齐九宫格（2026-10）：Word 式「上下 × 左右」单元格对齐（JS 构建 9 个按钮） -->
+<div id="tblAlignGrid" style="display:none;" role="menu" aria-label="单元格对齐"></div>
 <!-- 表格列/行尺寸拖拽手柄层：覆盖在表格上；层本身 pointer-events:none，仅手柄可拖 -->
 <div id="tblResizeLayer" aria-hidden="true"></div>
 <!-- 单元格/行列尺寸弹窗（2026-10）：列宽(%)、行高(数值+单位) -->

@@ -33,6 +33,12 @@ _MARKUP_RE = re.compile(
 # 只认这一对外层标签，内部结构标签（thead/tbody/tfoot/tr/td/th）保持透明。
 # 合成新开标签的正则一律不含 table——表格的 class/缩进属性属于单元格而非表格本身。
 _TABLE_TAG_RE = re.compile(r"</?table\b[^>]*>", flags=re.I)
+# 单元格边界与单元格内段落开标签（2026-10-19）：表内 <p> 与表外同口径重建
+# 开标签（class 白名单 + 「段落设置」data-* → 内联 style），否则单元格里设的
+# 引用/缩进在 EPUB 导出后与界面显示不一致。
+_TABLE_CELL_OPEN_RE = re.compile(r"<(?:td|th)\b[^>]*>", flags=re.I)
+_TABLE_CELL_CLOSE_RE = re.compile(r"</(?:td|th)\s*>", flags=re.I)
+_CELL_PARA_OPEN_RE = re.compile(r"<p\b([^>]*)>", flags=re.I)
 
 # 块级保留 class：注释（ptoe-note）+ 对齐类（ptoe-align-*）+ 换页（ptoe-page-break）
 _NOTE_CLASS = "ptoe-note"
@@ -941,6 +947,28 @@ class CSSManager:
         td {
           text-align: left;
         }
+        /* 单元格垂直对齐（2026-10）：矫正界面「对齐 ▾」九宫格给 td/th 加
+           ptoe-vtop/vmid/vbot（与编辑器 CSS 同名同值）。th,td 的默认
+           vertical-align:top 特异性低，这几条会正确覆盖；类随单元格 HTML
+           原样透传（table 分支不经过块级 class 白名单）。 */
+        td.ptoe-vtop, th.ptoe-vtop {
+          vertical-align: top;
+        }
+        td.ptoe-vmid, th.ptoe-vmid {
+          vertical-align: middle;
+        }
+        td.ptoe-vbot, th.ptoe-vbot {
+          vertical-align: bottom;
+        }
+        /* 无边框表格（2026-10）：矫正界面表格菜单「不显示边框」给表格加
+           class="ptoe-noborder"（分栏/批注版式用）。只去框线与表头底色，
+           其余（宽度/边距）与普通表格一致；类随 HTML 原样透传。 */
+        table.ptoe-noborder th, table.ptoe-noborder td {
+          border: none;
+        }
+        table.ptoe-noborder th {
+          background: none;
+        }
         .cover {
           text-align: center;
           margin-top: 2em;
@@ -1211,6 +1239,7 @@ class HTMLConverter:
         # （`if kind:` 为假 → 不 flush），或被 EOF 的 `kind or 'p'` 包成
         # <p><table>…</table></p>——既是非法嵌套，又把表格后面的真段落一起吞掉。
         in_table = False
+        in_cell = False  # 是否处于单元格内（表内 <p> 开标签按单元格段落重建）
         table_buf: List[str] = []
 
         def _flush_block() -> None:
@@ -1235,13 +1264,21 @@ class HTMLConverter:
             if _TABLE_TAG_RE.fullmatch(tok):
                 if tok.startswith("</"):
                     in_table = False
+                    in_cell = False
                     table_buf.append(tok)  # 闭合标签本身也要进缓冲，否则表格丢 </table>
                     blocks.append("".join(table_buf))
                     table_buf = []
                 else:
+                    # Flush any pending text content as a paragraph before the table
                     if kind:
                         _flush_block()
+                    elif cur:
+                        # Raw text without explicit block tags: flush as paragraph
+                        blocks.append(f"<p>{''.join(cur)}</p>")
+                        cur = []
+                        heading = None
                     in_table = True
+                    in_cell = False
                     table_buf = [tok]
                 continue
             if in_table:
@@ -1249,6 +1286,24 @@ class HTMLConverter:
                 # 一部分，不能过 _strip_ws_text，否则首尾空格/连续空格被吃掉。
                 # 也不走下面的 data-ptoe-marker 兜底（标记已由 apply_markers 消费，
                 # 删 token 会破坏表格结构），更不进块标签分支 → 无包裹/无 id/无 TOC。
+                # 例外（2026-10-19）：单元格内的 <p> 开标签与表外同口径重建
+                # （class 白名单 + 「段落设置」data-* → 内联 style）——否则单元格里
+                # 设的引用/缩进在 EPUB 导出后与界面显示不一致。
+                if _TABLE_CELL_OPEN_RE.match(tok):
+                    in_cell = True
+                elif _TABLE_CELL_CLOSE_RE.match(tok):
+                    in_cell = False
+                elif in_cell:
+                    mp = _CELL_PARA_OPEN_RE.fullmatch(tok)
+                    if mp:
+                        raw = mp.group(1) or ""
+                        table_buf.append(
+                            "<p"
+                            + _block_class_html(raw)
+                            + _indent_style_attrs(raw)
+                            + ">"
+                        )
+                        continue
                 table_buf.append(tok)
                 continue
             # 防御：标记 span 已由 apply_markers 提取，此处兜底剔除

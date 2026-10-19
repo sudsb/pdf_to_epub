@@ -378,9 +378,17 @@
       [
         "；",
         ";"
+      ],
+      [
+        "．",
+        "."
       ]
     ],
-    "search_max_results": 200
+    "search_max_results": 200,
+    "tbl_popup_menu": false,
+    "tbl_ctx_menu": false,
+    "tbl_tbl_menu": false,
+    "clean_blank_lines": false
   },
   "proofread_engine": "llama",
   "mouse_shortcuts": {},

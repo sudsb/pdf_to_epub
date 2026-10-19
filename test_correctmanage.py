@@ -89,6 +89,329 @@ class TestTableConvertLoad(unittest.TestCase):
         self.assertIn("ptoe-align-center", out)
 
 
+class TestTableNoborderAndColumns(unittest.TestCase):
+    """无边框表格 + 分栏（2026-10）：保存白名单 / DOCX 导出 / 富文本解析契约。"""
+
+    def test_noborder_class_survives_sanitize(self):
+        out = sanitize_html(
+            '<table class="ptoe-noborder" style="table-layout:fixed">'
+            "<tbody><tr><td>左</td><td>右</td></tr></tbody></table>"
+        )
+        self.assertIn('<table class="ptoe-noborder" style="table-layout:fixed">', out)
+
+    def test_table_unknown_class_dropped(self):
+        # 表格级 class 白名单：非 TBL_TABLE_CLASSES 的 class 一律丢弃
+        out = sanitize_html(
+            '<table class="ptoe-noborder evil other"><tbody><tr><td>a</td></tr></tbody></table>'
+        )
+        self.assertIn('class="ptoe-noborder"', out)
+        self.assertNotIn("evil", out)
+        self.assertNotIn("other", out)
+        out2 = sanitize_html(
+            '<table class="evil"><tbody><tr><td>a</td></tr></tbody></table>'
+        )
+        self.assertNotIn('class=', out2)
+
+    def test_rich_blocks_capture_noborder(self):
+        blocks = _html_to_rich_blocks(
+            '<table class="ptoe-noborder"><tbody><tr><td>a</td><td>b</td></tr></tbody></table>'
+        )
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["kind"], "table")
+        self.assertTrue(blocks[0].get("noborder"))
+        plain = _html_to_rich_blocks(
+            "<table><tbody><tr><td>a</td><td>b</td></tr></tbody></table>"
+        )
+        self.assertNotIn("noborder", plain[0])
+
+    def test_docx_table_noborder_borders(self):
+        # 无边框表：六向 w:val="none"；普通表保持单线 999999
+        out = correctmanage._build_docx_table([["a", "b"]], False, None, noborder=True)
+        self.assertIn('w:val="none"', out)
+        self.assertNotIn('w:val="single"', out)
+        out2 = correctmanage._build_docx_table([["a", "b"]], False, None)
+        self.assertIn('w:val="single"', out2)
+        self.assertNotIn('w:val="none"', out2)
+
+    def test_docx_export_noborder_end_to_end(self):
+        # _build_docx 消费富文本块的 noborder 标志（tmp 目录落盘再删除）
+        import tempfile
+
+        blocks = _html_to_rich_blocks(
+            '<p>前段</p><table class="ptoe-noborder"><tbody><tr><td>x</td><td>y</td></tr></tbody></table>'
+        )
+        with tempfile.TemporaryDirectory() as td_:
+            path = str(Path(td_) / "out.docx")
+            correctmanage._build_docx(blocks, path)
+            import zipfile
+
+            with zipfile.ZipFile(path) as zf:
+                xml = zf.read("word/document.xml").decode("utf-8")
+        self.assertIn("<w:tbl>", xml)
+        self.assertIn('w:val="none"', xml)
+        self.assertNotIn('w:val="single"', xml)
+
+
+class TestColumnsExport(unittest.TestCase):
+    """分栏无边框表格导出修复（2026-10）：框线 / 单元格段落 / 连续分栏合并 / 表内标记。"""
+
+    def test_apply_markers_keeps_noborder_table_attrs(self):
+        # 框线修复：apply_markers 重建 <table> 必须带回 class 与 table-layout:fixed，
+        # 否则导出 EPUB 丢无边框 class → 分栏表格显示框线。
+        pages = [
+            {
+                "page": 1,
+                "text": (
+                    '<table class="ptoe-noborder" style="table-layout:fixed">'
+                    "<tbody><tr><td>左</td><td>右</td></tr></tbody></table>"
+                ),
+            }
+        ]
+        out = apply_markers(pages)[0]["text"]
+        self.assertIn('<table class="ptoe-noborder" style="table-layout:fixed">', out)
+        self.assertIn("<td>左</td>", out)
+
+    def test_apply_markers_drops_unknown_table_class(self):
+        pages = [
+            {"page": 1, "text": '<table class="evil"><tbody><tr><td>a</td></tr></tbody></table>'}
+        ]
+        out = apply_markers(pages)[0]["text"]
+        self.assertIn("<table>", out)
+        self.assertNotIn("evil", out)
+
+    def test_apply_markers_keeps_cell_paragraphs(self):
+        # 单元格内多段不得被并成一段（此前被拍平为 <td>段一段二</td>）
+        pages = [
+            {
+                "page": 1,
+                "text": (
+                    '<table class="ptoe-noborder"><tbody><tr>'
+                    "<td><p>段一</p><p>段二</p></td><td>右</td>"
+                    "</tr></tbody></table>"
+                ),
+            }
+        ]
+        out = apply_markers(pages)[0]["text"]
+        self.assertIn("<td><p>段一</p><p>段二</p></td>", out)
+
+    def test_apply_markers_join_inside_cell(self):
+        # 单元格内段落标记：标记前后两段合并为一段，标记被消费
+        pages = [
+            {
+                "page": 1,
+                "text": (
+                    '<table class="ptoe-noborder"><tbody><tr>'
+                    '<td><p>甲</p><p><span data-ptoe-marker="join">段落</span>乙</p></td>'
+                    "<td>右</td></tr></tbody></table>"
+                ),
+            }
+        ]
+        out = apply_markers(pages)[0]["text"]
+        self.assertIn("<td><p>甲乙</p></td>", out)
+        self.assertNotIn("data-ptoe-marker", out)
+
+    def test_sanitize_keeps_cell_paragraph_class_and_indent(self):
+        # 表格单元格里的段落级格式（引用/注释）与「段落设置」data-* 必须保留：
+        # 否则保存/导出后单元格内的引用降级为正文（界面显示引用、导出变正文）
+        src = (
+            "<table><tbody><tr>"
+            '<td><p class="ptoe-citation">引用甲</p></td>'
+            '<td><p class="ptoe-note" data-pl="2" data-ind="first">注释乙</p></td>'
+            "</tr></tbody></table>"
+        )
+        out = sanitize_html(src)
+        self.assertIn('<p class="ptoe-citation">引用甲</p>', out)
+        self.assertIn(
+            '<p class="ptoe-note" data-pl="2" data-ind="first">注释乙</p>', out
+        )
+
+    def test_sanitize_cell_paragraph_drops_unknown_class(self):
+        # 单元格段落仍走白名单：非白名单 class 不因本次修复被放行
+        src = (
+            "<table><tbody><tr>"
+            '<td><p class="evil">x</p></td></tr></tbody></table>'
+        )
+        out = sanitize_html(src)
+        self.assertIn("<td><p>x</p></td>", out)
+        self.assertNotIn("evil", out)
+
+    def test_sanitize_cell_heading_becomes_paragraph_with_class(self):
+        # 单元格内标题降级为 <p>（既有契约），但格式类随之下移
+        src = '<table><tbody><tr><td><h3 class="ptoe-citation">标题引用</h3></td></tr></tbody></table>'
+        self.assertEqual(
+            sanitize_html(src),
+            '<table><tbody><tr><td><p class="ptoe-citation">标题引用</p></td></tr></tbody></table>',
+        )
+
+    def test_apply_markers_keeps_cell_paragraph_format(self):
+        # 导出链路（apply_markers）同样不得抹掉单元格内段落的 class/data-*
+        pages = [
+            {
+                "page": 1,
+                "text": (
+                    '<table class="ptoe-noborder"><tbody><tr>'
+                    '<td><p class="ptoe-citation">引用甲</p></td>'
+                    '<td><p data-pl="2">正文</p></td>'
+                    "</tr></tbody></table>"
+                ),
+            }
+        ]
+        out = apply_markers(pages)[0]["text"]
+        self.assertIn('<p class="ptoe-citation">引用甲</p>', out)
+        self.assertIn('<p data-pl="2">正文</p>', out)
+
+    def test_apply_markers_join_in_cell_keeps_leading_format(self):
+        # 单元格内 join 合并：结果保留前一段（引用）的格式，标记被消费
+        pages = [
+            {
+                "page": 1,
+                "text": (
+                    '<table class="ptoe-noborder"><tbody><tr><td>'
+                    '<p class="ptoe-citation">甲</p>'
+                    '<p><span data-ptoe-marker="join">段落</span>乙</p>'
+                    "</td></tr></tbody></table>"
+                ),
+            }
+        ]
+        out = apply_markers(pages)[0]["text"]
+        self.assertIn('<p class="ptoe-citation">甲乙</p>', out)
+        self.assertNotIn("data-ptoe-marker", out)
+
+    def test_bridge_join_keeps_cell_paragraph_format(self):
+        # 跨表桥接合并（前表末段 + 后表首段）保留前表末段格式
+        pages = [
+            {
+                "page": 1,
+                "text": (
+                    '<table class="ptoe-noborder"><tbody><tr>'
+                    '<td>x</td><td><p class="ptoe-citation">前</p></td>'
+                    "</tr></tbody></table>"
+                    '<p><span data-ptoe-marker="join">段落</span></p>'
+                    '<table class="ptoe-noborder"><tbody><tr>'
+                    '<td><p>后</p></td><td>y</td>'
+                    "</tr></tbody></table>"
+                ),
+            }
+        ]
+        out = apply_markers(pages)[0]["text"]
+        self.assertEqual(out.count("<table"), 1)
+        self.assertIn('<p class="ptoe-citation">前后</p>', out)
+
+    def test_consecutive_column_tables_merged(self):
+        # 一篇文章里连续两个分栏 → 导出合并为一张表（两行）
+        pages = [
+            {
+                "page": 1,
+                "text": (
+                    '<table class="ptoe-noborder" style="table-layout:fixed">'
+                    "<tbody><tr><td>a1</td><td>a2</td></tr></tbody></table>"
+                    '<table class="ptoe-noborder" style="table-layout:fixed">'
+                    "<tbody><tr><td>b1</td><td>b2</td></tr></tbody></table>"
+                ),
+            }
+        ]
+        out = apply_markers(pages)[0]["text"]
+        self.assertEqual(out.count("<table"), 1)
+        self.assertEqual(out.count("<tr>"), 2)
+        self.assertIn("<td>a1</td>", out)
+        self.assertIn("<td>b2</td>", out)
+
+    def test_consecutive_column_tables_bridged_by_join_marker(self):
+        # 两分栏之间夹一个「纯段落标记」段：视为桥接——并表且前表末段与后表首段合一段
+        pages = [
+            {
+                "page": 1,
+                "text": (
+                    '<table class="ptoe-noborder"><tbody><tr><td>左一</td><td>右一</td></tr></tbody></table>'
+                    '<p><span data-ptoe-marker="join">段落</span></p>'
+                    '<table class="ptoe-noborder"><tbody><tr><td>左二</td><td>右二</td></tr></tbody></table>'
+                ),
+            }
+        ]
+        out = apply_markers(pages)[0]["text"]
+        self.assertEqual(out.count("<table"), 1)
+
+    def test_column_tables_not_merged_across_text(self):
+        # 中间隔着正文段落 → 不合并
+        pages = [
+            {
+                "page": 1,
+                "text": (
+                    '<table class="ptoe-noborder"><tbody><tr><td>a</td><td>b</td></tr></tbody></table>'
+                    "<p>正文</p>"
+                    '<table class="ptoe-noborder"><tbody><tr><td>c</td><td>d</td></tr></tbody></table>'
+                ),
+            }
+        ]
+        out = apply_markers(pages)[0]["text"]
+        self.assertEqual(out.count("<table"), 2)
+
+    def test_plain_tables_not_merged(self):
+        # 无 ptoe-noborder 的普通表格不参与连续合并
+        pages = [
+            {
+                "page": 1,
+                "text": (
+                    "<table><tbody><tr><td>a</td></tr></tbody></table>"
+                    "<table><tbody><tr><td>b</td></tr></tbody></table>"
+                ),
+            }
+        ]
+        out = apply_markers(pages)[0]["text"]
+        self.assertEqual(out.count("<table"), 2)
+
+    def test_rich_blocks_keep_cell_paragraphs_and_merge(self):
+        # TXT/MD/DOCX 路径：单元格段界保留（_cell_plain_text 用 \n），连续分栏并表
+        blocks = _html_to_rich_blocks(
+            '<table class="ptoe-noborder"><tbody><tr><td><p>A</p><p>B</p></td></tr></tbody></table>'
+        )
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["kind"], "table")
+        self.assertEqual(correctmanage._cell_plain_text(blocks[0]["rows"][0][0]), "A\nB")
+
+
+class TestExportCleanBlankLines(unittest.TestCase):
+    """导出时清理空白行（2026-10，默认关）。"""
+
+    def test_flag_reads_setting(self):
+        with mock.patch.object(
+            configmanage, "get_clean_settings", return_value={"clean_blank_lines": True}
+        ):
+            self.assertTrue(correctmanage.export_clean_blank_lines_enabled())
+        with mock.patch.object(
+            configmanage, "get_clean_settings", return_value={"clean_blank_lines": False}
+        ):
+            self.assertFalse(correctmanage.export_clean_blank_lines_enabled())
+
+    def test_strip_blank_paragraphs_outside_tables(self):
+        html = "<p>甲</p><p></p><p>&nbsp;</p><p><br/></p><p>乙</p>"
+        self.assertEqual(
+            correctmanage._strip_blank_paragraphs(html), "<p>甲</p><p>乙</p>"
+        )
+
+    def test_strip_blank_paragraphs_keeps_table_inner(self):
+        html = (
+            "<p></p><table><tbody><tr><td><p></p></td></tr></tbody></table><p>乙</p>"
+        )
+        out = correctmanage._strip_blank_paragraphs(html)
+        self.assertTrue(out.startswith("<table"))
+        self.assertIn("<td><p></p></td>", out)
+        self.assertTrue(out.endswith("<p>乙</p>"))
+
+    def test_collapse_blank_lines(self):
+        self.assertEqual(correctmanage._collapse_blank_lines("a\n\n\n\nb\n\n\n"), "a\n\nb")
+        self.assertEqual(correctmanage._collapse_blank_lines("\n\n\na"), "a")
+
+    def test_drop_blank_blocks(self):
+        blocks = [
+            {"kind": "p", "runs": [{"text": "甲"}]},
+            {"kind": "p", "runs": [{"text": "   "}]},
+            {"kind": "table", "rows": [[]]},
+        ]
+        out = correctmanage._drop_blank_blocks(blocks)
+        self.assertEqual([b["kind"] for b in out], ["p", "table"])
+
+
 class TestSanitize(unittest.TestCase):
     def test_plain_text_escaped(self):
         # 文本内容中的 < & 被转义；未知标签 <x> 整体丢弃（白名单设计）
@@ -776,6 +1099,30 @@ class TestCleanDigitPunct(unittest.TestCase):
         html, st = clean_page_html("<p>1。2</p>", with_stats=True)
         self.assertEqual(html, "<p>1.2</p>")
         self.assertEqual(st["punct"], 1)
+
+    def test_letter_and_ws(self):
+        # 字母间标点 → 英文 + 行内空格容忍（2026-10-18）
+        self.assertEqual(clean_page_html("<p>1 。2</p>"), "<p>1.2</p>")
+        self.assertEqual(clean_page_html("<p>H，W 与 中文</p>"), "<p>H,W 与 中文</p>")
+        # 字母收尾句号保持（中文句末保护）
+        self.assertEqual(clean_page_html("<p>标记为Z。</p>"), "<p>标记为Z。</p>")
+
+    def test_alnum_space_cleanup(self):
+        # 数字间/单字母间空格清理（2026-10-18）；英文短语与「第 1 章」不动
+        self.assertEqual(clean_page_html("<p>1 2</p>"), "<p>12</p>")
+        self.assertEqual(clean_page_html("<p>M a r x</p>"), "<p>Marx</p>")
+        self.assertEqual(
+            clean_page_html("<p>World Health Organization</p>"),
+            "<p>World Health Organization</p>",
+        )
+        self.assertEqual(clean_page_html("<p>第 1 章</p>"), "<p>第 1 章</p>")
+
+    def test_switch_off_skips_spaces(self):
+        # 开关关闭 → 标点与空格两步整体跳过（2026-10-18）
+        self.assertEqual(
+            clean_page_html("<p>1 。2 与 3 4</p>", clean_digit_punct=False),
+            "<p>1 。2 与 3 4</p>",
+        )
 
 
 class TestCleanDigitPunctUiSync(unittest.TestCase):
@@ -3663,8 +4010,12 @@ class TestApplyMarkersTableBlock(unittest.TestCase):
             for open_t in (f"<p><{tag}>", f"<h1><{tag}>", f"<{tag}><p>"):
                 self.assertNotIn(open_t, out, f"{tag} 被独立包裹/包裹他者")
 
-    def test_sanitizer_never_puts_block_tag_in_cell(self):
-        """前置事实：清洗器会把单元格内的 p/h1/div 降级为行内内容，故不会切断表格。"""
+    def test_sanitizer_keeps_cell_paragraphs_as_p(self):
+        """清洗器把单元格内的 p/h1/div 统一降级为 <p> 并**保留段界**（2026-10）。
+
+        此前是只留行内文本（<td>cell</td>），导致分栏单元格里的多段被并成一段；
+        现保留为 <p>…</p>，段界不丢，且不会切断表格（仍是一个 <td>）。
+        """
         for cell in ("<p>cell</p>", "<h1>cell</h1>", "<div>cell</div>"):
             with self.subTest(cell=cell):
                 out = sanitize_html(
@@ -3672,7 +4023,7 @@ class TestApplyMarkersTableBlock(unittest.TestCase):
                 )
                 self.assertEqual(
                     out,
-                    "<table><tbody><tr><td>cell</td></tr></tbody></table>",
+                    "<table><tbody><tr><td><p>cell</p></td></tr></tbody></table>",
                 )
 
     def test_unsanitized_block_tag_in_cell_still_safe(self):
@@ -4254,13 +4605,15 @@ class TestCleanBlocksTableBlock(unittest.TestCase):
         self.assertIn("\xa0", clean_page_html(src))
 
     def test_h1_like_text_in_cell(self):
-        """单元格里的标题样文字：sanitize 压成行内文本，表格结构完好。"""
+        """单元格里的标题样文字：sanitize 降级为 <p>（段界保留），表格结构完好。"""
         out = clean_page_html(
             "<table><tbody><tr><td><h1>假章标题</h1></td></tr></tbody></table>",
             strip_tags=False,
         )
-        self.assertEqual(out, "<table><tbody><tr><td>假章标题</td></tr></tbody></table>")
-        self.assertNotIn("<h1>", out)  # 单元格内不留块级标签
+        self.assertEqual(
+            out, "<table><tbody><tr><td><p>假章标题</p></td></tr></tbody></table>"
+        )
+        self.assertNotIn("<h1>", out)  # 单元格内不留标题块
         self.assertIn("<table>", out)
 
     def test_unclosed_table_is_kept_whole(self):
@@ -4361,22 +4714,29 @@ class TestCleanBlocksTableBlock(unittest.TestCase):
         )
         self.assertEqual(out.lower().count("<table"), 1)
 
-    def test_block_tags_inside_cell_are_not_kept_as_blocks(self):
-        """<td> 内的 <p>/<div>：由 sanitize 压成行内文本，单元格内不留块标签。
+    def test_block_tags_inside_cell_are_downgraded_to_p(self):
+        """<td> 内的 <p>/<div>/<h2>：sanitize 统一降级为 <p>，段界保留（2026-10）。
 
-        _clean_blocks 本身是逐字节透传，不参与这层决策；钉住它以防
-        <td><p>…</p></td> 这种非法嵌套流到 EPUB。
+        此前会被压成行内文本（段界丢失，分栏单元格多段被并）；现保留为 <p>，
+        且不再出现 <div>/<h2> 等块级标签。_clean_blocks 本身逐字节透传。
         """
-        for cell in ("<p>in para</p>", "<div>in div</div>", "<h2>in h2</h2>"):
+        cases = {
+            "<p>in para</p>": "in para",
+            "<div>in div</div>": "in div",
+            "<h2>in h2</h2>": "in h2",
+        }
+        for cell, text in cases.items():
             with self.subTest(cell=cell):
                 out = clean_page_html(
                     f"<table><tbody><tr><td>{cell}tail</td></tr></tbody></table>",
                     strip_tags=False,
                 )
-                self.assertNotIn("<p>", out.split("</table>")[0])
+                self.assertEqual(
+                    out,
+                    f"<table><tbody><tr><td><p>{text}</p>tail</td></tr></tbody></table>",
+                )
                 self.assertNotIn("<div>", out)
                 self.assertNotIn("<h2>", out)
-                self.assertIn("<td>", out)
 
     def test_table_without_tbody_is_normalized_by_sanitize(self):
         """无 <tbody> 的表：sanitize 补齐 tbody，_clean_blocks 逐字节透传。"""
@@ -9448,7 +9808,13 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "clean_paragraphs": False,
                     "clean_symbol_map": [["[", "【"], ["]", "】"], ["--", "——"], ["~", "～"]],
                     "clean_digit_punct": True,
-                    "clean_digit_punct_map": [["。", "."], ["，", ","], ["、", ","], ["：", ":"], ["；", ";"]],
+                    "clean_digit_punct_map": [["。", "."], ["，", ","], ["、", ","], ["：", ":"], ["；", ";"], ["．", "."]],
+                    # 导出时清理空白行（2026-10）：默认关，只在导出流程生效
+                    "clean_blank_lines": False,
+                    # 表格内浮层菜单开关（2026-10）：默认全关，只影响表格范围
+                    "tbl_popup_menu": False,
+                    "tbl_ctx_menu": False,
+                    "tbl_tbl_menu": False,
                 },
             )
         finally:
@@ -9490,7 +9856,13 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "clean_paragraphs": False,
                     "clean_symbol_map": [["[", "【"], ["]", "】"], ["--", "——"], ["~", "～"]],
                     "clean_digit_punct": True,
-                    "clean_digit_punct_map": [["。", "."], ["，", ","], ["、", ","], ["：", ":"], ["；", ";"]],
+                    "clean_digit_punct_map": [["。", "."], ["，", ","], ["、", ","], ["：", ":"], ["；", ";"], ["．", "."]],
+                    # 导出时清理空白行（2026-10）：默认关，只在导出流程生效
+                    "clean_blank_lines": False,
+                    # 表格内浮层菜单开关（2026-10）：默认全关，只影响表格范围
+                    "tbl_popup_menu": False,
+                    "tbl_ctx_menu": False,
+                    "tbl_tbl_menu": False,
                 },
             )
         finally:
@@ -10058,7 +10430,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
             self._stop(server)
 
     def test_post_search_max_results_persists(self):
-        # 搜索结果列表显示上限（10-1000）：合法值原样传给 set_ui_settings
+        # 搜索结果列表显示上限（10-1000000）：合法值原样传给 set_ui_settings
         import json as _json
 
         import requests
@@ -10106,7 +10478,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
         try:
             res = requests.post(
                 base + "/api/ui_settings",
-                data=_json.dumps({"ui_settings": {"search_max_results": 5000}}),
+                data=_json.dumps({"ui_settings": {"search_max_results": 2000000}}),
             ).json()
             self.assertFalse(res["ok"])
             self.assertIn("超出范围", res["error"])
@@ -10933,7 +11305,7 @@ class TestCleanDigitPunctConfig(unittest.TestCase):
     def test_default_when_missing(self):
         self.assertEqual(
             self.cm.get_clean_digit_punct_map(),
-            [["。", "."], ["，", ","], ["、", ","], ["：", ":"], ["；", ";"]],
+            [["。", "."], ["，", ","], ["、", ","], ["：", ":"], ["；", ";"], ["．", "."]],
         )
         self.assertIs(self.cm.get_clean_settings()["clean_digit_punct"], True)
 
@@ -11077,7 +11449,13 @@ class TestSetUiSettingsConfig(unittest.TestCase):
                 "clean_paragraphs": False,
                 "clean_symbol_map": [["[", "【"], ["]", "】"], ["--", "——"], ["~", "～"]],
                 "clean_digit_punct": True,
-                "clean_digit_punct_map": [["。", "."], ["，", ","], ["、", ","], ["：", ":"], ["；", ";"]],
+                "clean_digit_punct_map": [["。", "."], ["，", ","], ["、", ","], ["：", ":"], ["；", ";"], ["．", "."]],
+                # 导出时清理空白行（2026-10）：默认关，只在导出流程生效
+                "clean_blank_lines": False,
+                # 表格内浮层菜单开关（2026-10）：默认全关，只影响表格范围
+                "tbl_popup_menu": False,
+                "tbl_ctx_menu": False,
+                "tbl_tbl_menu": False,
             },
         )
 
@@ -11089,15 +11467,18 @@ class TestSetUiSettingsConfig(unittest.TestCase):
         self.assertEqual(cfg2["ui_settings"]["undo_depth"], 200)
 
     def test_search_max_results_defensive_fallback(self):
-        # 搜索结果列表显示上限：越界 clamp 到 10-1000，非数值回退默认 200，合法值保留
-        cfg = self.cm.set_ui_settings({"search_max_results": 99999})
-        self.assertEqual(cfg["ui_settings"]["search_max_results"], 1000)
+        # 搜索结果列表显示上限：越界 clamp 到 10-1000000，非数值回退默认 200，合法值保留
+        cfg = self.cm.set_ui_settings({"search_max_results": 2000000})
+        self.assertEqual(cfg["ui_settings"]["search_max_results"], 1000000)
         cfg = self.cm.set_ui_settings({"search_max_results": 1})
         self.assertEqual(cfg["ui_settings"]["search_max_results"], 10)
         cfg = self.cm.set_ui_settings({"search_max_results": "abc"})
         self.assertEqual(cfg["ui_settings"]["search_max_results"], 200)
         cfg = self.cm.set_ui_settings({"search_max_results": 400})
         self.assertEqual(cfg["ui_settings"]["search_max_results"], 400)
+        # 上限已提升到 1,000,000（列表改虚拟滚动，大上限不再拖垮渲染）
+        cfg = self.cm.set_ui_settings({"search_max_results": 1000000})
+        self.assertEqual(cfg["ui_settings"]["search_max_results"], 1000000)
 
     def test_line_num_size_defensive_fallback(self):
         # 非法尺寸 → 回退默认 large；合法尺寸保留
@@ -11151,7 +11532,7 @@ class TestSetUiSettingsConfig(unittest.TestCase):
         self.assertEqual(cfg["ui_settings"]["popup_row1"], [])
 
     def test_clean_settings_defaults_and_persist(self):
-        # 智能清理开关默认值：除 clean_paragraphs=False 外均 True
+        # 智能清理开关默认值：除 clean_paragraphs=False、clean_blank_lines=False 外均 True
         from configmanage import CLEAN_SETTINGS_DEFAULTS
 
         self.assertEqual(
@@ -11163,11 +11544,15 @@ class TestSetUiSettingsConfig(unittest.TestCase):
                 "clean_html_tags": True,
                 "clean_paragraphs": False,
                 "clean_digit_punct": True,
+                "clean_blank_lines": False,
             },
         )
-        cfg = self.cm.set_ui_settings({"clean_symbols": False, "clean_paragraphs": True})
+        cfg = self.cm.set_ui_settings(
+            {"clean_symbols": False, "clean_paragraphs": True, "clean_blank_lines": True}
+        )
         self.assertEqual(cfg["ui_settings"]["clean_symbols"], False)
         self.assertEqual(cfg["ui_settings"]["clean_paragraphs"], True)
+        self.assertEqual(cfg["ui_settings"]["clean_blank_lines"], True)
         # 未显式传入的键保留默认
         self.assertEqual(cfg["ui_settings"]["clean_punctuation"], True)
         self.assertEqual(cfg["ui_settings"]["clean_md_tags"], True)
@@ -14673,10 +15058,13 @@ class TestTable(unittest.TestCase):
         )
         self.assertNotIn("colspan", out2)
 
-    def test_sanitize_table_block_tags_in_cell_dropped(self):
+    def test_sanitize_table_block_tags_in_cell_kept_as_paragraphs(self):
+        # 2026-10 行为变更：单元格内块级标签不再被降级拍平，而是统一保留为 <p>，
+        # 段界不丢（分栏单元格多段不再被并成一段）。
         out = sanitize_html("<table><tr><td><p>段1</p><div>段2</div></td></tr></table>")
         self.assertEqual(
-            out, "<table><tbody><tr><td>段1段2</td></tr></tbody></table>"
+            out,
+            "<table><tbody><tr><td><p>段1</p><p>段2</p></td></tr></tbody></table>",
         )
 
     def test_sanitize_table_nested_dropped(self):
@@ -15204,23 +15592,39 @@ class TestTableEnhancements(unittest.TestCase):
         html = correctmanage._UI_HTML
         for tid in ("tblBar", "tblMenu", "tblResizeLayer", "tblSizeModalBg",
                     "tblSizeColWidth", "tblSizeRowHeight", "tblSizeRowUnit",
-                    "tblSizeApply", "tblSizeCancel"):
+                    "tblSizeApply", "tblSizeCancel", "tblAlignGrid"):
             self.assertIn('id="%s"' % tid, html)
 
     def test_toolbar_exposes_enhancement_ops(self):
         html = correctmanage._UI_HTML
-        for op in ("merge", "split", "colwidth", "rowheight", "more"):
+        for op in ("merge", "split", "colwidth", "rowheight", "more", "aligngrid"):
             self.assertIn('data-tbl-op="%s"' % op, html)
 
     def test_css_row_grow_sel_and_resize_layer(self):
-        # 用「折叠为单空格」而非删除空白：删除会抹掉后代组合器空格，
-        # `.page-row.ptoe-has-table .editable{` 会变成 `...table.editable{`。
+        # 用「折叠为单空格」而非删除空白：删除会抹掉后代组合器空格。
         compact = re.sub(r"\s+", " ", correctmanage._UI_HTML)
-        self.assertIn(".page-row.ptoe-has-table .editable{", compact)
-        self.assertIn("height:auto", compact)
+        # 2026-10 修订：含表格的行不再撑高（旧规则 .page-row.ptoe-has-table .editable
+        # 的 height:auto 会让页高超过左侧图片且不出现滚动条）→ 断言已移除；基础
+        # .editable 仍为 height:0 / min-height:100%（= 行高 = 图片高，超出内部滚动）。
+        self.assertNotIn(".page-row.ptoe-has-table .editable", compact)
+        self.assertIn(".editable{height:0;min-height:100%", compact)
         self.assertIn("#tblResizeLayer{position:fixed", compact)
         self.assertIn(".ptoe-cell-sel", compact)
         self.assertIn(".ptoe-vmid", compact)
+        self.assertIn("#tblAlignGrid", compact)
+
+    def test_editor_css_cell_alignment_classes(self):
+        # 2026-10 修复：单元格对齐类必须用 .editable td/th 级选择器（特异性 0,2,1），
+        # 否则被同区块的 .editable th,.editable td{text-align:left}（0,1,1）压过 →
+        # 表格里设「居中/居右」看不到效果（用户反馈「对齐设置后不生效」）。
+        compact = re.sub(r"\s+", " ", correctmanage._UI_HTML)
+        for sel in (".editable td.ptoe-align-left", ".editable td.ptoe-align-center",
+                    ".editable td.ptoe-align-right", ".editable th.ptoe-align-left",
+                    ".editable th.ptoe-align-center", ".editable th.ptoe-align-right"):
+            self.assertIn(sel, compact, "缺单元格水平对齐 CSS：" + sel)
+        for sel in (".editable td.ptoe-vtop", ".editable td.ptoe-vmid",
+                    ".editable td.ptoe-vbot", ".editable th.ptoe-vmid"):
+            self.assertIn(sel, compact, "缺单元格垂直对齐 CSS：" + sel)
 
     def test_appjs_defines_table_enhancement_functions(self):
         js = self._read_js()
@@ -15229,7 +15633,10 @@ class TestTableEnhancements(unittest.TestCase):
                    "_tblDelCol", "_tblMoveCol", "_tblToggleHeader",
                    "_tblSetColWidthPct", "_tblSetRowHeight", "_tblDistributeCols",
                    "_tblResetSizes", "_tblVAlign", "_tblDoOp", "_tblTabMove",
-                   "_syncTblGrow", "_tblShowResizeLayer"):
+                   "_syncTblGrow", "_tblShowResizeLayer",
+                   # 2026-10 新增：九宫格对齐 + 多格选区目标
+                   "_tblVAlignOf", "_tblTargetCells", "_ensureTblAlignGrid",
+                   "_tblSyncAlignGridActive", "_tblAlignGridOpen", "_tblAlignGridClose"):
             self.assertIn("function %s(" % fn, js, "缺函数 " + fn)
 
     def test_appjs_dispatch_covers_menu_ops(self):
@@ -15237,13 +15644,72 @@ class TestTableEnhancements(unittest.TestCase):
         for op in ("insertrowabove", "insertrowbelow", "moverowup", "moverowdown",
                    "insertcolleft", "insertcolright", "movecolleft", "movecolright",
                    "distribute", "reset", "valigntop", "valignmiddle",
-                   "valignbottom", "header"):
+                   "valignbottom", "header", "aligngrid"):
             self.assertIn("op === '%s'" % op, js, "分派缺 " + op)
 
     def test_sync_content_hooks_row_grow(self):
         js = self._read_js()
         self.assertIn("_syncTblGrow(ed, i);", js)
         self.assertIn("_syncTblGrow(row.querySelector('.editable'), i);", js)
+
+    def test_css_table_rows_get_line_numbers(self):
+        # 表格行也参与行号（连续编号）：tr 计数 + 首格 ::after 摆到行号栏
+        compact = re.sub(r"\s+", " ", correctmanage._UI_HTML)
+        self.assertIn("#pages.ptoe-line-num .editable > table tr{counter-increment:ptoe-ln;}", compact)
+        self.assertIn("tr > td:first-child::after", compact)
+        self.assertIn("tr.ptoe-cur-line", compact)
+
+    def test_appjs_cmdline_counts_table_rows(self):
+        # 命令行行号口径与显示行号 1:1：_cmdLineBlocks 把每个 tr 计为一行
+        js = self._read_js()
+        self.assertIn("function _cmdLineBlocks(ed) {", js)
+        self.assertIn("if (c.tagName === 'TABLE') {", js)
+        self.assertIn("c.querySelectorAll('tr')", js)
+        # 光标在表格内 → 所在行 = 该 tr
+        self.assertIn("const tr = n.closest('tr');", js)
+
+    def test_appjs_search_virtual_scroll(self):
+        # 上限 1,000,000：结果列表虚拟滚动（窗口化渲染 + 上下占位），不再逐条建 DOM
+        js = self._read_js()
+        for fn in ("_srScaffold", "_srBuildItem", "_srRenderWindow",
+                   "_srSyncCurrent", "_srScrollCurrentIntoView"):
+            self.assertIn("function %s(" % fn, js, "缺函数 " + fn)
+        self.assertIn("const SR_ROW_H = 50;", js)
+        self.assertIn("Math.min(1000000, v)", js)
+        self.assertIn("_srRenderWindow(true);", js)
+
+    def test_css_search_items_fixed_row_height(self):
+        # 虚拟滚动依赖固定行高：.sr-item height + .sr-ctx 单行省略
+        compact = re.sub(r"\s+", " ", correctmanage._UI_HTML)
+        self.assertIn(".sr-item{height:44px;", compact)
+        self.assertIn("text-overflow:ellipsis", compact)
+        self.assertIn('id="searchMaxResultsInput" min="10" max="1000000"', compact)
+
+    def test_docx_table_vertical_align(self):
+        # 垂直对齐必须出现在 DOCX 导出（w:vAlign），否则「对齐 ▾」只有屏幕生效
+        html = ('<table><tr><td class="ptoe-vtop">a</td>'
+                '<td class="ptoe-vbot">b</td></tr></table>')
+        blk = correctmanage._html_to_rich_blocks(html)[0]
+        self.assertEqual(blk.get("valgn"), [["top", "bottom"]])
+        docx = correctmanage._build_docx_table(
+            blk["rows"], blk["header"], blk.get("algn"), valgn=blk.get("valgn")
+        )
+        self.assertIn('<w:vAlign w:val="top"/>', docx)
+        self.assertIn('<w:vAlign w:val="bottom"/>', docx)
+
+    def test_docx_table_vertical_align_middle_maps_to_center(self):
+        html = '<table><tr><td class="ptoe-vmid">a</td></tr></table>'
+        blk = correctmanage._html_to_rich_blocks(html)[0]
+        self.assertEqual(blk.get("valgn"), [["middle"]])
+        docx = correctmanage._build_docx_table(
+            blk["rows"], blk["header"], valgn=blk.get("valgn")
+        )
+        self.assertIn('<w:vAlign w:val="center"/>', docx)
+
+    def test_valgn_key_absent_without_vertical_align(self):
+        blk = correctmanage._html_to_rich_blocks('<table><tr><td>a</td></tr></table>')[0]
+        self.assertNotIn("valgn", blk)
+
 
     # ---- 回归：滚动后浮层残留（2026-10「非表格位置出现表格框线」） ----
 

@@ -967,13 +967,13 @@ const clone = range.cloneRange();
   // 高亮为视图层（<mark class="ptoe-search">），不进影子数组——同步写回时剥离。
   let searchResults = [];
   let searchCurrent = -1;
-  let searchMaxResults = 200; // 搜索结果列表显示上限（10-1000，默认 200；服务端持久化）
+  let searchMaxResults = 200; // 搜索结果列表显示上限（10-1000000，默认 200；服务端持久化）
   // 拉取搜索结果上限（打开搜索弹窗时刷新：矫正界面改设置后无需重启编辑器即生效）
   async function refreshSearchMaxResults() {
     try {
       const res = await fetchJSON('/api/ui_settings');
       const v = res && res.ok && res.ui_settings ? parseInt(res.ui_settings.search_max_results, 10) : NaN;
-      if (isFinite(v)) searchMaxResults = Math.max(10, Math.min(1000, v));
+      if (isFinite(v)) searchMaxResults = Math.max(10, Math.min(1000000, v));
     } catch (e) { /* 保留默认 200：设置读取失败不影响搜索 */ }
   }
   let _searchHighlightQuery = '';
@@ -994,36 +994,106 @@ const clone = range.cloneRange();
     const q = regexMode ? query : query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     return new RegExp(q, regexMode ? 'gimu' : 'giu');
   }
+  // ---------- 搜索结果列表：虚拟滚动（2026-10）----------
+  // 上限放宽到 1,000,000 后逐条建 DOM 会卡死，改为只渲染视口内 ± 缓冲的行，用上下占位
+  // 块撑出真实滚动高度；行距固定（见 .sr-item height），滚动位置可精确换算。
+  const SR_ROW_H = 46;      // = .sr-item height（epubedit.html，无外边距）
+  const SR_OVERSCAN = 8;
+  const _srRAF = (typeof requestAnimationFrame === 'function')
+    ? requestAnimationFrame
+    : function (cb) { return setTimeout(cb, 16); };
+  let _srFrom = -1, _srTo = -1;
+
+  function _srScaffold(list) {
+    const first = list.firstElementChild;
+    if (first && first.classList && first.classList.contains('sr-top')) return;
+    list.innerHTML = '';
+    const top = document.createElement('div'); top.className = 'sr-top';
+    const win = document.createElement('div'); win.className = 'sr-window';
+    const bot = document.createElement('div'); bot.className = 'sr-bot';
+    top.style.height = '0px'; bot.style.height = '0px';
+    list.appendChild(top); list.appendChild(win); list.appendChild(bot);
+    _srFrom = _srTo = -1;
+  }
+  function _srBuildItem(r, k) {
+    const item = document.createElement('div');
+    item.className = 'sr-item' + (k === searchCurrent ? ' current' : '');
+    item.dataset.srIndex = String(k);
+    item.innerHTML = '<div class="sr-page">第 ' + r.page + ' 章</div><div class="sr-ctx">' + r.ctx + '</div>';
+    item.addEventListener('click', function () {
+      searchCurrent = k;
+      updateSearchNav();
+      scrollToIndex(r.i);
+    });
+    return item;
+  }
+  function _srRenderWindow(force) {
+    const list = document.getElementById('searchList');
+    if (!list) return;
+    const win = list.querySelector('.sr-window');
+    if (!win) return; // 无结果时是 .sr-empty
+    const top = list.firstElementChild, bot = list.lastElementChild;
+    const n = searchResults.length;
+    const vh = list.clientHeight || 260;
+    const first = Math.max(0, Math.floor(list.scrollTop / SR_ROW_H) - SR_OVERSCAN);
+    const last = Math.min(n, Math.ceil((list.scrollTop + vh) / SR_ROW_H) + SR_OVERSCAN);
+    if (!force && first === _srFrom && last === _srTo) return;
+    _srFrom = first; _srTo = last;
+    top.style.height = (first * SR_ROW_H) + 'px';
+    bot.style.height = ((n - last) * SR_ROW_H) + 'px';
+    const frag = document.createDocumentFragment();
+    for (let k = first; k < last; k++) frag.appendChild(_srBuildItem(searchResults[k], k));
+    win.innerHTML = '';
+    win.appendChild(frag);
+  }
+  function _srSyncCurrent() {
+    const win = document.querySelector('#searchList .sr-window');
+    if (!win) return;
+    for (let k = 0; k < win.children.length; k++) {
+      const item = win.children[k];
+      item.classList.toggle('current', Number(item.dataset.srIndex) === searchCurrent);
+    }
+  }
+  function _srScrollCurrentIntoView() {
+    const list = document.getElementById('searchList');
+    if (!list || searchCurrent < 0 || !searchResults.length) return;
+    if (!list.querySelector('.sr-window')) return;
+    const vh = list.clientHeight || 260;
+    const top = searchCurrent * SR_ROW_H;
+    if (top < list.scrollTop) list.scrollTop = top;
+    else if (top + SR_ROW_H > list.scrollTop + vh) list.scrollTop = top + SR_ROW_H - vh;
+    _srRenderWindow(true);
+  }
+  (function () {
+    let raf = 0;
+    const schedule = function () {
+      if (raf) return;
+      raf = _srRAF(function () { raf = 0; _srRenderWindow(false); _srSyncCurrent(); });
+    };
+    const list = document.getElementById('searchList');
+    if (list) list.addEventListener('scroll', schedule, { passive: true });
+    window.addEventListener('resize', schedule);
+  })();
+
   function updateSearchNav() {
     const pos = document.getElementById('searchPos');
     if (pos) pos.textContent = searchResults.length ? (searchCurrent + 1) + ' / ' + searchResults.length : '';
-    const list = document.getElementById('searchList');
-    if (list) {
-      for (let k = 0; k < list.children.length; k++) list.children[k].classList.toggle('current', k === searchCurrent);
-    }
+    _srScrollCurrentIntoView(); // 虚拟列表：滚动到当前项并刷新窗口
+    _srSyncCurrent();
   }
   function renderSearchResults(results, total, MAX) {
     const list = document.getElementById('searchList');
     const count = document.getElementById('srCount');
     if (count) count.textContent = '共 ' + total + ' 处匹配' + (total > MAX ? '，仅显示前 ' + MAX + ' 条' : '');
-    if (list) {
-      list.innerHTML = '';
-      if (!results.length) {
-        list.innerHTML = '<div class="sr-empty">未找到匹配内容</div>';
-        return;
-      }
-      results.forEach(function (r, k) {
-        const item = document.createElement('div');
-        item.className = 'sr-item';
-        item.innerHTML = '<div class="sr-page">第 ' + r.page + ' 章</div><div class="sr-ctx">' + r.ctx + '</div>';
-        item.addEventListener('click', function () {
-          searchCurrent = k;
-          updateSearchNav();
-          scrollToIndex(r.i);
-        });
-        list.appendChild(item);
-      });
+    if (!list) return;
+    if (!results.length) {
+      list.innerHTML = '<div class="sr-empty">未找到匹配内容</div>';
+      _srFrom = _srTo = -1;
+      return;
     }
+    _srScaffold(list);
+    list.scrollTop = 0;
+    _srRenderWindow(true);
   }
   function openSearchModal(pinIdx) {
     searchModalOpen = true;
@@ -1034,6 +1104,9 @@ const clone = range.cloneRange();
     _pendingSearchIdx = (pinIdx >= 0 && pinIdx < articles.length) ? pinIdx : currentIdx();
     const bg = document.getElementById('searchModalBg');
     if (bg) { bg.style.display = 'flex'; bg.hidden = false; }
+    // 虚拟列表：弹窗隐藏时 clientHeight=0，打开后用真实可视高度重算窗口
+    _srRenderWindow(true);
+    _srSyncCurrent();
     const inp = document.getElementById('searchInput');
     if (inp) inp.focus();
     const idx = _pendingSearchIdx;
@@ -1080,12 +1153,8 @@ const clone = range.cloneRange();
   function gotoMatch(dir) {
     if (!searchResults.length) return;
     searchCurrent = (searchCurrent + dir + searchResults.length) % searchResults.length;
-    updateSearchNav();
+    updateSearchNav(); // 虚拟列表：内含「滚动到当前项」+ .current 高亮
     const cur = searchResults[searchCurrent];
-    const list = document.getElementById('searchList');
-    if (list && list.children[searchCurrent]) {
-      try { list.children[searchCurrent].scrollIntoView({ block: 'nearest' }); } catch (e) { }
-    }
     scrollToIndex(cur.i);
     setStatus('第 ' + (cur.i + 1) + ' 章，第 ' + (searchCurrent + 1) + ' / ' + searchResults.length + ' 处');
   }

@@ -533,21 +533,28 @@ def _normalize_punctuation_extended(text: str) -> str:
 
 # 数字里的中文标点 → 英文（智能清理「数字标点归一」；2026-10 规格：
 # 1。2 → 1.2、1，2 → 1,2、1。 → 1.）。表可在设置里自定义
-# （config.json ui_settings.clean_digit_punct_map）；仅认单字符源 + 前一字符是数字。
-DIGIT_PUNCT_DEFAULT = (("。", "."), ("，", ","), ("、", ","), ("：", ":"), ("；", ";"))
+# （config.json ui_settings.clean_digit_punct_map）；仅认单字符源 + 前一字符是数字/字母。
+DIGIT_PUNCT_DEFAULT = (("。", "."), ("，", ","), ("、", ","), ("：", ":"), ("；", ";"), ("．", "."))
 _DIGIT_CHARS = "0-9０-９"
+_ALNUM_CHARS = "0-9Ａ-Ｚａ-ｚA-Za-z０-９"
 _DIGIT_PUNCT_CACHE: dict = {}
+_DIGIT_PUNCT_END_CACHE: dict = {}
 
 
 def normalize_digit_punct(text: str, pairs=None) -> str:
-    """把「数字里的」中文标点换成英文（不动正文里其它中文标点）。
+    """把「数字/字母里的」中文标点换成英文（不动正文里其它中文标点）。
 
     ``pairs`` 为 ``[("。", "."), …]`` 形式的替换表（None → ``DIGIT_PUNCT_DEFAULT``）；
-    只取单字符源。命中位置（前一字符必须是数字，半角/全角皆可）：
-    1. 夹在数字之间：``1。2`` → ``1.2``、``1，2`` → ``1,2``、``1、2`` → ``1,2``；
-    2. 数字之后即收尾（行尾/串尾或紧跟空白）：``1。`` → ``1.``、``共 1。 条`` → ``共 1. 条``。
-    正文里「数字后接中文」的标点属正常中文标点，**不**替换：
-    ``圆周率 3.14，和`` 保持不变（保底：只认数字/空白/串尾收尾）。空表/无命中原样返回。
+    只取单字符源。命中位置（前一字符必须是数字/字母，半角/全角皆可）：
+    1. 夹在数字/字母之间：``1。2`` → ``1.2``、``1，2`` → ``1,2``、``1、2`` → ``1,2``、
+       ``H，W`` → ``H,W``、``1。A`` → ``1.A``、``A。1`` → ``A.1``（跨类型同理）；
+    2. 数字/字母之后即收尾（行尾/串尾或紧跟空白）：``1。`` → ``1.``、``共 1。 条`` → ``共 1. 条``。
+       注意：字母收尾（如 ``H。``）不转换，避免误伤中文语境。
+    3. 容忍行内空格/换行：``1 。 2`` → ``1.2``、``H , W`` → ``H,W``、``1。\n2`` → ``1.\n2``。
+    正文里「数字/字母后接中文」的标点属正常中文标点，**不**替换：
+    ``圆周率 3.14，和`` 保持不变（保底：只认数字/字母/空白/串尾收尾）。
+    英文词组内的逗号（如 ``test,OK``）属正常文本标点，**不**替换。
+    空表/无命中原样返回。
     """
     s = str(text if text is not None else "")
     if not s:
@@ -564,12 +571,110 @@ def normalize_digit_punct(text: str, pairs=None) -> str:
     if not mapping:
         return s
     key = tuple(sorted(mapping.items()))
+    
+    # 统一处理：alnum 之间（数字-数字、字母-字母、数字-字母、字母-数字）
+    # 单字符 = 单个数字或单个 ASCII/全角字母（非单词内部）
+    # 要求：前一个字符不是字母（避免匹配单词内部如 "test" 里的 "t"）
+    #       后一个字符不是字母（避免匹配单词内部如 "OK" 里的 "O"）
+    # 但允许数字-字母、字母-数字
+    alnum = r"[0-9０-９A-Za-zＡ-Ｚａ-ｚ]"
+    letter = r"[A-Za-zＡ-Ｚａ-ｚ]"
+    punct_alts = "|".join(re.escape(k) for k in mapping)
+    # 空白字符（不含换行）：空格、制表符、全角空格
+    ws = r"[ \t\u3000]"
+    
+    # 正则：前向断言非字母，捕获 alnum，可选空白(不含换行)，标点，可选空白(不含换行)，后向断言 alnum(非字母结尾)
+    # 这样处理：1。2、1。A、A。1、H，W、1\u3000。2
+    # 注意：用 [ \t\u3000]* 而不是 \s* 以保留换行符
     pat = _DIGIT_PUNCT_CACHE.get(key)
     if pat is None:
-        # 后向断言：前一字符是数字；前向断言：后面是数字/空白/串尾（数字内部或数字收尾）
         pat = re.compile(
-            "(?<=[%s])(?:%s)(?=$|[\\s%s])"
-            % (_DIGIT_CHARS, "|".join(re.escape(k) for k in mapping), _DIGIT_CHARS)
+            r"(?<!%s)(%s)%s*(?:%s)%s*(?=%s(?!%s))" % (letter, alnum, ws, punct_alts, ws, alnum, letter)
         )
         _DIGIT_PUNCT_CACHE[key] = pat
-    return pat.sub(lambda m: mapping[m.group(0)], s)
+    def _repl_between(m):
+        return m.group(1) + mapping[m.group(0)[len(m.group(1)):].lstrip()[0]]
+    s = pat.sub(_repl_between, s)
+    
+    # 第二步：处理收尾情况（仅限数字，不处理字母收尾）
+    # 也保留换行：只匹配空格/制表符/全角空格，不匹配换行
+    pat_end = _DIGIT_PUNCT_END_CACHE.get(key)
+    if pat_end is None:
+        digit = r"[0-9０-９]"
+        pat_end = re.compile(
+            r"(%s)%s*(?:%s)%s*(?=\s|$)" % (digit, ws, punct_alts, ws)
+        )
+        _DIGIT_PUNCT_END_CACHE[key] = pat_end
+    def _repl_end(m):
+        return m.group(1) + mapping[m.group(0)[len(m.group(1)):].lstrip()[0]]
+    return pat_end.sub(_repl_end, s)
+
+
+def clean_alnum_spaces(text: str) -> str:
+    """清理数字间/单字母间的多余空格，保留英文词组内部空格。
+
+    规则：
+    - 连续数字间的空格：``1 2 3`` → ``123``
+    - 单字母序列（3个以上连续单字母词）的空格：``M a r x`` → ``Marx``、``U S A`` → ``USA``、
+      ``Ｍ ａ ｒ ｘ`` → ``Ｍａｒｘ``
+    - 英文词组（含连字符/撇号的单词）内部空格保留：``hello world`` → ``hello world``、
+      ``state-of-the-art`` → ``state-of-the-art``
+    - 普通单字母词（如 "I am a man" 中的 "I"、"a"）不合并
+    - 换行符保留不变
+    - 全角空格(U+3000)同理
+    - 全角字母同理
+
+    使用正则：先合并数字/单字母序列，再清理其中的空格。
+    """
+    if not text:
+        return ""
+    # 1. 数字序列内的空格：(?<=\d)\s+(?=\d) - 只匹配空格/制表符/全角空格，不匹配换行
+    text = re.sub(r"(?<=[0-9０-９])[ \t\u3000]+(?=[0-9０-９])", "", text)
+    # 2. 单字母缩写序列处理
+    #    单字母词 = 单个大写ASCII字母(A-Z)或全角字母(Ａ-Ｚａ-ｚ)，前后为空格/边界
+    #    算法：扫描文本，找出连续的单字母词序列，按规则合并
+    ws = r"[ \t\u3000]"
+    # 先用正则找出所有单字母词的位置（单字母 = A-Z, a-z, 全角字母，前后为空白/边界）
+    single_letter_pat = re.compile(r"(?:^|%s)([A-Za-zＡ-Ｚａ-ｚ])(?=%s|$)" % (ws, ws))
+    matches = list(single_letter_pat.finditer(text))
+    if len(matches) >= 2:
+        # 分组连续的单字母词
+        groups = []
+        current_group = [matches[0]]
+        for i in range(1, len(matches)):
+            prev = current_group[-1]
+            curr = matches[i]
+            # 检查是否连续（中间只有空白字符）
+            # prev.end() 指向字母后的位置，curr.start() 指向字母前的位置（可能含空白）
+            # 需要检查 prev.end() 到 curr.start(1) 之间是否全是空白
+            # curr.start(1) 是捕获组1的开始位置
+            gap_start = prev.end()
+            gap_end = curr.start(1)
+            if gap_start < gap_end and all(c in " \t\u3000" for c in text[gap_start:gap_end]):
+                current_group.append(curr)
+            else:
+                if len(current_group) >= 2:
+                    groups.append(current_group)
+                current_group = [curr]
+        if len(current_group) >= 2:
+            groups.append(current_group)
+        
+        # 从后往前替换，避免位置偏移
+        text_list = list(text)
+        for group in reversed(groups):
+            if len(group) >= 3:
+                # 3个以上：全部合并
+                start = group[0].start(1)
+                end = group[-1].end(1)
+                merged = "".join(m.group(1) for m in group)
+                text_list[start:end] = list(merged)
+            elif len(group) == 2:
+                # 2个：仅当都是大写ASCII时合并
+                c1, c2 = group[0].group(1), group[1].group(1)
+                if 'A' <= c1 <= 'Z' and 'A' <= c2 <= 'Z':
+                    start = group[0].start(1)
+                    end = group[1].end(1)
+                    merged = c1 + c2
+                    text_list[start:end] = list(merged)
+        text = "".join(text_list)
+    return text
