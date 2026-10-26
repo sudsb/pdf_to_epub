@@ -93,10 +93,21 @@ except ImportError:
     rulemanage = None
 
 # 加粗注释标签转换（htmlmanage.py）
+# strip_block_ws / blank_block_ws：多行对齐段（ptoe-align-lines）的 &nbsp; 填充是
+# 版式的一部分，默认口径的 str.strip() 会连它一起剥掉——导出后左右两侧就对不齐了
 try:
-    from htmlmanage import transform_note_labels
-except ImportError:
+    from htmlmanage import transform_note_labels, strip_block_ws, blank_block_ws
+except ImportError:  # pragma: no cover - htmlmanage 缺失时的兜底
     transform_note_labels = None
+    _WS_KEEP_NBSP = " \t\n\r\f\v\u3000\u200b\u200c\ufeff"
+
+    def strip_block_ws(text, keep_nbsp=False):
+        """块首尾空白清理；keep_nbsp=True 时保留 &nbsp;（U+00A0）不剥。"""
+        return text.strip(_WS_KEEP_NBSP) if keep_nbsp else text.strip()
+
+    def blank_block_ws(text, keep_nbsp=False):
+        """文本是否只有空白；keep_nbsp=True 时 &nbsp; 算内容（不算空白）。"""
+        return not strip_block_ws(text, keep_nbsp)
 
 __all__ = [
     "apply_markers",
@@ -126,8 +137,45 @@ TBL_TABLE_CLASSES = ("ptoe-noborder",)
 
 
 _ALIGN_CLASSES = {"ptoe-align-center", "ptoe-align-left", "ptoe-align-right"}
+# 多行对齐标记类（2026-10-20）：矫正界面「多行对齐」给对齐段落打的块级标记。
+# 作用只有一个——导出 EPUB 时该段豁免空白符清理（对齐用的空白是版式的一部分，
+# 与居右段 ptoe-align-right、注释标签段 ptoe-note-label 同策略）。
+# 不并入 _ALIGN_CLASSES：那是「水平对齐」语义（左/中/右互斥、各留一个），
+# 多行对齐与左/中/右可以并存，塞进去会挤掉真正的水平对齐类。
+_ALIGN_LINES_CLASS = "ptoe-align-lines"
 # 单元格垂直对齐类（2026-10 表格增强）：与水平对齐类同策略，单元格内各保留一个。
 _VALIGN_CLASSES = {"ptoe-vtop", "ptoe-vmid", "ptoe-vbot"}
+# ---------------------------------------------------------------------------
+# MathML 公式（2026-10-21）—— LaTeX 的载体
+#
+# 矫正界面用 KaTeX（ui/vendor/katex.min.js）把 LaTeX 源码渲染成 MathML 存进正文：
+#     <math xmlns="…" alttext="E=mc^2" display="inline"><semantics>…</semantics></math>
+# 导出 EPUB 时原样保留（EPUB 3 阅读器原生支持 MathML → 公式照常显示）；
+# DOCX/MD/TXT 无 MathML 概念 → 走 alttext 里的 LaTeX 源码做纯文本兜底（$…$）。
+#
+# 标签/属性白名单统一放在 rulemanage（单一事实来源，与 MiniDOMParser 同口径）——
+# 两条链路（保存清洗 / 规则引擎重排）必须放行同一批标签，否则「应用一次格式规则
+# 就把公式清空」。
+# ---------------------------------------------------------------------------
+_MATHML_TAGS = frozenset(getattr(rulemanage, "MATHML_TAGS", ()) or ())
+_MATHML_ATTRS = frozenset(getattr(rulemanage, "MATHML_ATTRS", ()) or ())
+_MATHML_NS = "http://www.w3.org/1998/Math/MathML"
+
+
+def _mathml_open_tag(tag: str, attrs) -> str:
+    """MathML 开标签 → 规范化 HTML 串（属性走白名单，xmlns 只认 MathML 命名空间）。"""
+    parts: list[str] = []
+    for k, v in attrs:
+        kl = (k or "").lower()
+        if kl not in _MATHML_ATTRS:
+            continue
+        val = v or ""
+        if kl == "xmlns" and val != _MATHML_NS:
+            continue
+        parts.append(f'{kl}="{_html.escape(val, quote=True)}"')
+    return "<" + tag + ("".join(" " + p for p in parts)) + ">"
+
+
 # 行内对齐样式正则：style="text-align:left|center|right"（含空格容忍）
 _ALIGN_STYLE_RE = re.compile(r"text-align\s*:\s*(left|center|right)\s*(?:;|$)")
 
@@ -158,6 +206,14 @@ _ALIAS_INLINE_TAGS = {
 _STYLE_TO_INLINE_CLASS = (
     # 下加点（dotted 变体优先匹配，互斥于实线下划线）
     (re.compile(r"text-decoration[^;]*\bdotted\b", re.IGNORECASE), "ptoe-underdot"),
+    # 波浪下划线（2026-10-21）：underline wavy 变体，须先于实线下划线匹配
+    (re.compile(r"text-decoration[^;]*\bunderline\b[^;]*\bwavy\b", re.IGNORECASE), "ptoe-wavy"),
+    # 双下划线（2026-10-21）：underline double 变体
+    (re.compile(r"text-decoration[^;]*\bunderline\b[^;]*\bdouble\b", re.IGNORECASE), "ptoe-double"),
+    # 上划线（2026-10-21）
+    (re.compile(r"text-decoration[^;]*\boverline\b", re.IGNORECASE), "ptoe-overline"),
+    # 着重号（2026-10-21）：text-emphasis: dot / circle / sesame
+    (re.compile(r"text-emphasis\s*:\s*(?:dot|circle|sesame)", re.IGNORECASE), "ptoe-emphasis"),
     (re.compile(r"text-decoration[^;]*\bunderline\b(?!\s*(?:dotted|dashed|double|wavy))", re.IGNORECASE), "ptoe-underline"),
     (re.compile(r"text-decoration[^;]*line-through", re.IGNORECASE), "ptoe-strike"),
     (re.compile(r"vertical-align\s*:\s*super", re.IGNORECASE), "ptoe-sup"),
@@ -212,13 +268,41 @@ DIVIDER_STYLES = {
     "dashed": "ptoe-divider-dashed",  # 线段 ╌╌ U+254C
     "dotted": "ptoe-divider-dotted",  # 点线 ╌┈ U+2508
     "double": "ptoe-divider-double",  # 双线 ══ U+2550
+    # —— 花样分割符号（2026-10-21）：非线条型，用装饰字形排成分隔 ——
+    "stars": "ptoe-divider-stars",        # ★ 五角星
+    "diamonds": "ptoe-divider-diamonds",  # ◆ 菱形
+    "circles": "ptoe-divider-circles",    # ● 圆点
+    "flowers": "ptoe-divider-flowers",    # ❀ 花纹
+    "snow": "ptoe-divider-snow",          # ❄ 雪花
+    "wave": "ptoe-divider-wave",          # ≈ 波浪
+    "note": "ptoe-divider-note",          # ※ 注记
+    "leaf": "ptoe-divider-leaf",          # ❦ 叶形
 }
-# 每个分隔线固定 8 个字形（视觉宽度一致）
+# 每个分隔线固定字形个数：线条型 8 个（视觉宽度一致），花样型 5 个（全角字形更宽）
 DIVIDER_GLYPHS = {
     "solid": "─" * 8,
     "dashed": "╌" * 8,
     "dotted": "┈" * 8,
     "double": "═" * 8,
+    "stars": "★" * 5,
+    "diamonds": "◆" * 5,
+    "circles": "●" * 5,
+    "flowers": "❀" * 5,
+    "snow": "❄" * 5,
+    "wave": "≈" * 5,
+    "note": "※" * 5,
+    "leaf": "❦" * 5,
+}
+# 花样型（字形排布，不是线条）：导出到 Word/纯文本时按字形输出（无边框可画）
+DIVIDER_DECORATIVE = {
+    "stars",
+    "diamonds",
+    "circles",
+    "flowers",
+    "snow",
+    "wave",
+    "note",
+    "leaf",
 }
 _DIVIDER_STYLE_BY_CLASS = {cls: name for name, cls in DIVIDER_STYLES.items()}
 # 缺省样式（未知/缺失后缀时用直线）
@@ -364,6 +448,16 @@ _VALID_FORMAT_OPS = {
     "highlight",    # 突显
     "sup",          # 上标
     "sub",          # 下标
+    # 2026-10-21 新增行内格式操作：与 ui/app.js FORMAT_RULE_OPTS 一一对应
+    "wavy",         # 波浪下划线
+    "double",       # 双下划线
+    "overline",     # 上划线
+    "emphasis",     # 着重号
+    "highlight_green",   # 多色突显（绿）
+    "highlight_blue",    # 多色突显（蓝）
+    "highlight_pink",    # 多色突显（粉）
+    "highlight_orange",  # 多色突显（橙）
+    "highlight_purple",  # 多色突显（紫）
 }
 
 # 预览图磁盘缓存预热：模块级引用 ProcessPoolExecutor，便于测试 monkeypatch。
@@ -1159,6 +1253,7 @@ def _block_class_html(attrs: str) -> str:
         for c in m.group(1).split()
         if c == _NOTE_CLASS
         or c in _ALIGN_CLASSES
+        or c == _ALIGN_LINES_CLASS
         or c == _PAGE_BREAK_CLASS
         or c in _IMG_CLASSES
         or c == "ptoe-flush"
@@ -1180,6 +1275,7 @@ def _block_classes(attrs: list[tuple[str, str | None]]) -> list[str]:
                 if (
                     c == _NOTE_CLASS
                     or c in _ALIGN_CLASSES
+                    or c == _ALIGN_LINES_CLASS
                     or c == _PAGE_BREAK_CLASS
                     or c in _IMG_CLASSES
                     or c == "ptoe-flush"
@@ -1644,6 +1740,14 @@ class _Sanitizer(HTMLParser):
         elif tag == "br":
             buf, _ = self._inline_target()
             buf.append("<br/>")
+        elif tag in _MATHML_TAGS:
+            # MathML 公式（2026-10-21）：<math …>…</math> 原样透传（属性走白名单）。
+            # LaTeX 源码存放在 <math alttext="…"> 里——EPUB 导出用 MathML 渲染，
+            # DOCX/MD/TXT 导出用 alttext 里的源码做纯文本兜底。
+            open_html = _mathml_open_tag(tag, attrs)
+            buf, stack = self._inline_target()
+            buf.append(open_html)
+            stack.append((tag, open_html))
         elif tag in ("p", "div"):
             self._open_block(
                 "p", classes=_block_classes(attrs), data_attrs=_block_data_attrs(attrs)
@@ -1706,6 +1810,14 @@ class _Sanitizer(HTMLParser):
                     keep_attrs.append(
                         f'class="{_html.escape(" ".join(classes), quote=True)}"'
                     )
+                if "ptoe-ruby" in classes:
+                    # 拼音注音（2026-10-21）：注音内容放 data-rt 属性；
+                    # 规范化（去控制字符、限长 32）后放行，属性值不含换行/引号
+                    rt = rulemanage.normalize_ruby_rt(attrs_d.get("data-rt") or "")
+                    if rt:
+                        keep_attrs.append(
+                            f'data-rt="{_html.escape(rt, quote=True)}"'
+                        )
                 if keep_attrs:
                     open_html = f"<span {' '.join(keep_attrs)}>"
                     # 必须走 _inline_target()：单元格内须写入 _cell_buf/_cell_stack，
@@ -1801,6 +1913,16 @@ class _Sanitizer(HTMLParser):
         # 搜索高亮 <mark class="ptoe-search"> 只压了占位栈项：这里只弹栈
         if tag == "mark" and stack and stack[-1][0] == "__skip_mark__":
             stack.pop()
+            return
+        # MathML 公式（2026-10-21）：弹到匹配的 mathml 标签；中间未闭合的标签
+        # 一并补闭（脏数据容错），保证输出的 XHTML 标签栈平衡。
+        if tag in _MATHML_TAGS:
+            for i in range(len(stack) - 1, -1, -1):
+                if stack[i][0] == tag:
+                    while len(stack) > i:
+                        name, _ = stack.pop()
+                        buf.append(f"</{name}>")
+                    return
             return
         # 原生/外部行内标签已归一为 span（见 _ALIAS_INLINE_TAGS / font 分支）
         if tag in _ALIAS_INLINE_TAGS:
@@ -2059,9 +2181,15 @@ _FULL_TO_HALF = (
 # 认领 → 一次点击「清理」即毁表：
 #   <p>before</p><table>…<td>c1</td><td>c2</td>…</table><p>AFTER</p>
 #   → <p>before</p><p>c1c2AFTER</p>（表格消失，AFTER 段被吸收）
+#
+# 2026-10-21：MathML 公式标签（<math>/<semantics>/<mrow>/<mi>…）一并豁免——
+# 与表格同型的静默丢失：剥掉标签会把公式拆成一堆散字（"E=mc2"），
+# 一次「智能清理」即毁公式。标签清单取自 rulemanage.MATHML_TAGS（单一事实来源）。
 _STRIP_TAG_RE = re.compile(
     r"</?(?!p\b|h[1-6]\b|strong\b|em\b|b\b|i\b|br\b|span\b|img\b"
-    r"|table\b|thead\b|tfoot\b|tbody\b|tr\b|th\b|td\b)[a-zA-Z][^>]*>"
+    r"|table\b|thead\b|tfoot\b|tbody\b|tr\b|th\b|td\b|"
+    + "|".join(t + r"\b" for t in sorted(rulemanage.MATHML_TAGS))
+    + r")[a-zA-Z][^>]*>"
 )
 
 # 表格整块识别（_clean_blocks 用，2026-09-27）：<table …> / </table>。
@@ -3265,6 +3393,8 @@ def _clean_blocks(
     clean_md_tags: bool = True,
     symbol_pairs=None,
     digit_punct_pairs=None,
+    clean_spaces: bool = False,
+    keep_word_gap: bool = True,
     stats=None,
 ) -> str:
     """按块级标签切分已清洗的 HTML，逐块做文本处理并可选合并相邻段落。
@@ -3272,6 +3402,9 @@ def _clean_blocks(
     合并启发式（保守，避免把真正的段落粘在一起）：仅合并两个无 class 的
     普通 <p> 块，且前块不以句末标点（。！？…；）结尾、前后块均非空。
     <h1-6> 与带 class 的 <p>（注释/对齐/图片）视为有结构意图，不合并。
+    合并成功后自动清理合并段的段内空白（2026-10-22）：软换行、行首行尾
+    空格、中文之间的空白一并删除，英文/数字单词间空白折叠为一个空格，
+    因此无需额外开启 clean_spaces 也能得到干净的自然段。
 
     表格是**原子块**（2026-09-27）：<table>…</table> 整表逐字节透传，既不切块、
     不套文本处理（段首符号/中英标点/**/[n]），也不与任何相邻段落合并。
@@ -3364,6 +3497,32 @@ def _clean_blocks(
 
         _normalize_digit_punct = _ndp
         _clean_alnum_spaces = _cas
+    _strip_inline_spaces = None
+    if clean_spaces or merge_paragraphs:
+        # 惰性导入：与本仓「重模块内延迟导入」约定一致。
+        # 合并段落也依赖它：合并后的段落自动清理段内空白（2026-10-22）。
+        from stringmanage import strip_inline_spaces as _sis
+
+        _strip_inline_spaces = _sis
+
+    def _clean_merged_ws(block_toks: list[str]) -> None:
+        """合并后的普通段落自动去空白（仅文本，不含标签）。
+
+        与「清理段落内空白」同一套规则：删除水平空白/不可见字符并合并
+        OCR 软换行；英文/数字单词之间的空白折叠为一个空格。合并块本身
+        不含行内标签（_block_is_plain），可直接整体处理成一个文本 token。
+        """
+        if _strip_inline_spaces is None:
+            return
+        raw = "".join(block_toks)
+        cleaned = _strip_inline_spaces(
+            raw, keep_word_gap=keep_word_gap, keep_newlines=False
+        )
+        if cleaned == raw:
+            return
+        if stats is not None:
+            stats["spaces"] = stats.get("spaces", 0) + max(0, len(raw) - len(cleaned))
+        block_toks[:] = [cleaned]
     for open_tag, toks in blocks:
         if open_tag == _TABLE_BLOCK:
             continue  # 表格：逐字节透传，不做任何文本处理
@@ -3411,6 +3570,17 @@ def _clean_blocks(
                 if stats is not None:
                     stats["punct"] += _char_delta(t2, nd)
                 t2 = nd
+            # 去除段落内空白（2026-10-21）：普通段落把 OCR 软换行也合并掉
+            # （换行在浏览器里会渲染成词间空隙，是「清完仍有空白」的根因）；
+            # ptoe-align-lines 是逐行排版，必须保留换行。keep_word_gap=True 时
+            # 英文单词之间的空白折叠为一个空格。
+            if _strip_inline_spaces is not None and clean_spaces:
+                preserve_lines = _ALIGN_LINES_CLASS in open_tag
+                ns = _strip_inline_spaces(t2, keep_word_gap=keep_word_gap,
+                                          keep_newlines=preserve_lines)
+                if stats is not None and ns != t2:
+                    stats["spaces"] += len(t2) - len(ns)
+                t2 = ns
             toks[i] = t2
 
     # 相邻普通 <p> 段落合并（OCR 拆段修复）
@@ -3435,6 +3605,7 @@ def _clean_blocks(
             ):
                 # 任一为空：直接并入（空段不保留）
                 merged[-1][1].extend(toks)
+                _clean_merged_ws(merged[-1][1])
                 continue
             if (
                 merged
@@ -3465,6 +3636,9 @@ def _clean_blocks(
                             gap = " "
                     merged[-1][1].append(gap)
                     merged[-1][1].extend(toks)
+                    # 合并后自动清理段内空白：即使「清理段落内空白」未开启，
+                    # 也不会留下软换行/双空格/中文间空格（2026-10-22）。
+                    _clean_merged_ws(merged[-1][1])
                     if stats is not None:
                         stats["merged"] = stats.get("merged", 0) + 1
                     continue
@@ -3480,7 +3654,9 @@ def _clean_blocks(
             if raw:
                 parts.append(raw)
             continue
-        inner = "".join(toks).strip()
+        # 多行对齐段（2026-10-20）：段尾的 &nbsp; 填充是版式的一部分，默认口径的
+        # .strip() 会连 &nbsp; 一起剥掉——导出后左右两侧就对不齐了
+        inner = strip_block_ws("".join(toks), keep_nbsp=_ALIGN_LINES_CLASS in open_tag)
         if not inner:
             continue
         parts.append(f"{open_tag}{inner}{_close_of(open_tag)}")
@@ -3638,6 +3814,8 @@ def clean_page_html(
     symbol_map=None,
     clean_digit_punct: bool = True,
     digit_punct_map=None,
+    clean_spaces: bool = False,
+    clean_spaces_keep_word_gap: bool = True,
     with_stats: bool = False,
 ):
     """矫正界面的智能清理入口：清理段首 #/* 等符号、归一化中英文标点、
@@ -3656,7 +3834,9 @@ def clean_page_html(
     - clean_html_tags：剥离非白名单 HTML 标签（保留 rich text）默认开；
       与旧参数 strip_tags 取「与」，任一为 False 即不剥标签。
     - clean_paragraphs：段落合并优化（OCR 拆段修复）默认关；
-      与旧参数 merge_paragraphs 取「或」，任一为 True 即合并。
+      与旧参数 merge_paragraphs 取「或」，任一为 True 即合并。合并成功的
+      段落会自动清理段内空白（软换行/行首行尾/中文间空格等），即使
+      clean_spaces=False 也生效；未参与合并的段落不受影响。
     - clean_digit_punct：数字里的中文标点 → 英文（2026-10，映射表可在设置里自定义，
       见 configmanage.CLEAN_DIGIT_PUNCT_MAP_DEFAULT / ui_settings.clean_digit_punct_map）：
       1。2 → 1.2、1，2 → 1,2、1。 → 1.。与 clean_punctuation 独立，且在其之后执行
@@ -3664,6 +3844,11 @@ def clean_page_html(
 
     2026-09-21：剥除 $ 紧贴括号包裹（$〔1〕$ → 〔1〕）——OvisOCR/o 系模型
     自造 $ 包裹引注括号；不紧贴括号的 $（价格 $5 / $x$ 等）原样保留。
+
+    - clean_spaces：去除段落内的空白（2026-10-21 新增，默认关）：
+      空格/制表符/全角空格等一律删除，OCR 软换行也合并回自然段（换行在
+      浏览器里会渲染成词间空隙）；ptoe-align-lines 逐行段落仍保留换行。
+      clean_spaces_keep_word_gap=True（默认）时保留英文单词之间的单个空格。
 
     幂等：已清理的内容再次清理结果不变。
     """
@@ -3677,7 +3862,15 @@ def clean_page_html(
     # 相邻关系最完整，且不依赖标签结构）；幂等（剥完一遍后无 $ 紧贴括号残留）。
     text = _strip_dollar_bracket_hug(text)
     html = sanitize_html(text)
-    stats: dict = {"punct": 0, "symbols": 0, "md": 0, "merged": 0, "tags": 0, "chars": 0}
+    stats: dict = {
+        "punct": 0,
+        "symbols": 0,
+        "md": 0,
+        "merged": 0,
+        "tags": 0,
+        "chars": 0,
+        "spaces": 0,
+    }
     # 数字标点映射表三态：None → stringmanage 默认表（调用方没配过）；
     # [] → 显式空表（不替换）；list → 按用户表替换。clean_digit_punct=False 则整步跳过。
     digit_pairs = None
@@ -3697,6 +3890,8 @@ def clean_page_html(
         clean_md_tags=clean_md_tags,
         symbol_pairs=symbol_map,
         digit_punct_pairs=digit_pairs,
+        clean_spaces=clean_spaces,
+        keep_word_gap=clean_spaces_keep_word_gap,
         stats=stats,
     )
     # 计算 tags/chars
@@ -3851,6 +4046,7 @@ def initial_html(text: str) -> str:
 
 def _split_segments(
     html: str,
+    keep_nbsp: bool = False,
 ) -> tuple[list[tuple[str, list[tuple[str, str]]]], list[tuple[str, str]]]:
     """把块内 html 按标记 span 切分为内容段，返回 (segments, trailing)。
 
@@ -3860,6 +4056,8 @@ def _split_segments(
     标记切在行内标签内部时，前段自动补闭合、后段重新打开，保证每段都是合法
     片段。（此前只跟踪 strong/em，注释 span 被标记切断时会漏掉 </span>，
     合并段落后产生未闭合标签 → 导出 EPUB 后段落结构错乱。）
+    keep_nbsp=True：多行对齐段（ptoe-align-lines），段尾的 &nbsp; 填充是版式的
+    一部分，strip() 默认口径会把它剥掉——剥了对齐就废了。
     """
     segments: list[tuple[str, list[tuple[str, str]]]] = []
     trailing: list[tuple[str, str]] = []
@@ -3874,8 +4072,9 @@ def _split_segments(
         content = "".join(buf) + "".join(f"</{t}>" for t, _o in reversed(stack))
         # 无可见文本（如连续标记之间的空行内标签）不产出段，标记继续累积；
         # 但纯图片块（<img> 无文字）必须保留——剥标签后为空但内容有效
-        if re.sub(r"<[^>]+>", "", content).strip() or "<img" in content.lower():
-            segments.append((content.strip(), list(pending)))
+        # 多行对齐段：&nbsp; 算内容不算空白（否则只剩填充的行会被丢掉）
+        if not blank_block_ws(re.sub(r"<[^>]+>", "", content), keep_nbsp) or "<img" in content.lower():
+            segments.append((strip_block_ws(content, keep_nbsp), list(pending)))
             pending.clear()
         saved = list(stack) if reopen else []
         buf.clear()
@@ -4372,7 +4571,10 @@ def apply_markers(pages: list[dict[str, Any]]) -> list[dict[str, str]]:
             segments = [(_apply_markers_in_table(b["html"]), [])]
             trailing: list[tuple[str, str]] = []
         else:
-            segments, trailing = _split_segments(b["html"])
+            # 多行对齐段（2026-10-20）：段尾的 &nbsp; 填充是版式的一部分，切段时不能剥
+            segments, trailing = _split_segments(
+                b["html"], keep_nbsp=_ALIGN_LINES_CLASS in (b.get("attrs") or "")
+            )
         parsed.append(
             {
                 "kind": b["kind"],
@@ -5992,6 +6194,7 @@ _DOCX_RPR_ORDER = (
     "bdr",
     "shd",
     "vertAlign",
+    "em",
 )
 
 # ---- 题注（ptoe-caption）版式契约（2026-10 非 EPUB 导出落地）--------------------
@@ -6225,6 +6428,7 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             self.inner: list[str] = []
             self.note = False
             self.caption = False  # 题注块（ptoe-caption），2026-10 非 EPUB 导出版式
+            self.align_lines = False  # 多行对齐段（ptoe-align-lines），2026-10-20 段尾 &nbsp; 填充不剥
             self.indent = _rich_parse_indent({})
             self.divider = ""  # 分隔线样式名（solid/dashed/dotted/double），非分隔线为 ""
             self.block_seen = False  # 是否已进入过块（孤立 img 不产生块）
@@ -6234,6 +6438,11 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             self._join_at_start = False
             self._join_last = False
             self._has_non_ws_text = False
+            # MathML 公式（2026-10-21）：DOCX/MD/TXT 无 MathML 概念 → 用
+            # <math alttext="…"> 里的 LaTeX 源码做纯文本兜底（$…$）。
+            # math_depth>0 表示处于公式内部（内部标签/文本一律不参与富文本解析，
+            # 否则 <mi>x</mi> 的 "x" 会变成正文里一个孤零零的字母）。
+            self.math_depth = 0
             # 表格块累积（2026-09-20）：<table> 整表产出一个 "table" 块
             self.tbl_depth = 0  # 表格嵌套深度（>0 = 处于表格内）
             self.tbl_skip = 0  # 嵌套表格丢弃深度
@@ -6351,6 +6560,13 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             highlight = False
             sup = False
             sub = False
+            # 2026-10-21 新增行内格式标志
+            wavy = False
+            double = False
+            overline = False
+            emphasis = False
+            highlight_color = ""
+            ruby = ""
             # 字符样式（字号/字体/颜色的 style 载体，2026-09-27）：栈自外向内，
             # 由内向外取首个非空（最内层 span 的声明更具体，优先）
             char_style = ""
@@ -6384,6 +6600,24 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                     sup = True
                 if fmt.get("sub"):
                     sub = True
+                if fmt.get("wavy"):
+                    wavy = True
+                if fmt.get("double"):
+                    double = True
+                if fmt.get("overline"):
+                    overline = True
+                if fmt.get("emphasis"):
+                    emphasis = True
+            # 多色突显与注音内容：取最内层（与字符样式同口径）
+            for _, is_marker, fmt in reversed(self.stack):
+                if is_marker:
+                    continue
+                if not highlight_color:
+                    highlight_color = fmt.get("highlight_color") or ""
+                if not ruby:
+                    ruby = fmt.get("ruby") or ""
+                if highlight_color and ruby:
+                    break
             return {
                 "bold": bold,
                 "italic": italic,
@@ -6395,6 +6629,13 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                 "highlight": highlight,
                 "sup": sup,
                 "sub": sub,
+                # 2026-10-21 新增行内格式
+                "wavy": wavy,
+                "double": double,
+                "overline": overline,
+                "emphasis": emphasis,
+                "highlight_color": highlight_color,
+                "ruby": ruby,
                 # 规范化字符样式串（"" = 无）；DOCX 导出据此写 w:sz/w:rFonts/w:color
                 "style": char_style,
             }
@@ -6432,6 +6673,8 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             # 题注块（2026-10）：登记到块模型，供 DOCX（0.85 倍字号 + 灰 + 居中）与
             # Markdown（内联样式）两条非 EPUB 链路还原版式
             self.caption = _CAPTION_CLASS in (d.get("class") or "").split()
+            # 多行对齐段（2026-10-20）：段尾的 &nbsp; 填充是版式的一部分，导出时不能剥
+            self.align_lines = _ALIGN_LINES_CLASS in (d.get("class") or "").split()
             self.indent = _rich_parse_indent(d)
             # 分隔线段落（2026-09-27）：class 前缀 ptoe-divider + 样式后缀
             self.divider = _divider_style_from_attrs(d)
@@ -6446,13 +6689,24 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             inner = "".join(self.inner)
             self.inner = []
             # 去掉块首尾空白（与旧导出的整块 .strip() 等价）
-            while runs and not runs[0]["text"].strip():
-                runs.pop(0)
-            while runs and not runs[-1]["text"].strip():
-                runs.pop()
-            if runs:
-                runs[0]["text"] = runs[0]["text"].lstrip()
-                runs[-1]["text"] = runs[-1]["text"].rstrip()
+            # 多行对齐段（2026-10-20）：段尾的 &nbsp; 填充是版式的一部分，默认口径会
+            # 连 &nbsp; 一起剥掉——导出后左右两侧就对不齐了
+            if self.align_lines:
+                while runs and blank_block_ws(runs[0]["text"], True):
+                    runs.pop(0)
+                while runs and blank_block_ws(runs[-1]["text"], True):
+                    runs.pop()
+                if runs:
+                    runs[0]["text"] = strip_block_ws(runs[0]["text"], True)
+                    runs[-1]["text"] = strip_block_ws(runs[-1]["text"], True)
+            else:
+                while runs and not runs[0]["text"].strip():
+                    runs.pop(0)
+                while runs and not runs[-1]["text"].strip():
+                    runs.pop()
+                if runs:
+                    runs[0]["text"] = runs[0]["text"].lstrip()
+                    runs[-1]["text"] = runs[-1]["text"].rstrip()
             text = "".join(r["text"] for r in runs)
             if text:
                 if self.divider:
@@ -6574,6 +6828,8 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                 return
             if self.tbl_depth:
                 self.tbl_raw.append(self.get_starttag_text() or f"<{tag}>")
+                if self.math_depth > 0:
+                    return  # 公式内部标签不进单元格文本（否则漏出 <semantics> 等字面量）
                 if tag in ("thead", "tfoot"):
                     self.tbl_has_thead = self.tbl_has_thead or tag == "thead"
                     self.tbl_in_thead = tag == "thead"
@@ -6605,6 +6861,14 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                 if tag == "br":
                     self.tbl_cell.append("<br>")
                     return
+                if tag == "math":
+                    # MathML 公式（2026-10-21）：单元格内公式同样退化为 $LaTeX$
+                    # （公式内部结构不进单元格文本，否则会漏出一堆散字）
+                    tex = str(dict(attrs).get("alttext") or "").strip()
+                    if tex:
+                        self.tbl_cell.append("$" + tex + "$")
+                    self.math_depth += 1
+                    return
                 if tag == "img":
                     return  # 单元格内图片不导出（与 block 分支 img 语义一致即可，防御）
                 if tag in _RICH_INLINE_TAGS:
@@ -6626,6 +6890,17 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                 self._open_block(tag, attrs)
                 return
             if self.skip:
+                return
+            if tag == "math":
+                # MathML 公式（2026-10-21）：DOCX/MD/TXT 无 MathML 概念 →
+                # 用 alttext 里的 LaTeX 源码做纯文本兜底（$…$），公式内部结构丢弃。
+                self.math_depth += 1
+                tex = str(dict(attrs).get("alttext") or "").strip()
+                if tex:
+                    self._push_text("$" + tex + "$")
+                return
+            if self.math_depth > 0:
+                # 公式内部标签（mrow/mi/mo/…）：不参与富文本解析
                 return
             if tag == "br":
                 self._push_text("\n")
@@ -6661,6 +6936,20 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
                             fmt["sup"] = True
                         elif c == "ptoe-sub":
                             fmt["sub"] = True
+                        elif c == "ptoe-wavy":
+                            fmt["wavy"] = True
+                        elif c == "ptoe-double":
+                            fmt["double"] = True
+                        elif c == "ptoe-overline":
+                            fmt["overline"] = True
+                        elif c == "ptoe-emphasis":
+                            fmt["emphasis"] = True
+                        elif c in rulemanage.HIGHLIGHT_COLORS and c != "ptoe-highlight":
+                            fmt["highlight_color"] = c
+                        elif c == "ptoe-ruby":
+                            fmt["ruby"] = rulemanage.normalize_ruby_rt(
+                                attrs_d.get("data-rt") or ""
+                            )
                     # 字符样式（字号/字体/颜色，style 载体，2026-09-27）：
                     # 走与 sanitize_html 同一校验/序列化契约，保证 DOCX 导出
                     # 拿到的值与落盘 HTML 一致
@@ -6708,6 +6997,13 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
             if tag in _SKIP_TAGS:
                 self.skip = max(0, self.skip - 1)
                 return
+            # MathML 公式（2026-10-21）：</math> 结束公式；公式内部其它闭合标签忽略
+            if tag == "math":
+                if self.math_depth > 0:
+                    self.math_depth -= 1
+                return
+            if self.math_depth > 0:
+                return
             if self.tbl_skip:
                 if tag == "table":
                     self.tbl_skip -= 1
@@ -6752,10 +7048,14 @@ def _html_to_rich_blocks(html: str) -> list[dict]:
         def handle_data(self, data) -> None:
             if self.skip:
                 return
+            if self.math_depth > 0:
+                return  # 公式内部文本（mrow/mi/… 的内容）不进正文
             if self.tbl_skip:
                 self.tbl_raw.append(data)
                 return
             if self.tbl_depth:
+                if self.math_depth > 0:
+                    return  # 公式内部文本（mrow/mi/… 的内容）不进单元格
                 self.tbl_raw.append(data)
                 if self.tbl_cell_open and (
                     not self.tbl_cell_stack or self.tbl_cell_stack[-1] != "__marker__"
@@ -7200,7 +7500,19 @@ def _build_docx(blocks: list[Any], path: str) -> None:
         if block["kind"] == "divider":
             # 分隔线（2026-09-27）→ 空段落 + 下边框；线型映射到 OOXML 枚举。
             # 不写任何 <w:t> 文本：字形交给边框画，避免不同字体缺字。
+            # 花样型（2026-10-21）没有可画的边框 → 改为输出居中的字形文本。
             style = block.get("style") or DIVIDER_DEFAULT_STYLE
+            if style in DIVIDER_DECORATIVE:
+                glyph = _divider_glyph(style)
+                parts.append(
+                    "<w:p><w:pPr>"
+                    '<w:spacing w:before="180" w:after="180"/>'
+                    '<w:jc w:val="center"/>'
+                    "</w:pPr>"
+                    "<w:r><w:rPr><w:color w:val=\"999999\"/></w:rPr>"
+                    '<w:t xml:space="preserve">' + glyph + "</w:t></w:r></w:p>"
+                )
+                continue
             val = _DOCX_DIVIDER_BORDER.get(style, "single")
             parts.append(
                 "<w:p><w:pPr>"
@@ -7299,6 +7611,12 @@ def _build_docx(blocks: list[Any], path: str) -> None:
                 rpr_slot["color"] = f'<w:color w:val="{_CAPTION_COLOR_HEX}"/>'
             if r.get("underline"):
                 rpr_slot["u"] = '<w:u w:val="single"/>'
+            if r.get("wavy"):
+                # 波浪下划线（2026-10-21）：OOXML 有 wave 取值
+                rpr_slot["u"] = '<w:u w:val="wave"/>'
+            if r.get("double"):
+                # 双下划线（2026-10-21）
+                rpr_slot["u"] = '<w:u w:val="double"/>'
             if r.get("underdot"):
                 # w:u 只能出现一次：下加点与下划线同开时以下加点为准
                 rpr_slot["u"] = '<w:u w:val="dotted"/>'
@@ -7316,6 +7634,19 @@ def _build_docx(blocks: list[Any], path: str) -> None:
                 rpr_slot["bdr"] = (
                     '<w:bdr w:val="single" w:sz="4" w:space="1" w:color="333333"/>'
                 )
+            if r.get("emphasis"):
+                # 着重号（2026-10-21）：OOXML 的 w:em 就是着重号标记
+                rpr_slot["em"] = '<w:em w:val="dot"/>'
+            if r.get("highlight_color"):
+                # 多色突显（2026-10-21）：w:shd 只能出现一次，
+                # 颜色突显优先于单色突显（此处后写 → 覆盖）
+                fill = (
+                    rulemanage.HIGHLIGHT_COLORS.get(r["highlight_color"], "")
+                    .lstrip("#")
+                    .upper()
+                )
+                if fill:
+                    rpr_slot["shd"] = f'<w:shd w:val="clear" w:fill="{fill}"/>'
             if sz:
                 rpr_slot["sz"] = f'<w:sz w:val="{sz}"/><w:szCs w:val="{sz}"/>'
             # 字符样式（字号/字体/颜色，2026-09-27）：span style → w:sz/w:rFonts/w:color
@@ -7356,6 +7687,21 @@ def _build_docx(blocks: list[Any], path: str) -> None:
                 f"<w:r><w:rPr>{rpr}</w:rPr>"
                 f'<w:t xml:space="preserve">{t}</w:t></w:r>'
             )
+            # 拼音注音（2026-10-21）：OOXML 有原生 w:ruby，但结构复杂、兼容性差；
+            # 这里退化为「正文 + 括号注音（小字）」，注音信息不丢
+            ruby_rt = r.get("ruby") or ""
+            if ruby_rt:
+                ann_sz = max(
+                    _DOCX_MIN_SZ, int(round((sz or _DOCX_BODY_SZ) * 0.6))
+                )
+                ann_rpr = (
+                    f'<w:sz w:val="{ann_sz}"/><w:szCs w:val="{ann_sz}"/>'
+                )
+                at = _docx_escape(f"({ruby_rt})")
+                run_xml_parts.append(
+                    f"<w:r><w:rPr>{ann_rpr}</w:rPr>"
+                    f'<w:t xml:space="preserve">{at}</w:t></w:r>'
+                )
         ppr_xml = f"<w:pPr>{''.join(ppr_parts)}</w:pPr>" if ppr_parts else ""
         parts.append(f"<w:p>{ppr_xml}{''.join(run_xml_parts)}</w:p>")
     parts.append(_DOCX_DOCUMENT_TAIL)
@@ -7410,9 +7756,19 @@ def _build_md(blocks: list[Any], path: str) -> None:
 
     def _has_inline_formats(inner: str) -> bool:
         """检查 inner HTML 是否包含新增的行内格式类或字符样式 style 属性。"""
+        # 行内格式类：出现在 class 属性值里即算（含多类共存，如
+        # class="ptoe-wavy ptoe-underline"）—— 单词边界匹配，避免 ptoe-highlight
+        # 误命中 ptoe-highlight-green
         for cls in ("ptoe-underline", "ptoe-underdot", "ptoe-strike", "ptoe-charbox",
-                      "ptoe-shade", "ptoe-highlight", "ptoe-sup", "ptoe-sub"):
-            if f'class="{cls}"' in inner or f"class='{cls}'" in inner:
+                      "ptoe-shade", "ptoe-highlight", "ptoe-sup", "ptoe-sub",
+                      "ptoe-wavy", "ptoe-double", "ptoe-overline", "ptoe-emphasis",
+                      "ptoe-highlight-green", "ptoe-highlight-blue",
+                      "ptoe-highlight-pink", "ptoe-highlight-orange",
+                      "ptoe-highlight-purple", "ptoe-ruby"):
+            if re.search(
+                r'class=["\'][^"\']*\b' + re.escape(cls) + r'\b[^"\']*["\']',
+                inner,
+            ):
                 return True
         # 字符样式（2026-09-27）：Markdown 无字号/字体/颜色语法，走与行内格式类
         # 相同的 raw HTML 整块透传，mdToHtml 可无损还原，不丢 span style
@@ -7525,6 +7881,10 @@ def _build_md(blocks: list[Any], path: str) -> None:
         if b["kind"] == "divider":
             # 分隔线（2026-09-27）→ GFM 分隔线 '---'（Markdown 只有一个横线记号，
             # 写 '- - -' 会与列表项混淆；四种线型差异由 EPUB/DOCX 承载）
+            # 花样型（2026-10-21）没有横线记号 → 直接写字形（保留装饰效果）
+            style = b.get("style") or DIVIDER_DEFAULT_STYLE
+            if style in DIVIDER_DECORATIVE:
+                return (_divider_glyph(style), None)
             return ("---", None)
         if _is_caption_block(b):
             # 题注段（2026-10）：raw HTML 通道 + 内联样式（居中/小号/灰色在 GFM
@@ -7955,6 +8315,19 @@ def _ui_js_path() -> str:
     if base:
         return os.path.join(base, "ui", "app.js")
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "app.js")
+
+
+def _ui_asset_path(rel: str) -> str:
+    """定位 ui/ 下的静态资源（冻结 exe 从 _MEIPASS 读取）。
+
+    用于 KaTeX（ui/vendor/katex.min.js）等随包分发的前端库：离线可用，
+    不依赖 CDN（矫正界面可能处于无外网环境）。
+    """
+    rel = str(rel or "").replace("\\", "/").lstrip("/")
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        return os.path.join(base, "ui", *rel.split("/"))
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", *rel.split("/"))
 
 
 # ---------------------------------------------------------------------------
@@ -8464,6 +8837,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "clean_digit_punct": True,
                     # 导出时清理空白行（2026-10）：默认关；只作用于导出
                     "clean_blank_lines": False,
+                    # 清理段落内空白（2026-10-21）：默认关；保留英文单词间空格默认开
+                    "clean_spaces": False,
+                    "clean_spaces_keep_word_gap": True,
                     "proofread_auto_jump": True,
                     "tbl_popup_menu": False,
                     "tbl_ctx_menu": False,
@@ -8496,6 +8872,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "clean_digit_punct_map": stored.get("clean_digit_punct_map", defaults.get("clean_digit_punct_map", CLEAN_DIGIT_PUNCT_MAP_DEFAULT)),
                     # 导出时清理空白行（2026-10）：默认关；只作用于导出
                     "clean_blank_lines": bool(stored.get("clean_blank_lines", defaults.get("clean_blank_lines", False))),
+                    # 清理段落内空白（2026-10-21）：删空白并合并 OCR 软换行（对齐段保留换行）
+                    "clean_spaces": bool(stored.get("clean_spaces", defaults.get("clean_spaces", False))),
+                    "clean_spaces_keep_word_gap": bool(stored.get("clean_spaces_keep_word_gap", defaults.get("clean_spaces_keep_word_gap", True))),
                     "proofread_auto_jump": bool(stored.get("proofread_auto_jump", defaults.get("proofread_auto_jump", True))),
                     # 表格内浮层菜单开关（2026-10）：只影响表格范围，默认全关
                     "tbl_popup_menu": bool(stored.get("tbl_popup_menu", defaults.get("tbl_popup_menu", False))),
@@ -8671,6 +9050,8 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 "clean_paragraphs",
                 "brush_merge_on_leave",
                 "clean_blank_lines",
+                "clean_spaces",
+                "clean_spaces_keep_word_gap",
             ):
                 if _clean_key in ui:
                     v = ui[_clean_key]
@@ -9129,6 +9510,22 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
             else:
                 self._send(200, data, "application/javascript; charset=utf-8")
             return
+        if path.startswith("/ui/vendor/"):
+            # 随包分发的前端库（2026-10-21：KaTeX，LaTeX 公式渲染成 MathML）。
+            # 离线可用——矫正界面可能在无外网环境，不能依赖 CDN。
+            rel = path[len("/ui/vendor/"):]
+            # 只允许 vendor 下的单层文件名，杜绝 ../ 穿越
+            if not rel or "/" in rel or "\\" in rel or rel.startswith("."):
+                self._send(404, b"// not found", "application/javascript; charset=utf-8")
+                return
+            try:
+                with open(_ui_asset_path("vendor/" + rel), "rb") as f:
+                    data = f.read()
+            except OSError:
+                self._send(404, b"// not found", "application/javascript; charset=utf-8")
+            else:
+                self._send(200, data, "application/javascript; charset=utf-8")
+            return
         if path == "/api/heartbeat":
             self._touch_heartbeat()
             self._send(204, b"", "text/plain")
@@ -9185,8 +9582,55 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 "proofread": state.get("proofread")
                 or {"errors": {}, "original": {}, "dismissed": {}},
                 "last_proofread_page": state.get("last_proofread_page"),
+                # 实时跟随 OCR 进度（2026-10-21）：前端据此开启增量轮询
+                "live": bool(state.get("live_ocr_path")),
+                "live_version": int(state.get("live_version") or 0),
+                "live_done": int(state.get("live_done") or 0),
+                "live_total": int(state.get("live_total") or 0),
+                "live_status": str(state.get("live_status") or ""),
             }
             self._send(200, self._json(payload), "application/json; charset=utf-8")
+            return
+        if path == "/api/live_status":
+            # 实时跟随 OCR 进度（2026-10-21）：返回「自 since 版本号之后」新增的
+            # 页面（转换进行中识别完成的页），前端增量插入编辑器。
+            import urllib.parse as _up
+
+            state = self.server.state
+            try:
+                qs = _up.parse_qs(_up.urlsplit(self.path).query)
+                since = int((qs.get("since") or ["0"])[0])
+            except (TypeError, ValueError):
+                since = 0
+            lock = state.get("pages_lock")
+            added: list[dict[str, Any]] = []
+            with lock if lock is not None else nullcontext():
+                for n, item in (state.get("live_added") or {}).items():
+                    try:
+                        ver = int((item or {}).get("version") or 0)
+                        pno = int(n)
+                    except (TypeError, ValueError):
+                        continue
+                    if ver > since:
+                        added.append(
+                            {"page": pno, "text": (item or {}).get("text") or ""}
+                        )
+            added.sort(key=lambda x: x["page"])
+            self._send(
+                200,
+                self._json(
+                    {
+                        "ok": True,
+                        "live": bool(state.get("live_ocr_path")),
+                        "version": int(state.get("live_version") or 0),
+                        "done": int(state.get("live_done") or 0),
+                        "total": int(state.get("live_total") or 0),
+                        "status": str(state.get("live_status") or ""),
+                        "added": added,
+                    }
+                ),
+                "application/json; charset=utf-8",
+            )
             return
         if path == "/api/format_rules":
             # 格式规则列表（config.json format_rules 键；缺失返回空列表）。
@@ -9885,6 +10329,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "symbol_map": sym_map,
                     "clean_digit_punct": opts["clean_digit_punct"],
                     "digit_punct_map": digit_map,
+                    # 去除段落内空白（2026-10-21）：普通段落合并软换行，对齐段保留换行
+                    "clean_spaces": opts["clean_spaces"],
+                    "clean_spaces_keep_word_gap": opts["clean_spaces_keep_word_gap"],
                 }
                 cleaned = _clean_pages(body.get("pages") or [], clean_kw)
                 self._send(
@@ -11378,6 +11825,157 @@ def _serve_loop(
                     break
 
 
+# ---------------------------------------------------------------------------
+# 实时跟随 OCR 进度（2026-10-21）
+#   转换与矫正分离后，转换进行中也能启动矫正界面：识别完成的页面实时进入
+#   矫正页（不必等整本转换结束）。
+#   进度文件由 mian.py 写入：data/<PDF名>[_n]/.ocr_progress.json
+#     {"pdf":..., "total":N, "status":"running|ocr_done",
+#      "pages":{"<页码>":{"status":"done|error","result":"识别文本"}}}
+# ---------------------------------------------------------------------------
+
+
+def _ocr_progress_files(pdf_path: str | Path) -> list[Path]:
+    """列出与该 PDF 相关的 OCR 进度文件（按修改时间倒序）。
+
+    分页目录名是 PDF 名（同名重复时自动加 _1/_2 后缀），故按前缀匹配扫描。
+    """
+    try:
+        stem = Path(pdf_path).stem
+    except Exception:  # noqa: BLE001
+        return []
+    if not stem:
+        return []
+    try:
+        from pdfmanage import app_base_dir
+
+        data_dir = app_base_dir() / "data"
+    except Exception:  # noqa: BLE001
+        return []
+    try:
+        if not data_dir.is_dir():
+            return []
+        cands = [
+            child / ".ocr_progress.json"
+            for child in data_dir.iterdir()
+            if child.is_dir() and child.name.startswith(stem)
+        ]
+        cands = [p for p in cands if p.is_file()]
+    except Exception:  # noqa: BLE001
+        return []
+    cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return cands
+
+
+def _read_ocr_progress(path: Path) -> dict[str, Any]:
+    """读取 OCR 进度文件（损坏/不存在返回空 dict）。"""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _seed_live_pages(state: dict[str, Any], path: Path) -> list[int]:
+    """把进度文件里「已识别完成」的页面立即写入矫正界面（初始内容）。
+
+    返回新增的页码列表。已存在的页（用户编辑过/历史载入）不覆盖。
+    """
+    data = _read_ocr_progress(path)
+    pages = data.get("pages") or {}
+    added: list[int] = []
+    lock = state.get("pages_lock")
+    with lock if lock is not None else nullcontext():
+        for key, info in pages.items():
+            if not isinstance(info, dict) or info.get("status") != "done":
+                continue
+            try:
+                n = int(key)
+            except (TypeError, ValueError):
+                continue
+            if n in state["pages"]:
+                continue
+            state["pages"][n] = _page_text(str(info.get("result") or ""))
+            added.append(n)
+        state["live_done"] = len(added)
+        try:
+            state["live_total"] = int(data.get("total") or 0)
+        except (TypeError, ValueError):
+            state["live_total"] = 0
+        state["live_status"] = str(data.get("status") or "")
+    return added
+
+
+def _watch_ocr_progress(
+    state: dict[str, Any], stop_event: threading.Event, interval: float = 2.0
+) -> None:
+    """后台轮询 OCR 进度文件，把新识别完成的页面塞进矫正界面。
+
+    - 只新增「尚未出现在 state['pages'] 里」的页（不覆盖用户已编辑的页面）；
+    - 每批新页共享一个版本号（live_version），前端按 since=版本号 增量拉取；
+    - 页面内容与初始页一致地走 _page_text（标题归一为正文）。
+    """
+    raw_path = state.get("live_ocr_path")
+    pdf_hint = state.get("live_ocr_pdf") or ""
+    try:
+        path = Path(raw_path) if raw_path else None
+    except Exception:  # noqa: BLE001
+        path = None
+    while not stop_event.wait(interval):
+        if path is None:
+            # 进度文件尚未落盘（转换刚起步）：持续按 PDF 名查找，找到即接管
+            if not pdf_hint:
+                return
+            _found = _ocr_progress_files(pdf_hint)
+            if not _found:
+                continue
+            path = _found[0]
+            state["live_ocr_path"] = str(path)
+            _seed_live_pages(state, path)
+            print(f"      实时跟随：已接入 OCR 进度文件 {path.parent.name}")
+        data = _read_ocr_progress(path)
+        if not data:
+            continue
+        pages = data.get("pages") or {}
+        added: list[int] = []
+        lock = state.get("pages_lock")
+        try:
+            with lock if lock is not None else nullcontext():
+                version = int(state.get("live_version") or 0) + 1
+                for key, info in pages.items():
+                    if not isinstance(info, dict) or info.get("status") != "done":
+                        continue
+                    try:
+                        n = int(key)
+                    except (TypeError, ValueError):
+                        continue
+                    if n in state["pages"]:
+                        continue
+                    html = _page_text(str(info.get("result") or ""))
+                    state["pages"][n] = html
+                    state["live_added"][n] = {"version": version, "text": html}
+                    added.append(n)
+                if added:
+                    state["live_version"] = version
+        except Exception:  # noqa: BLE001  轮询异常不致命，下一轮继续
+            continue
+        state["live_done"] = sum(
+            1
+            for i in pages.values()
+            if isinstance(i, dict) and i.get("status") == "done"
+        )
+        try:
+            state["live_total"] = int(data.get("total") or 0)
+        except (TypeError, ValueError):
+            state["live_total"] = 0
+        state["live_status"] = str(data.get("status") or "")
+        if added:
+            print(
+                f"      实时跟随：新增 {len(added)} 页已识别内容"
+                f"（{min(added)}-{max(added)}）"
+            )
+
+
 def correct_pages(
     pages: list[dict[str, Any]],
     *,
@@ -11393,6 +11991,7 @@ def correct_pages(
     history: bool = True,
     preload_history: bool = True,
     history_id: str | None = None,
+    live_ocr: bool = False,
 ) -> list[dict[str, Any]]:
     """启动手动矫正界面并阻塞，直到浏览器被关闭（或 Ctrl+C）。
 
@@ -11516,6 +12115,15 @@ def correct_pages(
         "prerender_max_pages": _resolve_prerender_max(),
         "embedded_images": {},
         "history_id": None,
+        # 实时跟随 OCR 进度（2026-10-21）：live_ocr=True 时后台轮询进度文件，
+        # 识别完成的页面实时进入矫正界面（前端按 live_version 增量拉取）
+        "live_ocr_path": None,
+        "live_ocr_pdf": "",
+        "live_version": 0,
+        "live_added": {},
+        "live_done": 0,
+        "live_total": 0,
+        "live_status": "",
     }
     # 指定历史版本（history_id）：把该版本的纠错状态/预览图等元数据灌入 state，
     # 保存（/api/save）时按 history_id 定向覆盖原文件而非"按 mtime 取最新"。
@@ -11555,6 +12163,25 @@ def correct_pages(
     server.state = state
     serve_thread = threading.Thread(target=server.serve_forever, daemon=True)
     serve_thread.start()
+    # 实时跟随 OCR 进度（2026-10-21）：转换进行中启动矫正时，先把「已识别完成」
+    # 的页面立即灌入初始内容（不必等第一轮轮询），再由后台线程持续跟进新页。
+    if live_ocr and pdf_path:
+        state["live_ocr_pdf"] = str(pdf_path)
+        _progress_files = _ocr_progress_files(str(pdf_path))
+        if _progress_files:
+            state["live_ocr_path"] = str(_progress_files[0])
+            _seeded = _seed_live_pages(state, _progress_files[0])
+            print(
+                f"      实时跟随 OCR 进度：已载入 {_seeded} 页"
+                f"（{_progress_files[0].parent.name}）"
+            )
+        else:
+            print("      未找到 OCR 进度文件，等待转换写入…")
+        _live_stop = threading.Event()
+        state["live_stop"] = _live_stop
+        threading.Thread(
+            target=_watch_ocr_progress, args=(state, _live_stop), daemon=True
+        ).start()
     # 后台渐进式预渲染预览图：用户在浏览器编辑期间把所有页渲染好，
     # 首次保存/暂存/完成时 _build_embedded_images 全命中缓存直接返回，
     # 不再阻塞按钮。每页单独持锁 + 50ms 间隔，不阻塞 UI 预览/请求线程。
@@ -11649,6 +12276,13 @@ def correct_pages(
     except KeyboardInterrupt:
         print("\n      手动矫正被中断，放弃本次矫正结果，继续原流程")
     finally:
+        # 停止实时跟随 OCR 进度的后台线程（2026-10-21）
+        _live_stop = state.get("live_stop")
+        if _live_stop is not None:
+            try:
+                _live_stop.set()
+            except Exception:
+                pass
         # 仅当我们是 owner 时才清会话；guest Ctrl+C 不应删除 owner 的会话
         if _role == "owner":
             try:
@@ -11937,9 +12571,9 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
 .anim-in{animation:ptoeFadeIn .16s ease both;}
 .anim-fade{animation:ptoeFade .16s ease both;}
 #contextMenu,#popup{animation:ptoeFadeIn .16s ease both;}
-#searchModalBg,#exportModalBg,#indentModalBg,#tableModalBg,#charFormatModalBg,#finishModalBg,#historyModalBg,#helpModalBg,#formatRulesModalBg,#frRuleModalBg,#replaceRulesModalBg,#rrEditModalBg{animation:ptoeFade .16s ease both;}
+#searchModalBg,#exportModalBg,#indentModalBg,#tableModalBg,#charFormatModalBg,#rubyModalBg,#latexModalBg,#finishModalBg,#historyModalBg,#helpModalBg,#formatRulesModalBg,#frRuleModalBg,#replaceRulesModalBg,#rrEditModalBg{animation:ptoeFade .16s ease both;}
 @media (prefers-reduced-motion: reduce){
-  .anim-in,.anim-fade,#contextMenu,#popup,#searchModalBg,#exportModalBg,#indentModalBg,#tableModalBg,#charFormatModalBg,#finishModalBg,#historyModalBg,#helpModalBg,#formatRulesModalBg,#frRuleModalBg,#replaceRulesModalBg,#rrEditModalBg{animation:none !important;}
+  .anim-in,.anim-fade,#contextMenu,#popup,#searchModalBg,#exportModalBg,#indentModalBg,#tableModalBg,#charFormatModalBg,#rubyModalBg,#latexModalBg,#finishModalBg,#historyModalBg,#helpModalBg,#formatRulesModalBg,#frRuleModalBg,#replaceRulesModalBg,#rrEditModalBg{animation:none !important;}
   button,#errBadge,.page-row,.toast{transition:none !important;transform:none !important;}
   #toolbar .ic-btn::after,#toolbar .tb-btn:not(.loading)::after{animation:none !important;content:none !important;}
 }
@@ -12138,6 +12772,18 @@ body.paint-mode{cursor:copy;}
 .ptoe-highlight{background:#e0e0e0;}
 .ptoe-sup{vertical-align:super;font-size:.7em;line-height:1;}
 .ptoe-sub{vertical-align:sub;font-size:.7em;line-height:1;}
+/* 2026-10-21 新增行内格式：波浪下划线/双下划线/上划线/着重号/多色突显/拼音注音 */
+.ptoe-wavy{text-decoration:underline wavy;text-decoration-style:wavy;border-bottom:1px solid #333;}
+.ptoe-double{text-decoration:underline double;}
+.ptoe-overline{text-decoration:overline;}
+.ptoe-emphasis{text-emphasis:dot;-webkit-text-emphasis:dot;text-emphasis-position:under right;-webkit-text-emphasis-position:under right;}
+.ptoe-highlight-green{background:#c8e6c9;}
+.ptoe-highlight-blue{background:#bbdefb;}
+.ptoe-highlight-pink{background:#f8bbd0;}
+.ptoe-highlight-orange{background:#ffe0b2;}
+.ptoe-highlight-purple{background:#e1bee7;}
+.ptoe-ruby{ruby-position:over;}
+.ptoe-ruby::after{content:"(" attr(data-rt) ")";font-size:.6em;vertical-align:super;}
 #errPopup{position:fixed;z-index:65;display:none;background:#fff;border:1px solid #ccc;border-radius:6px;padding:4px;box-shadow:0 2px 8px rgba(0,0,0,.2);gap:6px;}
 /* 图片设置弹窗：点击编辑区内的图片弹出，调整大小/位置/删除 */
 #imgPopup{position:fixed;z-index:65;display:none;flex-direction:column;gap:6px;padding:10px;background:#fff;border:1px solid #ccc;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.2);min-width:140px;}
@@ -12222,6 +12868,10 @@ body.paint-mode{cursor:copy;}
    该 class，EPUB（htmlmanage）/DOCX 导出按同一 class 输出无边框（勿单边改动）。 */
 .editable table.ptoe-noborder th,.editable table.ptoe-noborder td{border:none;}
 .editable table.ptoe-noborder th{background:transparent;}
+/* 编辑区内的 LaTeX 公式（2026-10-21）：<math> 元素由浏览器原生渲染（MathML），
+   这里只做版式微调——跟随正文字号、与基线对齐；不写 display（部分阅读器对
+   math 的 display 覆盖敏感，写死 inline 会让 display=block 的公式塌成一行） */
+.editable math{font-size:1em;vertical-align:middle;}
 /* 表格操作条（2026-09）：光标进入表格单元格时由 JS 定位并显示；
    加行/删行/加列/删列/对齐/删除表格；对齐按钮按当前单元格 class 高亮 */
 #tblBar{position:fixed;z-index:64;display:none;flex-wrap:wrap;gap:2px;align-items:center;padding:4px 6px;background:rgba(255,255,255,.94);border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.18);}
@@ -12315,11 +12965,40 @@ body.paint-mode{cursor:copy;}
 .table-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 14px;margin:10px 0;font-size:13px;}
 /* 字符格式弹窗（2026-09-27）：外层复用 .search-modal/.export-actions/.indent-mode-row */
 #charFormatModalBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+/* 拼音注音弹窗（2026-10-21）：内嵌浏览器不保证支持 window.prompt，改用应用内弹窗 */
+#rubyModalBg{position:fixed;inset:0;z-index:67;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+#rubyModalBg .modal{width:92%;max-width:420px;}
+#rubyModalBg input[type=text]{width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font:inherit;background:var(--bg);color:var(--fg);}
+/* LaTeX 公式弹窗（2026-10-21）：源码输入 + MathML 实时预览 */
+#latexModalBg{position:fixed;inset:0;z-index:67;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+#latexModalBg .modal{width:94%;max-width:560px;}
+#latexModalBg textarea{width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font:inherit;background:var(--bg);color:var(--fg);resize:vertical;font-family:Consolas,Menlo,monospace;}
+#latexModalBg code{background:rgba(127,127,127,.14);padding:0 3px;border-radius:3px;font-family:Consolas,Menlo,monospace;}
+.latex-preview-row{display:flex;align-items:flex-start;gap:8px;margin:10px 0 6px;}
+.latex-preview-label{flex:0 0 auto;font-size:12px;color:var(--text-muted);padding-top:6px;}
+.latex-preview{flex:1 1 auto;min-height:44px;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);overflow:auto;}
+.latex-preview-empty{color:var(--text-muted);font-size:12px;}
+.latex-preview-error{color:#c0392b;font-size:12px;}
+.latex-display-opt{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--text-muted);margin-bottom:4px;}
 #cfSizeNum{width:86px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;}
 #cfFontSel{max-width:190px;}
 #cfPreview p{margin:0;}
+/* 颜色面板（2026-10-21）：常用色 + 色板 + #HEX/rgb() 输入，字符格式弹窗与工具栏共用 */
+.cf-color-panel{margin-top:10px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg);}
+.cf-color-group{margin-bottom:8px;}
+.cf-color-group:last-child{margin-bottom:0;}
+.cf-color-label{display:block;font-size:12px;color:var(--text-muted);margin-bottom:5px;}
+.cf-swatches{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px;}
+.cf-palette{display:grid;grid-template-columns:repeat(12,20px);gap:3px;justify-content:start;}
+.cf-swatch{width:20px;height:20px;padding:0;border:1px solid rgba(0,0,0,.25);border-radius:3px;cursor:pointer;background-clip:padding-box;}
+.cf-swatch:hover{outline:2px solid var(--accent,#3b82f6);outline-offset:1px;}
+.cf-color-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap;}
+.cf-color-input{flex:1 1 130px;min-width:110px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;background:var(--bg);color:var(--fg);}
+/* 浮动颜色面板（工具栏「颜色」按钮） */
+.color-pop{position:fixed;z-index:80;width:300px;padding:8px;border:1px solid var(--border);border-radius:7px;background:var(--bg,#fff);box-shadow:0 4px 18px rgba(0,0,0,.22);}
 /* 分隔线下拉菜单里的字形预览（与正文里最终写入的 8 字形串一致） */
 #dividerMenu .div-glyph{margin-left:8px;font-family:monospace;color:var(--text-muted);letter-spacing:0;}
+#dividerMenu .sep{width:100%;height:0;border-top:1px solid var(--border);margin:4px 0;}
 #dividerMenu .div-dashed{letter-spacing:.12em;}
 #dividerMenu .div-dotted{letter-spacing:.12em;}
 #dividerMenu .div-double{font-weight:bold;letter-spacing:.05em;}
@@ -12331,6 +13010,15 @@ body.paint-mode{cursor:copy;}
 .editable p.ptoe-divider-dashed{letter-spacing:.12em;}
 .editable p.ptoe-divider-dotted{letter-spacing:.12em;}
 .editable p.ptoe-divider-double{letter-spacing:.05em;font-weight:bold;}
+/* 花样分割符号（2026-10-21）：非线条型，装饰字形排布，字距放宽 */
+.editable p.ptoe-divider-stars{letter-spacing:.35em;}
+.editable p.ptoe-divider-diamonds{letter-spacing:.35em;}
+.editable p.ptoe-divider-circles{letter-spacing:.35em;}
+.editable p.ptoe-divider-flowers{letter-spacing:.35em;}
+.editable p.ptoe-divider-snow{letter-spacing:.35em;}
+.editable p.ptoe-divider-wave{letter-spacing:.25em;}
+.editable p.ptoe-divider-note{letter-spacing:.35em;}
+.editable p.ptoe-divider-leaf{letter-spacing:.35em;}
 .editable p.ptoe-divider span{color:inherit;font-size:inherit;font-family:inherit;}
 .table-grid label{display:flex;align-items:center;gap:6px;white-space:nowrap;}
 .table-grid input[type="number"]{width:72px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;}
@@ -12342,6 +13030,12 @@ body.paint-mode{cursor:copy;}
 .search-head .x-btn:hover{background:#dfe7f3;color:#1c2733;}
 .search-row{display:flex;align-items:center;gap:8px;margin-bottom:8px;}
 .search-row input[type="text"]{flex:1;min-width:0;padding:6px 8px;border:1px solid var(--border);border-radius:5px;font:inherit;}
+/* 按格式查找/替换（2026-10-21）：格式下拉 + 取值输入 */
+.search-row select{padding:6px 8px;border:1px solid var(--border);border-radius:5px;font:inherit;background:#fff;color:var(--fg);max-width:190px;}
+.dark .search-row select{background:var(--bg-elev);color:var(--fg);}
+.fmt-value-wrap{display:inline-flex;align-items:center;gap:4px;}
+.fmt-value-input{width:120px;padding:5px 7px;border:1px solid var(--border);border-radius:5px;font:inherit;background:var(--bg);color:var(--fg);}
+.fmt-value-input[type=text]{flex:none;}
 .search-regex{display:inline-flex;align-items:center;gap:3px;font-size:13px;color:#33414f;white-space:nowrap;}
 .search-nav{display:flex;align-items:center;gap:8px;margin:2px 0 8px;}
 .search-nav button{width:32px;height:28px;padding:0;border:1px solid var(--border);background:#fff;border-radius:5px;cursor:pointer;font-size:14px;}
@@ -12454,6 +13148,9 @@ body.paint-mode{cursor:copy;}
 #shortcutTable td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:14px;}
 #shortcutTable tr{cursor:pointer;}
 #shortcutTable tr:hover td{background:#f7fafd;}
+/* 鼠标侧键表（2026-10-21）：侧键单独绑定，无需组合键盘按键 */
+#sideButtonTable{width:100%;border-collapse:collapse;}
+#sideButtonTable td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:14px;}
 /* 分组标题行（功能刷）：不可点（不进入捕获），无悬停高亮 */
 #shortcutTable tr.shortcut-group-row{cursor:default;}
 #shortcutTable tr.shortcut-group-row:hover td{background:none;}
@@ -12571,6 +13268,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
           <button type="button" class="tb-btn" id="supSubBtn" role="menuitem" title="上标下标下拉菜单：把选中文字设为上标或下标的小字符" aria-label="上标下标">上标/下标 <span class="ptoe-caret">▾</span></button>
           <button type="button" class="tb-btn" id="formatRulesBtn" role="menuitem" title="格式规则：对选中文字一键应用自定义规则（可多条叠加 / 条件分支；Ctrl+Shift+Q）" aria-label="格式规则">格式规则</button>
           <button type="button" class="tb-btn" id="colorBtn" role="menuitem" title="文本颜色" aria-label="文本颜色">文本颜色</button>
+          <button type="button" class="tb-btn" id="latexBtn" role="menuitem" onmousedown="event.preventDefault()" title="插入 LaTeX 公式：输入 LaTeX 源码，KaTeX 渲染成 MathML；导出 EPUB 后照常显示" aria-label="插入公式">公式</button>
           <select id="imgModeSel" title="插入图片的显示模式：全画幅=占满文字宽度，局部=按原尺寸居中，行内=嵌在文字中间（50% 宽度）" style="width:100%;margin-bottom:4px;padding:4px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text);font:inherit;">
             <option value="full">全画幅</option>
             <option value="fit">局部</option>
@@ -12739,6 +13437,39 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   <span class="hint-text">左侧原图（点击切换预览/原图），右侧文字可直接编辑。选中文字弹出<b>图标快捷菜单</b>（悬停有提示）；支持<b>粗体</b>、<i>斜体</i>、标题、注释、居左/居中/居右与<span class="ptoe-marker">全文/段落/注释/换页标记</span>（标记插入到光标处；段落标记段首=合上段、段尾=合下段；换页标记=此后内容显示在新的一页）。可切换 <b>Markdown 模式</b>（#标题、**粗体**、*斜体*）、繁简转换、字号调整与页码跳转，详见「帮助」。</span>
   <button type="button" id="hintClose" title="关闭提示（可随时在「帮助」中查看）" aria-label="关闭提示">✕</button>
 </div>
+<!-- 拼音注音弹窗（2026-10-21）：注音内容存进 span 的 data-rt 属性 -->
+<div id="rubyModalBg"><div class="modal" role="dialog" aria-modal="true" aria-label="拼音注音">
+  <div class="search-head">
+    <h3>拼音注音</h3>
+    <button type="button" class="x-btn" id="rubyCloseBtn" title="关闭 (Esc)" aria-label="关闭拼音注音">✕</button>
+  </div>
+  <p class="export-desc">为选中的文字添加注音（拼音 / 解释），最多 32 字。注音随内容保存，导出 EPUB 时显示在文字后的小括号里，导出 Word 时同样以小字括号注音呈现。</p>
+  <input type="text" id="rubyInput" maxlength="32" placeholder="例如：nǐ hǎo" aria-label="注音内容">
+  <div class="export-actions">
+    <button type="button" class="btn" id="rubyOkBtn">应用</button>
+    <button type="button" class="btn" id="rubyCancelBtn">取消</button>
+  </div>
+</div></div>
+<!-- LaTeX 公式弹窗（2026-10-21）：输入 LaTeX 源码 → KaTeX 渲染成 MathML 插入正文。
+     公式以 <math> 元素存进内容：导出 EPUB 原样保留（EPUB 3 原生支持 MathML），
+     导出 Word/Markdown/TXT 退化为 $公式$ 纯文本。 -->
+<div id="latexModalBg"><div class="modal" role="dialog" aria-modal="true" aria-label="LaTeX 公式">
+  <div class="search-head">
+    <h3>插入 LaTeX 公式</h3>
+    <button type="button" class="x-btn" id="latexCloseBtn" title="关闭 (Esc)" aria-label="关闭公式弹窗">✕</button>
+  </div>
+  <p class="export-desc">输入 LaTeX 源码（如 <code>\frac{-b \pm \sqrt{b^2-4ac}}{2a}</code>），下方实时预览。公式以 MathML 存入正文，导出 EPUB 后照常显示；导出 Word/Markdown 时输出为 <code>$公式$</code>。</p>
+  <textarea id="latexInput" rows="4" spellcheck="false" placeholder="例如：E=mc^2  或  \int_0^1 x^2\,dx" aria-label="LaTeX 源码"></textarea>
+  <div class="latex-preview-row">
+    <span class="latex-preview-label">预览</span>
+    <div id="latexPreview" class="latex-preview"><span class="latex-preview-empty">（预览区）</span></div>
+  </div>
+  <label class="latex-display-opt" title="勾选后公式独立成行显示（display=block），否则与文字同行"><input type="checkbox" id="latexDisplay">独立成行</label>
+  <div class="export-actions">
+    <button type="button" class="btn primary" id="latexOkBtn">插入</button>
+    <button type="button" class="btn" id="latexCancelBtn">取消</button>
+  </div>
+</div></div>
 <div id="pages"></div>
 <div id="popup"></div>
 <div id="tip"></div>
@@ -12778,10 +13509,22 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   <div class="ctx-item ctx-sub" data-ctx="wrap">文字包围 <span class="ctx-arrow">▸</span>
     <div class="ctx-submenu" id="ctxWrapSub">
       <button type="button" class="ctx-item" data-ctx-wrap="underline">下划线</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="wavy">波浪线</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="double">双下划线</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="overline">上划线</button>
       <button type="button" class="ctx-item" data-ctx-wrap="underdot">下加点</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="emphasis">着重号</button>
       <button type="button" class="ctx-item" data-ctx-wrap="strike">删除线</button>
       <button type="button" class="ctx-item" data-ctx-wrap="charbox">字符边框</button>
       <button type="button" class="ctx-item" data-ctx-wrap="shade">底纹</button>
+      <div class="ctx-sep"></div>
+      <button type="button" class="ctx-item" data-ctx-wrap="highlight-green">突显·绿</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="highlight-blue">突显·蓝</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="highlight-pink">突显·粉</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="highlight-orange">突显·橙</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="highlight-purple">突显·紫</button>
+      <div class="ctx-sep"></div>
+      <button type="button" class="ctx-item" data-ctx-wrap="ruby">拼音注音</button>
     </div>
   </div>
   <div class="ctx-sep"></div>
@@ -12793,6 +13536,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   <button type="button" class="ctx-item" data-ctx="clear">清除校正</button>
   <button type="button" class="ctx-item" data-ctx="applypr">应用校正</button>
   <button type="button" class="ctx-item" data-ctx="clearfmt">清除格式</button>
+  <button type="button" class="ctx-item" data-ctx="align_lines">多行对齐</button>
   <div class="ctx-sep"></div>
   <button type="button" class="ctx-item" data-ctx="clearpage">清空</button>
   <button type="button" class="ctx-item" data-ctx="fmtall">格式化</button>
@@ -12832,21 +13576,42 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
 </div>
 <div id="charWrapMenu" class="tb-menu">
   <button type="button" data-wrap="underline" role="menuitem">下划线</button>
+  <button type="button" data-wrap="wavy" role="menuitem">波浪线</button>
+  <button type="button" data-wrap="double" role="menuitem">双下划线</button>
+  <button type="button" data-wrap="overline" role="menuitem">上划线</button>
   <button type="button" data-wrap="underdot" role="menuitem">下加点</button>
+  <button type="button" data-wrap="emphasis" role="menuitem">着重号</button>
   <button type="button" data-wrap="strike" role="menuitem">删除线</button>
   <button type="button" data-wrap="charbox" role="menuitem">字符边框</button>
   <button type="button" data-wrap="shade" role="menuitem">底纹</button>
+  <div class="sep"></div>
+  <button type="button" data-wrap="highlight-green" role="menuitem">突显·绿</button>
+  <button type="button" data-wrap="highlight-blue" role="menuitem">突显·蓝</button>
+  <button type="button" data-wrap="highlight-pink" role="menuitem">突显·粉</button>
+  <button type="button" data-wrap="highlight-orange" role="menuitem">突显·橙</button>
+  <button type="button" data-wrap="highlight-purple" role="menuitem">突显·紫</button>
+  <div class="sep"></div>
+  <button type="button" data-wrap="ruby" role="menuitem">拼音注音</button>
 </div>
 <div id="supSubMenu" class="tb-menu">
   <button type="button" data-sup="sup" role="menuitem">上标</button>
   <button type="button" data-sup="sub" role="menuitem">下标</button>
 </div>
-<!-- 分隔线菜单（2026-09-27）：四种样式，字形预览即最终写入内容 -->
+<!-- 分隔线菜单（2026-09-27）：线条型四种 + 花样型八种（2026-10-21），字形预览即最终写入内容 -->
 <div id="dividerMenu" class="tb-menu">
   <button type="button" data-div="solid" role="menuitem" title="实线分隔线">直线 <span class="div-glyph div-solid">────────</span></button>
   <button type="button" data-div="dashed" role="menuitem" title="线段分隔线">线段 <span class="div-glyph div-dashed">╌╌╌╌╌╌╌╌</span></button>
   <button type="button" data-div="dotted" role="menuitem" title="点线分隔线">点线 <span class="div-glyph div-dotted">┈┈┈┈┈┈┈</span></button>
   <button type="button" data-div="double" role="menuitem" title="双线分隔线">双线 <span class="div-glyph div-double">════════</span></button>
+  <div class="sep"></div>
+  <button type="button" data-div="stars" role="menuitem" title="星形花样分隔">星形 <span class="div-glyph div-stars">★★★★★</span></button>
+  <button type="button" data-div="diamonds" role="menuitem" title="菱形花样分隔">菱形 <span class="div-glyph div-diamonds">◆◆◆◆◆</span></button>
+  <button type="button" data-div="circles" role="menuitem" title="圆点花样分隔">圆点 <span class="div-glyph div-circles">●●●●●</span></button>
+  <button type="button" data-div="flowers" role="menuitem" title="花纹花样分隔">花纹 <span class="div-glyph div-flowers">❀❀❀❀❀</span></button>
+  <button type="button" data-div="snow" role="menuitem" title="雪花花样分隔">雪花 <span class="div-glyph div-snow">❄❄❄❄❄</span></button>
+  <button type="button" data-div="wave" role="menuitem" title="波浪花样分隔">波浪 <span class="div-glyph div-wave">≈≈≈≈≈</span></button>
+  <button type="button" data-div="note" role="menuitem" title="注记花样分隔">注记 <span class="div-glyph div-note">※※※※※</span></button>
+  <button type="button" data-div="leaf" role="menuitem" title="叶形花样分隔">叶形 <span class="div-glyph div-leaf">❦❦❦❦❦</span></button>
 </div>
 <!-- 字符格式弹窗（2026-09-27）：逐字符 字号/字体/颜色，样式落在 span 的 style 上 -->
 <div id="charFormatModalBg"><div class="modal search-modal" role="dialog" aria-modal="true" aria-label="字符格式">
@@ -12895,6 +13660,8 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <button type="button" class="tb-btn" id="cfColorClearBtn" style="height:22px;" title="不修改颜色" aria-label="不修改颜色">不修改</button>
     </label>
   </div>
+  <!-- 颜色面板（2026-10-21）：常用色 + 色板 + #HEX/rgb() 输入 -->
+  <div class="cf-color-panel" id="cfColorPanel"></div>
   <div class="indent-preview" id="cfPreview"><p>预览：示例文字 ABC 123，可查看字号、字体与颜色的实际效果。</p></div>
   <div class="export-actions">
     <button type="button" id="cfClearBtn" title="清除所选范围内的逐字符字号/字体/颜色">清除字符格式</button>
@@ -12931,6 +13698,21 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   <div class="kg-row" id="keepGroupsRow" title="正则带捕获组时启用「部分替换」：勾选的组原样保留，只替换其余部分；组0=整段匹配全部保留">
     <span class="kg-hint">保留组</span>
     <div class="kg-chips" id="keepGroupsChips"></div>
+  </div>
+  <div class="search-row-group">
+    <div class="srow-label">按格式</div>
+    <div class="search-row">
+      <select id="fmtFindSel" title="要查找的格式（下划线/突显/粗体/颜色/字号…）" aria-label="查找格式"></select>
+      <button type="button" id="fmtFindBtn" class="primary" title="按格式查找：列出范围内所有带该格式的文字">查找格式</button>
+    </div>
+    <div class="search-row">
+      <select id="fmtReplaceSel" title="要替换成的目标格式" aria-label="替换格式"></select>
+      <span id="fmtValueWrap" class="fmt-value-wrap" style="display:none;">
+        <input type="text" id="fmtValueInput" class="fmt-value-input" placeholder="#ff0000 或 red" aria-label="目标格式取值">
+        <select id="fmtFontSel" class="fmt-value-input" style="display:none;" aria-label="目标字体"></select>
+      </span>
+      <button type="button" id="fmtReplaceBtn" title="把范围内所有「查找格式」命中的文字换成「替换格式」（颜色/字号/字体需填取值）">替换格式</button>
+    </div>
   </div>
   <div class="search-nav">
     <button type="button" id="searchPrevBtn" title="上一个匹配" aria-label="上一个匹配">↑</button>
@@ -13016,13 +13798,17 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   </div>
   <div class="settings-panels">
     <div class="settings-panel" id="panel-shortcuts">
-      <p style="font-size:12px;color:#5a6b7c;margin:8px 0;">每个操作绑定一个组合键；点击某行后按下新组合键完成绑定，Del/Backspace 清除，Esc 取消。绑定保存在本浏览器（localStorage）并同步到配置文件。</p>
+      <p style="font-size:12px;color:#5a6b7c;margin:8px 0;">每个操作绑定一个组合键；点击某行后按下新组合键（或鼠标侧键 X1/X2）完成绑定，Del/Backspace 清除，Esc 取消。绑定保存在本浏览器（localStorage）并同步到配置文件。</p>
       <table id="shortcutTable"></table>
       <div style="margin-top:8px;"><button type="button" id="resetShortcutsBtn">恢复默认</button></div>
       <h4 style="margin:18px 0 4px;">鼠标动作</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">按住鼠标中键滑动触发对应操作（如中键上滑 = 居中）。点击某行后按住中键滑动完成绑定，Del/Backspace 清除，Esc 取消。绑定保存在配置文件。</p>
       <table id="mouseShortcutTable"></table>
       <div style="margin-top:8px;"><button type="button" id="resetMouseShortcutsBtn">恢复默认</button></div>
+      <h4 style="margin:18px 0 4px;">鼠标侧键</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">鼠标侧键（X1 后退 / X2 前进）可以<b>单独</b>绑定到某个操作，<b>不需要</b>和键盘按键组合使用；也可以在上方「快捷键」表里点击某行后直接按侧键完成绑定。</p>
+      <table id="sideButtonTable"></table>
+      <p style="font-size:12px;color:#5a6b7c;margin:10px 0 0;">提示：选中文字后弹出的快捷菜单只响应鼠标左键与右键；中键专用于上/下/左/右滑动手势，落在菜单上不会误触发菜单操作。</p>
     </div>
     <div class="settings-panel" id="panel-fonts" style="display:none;">
       <p style="font-size:12px;color:#5a6b7c;margin:8px 0;">设置各类文本的字体（CSS font-family）。默认「不修改」= 使用阅读器默认字体，不额外指定。</p>
@@ -13187,14 +13973,24 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：&lt;font color="red"&gt;红&lt;/font&gt; → 红</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
         <input type="checkbox" id="cleanParagraphsChk" style="width:16px;height:16px;">
-        段落合并优化（OCR 误拆段落自动合并，默认关闭）
+        段落合并优化（OCR 误拆段落自动合并，并自动清理合并后的段内空白，默认关闭）
       </label>
-      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：&lt;p&gt;未完&lt;/p&gt;&lt;p&gt;待续&lt;/p&gt; → &lt;p&gt;未完待续&lt;/p&gt;</p>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：&lt;p&gt;未完&lt;/p&gt;&lt;p&gt;&amp;nbsp;待续&lt;/p&gt; → &lt;p&gt;未完待续&lt;/p&gt;</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
         <input type="checkbox" id="cleanDigitPunctChk" style="width:16px;height:16px;">
         数字/字母标点归一（数字、字母间的中文标点 → 英文，含空格容忍；并清理数字间/单字母间空格）
       </label>
       <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：1。2 → 1.2，1，2 → 1,2，1。 → 1.；映射表可在下方自定义</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="cleanSpacesChk" style="width:16px;height:16px;">
+        清理段落内空白（删除空格 / 制表符 / 全角空格，合并 OCR 软换行；逐行对齐段保留换行，默认关闭）
+      </label>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：你好 世界 → 你好世界（行首行尾、中文之间的空格都会被删；OCR 软换行会合并，逐行对齐段保留换行）</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="cleanSpacesGapChk" style="width:16px;height:16px;">
+        保留英文单词之间的空格（清理段落内空白 / 合并段落时生效）
+      </label>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：hello world → hello world（不勾选则变成 helloworld）</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
         <input type="checkbox" id="cleanBlankLinesChk" style="width:16px;height:16px;">
         导出时清理空白行（删掉空段落、连续空行合并为一个，默认关闭）
@@ -13381,6 +14177,10 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
 </div></div>
 <div id="historyModalBg"><div class="modal" style="max-width:960px; min-width:360px;">
   <h3>历史记录</h3>
+  <div style="display:flex;gap:8px;margin:8px 0;">
+    <input type="text" id="historySearchInput" placeholder="按文件名/路径搜索…" style="flex:1;min-width:200px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;font-size:12px;">
+    <button type="button" id="historySearchClear" style="display:none;padding:4px 12px;border:1px solid var(--border);border-radius:4px;background:var(--bg-elev);color:var(--text);font:inherit;font-size:12px;cursor:pointer;">清除</button>
+  </div>
   <p style="font-size:12px;color:#5a6b7c;">本地矫正缓存（同一文件保留多个版本，v1 为最新）。文件名与路径分列显示，同名不同路径的文件可区分；勾选后可删除或导出（支持多选）。</p>
   <div style="max-height:50vh;overflow:auto;border:1px solid var(--border);border-radius:4px;margin-top:6px;">
     <table id="historyTable" style="width:100%;border-collapse:collapse;font-size:13px;">
@@ -13505,6 +14305,10 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   </div>
 </div>
 <div id="toast" aria-hidden="true"></div>
+<!-- KaTeX（2026-10-21）：LaTeX 公式渲染成 MathML。随包分发（ui/vendor/），
+     离线可用——矫正界面可能在无外网环境，不能依赖 CDN。缺失时公式按钮会提示
+     「公式功能不可用」，其余功能不受影响。 -->
+<script src="/ui/vendor/katex.min.js"></script>
 <script src="/ui/app.js"></script>
 </body>
 </html>

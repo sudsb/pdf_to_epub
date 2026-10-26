@@ -31,10 +31,12 @@ class _FakeDictPredictor:
 
     def __init__(self, texts=None):
         self.calls = []
+        self.kwargs_calls = []
         self.texts = texts or ["顶层甲", "顶层乙"]
 
-    def predict(self, path):
+    def predict(self, path, **kwargs):
         self.calls.append(path)
+        self.kwargs_calls.append(dict(kwargs))
         return [{"rec_texts": self.texts}]
 
 
@@ -43,10 +45,12 @@ class _FakePredictor:
 
     def __init__(self, texts=None):
         self.calls = []
+        self.kwargs_calls = []
         self.texts = texts or ["第一行", "第二行"]
 
-    def predict(self, path):
+    def predict(self, path, **kwargs):
         self.calls.append(path)
+        self.kwargs_calls.append(dict(kwargs))
         return [_FakeRes(self.texts)]
 
 
@@ -73,10 +77,12 @@ class _FakeBoxPredictor:
 
     def __init__(self, res=None):
         self.calls = []
+        self.kwargs_calls = []
         self.res = res or _BOX_RES
 
-    def predict(self, path):
+    def predict(self, path, **kwargs):
         self.calls.append(path)
+        self.kwargs_calls.append(dict(kwargs))
         return [self.res]
 
 
@@ -101,10 +107,12 @@ class _MergeConfigMixin:
     value 为 None 时返回空 dict（模拟旧配置里没有该键）。
     """
 
-    def _patch_config(self, value):
+    def _patch_config(self, value, det_limit=None):
         import configmanage
 
         cfg = {} if value is None else {"paddle_merge_lines": value}
+        if det_limit is not None:
+            cfg["paddle_det_limit"] = det_limit
         self._saved_get_config = configmanage.get_config
         configmanage.get_config = lambda **kwargs: dict(cfg)
 
@@ -529,6 +537,131 @@ class TestBatchInferMergeLines(_MergeConfigMixin, unittest.TestCase):
         for r in res:
             self.assertEqual(r["result"], "顶层甲\n顶层乙")
 
+class TestDetLimit(unittest.TestCase):
+    """paddle_det_limit：配置读取（缺失/0/非法/负数/超限）、kwargs 生成。"""
+
+    def setUp(self):
+        import configmanage
+
+        self._saved_get_config = configmanage.get_config
+
+    def tearDown(self):
+        import configmanage
+
+        configmanage.get_config = self._saved_get_config
+
+    def _cfg(self, value):
+        import configmanage
+
+        cfg = {} if value is None else {"paddle_det_limit": value}
+        configmanage.get_config = lambda **kwargs: dict(cfg)
+
+    def test_default_constant_is_960(self):
+        self.assertEqual(paddleocrmanage._DEFAULT_DET_LIMIT, 960)
+
+    def test_missing_key_falls_back_to_default(self):
+        """旧配置里没有该键 → 960（不是关闭）。"""
+        self._cfg(None)
+        self.assertEqual(paddleocrmanage._read_det_limit_setting(), 960)
+
+    def test_zero_means_disabled(self):
+        """0 = 关闭检测缩放（按原图分辨率检测），必须原样返回 0。"""
+        self._cfg(0)
+        self.assertEqual(paddleocrmanage._read_det_limit_setting(), 0)
+
+    def test_string_zero_means_disabled(self):
+        """config.json 手改成字符串 "0" 也要认。"""
+        self._cfg("0")
+        self.assertEqual(paddleocrmanage._read_det_limit_setting(), 0)
+
+    def test_illegal_value_falls_back(self):
+        self._cfg("abc")
+        self.assertEqual(paddleocrmanage._read_det_limit_setting(), 960)
+
+    def test_negative_falls_back(self):
+        """负值非法 → 回退 960，不能变成「关闭」或负数传给 Paddle。"""
+        self._cfg(-1280)
+        self.assertEqual(paddleocrmanage._read_det_limit_setting(), 960)
+
+    def test_clamped_to_max(self):
+        self._cfg(99999)
+        self.assertEqual(
+            paddleocrmanage._read_det_limit_setting(), paddleocrmanage._DET_LIMIT_MAX
+        )
+
+    def test_config_read_failure_falls_back(self):
+        """get_config 抛异常（headless/损坏配置）→ 960，不能让 OCR 挂掉。"""
+        import configmanage
+
+        def boom(**kwargs):
+            raise RuntimeError("config 读不了")
+
+        configmanage.get_config = boom
+        self.assertEqual(paddleocrmanage._read_det_limit_setting(), 960)
+
+    def test_det_kwargs_for_zero_is_empty(self):
+        """0 → 不传任何 kwargs，检测行为与旧版完全一致。"""
+        self.assertEqual(paddleocrmanage.det_kwargs_for(0), {})
+
+    def test_det_kwargs_for_positive(self):
+        """正数 → max + 目标最长边（PaddleX 默认是 min/64，等于不缩放）。"""
+        self.assertEqual(
+            paddleocrmanage.det_kwargs_for(960),
+            {"text_det_limit_side_len": 960, "text_det_limit_type": "max"},
+        )
+
+
+class TestBatchInferDetLimit(_MergeConfigMixin, unittest.TestCase):
+    """batch_infer 每批读一次配置，把检测最长边传给 predictor.predict。"""
+
+    def setUp(self):
+        self._old_factory = paddleocrmanage._predictor_factory
+        self._old_available = paddleocrmanage.available
+        paddleocrmanage.reset_predictor()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.imgs = []
+        for i in (1, 2):
+            p = os.path.join(self.tmp.name, f"{i}.png")
+            with open(p, "wb") as f:
+                f.write(b"png")
+            self.imgs.append(p)
+        self.pred = _FakeBoxPredictor()
+
+    def tearDown(self):
+        self._restore_config()
+        paddleocrmanage.reset_predictor()
+        paddleocrmanage._predictor_factory = self._old_factory
+        paddleocrmanage.available = self._old_available
+        self.tmp.cleanup()
+
+    def _run(self, det_limit):
+        self._patch_config(True, det_limit)
+        paddleocrmanage.available = lambda: True
+        paddleocrmanage._predictor_factory = lambda: self.pred
+        return paddleocrmanage.batch_infer(self.imgs)
+
+    def test_default_limit_is_passed(self):
+        """未设该键 → 960 生效，每页都带上 max/960。"""
+        for r in self._run(None):
+            self.assertIsNone(r["error"])
+        self.assertEqual(
+            self.pred.kwargs_calls,
+            [{"text_det_limit_side_len": 960, "text_det_limit_type": "max"}] * 2,
+        )
+
+    def test_custom_limit_is_passed(self):
+        self._run(1600)
+        self.assertEqual(
+            self.pred.kwargs_calls,
+            [{"text_det_limit_side_len": 1600, "text_det_limit_type": "max"}] * 2,
+        )
+
+    def test_zero_omits_kwargs(self):
+        """0 = 关闭 → predict 不带任何额外参数（逐字节旧行为）。"""
+        for r in self._run(0):
+            self.assertIsNone(r["error"])
+        self.assertEqual(self.pred.kwargs_calls, [{}, {}])
+
 
 class TestDefaultConfigSeed(unittest.TestCase):
     """configmanage 种子键（新增顶层键由递归 merge 自动补全，不另写补全分支）。"""
@@ -545,6 +678,24 @@ class TestDefaultConfigSeed(unittest.TestCase):
 
         out = configmanage.validate_and_patch_config({})
         self.assertIs(out["paddle_merge_lines"], True)
+
+    def test_default_config_has_dpi_200(self):
+        """2026-10 起渲染默认 200dpi（实测精度收益远大于耗时代价）。"""
+        import configmanage
+
+        self.assertEqual(configmanage.DEFAULT_CONFIG["dpi"], 200)
+
+    def test_default_config_has_det_limit_960(self):
+        import configmanage
+
+        self.assertEqual(configmanage.DEFAULT_CONFIG["paddle_det_limit"], 960)
+
+    def test_validate_and_patch_fills_det_limit(self):
+        """旧配置（无该键）经 validate_and_patch_config 自动补成 960。"""
+        import configmanage
+
+        out = configmanage.validate_and_patch_config({})
+        self.assertEqual(out["paddle_det_limit"], 960)
 
 
 if __name__ == "__main__":

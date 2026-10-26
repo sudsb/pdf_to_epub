@@ -28,6 +28,7 @@ from unittest import mock
 import configmanage
 import epubmetamanage
 import guimanage
+import logmanage
 import mian
 
 
@@ -1145,6 +1146,53 @@ class TestGuiTableConvert(GuiServerTestBase):
         self.assertIs(self._on_disk().get("table_convert", True), True)
 
 
+class TestGuiPaddleDetLimit(GuiServerTestBase):
+    """paddle_det_limit（PaddleOCR 检测最长边）的 GET/POST 校验（2026-10）。"""
+
+    def _on_disk(self):
+        with open(self._cfg_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_default_is_960(self):
+        from configmanage import DEFAULT_CONFIG
+
+        self.assertEqual(DEFAULT_CONFIG["paddle_det_limit"], 960)
+
+    def test_get_defaults_960_then_post_persists_int(self):
+        """键缺失时 GET 下发 960；POST 1280 → 200 且写盘为 int。"""
+        status, _, body = self._get("/api/config")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["config"]["paddle_det_limit"], 960)
+
+        status, raw = self._post("/api/config", {"paddle_det_limit": 1280})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(raw)["ok"])
+        self.assertEqual(self._on_disk()["paddle_det_limit"], 1280)
+
+        status, _, body = self._get("/api/config")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["config"]["paddle_det_limit"], 1280)
+
+    def test_post_zero_means_disabled_and_persists(self):
+        """0 = 关闭检测缩放，必须能存成 0（不能被当成缺省/非法）。"""
+        status, raw = self._post("/api/config", {"paddle_det_limit": 0})
+        self.assertEqual(status, 200, raw)
+        self.assertEqual(self._on_disk()["paddle_det_limit"], 0)
+
+        status, _, body = self._get("/api/config")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["config"]["paddle_det_limit"], 0)
+
+    def test_post_invalid_value_rejected_and_not_written(self):
+        """负数/过小/过大/非数字 → 400 中文错误，且不写盘。"""
+        for bad in (-1, 63, 4001, "abc"):
+            status, raw = self._post("/api/config", {"paddle_det_limit": bad})
+            self.assertEqual(status, 400, f"值 {bad!r} 应被拒绝: {raw}")
+            data = json.loads(raw)
+            self.assertFalse(data["ok"])
+            self.assertIn("paddle_det_limit 仅接受", data["error"])
+
+
 class TestTabEndpoints(GuiServerTestBase):
     """标签页会话与 /api/tabs 端点测试。"""
 
@@ -1447,6 +1495,14 @@ class TestGuiConvert(GuiServerTestBase):
         self._pdf = os.path.join(tempfile.gettempdir(), "test_gui_convert_sample.pdf")
         with open(self._pdf, "w", encoding="utf-8") as f:
             f.write("%PDF-1.4\n%%EOF\n")
+        # 任务日志写到临时目录（不污染仓库 logs/）
+        self._logs_td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._logs_td.cleanup)
+        patcher = mock.patch.object(
+            logmanage, "logs_dir", return_value=_Path(self._logs_td.name)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         super().tearDown()
@@ -1599,6 +1655,50 @@ class TestGuiConvert(GuiServerTestBase):
         self.assertFalse(done["success"])
         self.assertEqual(done["exit_code"], 1)
         self.assertIn("错误行2", done["error"])
+
+    def test_convert_progress_marker_updates_message(self):
+        """进度标记行 → 状态里的 message/progress（界面只显示进度条+一条消息）。"""
+        marker = (
+            '__PTOE_PROGRESS__ {"stage": "ocr", "message": "正在识别 3/10 页（30%）", '
+            '"done": 3, "total": 10, "percent": 30.0}'
+        )
+        fake = self._make_fake_proc([marker, "Done: C:/tmp/out.epub"])
+        with mock.patch.object(guimanage.subprocess, "Popen", return_value=fake):
+            status, raw = self._post("/api/convert/start", self._start_body())
+        self.assertEqual(status, 200)
+        done = self._wait_done()
+        self.assertTrue(done["success"])
+        self.assertEqual(done["message"], "转换完成：C:/tmp/out.epub")
+        self.assertEqual(done["progress"]["done"], 3)
+        self.assertEqual(done["progress"]["total"], 10)
+        self.assertEqual(done["progress"]["percent"], 30.0)
+        # 进度标记行不进界面日志区（只进本地日志文件）
+        self.assertFalse(any("__PTOE_PROGRESS__" in ln for ln in done["lines"]))
+
+    def test_convert_output_written_to_local_log(self):
+        """完整输出写入本地日志文件（logs/convert-*.log）。"""
+        fake = self._make_fake_proc(["第一行输出", "Done: C:/tmp/out.epub"])
+        with mock.patch.object(guimanage.subprocess, "Popen", return_value=fake):
+            self._post("/api/convert/start", self._start_body())
+        done = self._wait_done()
+        log_path = done["log_path"]
+        self.assertTrue(log_path, "状态里应有日志文件路径")
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("第一行输出", content)
+        finally:
+            try:
+                os.unlink(log_path)
+            except OSError:
+                pass
+
+    def test_open_log_endpoint_rejects_outside_logs(self):
+        """打开日志接口：只允许 logs/ 目录下的文件。"""
+        status, raw = self._post("/api/open-log", {"path": "C:/Windows/win.ini"})
+        self.assertEqual(status, 400)
+        data = json.loads(raw)
+        self.assertFalse(data["ok"])
 
     # -- 弹窗询问（OCR 断点续传选择）--
 
@@ -2114,16 +2214,42 @@ class TestCorrectMultiInstance(GuiServerTestBase):
         self.assertNotEqual(insts[0]["id"], insts[1]["id"])
         self.assertTrue(all(i["running"] for i in insts))
 
-    def test_correct_start_rejects_when_convert_running(self):
-        """转换运行中 → 409（转换与矫正互斥）。"""
+    def _tmp_pdf(self):
+        """建一个真实存在的临时 PDF（接口校验文件存在）。"""
+        fd, path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        with open(path, "wb") as f:
+            f.write(b"%PDF-1.4\n")
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        return path
+
+    def test_correct_start_allowed_when_convert_running(self):
+        """转换运行中 → 仍可启动矫正（2026-10-21：转换与矫正分离）。"""
+        pdf = self._tmp_pdf()
         self._state["convert"]["running"] = True
-        with mock.patch.object(guimanage.subprocess, "Popen") as pop:
-            status, raw = self._post("/api/correct/start", {})
-        self.assertEqual(status, 409)
+        with mock.patch.object(
+            guimanage.subprocess, "Popen",
+            return_value=_FakeCorrectProc(block=True),
+        ) as pop:
+            status, raw = self._post("/api/correct/start", {"pdf": pdf})
+        self.assertEqual(status, 200)
         data = json.loads(raw)
-        self.assertFalse(data["ok"])
-        self.assertIn("已有转换在运行", data["error"])
-        pop.assert_not_called()
+        self.assertTrue(data["ok"])
+        self.assertTrue(pop.called)
+
+    def test_correct_start_live_flag_adds_live_ocr(self):
+        """live=True → argv 含 --live-ocr（实时跟随 OCR 进度）。"""
+        pdf = self._tmp_pdf()
+        with mock.patch.object(
+            guimanage.subprocess, "Popen",
+            return_value=_FakeCorrectProc(block=True),
+        ):
+            status, raw = self._post(
+                "/api/correct/start", {"pdf": pdf, "live": True}
+            )
+        self.assertEqual(status, 200)
+        data = json.loads(raw)
+        self.assertIn("--live-ocr", data["argv"])
 
     def test_correct_engine_default_from_proofread_engine(self):
         """config.proofread_engine=vllm 时启动缺省引擎为 vllm（argv 含 --engine vllm）。"""

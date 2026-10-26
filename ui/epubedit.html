@@ -183,6 +183,17 @@ button:active{transform:scale(.97);filter:brightness(.96);}
 .ptoe-highlight{background:#e0e0e0;}
 .ptoe-sup{vertical-align:super;font-size:.7em;line-height:1;}
 .ptoe-sub{vertical-align:sub;font-size:.7em;line-height:1;}
+/* 2026-10-21 新增行内格式 */
+.ptoe-wavy{text-decoration:underline wavy;text-decoration-style:wavy;border-bottom:1px solid #333;}
+.ptoe-double{text-decoration:underline double;}
+.ptoe-overline{text-decoration:overline;}
+.ptoe-emphasis{text-emphasis:dot;-webkit-text-emphasis:dot;}
+.ptoe-highlight-green{background:#c8e6c9;}
+.ptoe-highlight-blue{background:#bbdefb;}
+.ptoe-highlight-pink{background:#f8bbd0;}
+.ptoe-highlight-orange{background:#ffe0b2;}
+.ptoe-highlight-purple{background:#e1bee7;}
+.ptoe-ruby::after{content:"(" attr(data-rt) ")";font-size:.6em;vertical-align:super;}
 .ptoe-note{font-size:12px;color:#556677;}
 .ptoe-note p{font-size:12px;color:#556677;}
 .ptoe-align-left{text-align:left;}
@@ -323,6 +334,10 @@ mark.ptoe-search{background:#ffe9a8;color:inherit;border-radius:2px;padding:0 1p
       <button type="button" class="ic-btn" data-op="note" title="注释（小字灰字）" aria-label="注释"><svg viewBox="0 0 16 16" aria-hidden="true"><text x="8" y="12" text-anchor="middle" font-size="12" fill="currentColor" stroke="none">注</text></svg></button>
       <button type="button" class="ic-btn" data-op="highlight" title="突显" aria-label="突显"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="4" width="12" height="8" rx="1" style="fill:currentColor;fill-opacity:.25"/></svg></button>
       <button type="button" class="ic-btn" data-op="underdot" title="下加点" aria-label="下加点"><svg viewBox="0 0 16 16" aria-hidden="true"><text x="8" y="11" text-anchor="middle" font-size="11" fill="currentColor" stroke="none">u</text><circle cx="5" cy="13" r=".8" fill="currentColor" stroke="none"/><circle cx="8" cy="13.4" r=".8" fill="currentColor" stroke="none"/><circle cx="11" cy="13" r=".8" fill="currentColor" stroke="none"/></svg></button>
+      <button type="button" class="ic-btn" data-op="wavy" title="波浪线" aria-label="波浪线"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 9c1.5-2 3-2 4.5 0s3 2 4.5 0 3-2 3 0" fill="none" stroke="currentColor" stroke-width="1.2"/></svg></button>
+      <button type="button" class="ic-btn" data-op="double" title="双下划线" aria-label="双下划线"><svg viewBox="0 0 16 16" aria-hidden="true"><text x="8" y="10" text-anchor="middle" font-size="11" fill="currentColor" stroke="none">U</text><path d="M3 12h10M3 14h10" stroke="currentColor" stroke-width="1"/></svg></button>
+      <button type="button" class="ic-btn" data-op="overline" title="上划线" aria-label="上划线"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4h10" stroke="currentColor" stroke-width="1"/><text x="8" y="13" text-anchor="middle" font-size="11" fill="currentColor" stroke="none">U</text></svg></button>
+      <button type="button" class="ic-btn" data-op="emphasis" title="着重号" aria-label="着重号"><svg viewBox="0 0 16 16" aria-hidden="true"><text x="8" y="10" text-anchor="middle" font-size="11" fill="currentColor" stroke="none">U</text><circle cx="5" cy="13" r=".8" fill="currentColor" stroke="none"/><circle cx="8" cy="13.4" r=".8" fill="currentColor" stroke="none"/><circle cx="11" cy="13" r=".8" fill="currentColor" stroke="none"/></svg></button>
       <button type="button" class="ic-btn" data-op="sup" title="上标" aria-label="上标"><svg viewBox="0 0 16 16" aria-hidden="true"><text x="8" y="9" text-anchor="middle" font-size="12" fill="currentColor" stroke="none">上</text></svg></button>
       <button type="button" class="ic-btn" data-op="sub" title="下标" aria-label="下标"><svg viewBox="0 0 16 16" aria-hidden="true"><text x="8" y="15" text-anchor="middle" font-size="12" fill="currentColor" stroke="none">下</text></svg></button>
     </div>

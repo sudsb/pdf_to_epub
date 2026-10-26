@@ -2578,3 +2578,6 @@ node_modules/xmlchars/xmlns/1.0/ed3.js
 node_modules/xmlchars/xmlns/1.0/ed3.js.map
 
 .slim/deepwork/
+
+# 本地任务日志（转换/矫正输出）
+logs/

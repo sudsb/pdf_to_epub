@@ -135,5 +135,60 @@ class TestPopupMenuButtons(unittest.TestCase):
         self.assertIn("b.innerHTML = OP_ICON[op] || esc(popupOpIcon(op))", self.js)
 
 
+class TestPopupHiddenWhileDragging(unittest.TestCase):
+    """拖拽态（文字/图片/整段/尺寸手柄等）期间不得弹选中文字菜单。
+
+    回归动机（2026-10）：拖动已选中的文字、或拖动表格列宽/裁剪框/进度条时，
+    松手会补发 mouseup，选中菜单随即弹出并遮住落点。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = _read(os.path.join("ui", "app.js"))
+        cls.epub_js = _read(os.path.join("ui", "epubedit.js"))
+
+    def test_maybe_show_popup_guards_drag_state(self):
+        self.assertIn("let _dragUiActive = false;", self.js)
+        guard = "if (_dragUiActive) { hidePopup(); return; }"
+        self.assertIn(guard, self.js)
+        # 守卫必须位于时间窗检查之前：拖拽中任何 mouseup/keyup 都不弹
+        self.assertLess(
+            self.js.index(guard),
+            self.js.index("if (performance.now() < suppressPopupUntil) return;"),
+        )
+
+    def test_native_drag_enters_and_leaves_drag_state(self):
+        self.assertIn("_beginDragUi(); // 编辑区内起拖", self.js)
+        self.assertIn("function _beginDragUi()", self.js)
+        self.assertIn("function _endDragUi()", self.js)
+        # 松手后 300ms 抑制：浏览器可能在 drop/dragend 之后补发 mouseup
+        self.assertIn("suppressPopupUntil = performance.now() + 300;", self.js)
+        # drop 用捕获阶段兜底：drop 里源节点可能被移除，dragend 不保证再派发
+        self.assertRegex(
+            self.js,
+            r"document\.addEventListener\('drop', function \(\) \{\s*_endDragUi\(\);\s*\}, true\);",
+        )
+
+    def test_custom_drag_handles_enter_drag_state(self):
+        for snippet in (
+            "_beginDragUi(); // 尺寸拖拽期间不弹选中文字菜单",
+            "_beginDragUi(); // 裁剪拖拽期间不弹选中文字菜单",
+            "_beginDragUi(); // 候选列表高度拖拽期间不弹选中文字菜单",
+        ):
+            self.assertIn(snippet, self.js)
+        self.assertIn(
+            "wrap.addEventListener('mousedown', (e) => { _beginDragUi(); dragging = true; scrub(e); });",
+            self.js,
+        )
+
+    def test_epub_editor_popup_guards_drag_state(self):
+        self.assertIn("let dragActive = false;", self.epub_js)
+        self.assertIn("if (dragActive) { hidePopup(); return; }", self.epub_js)
+        self.assertIn(
+            "document.addEventListener('drop', function () { endDragPopup(); }, true);",
+            self.epub_js,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

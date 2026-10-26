@@ -241,9 +241,9 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
 .anim-in{animation:ptoeFadeIn .16s ease both;}
 .anim-fade{animation:ptoeFade .16s ease both;}
 #contextMenu,#popup{animation:ptoeFadeIn .16s ease both;}
-#searchModalBg,#exportModalBg,#indentModalBg,#tableModalBg,#charFormatModalBg,#finishModalBg,#historyModalBg,#helpModalBg,#formatRulesModalBg,#frRuleModalBg,#replaceRulesModalBg,#rrEditModalBg{animation:ptoeFade .16s ease both;}
+#searchModalBg,#exportModalBg,#indentModalBg,#tableModalBg,#charFormatModalBg,#rubyModalBg,#latexModalBg,#finishModalBg,#historyModalBg,#helpModalBg,#formatRulesModalBg,#frRuleModalBg,#replaceRulesModalBg,#rrEditModalBg{animation:ptoeFade .16s ease both;}
 @media (prefers-reduced-motion: reduce){
-  .anim-in,.anim-fade,#contextMenu,#popup,#searchModalBg,#exportModalBg,#indentModalBg,#tableModalBg,#charFormatModalBg,#finishModalBg,#historyModalBg,#helpModalBg,#formatRulesModalBg,#frRuleModalBg,#replaceRulesModalBg,#rrEditModalBg{animation:none !important;}
+  .anim-in,.anim-fade,#contextMenu,#popup,#searchModalBg,#exportModalBg,#indentModalBg,#tableModalBg,#charFormatModalBg,#rubyModalBg,#latexModalBg,#finishModalBg,#historyModalBg,#helpModalBg,#formatRulesModalBg,#frRuleModalBg,#replaceRulesModalBg,#rrEditModalBg{animation:none !important;}
   button,#errBadge,.page-row,.toast{transition:none !important;transform:none !important;}
   #toolbar .ic-btn::after,#toolbar .tb-btn:not(.loading)::after{animation:none !important;content:none !important;}
 }
@@ -442,6 +442,18 @@ body.paint-mode{cursor:copy;}
 .ptoe-highlight{background:#e0e0e0;}
 .ptoe-sup{vertical-align:super;font-size:.7em;line-height:1;}
 .ptoe-sub{vertical-align:sub;font-size:.7em;line-height:1;}
+/* 2026-10-21 新增行内格式：波浪下划线/双下划线/上划线/着重号/多色突显/拼音注音 */
+.ptoe-wavy{text-decoration:underline wavy;text-decoration-style:wavy;border-bottom:1px solid #333;}
+.ptoe-double{text-decoration:underline double;}
+.ptoe-overline{text-decoration:overline;}
+.ptoe-emphasis{text-emphasis:dot;-webkit-text-emphasis:dot;text-emphasis-position:under right;-webkit-text-emphasis-position:under right;}
+.ptoe-highlight-green{background:#c8e6c9;}
+.ptoe-highlight-blue{background:#bbdefb;}
+.ptoe-highlight-pink{background:#f8bbd0;}
+.ptoe-highlight-orange{background:#ffe0b2;}
+.ptoe-highlight-purple{background:#e1bee7;}
+.ptoe-ruby{ruby-position:over;}
+.ptoe-ruby::after{content:"(" attr(data-rt) ")";font-size:.6em;vertical-align:super;}
 #errPopup{position:fixed;z-index:65;display:none;background:#fff;border:1px solid #ccc;border-radius:6px;padding:4px;box-shadow:0 2px 8px rgba(0,0,0,.2);gap:6px;}
 /* 图片设置弹窗：点击编辑区内的图片弹出，调整大小/位置/删除 */
 #imgPopup{position:fixed;z-index:65;display:none;flex-direction:column;gap:6px;padding:10px;background:#fff;border:1px solid #ccc;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.2);min-width:140px;}
@@ -526,6 +538,10 @@ body.paint-mode{cursor:copy;}
    该 class，EPUB（htmlmanage）/DOCX 导出按同一 class 输出无边框（勿单边改动）。 */
 .editable table.ptoe-noborder th,.editable table.ptoe-noborder td{border:none;}
 .editable table.ptoe-noborder th{background:transparent;}
+/* 编辑区内的 LaTeX 公式（2026-10-21）：<math> 元素由浏览器原生渲染（MathML），
+   这里只做版式微调——跟随正文字号、与基线对齐；不写 display（部分阅读器对
+   math 的 display 覆盖敏感，写死 inline 会让 display=block 的公式塌成一行） */
+.editable math{font-size:1em;vertical-align:middle;}
 /* 表格操作条（2026-09）：光标进入表格单元格时由 JS 定位并显示；
    加行/删行/加列/删列/对齐/删除表格；对齐按钮按当前单元格 class 高亮 */
 #tblBar{position:fixed;z-index:64;display:none;flex-wrap:wrap;gap:2px;align-items:center;padding:4px 6px;background:rgba(255,255,255,.94);border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.18);}
@@ -619,11 +635,40 @@ body.paint-mode{cursor:copy;}
 .table-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 14px;margin:10px 0;font-size:13px;}
 /* 字符格式弹窗（2026-09-27）：外层复用 .search-modal/.export-actions/.indent-mode-row */
 #charFormatModalBg{position:fixed;inset:0;z-index:66;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+/* 拼音注音弹窗（2026-10-21）：内嵌浏览器不保证支持 window.prompt，改用应用内弹窗 */
+#rubyModalBg{position:fixed;inset:0;z-index:67;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+#rubyModalBg .modal{width:92%;max-width:420px;}
+#rubyModalBg input[type=text]{width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font:inherit;background:var(--bg);color:var(--fg);}
+/* LaTeX 公式弹窗（2026-10-21）：源码输入 + MathML 实时预览 */
+#latexModalBg{position:fixed;inset:0;z-index:67;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;}
+#latexModalBg .modal{width:94%;max-width:560px;}
+#latexModalBg textarea{width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font:inherit;background:var(--bg);color:var(--fg);resize:vertical;font-family:Consolas,Menlo,monospace;}
+#latexModalBg code{background:rgba(127,127,127,.14);padding:0 3px;border-radius:3px;font-family:Consolas,Menlo,monospace;}
+.latex-preview-row{display:flex;align-items:flex-start;gap:8px;margin:10px 0 6px;}
+.latex-preview-label{flex:0 0 auto;font-size:12px;color:var(--text-muted);padding-top:6px;}
+.latex-preview{flex:1 1 auto;min-height:44px;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);overflow:auto;}
+.latex-preview-empty{color:var(--text-muted);font-size:12px;}
+.latex-preview-error{color:#c0392b;font-size:12px;}
+.latex-display-opt{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--text-muted);margin-bottom:4px;}
 #cfSizeNum{width:86px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;}
 #cfFontSel{max-width:190px;}
 #cfPreview p{margin:0;}
+/* 颜色面板（2026-10-21）：常用色 + 色板 + #HEX/rgb() 输入，字符格式弹窗与工具栏共用 */
+.cf-color-panel{margin-top:10px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg);}
+.cf-color-group{margin-bottom:8px;}
+.cf-color-group:last-child{margin-bottom:0;}
+.cf-color-label{display:block;font-size:12px;color:var(--text-muted);margin-bottom:5px;}
+.cf-swatches{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px;}
+.cf-palette{display:grid;grid-template-columns:repeat(12,20px);gap:3px;justify-content:start;}
+.cf-swatch{width:20px;height:20px;padding:0;border:1px solid rgba(0,0,0,.25);border-radius:3px;cursor:pointer;background-clip:padding-box;}
+.cf-swatch:hover{outline:2px solid var(--accent,#3b82f6);outline-offset:1px;}
+.cf-color-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap;}
+.cf-color-input{flex:1 1 130px;min-width:110px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;background:var(--bg);color:var(--fg);}
+/* 浮动颜色面板（工具栏「颜色」按钮） */
+.color-pop{position:fixed;z-index:80;width:300px;padding:8px;border:1px solid var(--border);border-radius:7px;background:var(--bg,#fff);box-shadow:0 4px 18px rgba(0,0,0,.22);}
 /* 分隔线下拉菜单里的字形预览（与正文里最终写入的 8 字形串一致） */
 #dividerMenu .div-glyph{margin-left:8px;font-family:monospace;color:var(--text-muted);letter-spacing:0;}
+#dividerMenu .sep{width:100%;height:0;border-top:1px solid var(--border);margin:4px 0;}
 #dividerMenu .div-dashed{letter-spacing:.12em;}
 #dividerMenu .div-dotted{letter-spacing:.12em;}
 #dividerMenu .div-double{font-weight:bold;letter-spacing:.05em;}
@@ -635,6 +680,15 @@ body.paint-mode{cursor:copy;}
 .editable p.ptoe-divider-dashed{letter-spacing:.12em;}
 .editable p.ptoe-divider-dotted{letter-spacing:.12em;}
 .editable p.ptoe-divider-double{letter-spacing:.05em;font-weight:bold;}
+/* 花样分割符号（2026-10-21）：非线条型，装饰字形排布，字距放宽 */
+.editable p.ptoe-divider-stars{letter-spacing:.35em;}
+.editable p.ptoe-divider-diamonds{letter-spacing:.35em;}
+.editable p.ptoe-divider-circles{letter-spacing:.35em;}
+.editable p.ptoe-divider-flowers{letter-spacing:.35em;}
+.editable p.ptoe-divider-snow{letter-spacing:.35em;}
+.editable p.ptoe-divider-wave{letter-spacing:.25em;}
+.editable p.ptoe-divider-note{letter-spacing:.35em;}
+.editable p.ptoe-divider-leaf{letter-spacing:.35em;}
 .editable p.ptoe-divider span{color:inherit;font-size:inherit;font-family:inherit;}
 .table-grid label{display:flex;align-items:center;gap:6px;white-space:nowrap;}
 .table-grid input[type="number"]{width:72px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;}
@@ -646,6 +700,12 @@ body.paint-mode{cursor:copy;}
 .search-head .x-btn:hover{background:#dfe7f3;color:#1c2733;}
 .search-row{display:flex;align-items:center;gap:8px;margin-bottom:8px;}
 .search-row input[type="text"]{flex:1;min-width:0;padding:6px 8px;border:1px solid var(--border);border-radius:5px;font:inherit;}
+/* 按格式查找/替换（2026-10-21）：格式下拉 + 取值输入 */
+.search-row select{padding:6px 8px;border:1px solid var(--border);border-radius:5px;font:inherit;background:#fff;color:var(--fg);max-width:190px;}
+.dark .search-row select{background:var(--bg-elev);color:var(--fg);}
+.fmt-value-wrap{display:inline-flex;align-items:center;gap:4px;}
+.fmt-value-input{width:120px;padding:5px 7px;border:1px solid var(--border);border-radius:5px;font:inherit;background:var(--bg);color:var(--fg);}
+.fmt-value-input[type=text]{flex:none;}
 .search-regex{display:inline-flex;align-items:center;gap:3px;font-size:13px;color:#33414f;white-space:nowrap;}
 .search-nav{display:flex;align-items:center;gap:8px;margin:2px 0 8px;}
 .search-nav button{width:32px;height:28px;padding:0;border:1px solid var(--border);background:#fff;border-radius:5px;cursor:pointer;font-size:14px;}
@@ -758,6 +818,9 @@ body.paint-mode{cursor:copy;}
 #shortcutTable td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:14px;}
 #shortcutTable tr{cursor:pointer;}
 #shortcutTable tr:hover td{background:#f7fafd;}
+/* 鼠标侧键表（2026-10-21）：侧键单独绑定，无需组合键盘按键 */
+#sideButtonTable{width:100%;border-collapse:collapse;}
+#sideButtonTable td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:14px;}
 /* 分组标题行（功能刷）：不可点（不进入捕获），无悬停高亮 */
 #shortcutTable tr.shortcut-group-row{cursor:default;}
 #shortcutTable tr.shortcut-group-row:hover td{background:none;}
@@ -875,6 +938,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
           <button type="button" class="tb-btn" id="supSubBtn" role="menuitem" title="上标下标下拉菜单：把选中文字设为上标或下标的小字符" aria-label="上标下标">上标/下标 <span class="ptoe-caret">▾</span></button>
           <button type="button" class="tb-btn" id="formatRulesBtn" role="menuitem" title="格式规则：对选中文字一键应用自定义规则（可多条叠加 / 条件分支；Ctrl+Shift+Q）" aria-label="格式规则">格式规则</button>
           <button type="button" class="tb-btn" id="colorBtn" role="menuitem" title="文本颜色" aria-label="文本颜色">文本颜色</button>
+          <button type="button" class="tb-btn" id="latexBtn" role="menuitem" onmousedown="event.preventDefault()" title="插入 LaTeX 公式：输入 LaTeX 源码，KaTeX 渲染成 MathML；导出 EPUB 后照常显示" aria-label="插入公式">公式</button>
           <select id="imgModeSel" title="插入图片的显示模式：全画幅=占满文字宽度，局部=按原尺寸居中，行内=嵌在文字中间（50% 宽度）" style="width:100%;margin-bottom:4px;padding:4px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text);font:inherit;">
             <option value="full">全画幅</option>
             <option value="fit">局部</option>
@@ -1043,6 +1107,39 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   <span class="hint-text">左侧原图（点击切换预览/原图），右侧文字可直接编辑。选中文字弹出<b>图标快捷菜单</b>（悬停有提示）；支持<b>粗体</b>、<i>斜体</i>、标题、注释、居左/居中/居右与<span class="ptoe-marker">全文/段落/注释/换页标记</span>（标记插入到光标处；段落标记段首=合上段、段尾=合下段；换页标记=此后内容显示在新的一页）。可切换 <b>Markdown 模式</b>（#标题、**粗体**、*斜体*）、繁简转换、字号调整与页码跳转，详见「帮助」。</span>
   <button type="button" id="hintClose" title="关闭提示（可随时在「帮助」中查看）" aria-label="关闭提示">✕</button>
 </div>
+<!-- 拼音注音弹窗（2026-10-21）：注音内容存进 span 的 data-rt 属性 -->
+<div id="rubyModalBg"><div class="modal" role="dialog" aria-modal="true" aria-label="拼音注音">
+  <div class="search-head">
+    <h3>拼音注音</h3>
+    <button type="button" class="x-btn" id="rubyCloseBtn" title="关闭 (Esc)" aria-label="关闭拼音注音">✕</button>
+  </div>
+  <p class="export-desc">为选中的文字添加注音（拼音 / 解释），最多 32 字。注音随内容保存，导出 EPUB 时显示在文字后的小括号里，导出 Word 时同样以小字括号注音呈现。</p>
+  <input type="text" id="rubyInput" maxlength="32" placeholder="例如：nǐ hǎo" aria-label="注音内容">
+  <div class="export-actions">
+    <button type="button" class="btn" id="rubyOkBtn">应用</button>
+    <button type="button" class="btn" id="rubyCancelBtn">取消</button>
+  </div>
+</div></div>
+<!-- LaTeX 公式弹窗（2026-10-21）：输入 LaTeX 源码 → KaTeX 渲染成 MathML 插入正文。
+     公式以 <math> 元素存进内容：导出 EPUB 原样保留（EPUB 3 原生支持 MathML），
+     导出 Word/Markdown/TXT 退化为 $公式$ 纯文本。 -->
+<div id="latexModalBg"><div class="modal" role="dialog" aria-modal="true" aria-label="LaTeX 公式">
+  <div class="search-head">
+    <h3>插入 LaTeX 公式</h3>
+    <button type="button" class="x-btn" id="latexCloseBtn" title="关闭 (Esc)" aria-label="关闭公式弹窗">✕</button>
+  </div>
+  <p class="export-desc">输入 LaTeX 源码（如 <code>\frac{-b \pm \sqrt{b^2-4ac}}{2a}</code>），下方实时预览。公式以 MathML 存入正文，导出 EPUB 后照常显示；导出 Word/Markdown 时输出为 <code>$公式$</code>。</p>
+  <textarea id="latexInput" rows="4" spellcheck="false" placeholder="例如：E=mc^2  或  \int_0^1 x^2\,dx" aria-label="LaTeX 源码"></textarea>
+  <div class="latex-preview-row">
+    <span class="latex-preview-label">预览</span>
+    <div id="latexPreview" class="latex-preview"><span class="latex-preview-empty">（预览区）</span></div>
+  </div>
+  <label class="latex-display-opt" title="勾选后公式独立成行显示（display=block），否则与文字同行"><input type="checkbox" id="latexDisplay">独立成行</label>
+  <div class="export-actions">
+    <button type="button" class="btn primary" id="latexOkBtn">插入</button>
+    <button type="button" class="btn" id="latexCancelBtn">取消</button>
+  </div>
+</div></div>
 <div id="pages"></div>
 <div id="popup"></div>
 <div id="tip"></div>
@@ -1082,10 +1179,22 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   <div class="ctx-item ctx-sub" data-ctx="wrap">文字包围 <span class="ctx-arrow">▸</span>
     <div class="ctx-submenu" id="ctxWrapSub">
       <button type="button" class="ctx-item" data-ctx-wrap="underline">下划线</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="wavy">波浪线</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="double">双下划线</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="overline">上划线</button>
       <button type="button" class="ctx-item" data-ctx-wrap="underdot">下加点</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="emphasis">着重号</button>
       <button type="button" class="ctx-item" data-ctx-wrap="strike">删除线</button>
       <button type="button" class="ctx-item" data-ctx-wrap="charbox">字符边框</button>
       <button type="button" class="ctx-item" data-ctx-wrap="shade">底纹</button>
+      <div class="ctx-sep"></div>
+      <button type="button" class="ctx-item" data-ctx-wrap="highlight-green">突显·绿</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="highlight-blue">突显·蓝</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="highlight-pink">突显·粉</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="highlight-orange">突显·橙</button>
+      <button type="button" class="ctx-item" data-ctx-wrap="highlight-purple">突显·紫</button>
+      <div class="ctx-sep"></div>
+      <button type="button" class="ctx-item" data-ctx-wrap="ruby">拼音注音</button>
     </div>
   </div>
   <div class="ctx-sep"></div>
@@ -1097,6 +1206,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   <button type="button" class="ctx-item" data-ctx="clear">清除校正</button>
   <button type="button" class="ctx-item" data-ctx="applypr">应用校正</button>
   <button type="button" class="ctx-item" data-ctx="clearfmt">清除格式</button>
+  <button type="button" class="ctx-item" data-ctx="align_lines">多行对齐</button>
   <div class="ctx-sep"></div>
   <button type="button" class="ctx-item" data-ctx="clearpage">清空</button>
   <button type="button" class="ctx-item" data-ctx="fmtall">格式化</button>
@@ -1136,21 +1246,42 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
 </div>
 <div id="charWrapMenu" class="tb-menu">
   <button type="button" data-wrap="underline" role="menuitem">下划线</button>
+  <button type="button" data-wrap="wavy" role="menuitem">波浪线</button>
+  <button type="button" data-wrap="double" role="menuitem">双下划线</button>
+  <button type="button" data-wrap="overline" role="menuitem">上划线</button>
   <button type="button" data-wrap="underdot" role="menuitem">下加点</button>
+  <button type="button" data-wrap="emphasis" role="menuitem">着重号</button>
   <button type="button" data-wrap="strike" role="menuitem">删除线</button>
   <button type="button" data-wrap="charbox" role="menuitem">字符边框</button>
   <button type="button" data-wrap="shade" role="menuitem">底纹</button>
+  <div class="sep"></div>
+  <button type="button" data-wrap="highlight-green" role="menuitem">突显·绿</button>
+  <button type="button" data-wrap="highlight-blue" role="menuitem">突显·蓝</button>
+  <button type="button" data-wrap="highlight-pink" role="menuitem">突显·粉</button>
+  <button type="button" data-wrap="highlight-orange" role="menuitem">突显·橙</button>
+  <button type="button" data-wrap="highlight-purple" role="menuitem">突显·紫</button>
+  <div class="sep"></div>
+  <button type="button" data-wrap="ruby" role="menuitem">拼音注音</button>
 </div>
 <div id="supSubMenu" class="tb-menu">
   <button type="button" data-sup="sup" role="menuitem">上标</button>
   <button type="button" data-sup="sub" role="menuitem">下标</button>
 </div>
-<!-- 分隔线菜单（2026-09-27）：四种样式，字形预览即最终写入内容 -->
+<!-- 分隔线菜单（2026-09-27）：线条型四种 + 花样型八种（2026-10-21），字形预览即最终写入内容 -->
 <div id="dividerMenu" class="tb-menu">
   <button type="button" data-div="solid" role="menuitem" title="实线分隔线">直线 <span class="div-glyph div-solid">────────</span></button>
   <button type="button" data-div="dashed" role="menuitem" title="线段分隔线">线段 <span class="div-glyph div-dashed">╌╌╌╌╌╌╌╌</span></button>
   <button type="button" data-div="dotted" role="menuitem" title="点线分隔线">点线 <span class="div-glyph div-dotted">┈┈┈┈┈┈┈</span></button>
   <button type="button" data-div="double" role="menuitem" title="双线分隔线">双线 <span class="div-glyph div-double">════════</span></button>
+  <div class="sep"></div>
+  <button type="button" data-div="stars" role="menuitem" title="星形花样分隔">星形 <span class="div-glyph div-stars">★★★★★</span></button>
+  <button type="button" data-div="diamonds" role="menuitem" title="菱形花样分隔">菱形 <span class="div-glyph div-diamonds">◆◆◆◆◆</span></button>
+  <button type="button" data-div="circles" role="menuitem" title="圆点花样分隔">圆点 <span class="div-glyph div-circles">●●●●●</span></button>
+  <button type="button" data-div="flowers" role="menuitem" title="花纹花样分隔">花纹 <span class="div-glyph div-flowers">❀❀❀❀❀</span></button>
+  <button type="button" data-div="snow" role="menuitem" title="雪花花样分隔">雪花 <span class="div-glyph div-snow">❄❄❄❄❄</span></button>
+  <button type="button" data-div="wave" role="menuitem" title="波浪花样分隔">波浪 <span class="div-glyph div-wave">≈≈≈≈≈</span></button>
+  <button type="button" data-div="note" role="menuitem" title="注记花样分隔">注记 <span class="div-glyph div-note">※※※※※</span></button>
+  <button type="button" data-div="leaf" role="menuitem" title="叶形花样分隔">叶形 <span class="div-glyph div-leaf">❦❦❦❦❦</span></button>
 </div>
 <!-- 字符格式弹窗（2026-09-27）：逐字符 字号/字体/颜色，样式落在 span 的 style 上 -->
 <div id="charFormatModalBg"><div class="modal search-modal" role="dialog" aria-modal="true" aria-label="字符格式">
@@ -1199,6 +1330,8 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <button type="button" class="tb-btn" id="cfColorClearBtn" style="height:22px;" title="不修改颜色" aria-label="不修改颜色">不修改</button>
     </label>
   </div>
+  <!-- 颜色面板（2026-10-21）：常用色 + 色板 + #HEX/rgb() 输入 -->
+  <div class="cf-color-panel" id="cfColorPanel"></div>
   <div class="indent-preview" id="cfPreview"><p>预览：示例文字 ABC 123，可查看字号、字体与颜色的实际效果。</p></div>
   <div class="export-actions">
     <button type="button" id="cfClearBtn" title="清除所选范围内的逐字符字号/字体/颜色">清除字符格式</button>
@@ -1235,6 +1368,21 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   <div class="kg-row" id="keepGroupsRow" title="正则带捕获组时启用「部分替换」：勾选的组原样保留，只替换其余部分；组0=整段匹配全部保留">
     <span class="kg-hint">保留组</span>
     <div class="kg-chips" id="keepGroupsChips"></div>
+  </div>
+  <div class="search-row-group">
+    <div class="srow-label">按格式</div>
+    <div class="search-row">
+      <select id="fmtFindSel" title="要查找的格式（下划线/突显/粗体/颜色/字号…）" aria-label="查找格式"></select>
+      <button type="button" id="fmtFindBtn" class="primary" title="按格式查找：列出范围内所有带该格式的文字">查找格式</button>
+    </div>
+    <div class="search-row">
+      <select id="fmtReplaceSel" title="要替换成的目标格式" aria-label="替换格式"></select>
+      <span id="fmtValueWrap" class="fmt-value-wrap" style="display:none;">
+        <input type="text" id="fmtValueInput" class="fmt-value-input" placeholder="#ff0000 或 red" aria-label="目标格式取值">
+        <select id="fmtFontSel" class="fmt-value-input" style="display:none;" aria-label="目标字体"></select>
+      </span>
+      <button type="button" id="fmtReplaceBtn" title="把范围内所有「查找格式」命中的文字换成「替换格式」（颜色/字号/字体需填取值）">替换格式</button>
+    </div>
   </div>
   <div class="search-nav">
     <button type="button" id="searchPrevBtn" title="上一个匹配" aria-label="上一个匹配">↑</button>
@@ -1320,13 +1468,17 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   </div>
   <div class="settings-panels">
     <div class="settings-panel" id="panel-shortcuts">
-      <p style="font-size:12px;color:#5a6b7c;margin:8px 0;">每个操作绑定一个组合键；点击某行后按下新组合键完成绑定，Del/Backspace 清除，Esc 取消。绑定保存在本浏览器（localStorage）并同步到配置文件。</p>
+      <p style="font-size:12px;color:#5a6b7c;margin:8px 0;">每个操作绑定一个组合键；点击某行后按下新组合键（或鼠标侧键 X1/X2）完成绑定，Del/Backspace 清除，Esc 取消。绑定保存在本浏览器（localStorage）并同步到配置文件。</p>
       <table id="shortcutTable"></table>
       <div style="margin-top:8px;"><button type="button" id="resetShortcutsBtn">恢复默认</button></div>
       <h4 style="margin:18px 0 4px;">鼠标动作</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">按住鼠标中键滑动触发对应操作（如中键上滑 = 居中）。点击某行后按住中键滑动完成绑定，Del/Backspace 清除，Esc 取消。绑定保存在配置文件。</p>
       <table id="mouseShortcutTable"></table>
       <div style="margin-top:8px;"><button type="button" id="resetMouseShortcutsBtn">恢复默认</button></div>
+      <h4 style="margin:18px 0 4px;">鼠标侧键</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">鼠标侧键（X1 后退 / X2 前进）可以<b>单独</b>绑定到某个操作，<b>不需要</b>和键盘按键组合使用；也可以在上方「快捷键」表里点击某行后直接按侧键完成绑定。</p>
+      <table id="sideButtonTable"></table>
+      <p style="font-size:12px;color:#5a6b7c;margin:10px 0 0;">提示：选中文字后弹出的快捷菜单只响应鼠标左键与右键；中键专用于上/下/左/右滑动手势，落在菜单上不会误触发菜单操作。</p>
     </div>
     <div class="settings-panel" id="panel-fonts" style="display:none;">
       <p style="font-size:12px;color:#5a6b7c;margin:8px 0;">设置各类文本的字体（CSS font-family）。默认「不修改」= 使用阅读器默认字体，不额外指定。</p>
@@ -1491,14 +1643,24 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：&lt;font color="red"&gt;红&lt;/font&gt; → 红</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
         <input type="checkbox" id="cleanParagraphsChk" style="width:16px;height:16px;">
-        段落合并优化（OCR 误拆段落自动合并，默认关闭）
+        段落合并优化（OCR 误拆段落自动合并，并自动清理合并后的段内空白，默认关闭）
       </label>
-      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：&lt;p&gt;未完&lt;/p&gt;&lt;p&gt;待续&lt;/p&gt; → &lt;p&gt;未完待续&lt;/p&gt;</p>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：&lt;p&gt;未完&lt;/p&gt;&lt;p&gt;&amp;nbsp;待续&lt;/p&gt; → &lt;p&gt;未完待续&lt;/p&gt;</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
         <input type="checkbox" id="cleanDigitPunctChk" style="width:16px;height:16px;">
         数字/字母标点归一（数字、字母间的中文标点 → 英文，含空格容忍；并清理数字间/单字母间空格）
       </label>
       <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：1。2 → 1.2，1，2 → 1,2，1。 → 1.；映射表可在下方自定义</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="cleanSpacesChk" style="width:16px;height:16px;">
+        清理段落内空白（删除空格 / 制表符 / 全角空格，合并 OCR 软换行；逐行对齐段保留换行，默认关闭）
+      </label>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：你好 世界 → 你好世界（行首行尾、中文之间的空格都会被删；OCR 软换行会合并，逐行对齐段保留换行）</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
+        <input type="checkbox" id="cleanSpacesGapChk" style="width:16px;height:16px;">
+        保留英文单词之间的空格（清理段落内空白 / 合并段落时生效）
+      </label>
+      <p style="font-size:11px;color:#8a9bab;margin:2px 0 0 24px;">示例：hello world → hello world（不勾选则变成 helloworld）</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:8px;">
         <input type="checkbox" id="cleanBlankLinesChk" style="width:16px;height:16px;">
         导出时清理空白行（删掉空段落、连续空行合并为一个，默认关闭）
@@ -1685,6 +1847,10 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
 </div></div>
 <div id="historyModalBg"><div class="modal" style="max-width:960px; min-width:360px;">
   <h3>历史记录</h3>
+  <div style="display:flex;gap:8px;margin:8px 0;">
+    <input type="text" id="historySearchInput" placeholder="按文件名/路径搜索…" style="flex:1;min-width:200px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;font:inherit;font-size:12px;">
+    <button type="button" id="historySearchClear" style="display:none;padding:4px 12px;border:1px solid var(--border);border-radius:4px;background:var(--bg-elev);color:var(--text);font:inherit;font-size:12px;cursor:pointer;">清除</button>
+  </div>
   <p style="font-size:12px;color:#5a6b7c;">本地矫正缓存（同一文件保留多个版本，v1 为最新）。文件名与路径分列显示，同名不同路径的文件可区分；勾选后可删除或导出（支持多选）。</p>
   <div style="max-height:50vh;overflow:auto;border:1px solid var(--border);border-radius:4px;margin-top:6px;">
     <table id="historyTable" style="width:100%;border-collapse:collapse;font-size:13px;">
@@ -1809,6 +1975,10 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   </div>
 </div>
 <div id="toast" aria-hidden="true"></div>
+<!-- KaTeX（2026-10-21）：LaTeX 公式渲染成 MathML。随包分发（ui/vendor/），
+     离线可用——矫正界面可能在无外网环境，不能依赖 CDN。缺失时公式按钮会提示
+     「公式功能不可用」，其余功能不受影响。 -->
+<script src="/ui/vendor/katex.min.js"></script>
 <script src="/ui/app.js"></script>
 </body>
 </html>

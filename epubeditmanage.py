@@ -658,6 +658,11 @@ class _EpubEditHandler(BaseHTTPRequestHandler):
                 clean_html_tags=opts["clean_html_tags"],
                 clean_paragraphs=opts["clean_paragraphs"],
                 symbol_map=sym_map,
+                # 清理段落内空白（2026-10-21）：删水平空白、保留换行
+                clean_spaces=bool(opts.get("clean_spaces", False)),
+                clean_spaces_keep_word_gap=bool(
+                    opts.get("clean_spaces_keep_word_gap", True)
+                ),
             )
         except Exception as exc:
             self._send(200, self._json({"ok": False, "error": f"清理失败：{exc}"}))

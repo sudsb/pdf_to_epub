@@ -9,7 +9,7 @@ CLI:
   python mian.py stop [--engine llama|vllm]   # 停止推理服务（llama-server / vLLM-Omni，释放端口）
 
 --dpi 接受档位 0-4（0=100, 1=150, 2=200, 3=300, 4=600）或原始 DPI 数值（36-1200）；
-未指定时回退到 config.json 的 dpi 键（默认 100）。可用
+未指定时回退到 config.json 的 dpi 键（默认 200）。可用
 `mian.py config set dpi 200` 持久化默认值。
 --correct 开启手动矫正：在浏览器中逐页对照原图与识别文字（默认关闭）。
 
@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from pdfmanage import split_pdf_to_images
+import progressmanage
 
 # Defer importing llamamanage (requests dependency) to runtime paths that need OCR.
 # Provide a safe fallback for REQUEST_TIMEOUT so CLI help and flags work.
@@ -45,16 +46,30 @@ def parse_exclude_spec(spec, label: str = "排除") -> set[int]:
     - 字符串 "1-15,17,20" -> {1..15, 17, 20}
     - 字符串 "1-15, 17, 20" （允许空白）
     - 列表 [1, 2, 5] -> {1, 2, 5}
-    - 空/None/"" -> 空集合
+    - 列表 ["1-3", "5"] / 嵌套列表 -> 递归解析（GUI/config 保存的混合格式）
+    - 空/None/""/空白 -> 空集合
     - 无效 token 会被忽略并打印警告（不崩溃）。
     """
     excluded: set[int] = set()
     if spec is None:
         return excluded
     if isinstance(spec, (list, tuple, set)):
+        # 列表/元组/集合：元素既可能是页码整数，也可能是 GUI 保存的区间字符串
+        # （如 ["1-15", "17"]）。此前只做 int(v)，区间项被静默忽略，导致
+        #「设置页排除页后 CLI 不生效」；这里按元素类型分别递归解析。
         for v in spec:
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, str):
+                excluded |= parse_exclude_spec(v, label=label)
+                continue
+            if isinstance(v, (list, tuple, set)):
+                excluded |= parse_exclude_spec(v, label=label)
+                continue
             try:
-                excluded.add(int(v))
+                n = int(v)
+                if n >= 1:
+                    excluded.add(n)
             except (TypeError, ValueError):
                 print(f"      ! {label}页码忽略无效项: {v!r}", file=sys.stderr)
         return excluded
@@ -92,6 +107,22 @@ def parse_exclude_spec(spec, label: str = "排除") -> set[int]:
         return parse_exclude_spec(str(spec), label=label)
     except Exception:
         return excluded
+
+
+def resolve_exclude_spec(exclude, cfg_exclude):
+    """选择本次运行实际使用的排除页规格。
+
+    ``--exclude`` 为空（None / 空白字符串 / 空列表）表示未指定，回退配置
+    ``exclude_pages``；非空值优先于配置。GUI 转换页每次都会提交 exclude 字段，
+    必须区分「留空」与「明确排除」，否则界面留空会覆盖配置里保存的排除页。
+    """
+    if exclude is None:
+        return cfg_exclude
+    if isinstance(exclude, str) and not exclude.strip():
+        return cfg_exclude
+    if isinstance(exclude, (list, tuple, set)) and not exclude:
+        return cfg_exclude
+    return exclude
 
 
 def parse_page_spec(spec) -> set[int] | None:
@@ -220,7 +251,7 @@ DPI_MIN = 36
 DPI_MAX = 1200
 
 
-def resolve_dpi(value, default: int = 100) -> int:
+def resolve_dpi(value, default: int = 200) -> int:
     """把 --dpi / 交互输入解析为原始 DPI 数值。
 
     接受两种写法：
@@ -251,6 +282,83 @@ def resolve_dpi(value, default: int = 100) -> int:
 
 # 进度条宽度（字符）
 _BAR_WIDTH = 24
+
+
+# ---------------------------------------------------------------------------
+# 进度上报协议（GUI 模式）
+# ---------------------------------------------------------------------------
+# GUI 转换页只显示「一条进度条 + 一条消息」，其余细节写本地日志文件。
+# 为此，转换子进程在 PTOE_UI_PROGRESS=1（guimanage 启动时注入）时向 stdout
+# 打印单行结构化标记：
+#   __PTOE_PROGRESS__ {"stage": "ocr", "message": "正在识别 3/10 页",
+#                      "done": 3, "total": 10, "percent": 30.0}
+# guimanage 的监控线程截获该标记后更新界面进度条/消息，标记行本身不进入
+# 界面日志（但会写入本地日志文件，便于排查）。
+_PROGRESS_MARKER = "__PTOE_PROGRESS__"
+_UI_PROGRESS_ENV = "PTOE_UI_PROGRESS"
+
+# 转换 ETA 跟踪器（2026-10-21）：CLI 终端进度条与 GUI 进度条共用同一份
+# 「阶段内剩余 + 整体剩余」估算（见 progressmanage.py）。
+_ETA_TRACKER = progressmanage.EtaTracker()
+
+# 进度阶段（GUI 界面按阶段换文案；整体百分比由界面按阶段权重换算）
+_PROGRESS_STAGES = (
+    "split",  # PDF 分割为图片
+    "ocr",  # 文字识别
+    "structure",  # 文本结构化
+    "render",  # 渲染 XHTML / 打包 EPUB
+    "correct",  # 手动矫正
+    "done",  # 完成
+    "error",  # 失败
+)
+
+
+def _gui_progress_mode() -> bool:
+    """是否 GUI 转换子进程模式（guimanage 启动时置 PTOE_UI_PROGRESS=1）。"""
+    import os
+
+    return os.environ.get(_UI_PROGRESS_ENV) == "1"
+
+
+def _emit_progress(
+    stage: str,
+    message: str,
+    *,
+    done: int = 0,
+    total: int = 0,
+    percent: float = 0.0,
+) -> dict:
+    """向 GUI 上报一次进度（仅 GUI 模式打印标记行；其它模式静默）。
+
+    非 GUI 模式（终端 / 管道）不打印标记行，避免污染控制台输出。
+    返回本次的 ETA 信息（阶段内剩余 / 整体剩余 / 预计完成时刻），
+    CLI 终端进度条复用同一份估算（2026-10-21）。
+    """
+    info = {}
+    try:
+        info = _ETA_TRACKER.update(stage, done=done, total=total)
+    except Exception:  # noqa: BLE001  ETA 估算失败不能影响转换
+        info = {}
+    if not _gui_progress_mode():
+        return info
+    import json
+
+    payload = {
+        "stage": stage,
+        "message": message,
+        "done": int(done or 0),
+        "total": int(total or 0),
+        "percent": round(float(percent or 0.0), 2),
+    }
+    # ETA（2026-10-21）：动态预计完成时间，供 GUI 渲染
+    for _k in ("eta_sec", "eta_total_sec", "eta_at", "elapsed_sec"):
+        if info.get(_k) is not None:
+            payload[_k] = info[_k]
+    try:
+        print(f"{_PROGRESS_MARKER} {json.dumps(payload, ensure_ascii=False)}", flush=True)
+    except Exception:  # noqa: BLE001  进度上报失败不能影响转换
+        pass
+    return info
 
 
 # 终端菜单横幅：字符画大字标题 + 双线边框，宽度 ≤ 78 列（含边框）
@@ -431,6 +539,7 @@ def correct_pdf(
     epub_path: str | Path | None = None,
     idle_timeout: int = 600,
     history_id: str | None = None,
+    live_ocr: bool = False,
 ) -> dict:
     """直接启动手动矫正界面（不跑 OCR）。
 
@@ -536,6 +645,7 @@ def correct_pdf(
         idle_timeout=idle_timeout,
         on_convert=_convert_corrected,
         history_id=history_id,
+        live_ocr=live_ocr,
     )
     if last_convert.get("result") is not None:
         # 浏览器端已「完成并转换」过（可多次），直接用最近一次转换结果
@@ -632,7 +742,7 @@ def _print_timing_summary(timings: dict[str, float], *, ocr_pages: int) -> None:
 def pdf_to_epub(
     pdf_path: str | Path,
     *,
-    dpi: int = 100,
+    dpi: int = 200,
     model_key: str = "HY",
     max_workers: int | None = None,
     thinking: bool = False,
@@ -676,6 +786,7 @@ def pdf_to_epub(
     print(f" done in {timings['split']:.1f}s")
     print(f"      {len(img_paths)} page(s) -> {img_dir}")
     logger.info(f"split done: pages={len(img_paths)}, dir={img_dir}, elapsed={timings['split']:.1f}s")
+    _emit_progress("split", f"PDF 已分割为 {len(img_paths)} 页图片")
 
     engine_label = _active_ocr_engine()
     if engine_label == "paddle":
@@ -696,7 +807,9 @@ def pdf_to_epub(
     from configmanage import get_config
 
     cfg = get_config(show_dialogs=False)
-    exclude_spec = exclude if exclude is not None else cfg.get("exclude_pages")
+    # 空字符串/空列表视为「未指定」→ 回退配置：GUI 转换页总会提交 exclude 字段，
+    # 若用户在界面留空，不应让空的 --exclude 覆盖 config.json 里已保存的排除页。
+    exclude_spec = resolve_exclude_spec(exclude, cfg.get("exclude_pages"))
     excluded_pages = parse_exclude_spec(exclude_spec)
     if excluded_pages:
         # 只保留在有效页码范围内的排除页
@@ -786,16 +899,61 @@ def pdf_to_epub(
         timings["model"] = time.perf_counter() - t_model
         logger.info(f"server ready: model={model_key}, elapsed={timings['model']:.1f}s")
 
+    # 终端进度条是否已绘制（原地刷新用；批次结束后补一个换行）
+    _ocr_bar_drawn = False
+
     def _on_progress(done: int, total: int) -> None:
-        """每完成一页 OCR 输出一行进度：已完成页数 + 百分比 + 已用时间（总 + 本步骤）。"""
+        """每完成一页 OCR 上报进度。
+
+        终端模式：同一条进度条原地刷新（只占一行），不再逐页刷屏；
+        GUI 模式：额外打印结构化进度标记行（界面据此渲染进度条+消息），
+        终端不再重复打印进度条（界面已有进度条）。
+        逐页细节（页码/耗时）写入文件日志。
+        """
+        nonlocal _ocr_bar_drawn
         elapsed = time.perf_counter() - t_start
         pct = done / total * 100 if total else 100.0
         filled = round(_BAR_WIDTH * pct / 100)
         bar = "#" * filled + "-" * (_BAR_WIDTH - filled)
-        print(
+        logger.info(
+            f"ocr progress: {done}/{total} ({pct:.1f}%) elapsed={elapsed:.1f}s"
+        )
+        eta_info = _emit_progress(
+            "ocr",
+            f"正在识别 {done}/{total} 页（{pct:.0f}%）",
+            done=done,
+            total=total,
+            percent=pct,
+        )
+        if _gui_progress_mode():
+            # GUI 已有进度条，终端不再打印（避免同一信息两处显示）
+            return
+        # 预计完成时间（2026-10-21）：阶段内剩余 + 整体剩余（随进度动态修正）
+        eta_txt = ""
+        if eta_info.get("eta_sec") is not None:
+            eta_txt = f" | eta {progressmanage.format_duration(eta_info['eta_sec'])}"
+        finish_txt = ""
+        if eta_info.get("eta_at"):
+            finish_txt = f" | finish ~{progressmanage.format_clock(eta_info['eta_at'])}"
+        line = (
             f"      OCR {done}/{total} [{bar}] {pct:5.1f}% | "
             f"elapsed {elapsed:6.1f}s | step {time.perf_counter() - t_ocr:6.1f}s"
+            f"{eta_txt}{finish_txt}"
         )
+        try:
+            if sys.stdout.isatty():
+                # 原地刷新同一行（\r + 清行尾），终端只保留一条进度条
+                if not _ocr_bar_drawn:
+                    # 首次绘制前换行：阶段前缀行（[2/4] OCR via …）不被进度条覆盖
+                    sys.stdout.write("\n")
+                sys.stdout.write("\r" + line + "\x1b[K")
+                sys.stdout.flush()
+                _ocr_bar_drawn = True
+            elif done == total:
+                # 管道/重定向：只在结束时打印一次（逐页输出会污染日志文件）
+                print(line, flush=True)
+        except Exception:  # noqa: BLE001  进度输出失败不能影响识别
+            pass
 
     # 进度写盘节流（2026-08-17 性能调优）：每页完成都整文件原子写，文件随页数
     # 增长（含全部已识别文本），快模型下磁盘写会成为批次瓶颈。改为最多每 2 秒
@@ -903,6 +1061,14 @@ def pdf_to_epub(
         results = []
     if total_pages == 0:
         print()
+    # 终端进度条收尾：原地刷新的进度条占着当前行，先换行再打印后续内容
+    if _ocr_bar_drawn and not _gui_progress_mode():
+        try:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        except Exception:  # noqa: BLE001
+            pass
+    _ocr_bar_drawn = False
 
     # 合并缓存结果 + 本次识别结果（按页排序）
     merged: dict[int, dict] = {
@@ -927,7 +1093,15 @@ def pdf_to_epub(
             error_count += 1
         pages.append({"page": page_no, "text": r.get("result") or ""})
     logger.info(f"ocr done: total_pages={total_pages}, todo={len(todo_images)}, excluded={len(excluded_pages)}, errors={error_count}, elapsed={timings.get('ocr', 0):.1f}s")
+    _emit_progress(
+        "ocr",
+        f"识别完成，共 {len(pages)} 页",
+        done=len(pages),
+        total=len(pages),
+        percent=100.0,
+    )
 
+    _emit_progress("structure", "正在整理文本结构")
     print(f"[3/4] Structuring text ({len(pages)} page(s)) ...", end="", flush=True)
     t0 = time.perf_counter()
     structured = clean_and_structure_text(pages)
@@ -957,6 +1131,7 @@ def pdf_to_epub(
 
     if correct:
         print("      矫正（OCR 文字与原文对照；默认关闭，仅 --correct 时启用）")
+        _emit_progress("correct", "等待手动矫正")
         t0 = time.perf_counter()
         last_convert: dict[str, Any] = {}
         from correctmanage import correct_pages
@@ -988,6 +1163,7 @@ def pdf_to_epub(
         timings["correct"] = time.perf_counter() - t0
         print(f"      矫正完成 in {timings['correct']:.1f}s")
         logger.info(f"correct done: elapsed={timings['correct']:.1f}s")
+        _emit_progress("correct", "矫正完成")
         if last_convert.get("result") is not None:
             # 浏览器端已「完成并转换」过（可多次），直接用最近一次转换结果
             result = last_convert["result"]
@@ -1003,6 +1179,7 @@ def pdf_to_epub(
         timings["history"] = time.perf_counter() - t_hist
         logger.info(f"history done: elapsed={timings['history']:.1f}s")
         print("[4/4] Rendering XHTML and packing EPUB ...", end="", flush=True)
+        _emit_progress("render", "正在生成 XHTML 与 EPUB")
         t0 = time.perf_counter()
         result = HTMLConverter(
             output_dir=str(root), epub_version="3.0"
@@ -1021,9 +1198,11 @@ def pdf_to_epub(
     if result.get("epub"):
         print(f"Done: {result['epub']}")
         logger.info(f"pdf_to_epub success: epub={result['epub']}, total_elapsed={timings['total']:.1f}s")
+        _emit_progress("done", f"EPUB 已生成：{result['epub']}", percent=100.0)
     elif result.get("epub_error"):
         print(f"EPUB packaging failed: {result['epub_error']}", file=sys.stderr)
         logger.error(f"pdf_to_epub failed: epub_error={result['epub_error']}, total_elapsed={timings['total']:.1f}s")
+        _emit_progress("error", f"EPUB 打包失败：{result['epub_error']}")
     return result
 
 
@@ -1257,8 +1436,8 @@ def _menu_epub(cfg: dict) -> None:
     model = _ask(f"模型键（默认 {cfg.get('selected_model', 'HY')}，回车用默认）：")
     if not model:
         model = cfg.get("selected_model", "HY")
-    # DPI：默认取 config.json 的 dpi（默认 100）；可输入档位 0-4 或原始数值（36-1200）。
-    dpi_default = resolve_dpi(cfg.get("dpi"), 100)
+    # DPI：默认取 config.json 的 dpi（默认 200）；可输入档位 0-4 或原始数值（36-1200）。
+    dpi_default = resolve_dpi(cfg.get("dpi"), 200)
     dpi_in = _ask(
         f"DPI（档位 0-4 或数值 {DPI_MIN}-{DPI_MAX}，默认 {dpi_default}，回车用默认）："
     )
@@ -1606,12 +1785,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Convert a PDF to an EPUB file",
         description="PDF -> images -> OCR -> XHTML -> EPUB",
     )
-    epub_p.add_argument("pdf", help="Path to the source PDF")
+    epub_p.add_argument(
+        "pdf",
+        nargs="+",
+        help="Path to the source PDF（可给多个，按顺序逐本转换）",
+    )
     epub_p.add_argument(
         "--dpi",
         default=None,
         help="DPI：档位 0-4（0=100, 1=150, 2=200, 3=300, 4=600）或原始数值 36-1200"
-        "（默认取 config.json 的 dpi，缺省 100）",
+        "（默认取 config.json 的 dpi，缺省 200）",
     )
     epub_p.add_argument(
         "--model",
@@ -1727,6 +1910,11 @@ def main(argv: list[str] | None = None) -> int:
         help="浏览器被关闭后自动继续后续流程的等待秒数（默认 600=10 分钟）",
     )
     correct_p.add_argument(
+        "--live-ocr",
+        action="store_true",
+        help="实时跟随 OCR 进度：转换进行中启动矫正时，识别完成的页面实时进入矫正界面",
+    )
+    correct_p.add_argument(
         "--history-id",
         default=None,
         help="打开指定历史版本矫正（版本 id = data/correction_history/ 下文件名的 stem，"
@@ -1770,7 +1958,7 @@ def main(argv: list[str] | None = None) -> int:
         "--dpi",
         default=None,
         help="DPI：档位 0-4（0=100, 1=150, 2=200, 3=300, 4=600）或原始数值 36-1200"
-        "（默认取 config.json 的 dpi，缺省 100）",
+        "（默认取 config.json 的 dpi，缺省 200）",
     )
     resume_p.add_argument(
         "--model",
@@ -2117,6 +2305,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             print(f"  ocr_prompt: {cfg.get('ocr_prompt', '')}")
             print(f"  paddle_merge_lines: {_paddle_merge_lines()}")
+            print(f"  paddle_det_limit: {cfg.get('paddle_det_limit', 960)}")
             print(f"  table_convert: {cfg.get('table_convert', True)}")
             sargs = cfg.get("llama_server_args", {}) or {}
             print("  llama_server_args:")
@@ -2152,6 +2341,33 @@ def main(argv: list[str] | None = None) -> int:
                 set_proofread_param(sub, value)
                 print(f"{key} = {value}")
                 return 0
+            if key.startswith("ui_settings."):
+                # ui_settings.<键名>：智能清理等界面开关（2026-10-21 新增）
+                # 走 configmanage.set_ui_settings 做逐键校验 + 原子写盘
+                sub = key.split(".", 1)[1]
+                from configmanage import CLEAN_SETTINGS_DEFAULTS, set_ui_settings
+
+                if sub not in CLEAN_SETTINGS_DEFAULTS:
+                    print(
+                        f"Error: 未知的 ui_settings 键：{sub}"
+                        f"（可用：{', '.join(sorted(CLEAN_SETTINGS_DEFAULTS))}）",
+                        file=sys.stderr,
+                    )
+                    return 1
+                raw = str(value).strip().lower()
+                if raw in ("1", "true", "yes", "on"):
+                    val = True
+                elif raw in ("0", "false", "no", "off"):
+                    val = False
+                else:
+                    print(
+                        "Error: 布尔值仅支持 1/0、true/false、yes/no、on/off",
+                        file=sys.stderr,
+                    )
+                    return 1
+                set_ui_settings({sub: val})
+                print(f"ui_settings.{sub} = {val}")
+                return 0
             if key not in (
                 "llama_server",
                 "models_dir",
@@ -2164,13 +2380,14 @@ def main(argv: list[str] | None = None) -> int:
                 "window_maximized",
                 "tabs_position",
                 "paddle_merge_lines",
+                "paddle_det_limit",
                 "table_convert",
                 "dpi",
                 "ocr_batch_size",
                 "ocr_group_by_size",
             ):
                 print(
-                    "Error: 可修改的键名仅限 llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / browser / gui_display / window_maximized / tabs_position / paddle_merge_lines / table_convert / dpi / ocr_batch_size / ocr_group_by_size / llama_server_args.<参数名> / vllm_server_args.<参数名> / proofread.<param>",
+                    "Error: 可修改的键名仅限 llama_server / models_dir / selected_model / ocr_prompt / engine / vllm_server / browser / gui_display / window_maximized / tabs_position / paddle_merge_lines / paddle_det_limit / table_convert / dpi / ocr_batch_size / ocr_group_by_size / llama_server_args.<参数名> / vllm_server_args.<参数名> / proofread.<param> / ui_settings.<键名>",
                     file=sys.stderr,
                 )
                 return 1
@@ -2246,6 +2463,22 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     return 1
                 value = parsed
+            if key == "paddle_det_limit":
+                # 检测最长边上限：0=关闭（按原图检测），否则 64-4000
+                try:
+                    n = int(str(value).strip())
+                except (TypeError, ValueError):
+                    n = -1
+                if n == 0:
+                    value = 0
+                elif 64 <= n <= 4000:
+                    value = n
+                else:
+                    print(
+                        "Error: paddle_det_limit 仅接受 0（关闭）或 64-4000 的整数",
+                        file=sys.stderr,
+                    )
+                    return 1
             update_config(key, value)
             print(f"{key} = {value}")
             return 0
@@ -2286,37 +2519,65 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "epub":
         try:
             _apply_engine_arg(args.engine)
-            result = pdf_to_epub(
-                args.pdf,
-                dpi=resolve_dpi(args.dpi, cfg.get("dpi", 100)),
-                model_key=args.model,
-                max_workers=args.workers,
-                thinking=args.thinking,
-                timeout=args.timeout,
-                title=args.title,
-                author=args.author,
-                language=args.lang,
-                out_dir=args.out_dir,
-                epub_path=args.epub_path,
-                correct=args.correct,
-                correct_idle_timeout=args.correct_timeout,
-                resume=(
-                    "resume" if args.resume else ("restart" if args.restart else None)
-                ),
-                exclude=args.exclude,
-            )
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
-        if result.get("epub_error"):
-            return 1
-        return 0
+        pdfs = args.pdf if isinstance(args.pdf, (list, tuple)) else [args.pdf]
+        multi = len(pdfs) > 1
+        out_root = Path(args.out_dir) if args.out_dir else None
+        if multi:
+            if args.title:
+                print("  ! 批量转换：--title 仅对单本有效，已忽略", file=sys.stderr)
+            if args.epub_path:
+                print("  ! 批量转换：--epub-path 仅对单本有效，已忽略", file=sys.stderr)
+        failed = 0
+        for idx, pdf_path in enumerate(pdfs, start=1):
+            book_title = None if multi else args.title
+            book_epub_path = None if multi else args.epub_path
+            book_out_dir = args.out_dir
+            if multi and out_root is not None:
+                # 多本共用一个输出目录时按书名分子目录，避免 OEBPS/EPUB 互相覆盖
+                book_out_dir = str(out_root / Path(pdf_path).stem)
+            if multi:
+                print(f"[book {idx}/{len(pdfs)}] {pdf_path}")
+            try:
+                result = pdf_to_epub(
+                    pdf_path,
+                    dpi=resolve_dpi(args.dpi, cfg.get("dpi", 200)),
+                    model_key=args.model,
+                    max_workers=args.workers,
+                    thinking=args.thinking,
+                    timeout=args.timeout,
+                    title=book_title,
+                    author=args.author,
+                    language=args.lang,
+                    out_dir=book_out_dir,
+                    epub_path=book_epub_path,
+                    correct=args.correct,
+                    correct_idle_timeout=args.correct_timeout,
+                    resume=(
+                        "resume" if args.resume else ("restart" if args.restart else None)
+                    ),
+                    exclude=args.exclude,
+                )
+            except Exception as e:
+                # 单本失败不中断后续（批量语义）
+                print(f"Error: {pdf_path} 转换失败：{e}", file=sys.stderr)
+                failed += 1
+                continue
+            if result.get("epub_error"):
+                print(
+                    f"Error: {pdf_path} EPUB 生成失败：{result['epub_error']}",
+                    file=sys.stderr,
+                )
+                failed += 1
+        return 1 if failed else 0
     if args.command == "resume":
         try:
             _apply_engine_arg(args.engine)
             result = pdf_to_epub(
                 args.pdf,
-                dpi=resolve_dpi(args.dpi, cfg.get("dpi", 100)),
+                dpi=resolve_dpi(args.dpi, cfg.get("dpi", 200)),
                 model_key=args.model,
                 max_workers=args.workers,
                 thinking=args.thinking,
@@ -2362,6 +2623,7 @@ def main(argv: list[str] | None = None) -> int:
                 epub_path=args.epub_path,
                 idle_timeout=args.correct_timeout,
                 history_id=args.history_id,
+                live_ocr=bool(getattr(args, "live_ocr", False)),
             )
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)

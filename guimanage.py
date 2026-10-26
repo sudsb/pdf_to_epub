@@ -49,6 +49,11 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+# 转换子进程输出的结构化进度标记前缀（与 mian.py 的 _PROGRESS_MARKER 一致）。
+# 子进程每到一个阶段打印一行 "__PTOE_PROGRESS__{json}"：界面据此渲染
+# 「一条进度条 + 一条消息」，其余 stdout 全部写入本地日志文件。
+_PROGRESS_MARKER = "__PTOE_PROGRESS__"
+
 # 占位符：集成阶段由编排者替换成真实 UI 文件内容（不得删除该占位行）
 _UI_HTML = r"""
 <!DOCTYPE html>
@@ -112,6 +117,16 @@ body{height:100%;font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",
 .form-ctrl .pick-row{display:flex;gap:6px;align-items:center}
 .form-ctrl .pick-row input{flex:1}
 .form-hint{font-size:11px;color:var(--text-dim);margin-top:4px}
+.prog-wrap{margin:2px 0 4px}
+.prog-track{height:10px;border-radius:6px;background:var(--bg);border:1px solid var(--border);overflow:hidden}
+.prog-fill{height:100%;width:0;border-radius:6px;background:linear-gradient(90deg,var(--accent),#5b9bff);transition:width .25s ease}
+.prog-fill.done{background:linear-gradient(90deg,var(--green),#4cc27a)}
+.prog-fill.err{background:linear-gradient(90deg,var(--red),#e07a6e)}
+.prog-msg{margin-top:8px;font-size:13px;color:var(--text-sec);min-height:20px;word-break:break-all}
+.prog-msg.ok{color:var(--green)}
+.prog-msg.err{color:var(--red)}
+.prog-msg.warn{color:var(--yellow)}
+.log-path{font-size:11px;color:var(--text-dim);word-break:break-all;margin-top:2px}
 .status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:16px}
 .status-item{background:var(--bg);border-radius:var(--radius-sm);padding:12px 14px;display:flex;flex-direction:column;gap:4px}
 .status-item .si-label{font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px}
@@ -183,6 +198,9 @@ body{height:100%;font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",
 /* 历史记录重命名弹窗 */
 #renameInput{width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;font-size:13px;color:var(--text);background:var(--card);transition:border-color .15s}
 #renameInput:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgba(47,111,237,.12)}
+/* 历史记录搜索框 */
+#historySearchInput{padding:5px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;font-size:13px;background:var(--card);color:var(--text)}
+#historySearchInput:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgba(47,111,237,.12)}
 /* 按压反馈：统一微暗 + 微缩（纯 CSS） */
 #saveBtn:active,.btn-outline:active,.btn-small:active,.btn-add:active,.btn-start:active,.btn-stop-convert:active,.engine-switch button:active,.del-btn:active,.menu-toggle:active{transform:scale(.97);filter:brightness(.95)}
 /* 尊重系统「减少动态效果」偏好：关闭本页新增动效 */
@@ -202,6 +220,7 @@ body{height:100%;font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",
 <div class="layout">
   <nav class="sidebar" id="sidebar">
     <div class="nav-item" data-page="convert" onclick="switchPage('convert')"><span class="nav-icon">▶</span> 转换</div>
+    <div class="nav-item" data-page="correct" onclick="switchPage('correct')"><span class="nav-icon">✎</span> 矫正</div>
     <div class="nav-item active" data-page="status" onclick="switchPage('status')"><span class="nav-icon">◉</span> 服务状态<span class="nav-badge stopped" id="navStatusBadge">--</span></div>
     <div class="nav-item" data-page="basic" onclick="switchPage('basic')"><span class="nav-icon">⚙</span> 基础设置</div>
     <div class="nav-item" data-page="models" onclick="switchPage('models')"><span class="nav-icon">★</span> 模型管理</div>
@@ -264,7 +283,7 @@ body{height:100%;font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",
         <div class="card-title"><span class="ct-icon">★</span> 模型与引擎</div>
         <div class="form-row"><span class="form-label">当前模型</span><div class="form-ctrl"><select id="cfgSelectedModel"></select></div></div>
         <div class="form-row"><span class="form-label">推理引擎</span><div class="form-ctrl" style="display:flex;gap:16px;align-items:center;"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgEngine" value="llama" checked> llama.cpp</label><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgEngine" value="vllm"> vLLM-Omni</label><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgEngine" value="paddle"> PaddleOCR</label></div></div>
-        <div class="form-row"><span class="form-label">合并多行为段落</span><div class="form-ctrl"><input type="checkbox" id="cfgPaddleMergeLines" title="仅 PaddleOCR 引擎生效" aria-label="合并多行为段落（仅 PaddleOCR 引擎生效）"></div><div class="form-hint">把 PaddleOCR 识别出的多行文本合并成段落（仅 PaddleOCR 引擎生效，llama.cpp / vLLM-Omni 不使用）。</div></div><div class="form-row"><span class="form-label">识别表格转换为表格</span><div class="form-ctrl"><input type="checkbox" id="cfgTableConvert" aria-label="识别表格转换为表格"></div><div class="form-hint">把识别文本里的表格（Markdown 管道表 / 画框字符表）自动转成程序原生表格。</div></div>
+        <div class="form-row"><span class="form-label">合并多行为段落</span><div class="form-ctrl"><input type="checkbox" id="cfgPaddleMergeLines" title="仅 PaddleOCR 引擎生效" aria-label="合并多行为段落（仅 PaddleOCR 引擎生效）"></div><div class="form-hint">把 PaddleOCR 识别出的多行文本合并成段落（仅 PaddleOCR 引擎生效，llama.cpp / vLLM-Omni 不使用）。</div></div><div class="form-row"><span class="form-label">检测最长边</span><div class="form-ctrl"><input type="number" id="cfgPaddleDetLimit" min="0" max="4000" step="80" style="width:110px;" placeholder="960"></div><div class="form-hint">仅 PaddleOCR 生效：0=关闭（按原图分辨率检测），默认 960。检测降分辨率、识别仍用原图裁线，200dpi 密排书约省 100ms/页。</div></div><div class="form-row"><span class="form-label">识别表格转换为表格</span><div class="form-ctrl"><input type="checkbox" id="cfgTableConvert" aria-label="识别表格转换为表格"></div><div class="form-hint">把识别文本里的表格（Markdown 管道表 / 画框字符表）自动转成程序原生表格。</div></div>
         <div class="form-row"><span class="form-label">校正引擎</span><div class="form-ctrl" style="display:flex;gap:16px;align-items:center;"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgProofreadEngine" value="llama" checked> llama.cpp</label><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="radio" name="cfgProofreadEngine" value="vllm"> vLLM-Omni</label></div><div class="form-hint">矫正界面使用的引擎（PaddleOCR 仅用于转换的图片识别阶段，不参与矫正/重识别）。</div></div>
       </div>
       <div class="card">
@@ -367,31 +386,24 @@ body{height:100%;font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",
     <!-- 9. 转换 -->
     <div class="page" id="page-convert">
       <h2 class="page-title">PDF → EPUB 转换</h2>
-      <p class="page-desc">选择 PDF 文件并设置参数，一键启动完整的转换流程。</p>
-      <!-- 矫正界面 -->
-      <div class="card">
-        <div class="card-title" style="display:flex;align-items:center;gap:8px;"><span class="ct-icon">✎</span> 矫正界面<span id="correctCount" style="margin-left:auto;font-size:12px;color:var(--text-dim);"></span></div>
-        <p class="page-desc" style="margin:0 0 12px;">在浏览器中手动校对 OCR 结果后生成 EPUB。可通过「历史记录」页多开矫正实例；启动后实例以 IP 地址+端口区分。</p>
-        <div class="action-row">
-          <button class="btn-start" id="crStartBtn" onclick="startCorrect()">启动矫正</button>
-          <button class="btn-stop-convert" id="crStopBtn" onclick="stopCorrect()" style="display:none;">停止</button>
-        </div>
-        <select id="correctSel" style="display:none;margin-top:10px;max-width:420px;" onchange="selectCorrect()"></select>
-        <pre id="correctLog" style="margin-top:10px;">等待矫正任务...</pre>
-      </div>
+      <p class="page-desc">选择 PDF 文件并设置参数，一键启动完整的转换流程。转换与矫正已分离，矫正请到「矫正」页。</p>
       <!-- 源文件 -->
       <div class="card">
-        <div class="card-title"><span class="ct-icon">☐</span> 源文件</div>
+        <div class="card-title"><span class="ct-icon">☐</span> 源文件<span id="cvtQueueCount" style="margin-left:auto;font-size:12px;color:var(--text-dim);"></span></div>
         <div class="form-row">
-          <span class="form-label">PDF 路径</span>
+          <span class="form-label">PDF 文件</span>
           <div class="form-ctrl">
             <div class="pick-row">
               <input type="text" id="cvtPdf" placeholder="选择要转换的 PDF 文件..." readonly>
               <button class="btn-small" onclick="pickPdf()">选择文件…</button>
+              <button class="btn-small" onclick="pickPdfs()">批量添加…</button>
+              <button class="btn-small" id="cvtQueueClearBtn" onclick="clearConvertQueue()">清空</button>
             </div>
             <div class="form-hint" id="cvtPdfHint"></div>
+            <div class="form-hint">支持一次选择多本图书：按列表顺序逐本识别，单本失败不影响后续。</div>
           </div>
         </div>
+        <div id="cvtPdfList" class="merge-file-list"><div class="empty-state">未添加文件。单本可直接「选择文件」，多本点「批量添加」。</div></div>
       </div>
 <!-- 转换参数 -->
       <div class="card">
@@ -406,7 +418,7 @@ body{height:100%;font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",
           <div class="form-row"><span class="form-label">标题</span><div class="form-ctrl"><input type="text" id="cvtTitle" placeholder="可留空（自动提取）"></div></div>
           <div class="form-row"><span class="form-label">作者</span><div class="form-ctrl"><input type="text" id="cvtAuthor" placeholder="可留空"></div></div>
           <div class="form-row"><span class="form-label">语言</span><div class="form-ctrl"><input type="text" id="cvtLang" value="zh-CN"></div></div>
-          <div class="form-row"><span class="form-label">输出目录</span><div class="form-ctrl"><div class="pick-row"><input type="text" id="cvtOutDir" placeholder="留空则使用默认目录"><button class="btn-small" onclick="pickOutDir()">选择目录&#8230;</button></div><div class="form-hint">留空时输出到 data/<pdf名>/</div></div></div>
+          <div class="form-row"><span class="form-label">输出目录</span><div class="form-ctrl"><div class="pick-row"><input type="text" id="cvtOutDir" placeholder="留空则使用默认目录"><button class="btn-small" onclick="pickOutDir()">选择目录&#8230;</button></div><div class="form-hint">留空时输出到 data/<pdf名>/；批量转换时每本书在所选目录下单独建子目录</div></div></div>
           <div class="form-row"><span class="form-label">排除页</span><div class="form-ctrl"><input type="text" id="cvtExclude" placeholder="如 1-15,17,20（可选）"><div class="form-hint">跳过对指定序号图片的识别，多个用逗号分隔，支持区间。</div></div></div>
         </div>
       </div>
@@ -418,10 +430,56 @@ body{height:100%;font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",
           <button class="btn-stop-convert" id="cvtStopBtn" onclick="stopConvert()" style="display:none;">停止</button>
         </div>
       </div>
-      <!-- 运行日志 -->
+      <!-- 转换进度（只显示一条进度条 + 一条消息，其余写本地日志） -->
       <div class="card">
-        <div class="card-title"><span class="ct-icon">✒</span> 运行日志</div>
-        <pre id="convertLog">等待转换任务...</pre>
+        <div class="card-title"><span class="ct-icon">✒</span> 转换进度</div>
+        <div class="prog-wrap">
+          <div class="prog-track"><div class="prog-fill" id="convertBar"></div></div>
+          <div class="prog-msg" id="convertMsg">等待转换任务…</div>
+        </div>
+        <div class="form-hint" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">详细输出已写入本地日志：<span class="log-path" id="convertLogPath">（暂无）</span><button class="btn-small" onclick="openConvertLog()">打开日志</button></div>
+        <pre id="convertLog" style="display:none;"></pre>
+      </div>
+      <!-- 转换中启动矫正 -->
+      <div class="card">
+        <div class="card-title"><span class="ct-icon">✎</span> 转换中矫正</div>
+        <p class="page-desc" style="margin:0 0 12px;">转换进行中也能启动矫正界面：已识别完成的页面会边识别边出现在矫正界面里，识别结束后可继续校对。</p>
+        <div class="action-row">
+          <button class="btn-small" id="cvtCorrectBtn" onclick="startCorrectFromConvert()">启动矫正（跟随当前转换）</button>
+        </div>
+        <div class="form-hint" id="cvtCorrectHint"></div>
+      </div>
+    </div>
+    <!-- 10. 矫正（与转换分离） -->
+    <div class="page" id="page-correct">
+      <h2 class="page-title">矫正</h2>
+      <p class="page-desc">在浏览器中手动校对 OCR 结果后生成 EPUB。矫正与转换相互独立：可单独选 PDF，也可在转换进行中启动。</p>
+      <div class="card">
+        <div class="card-title" style="display:flex;align-items:center;gap:8px;"><span class="ct-icon">☐</span> 源文件<span id="correctCount" style="margin-left:auto;font-size:12px;color:var(--text-dim);"></span></div>
+        <div class="form-row">
+          <span class="form-label">PDF 文件</span>
+          <div class="form-ctrl">
+            <div class="pick-row">
+              <input type="text" id="crPdf" placeholder="选择要矫正的 PDF 文件..." readonly>
+              <button class="btn-small" onclick="pickCorrectPdf()">选择文件…</button>
+              <button class="btn-small" onclick="useConvertingPdf()">用当前转换中的文件</button>
+            </div>
+            <div class="form-hint" id="crPdfHint"></div>
+            <div class="form-hint">矫正启动后会打开浏览器页面；同一 PDF 可重复启动多个实例，实例以 IP 地址+端口区分。</div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="ct-icon">✎</span> 矫正实例</div>
+        <div class="action-row">
+          <button class="btn-start" id="crStartBtn" onclick="startCorrect()">启动矫正</button>
+          <button class="btn-stop-convert" id="crStopBtn" onclick="stopCorrect()" style="display:none;">停止</button>
+        </div>
+        <select id="correctSel" style="display:none;margin-top:10px;max-width:420px;" onchange="selectCorrect()"></select>
+        <div class="prog-wrap" style="margin-top:12px;">
+          <div class="prog-msg" id="correctMsg">等待矫正任务…</div>
+        </div>
+        <pre id="correctLog" style="display:none;"></pre>
       </div>
     </div>
     <!-- 10. 历史记录 -->
@@ -431,6 +489,10 @@ body{height:100%;font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
         <div class="card-title" style="margin-bottom:0;"><span class="ct-icon">↺</span> 矫正历史</div>
         <button class="btn-outline" id="historyRefreshBtn" onclick="renderHistory()">刷新</button>
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:8px;">
+        <input type="text" id="historySearchInput" placeholder="按标题或 PDF 文件名搜索…" class="search-input" style="flex:1;min-width:220px;">
+        <button class="btn-small" id="historySearchClear" onclick="clearHistorySearch()" style="display:none;">清除</button>
       </div>
       <div class="card">
         <table class="dyn-table" style="width:100%;">
@@ -579,7 +641,7 @@ function setEngine(eng){cfg.engine=eng;document.querySelectorAll(".engine-switch
 function updateEngineHint(){var eng=cfg.engine||"llama",hint;if(eng==="paddle"){hint="当前引擎: paddle | 本地推理，无需启动服务"}else{var port=eng==="llama"?(cfg.llama_server_args||{}).port||"8080":(cfg.vllm_server_args||{}).port||"8000";hint="当前引擎: "+eng+" | 默认端口: "+port}document.getElementById("engineHint").textContent=hint}
 function renderStatus(s){var badgeEl=document.getElementById("stRunning"),navBadge=document.getElementById("navStatusBadge"),label,cls;if(s.probe==="match"){label="运行中";cls="badge-green";navBadge.textContent="运行中";navBadge.className="nav-badge running"}else if(s.probe==="mismatch"){label="模型不匹配";cls="badge-yellow";navBadge.textContent="异常";navBadge.className="nav-badge stopped"}else{label="未运行";cls=s.busy?"badge-yellow":"badge-gray";navBadge.textContent=s.busy?"启动中":"未运行";navBadge.className="nav-badge "+(s.busy?"running":"stopped")}badgeEl.innerHTML='<span class="badge '+cls+'">'+label+"</span>";if(s.busy&&s.probe==="none")badgeEl.innerHTML+=' <span style="font-size:11px;color:var(--yellow);margin-left:6px;">启动中...</span>';document.getElementById("stModel").textContent=s.model_name||s.model_key||"--";document.getElementById("stPort").textContent=s.port||"--";document.getElementById("stEngine").textContent=s.engine||cfg.engine||"llama";if(s.engine){document.querySelectorAll(".engine-switch button").forEach(function(b){b.classList.toggle("active",b.dataset.eng===s.engine)});cfg.engine=s.engine}updateEngineHint();document.getElementById("btnStart").disabled=s.probe==="match"||s.busy;document.getElementById("btnStop").disabled=s.probe==="none"&&!s.busy;if(s.engine==="paddle"){badgeEl.innerHTML='<span class="badge badge-green">本地推理</span>';document.getElementById("stPort").textContent="--";navBadge.textContent="本地推理";navBadge.className="nav-badge running";document.getElementById("btnStart").disabled=true;document.getElementById("btnStop").disabled=true}if(s.last_error&&s.last_error!==_lastShownError){_lastShownError=s.last_error;addLog("服务错误: "+s.last_error,"log-err")}}
 function renderAll(){renderBasic();renderModels();renderArgs("llamaArgs",cfg.llama_server_args);renderArgs("vllmArgs",cfg.vllm_server_args);renderProofread();renderShortcuts();renderRules();renderConvert();document.querySelectorAll(".engine-switch button").forEach(function(b){b.classList.toggle("active",b.dataset.eng===(cfg.engine||"llama"))});updateEngineHint()}
-function renderBasic(){document.getElementById("cfgLlamaServer").value=cfg.llama_server||"";document.getElementById("cfgModelsDir").value=cfg.models_dir||"";document.getElementById("cfgBrowser").value=cfg.browser||"";document.getElementById("cfgGuiDisplay").value=(cfg.gui_display||"pywebview");document.getElementById("cfgOcrPrompt").value=cfg.ocr_prompt||"";var sel=document.getElementById("cfgSelectedModel");sel.innerHTML="";models.forEach(function(m){var o=document.createElement("option");o.value=m.key;o.textContent=m.key+" - "+m.name;sel.appendChild(o)});sel.value=cfg.selected_model||"";document.querySelectorAll('input[name="cfgEngine"]').forEach(function(r){r.checked=r.value===(cfg.engine||"llama")});document.querySelectorAll('input[name="cfgProofreadEngine"]').forEach(function(r){r.checked=r.value===(cfg.proofread_engine||"llama")});try{document.getElementById("cfgFontBody").value=(cfg.fonts&&cfg.fonts.body)||"";document.getElementById("cfgFontHeading").value=(cfg.fonts&&cfg.fonts.heading)||"";document.getElementById("cfgFontNote").value=(cfg.fonts&&cfg.fonts.note)||"";document.getElementById("cfgFontCitation").value=(cfg.fonts&&cfg.fonts.citation)||""}catch(e){}try{var ip=cfg.image_preprocess||{};document.getElementById("cfgImgPreEnabled").checked=!!ip.enabled;document.getElementById("cfgImgGray").checked=!!ip.gray;document.getElementById("cfgImgDenoise").checked=!!ip.denoise;document.getElementById("cfgImgSharpen").checked=!!ip.sharpen;document.getElementById("cfgImgBinarize").checked=!!ip.binarize;document.getElementById("cfgImgWorkers").value=(ip.workers!=null?ip.workers:"")}catch(e){}try{document.getElementById("cfgPaddleMergeLines").checked=cfg.paddle_merge_lines!==false}catch(e){}try{document.getElementById("cfgTableConvert").checked=cfg.table_convert!==false}catch(e){}
+function renderBasic(){document.getElementById("cfgLlamaServer").value=cfg.llama_server||"";document.getElementById("cfgModelsDir").value=cfg.models_dir||"";document.getElementById("cfgBrowser").value=cfg.browser||"";document.getElementById("cfgGuiDisplay").value=(cfg.gui_display||"pywebview");document.getElementById("cfgOcrPrompt").value=cfg.ocr_prompt||"";var sel=document.getElementById("cfgSelectedModel");sel.innerHTML="";models.forEach(function(m){var o=document.createElement("option");o.value=m.key;o.textContent=m.key+" - "+m.name;sel.appendChild(o)});sel.value=cfg.selected_model||"";document.querySelectorAll('input[name="cfgEngine"]').forEach(function(r){r.checked=r.value===(cfg.engine||"llama")});document.querySelectorAll('input[name="cfgProofreadEngine"]').forEach(function(r){r.checked=r.value===(cfg.proofread_engine||"llama")});try{document.getElementById("cfgFontBody").value=(cfg.fonts&&cfg.fonts.body)||"";document.getElementById("cfgFontHeading").value=(cfg.fonts&&cfg.fonts.heading)||"";document.getElementById("cfgFontNote").value=(cfg.fonts&&cfg.fonts.note)||"";document.getElementById("cfgFontCitation").value=(cfg.fonts&&cfg.fonts.citation)||""}catch(e){}try{var ip=cfg.image_preprocess||{};document.getElementById("cfgImgPreEnabled").checked=!!ip.enabled;document.getElementById("cfgImgGray").checked=!!ip.gray;document.getElementById("cfgImgDenoise").checked=!!ip.denoise;document.getElementById("cfgImgSharpen").checked=!!ip.sharpen;document.getElementById("cfgImgBinarize").checked=!!ip.binarize;document.getElementById("cfgImgWorkers").value=(ip.workers!=null?ip.workers:"")}catch(e){}try{document.getElementById("cfgPaddleMergeLines").checked=cfg.paddle_merge_lines!==false}catch(e){}try{var _dl=cfg.paddle_det_limit;document.getElementById("cfgPaddleDetLimit").value=(_dl===0||_dl)?_dl:960}catch(e){}try{document.getElementById("cfgTableConvert").checked=cfg.table_convert!==false}catch(e){}
 }
 function renderModels(){var tbody=document.getElementById("modelTbody");tbody.innerHTML="";var keys=Object.keys(cfg.model_choices||{});if(!keys.length){tbody.innerHTML='<tr><td colspan="7" class="empty-state">暂无模型，点击上方「添加模型」</td></tr>';return}keys.forEach(function(key){var m=cfg.model_choices[key],info=models.find(function(x){return x.key===key}),nameOk=info?info.name_exists:false,mmOk=info?info.mmproj_exists:false,tr=document.createElement("tr");tr.innerHTML='<td><input type="text" value="'+escH(key)+'" data-field="key" style="font-weight:600;background:#f8f9fb;"></td><td><input type="text" value="'+escH(m.name||"")+'" data-field="name"></td><td><input type="text" value="'+escH(m.mmproj||"")+'" data-field="mmproj"></td><td><input type="number" min="1" max="64" value="'+(m.workers!=null?m.workers:"")+'" data-field="workers" style="width:52px;"></td><td class="'+(nameOk?"file-ok":"file-miss")+'">'+(nameOk?"\u2713":"\u2717")+'</td><td class="'+(mmOk?"file-ok":"file-miss")+'">'+(mmOk?"\u2713":"\u2717")+'</td><td class="del-cell"><button class="del-btn" title="删除模型">\u2715</button></td>';tr.querySelector(".del-btn").onclick=function(){if(confirm("确定删除模型「"+key+"」？")){delete cfg.model_choices[key];models=models.filter(function(x){return x.key!==key});renderModels();toast("已删除模型 "+key,"ok")}};tbody.appendChild(tr)})}
 function addModel(){var nk="NEW",i=1;while(cfg.model_choices[nk])nk="NEW"+(i++);cfg.model_choices[nk]={name:"",mmproj:""};models.push({key:nk,name:"",mmproj:"",name_exists:false,mmproj_exists:false});renderModels();toast("已添加空模型行，请填写后保存","warn")}
@@ -611,6 +673,7 @@ function collectExtraConfig(){
   }catch(e){/* element missing -> skip */}
   try{
     cfg.paddle_merge_lines = !!document.getElementById("cfgPaddleMergeLines").checked;
+    try{var _dlv=parseInt(document.getElementById("cfgPaddleDetLimit").value,10);cfg.paddle_det_limit=isNaN(_dlv)?960:_dlv}catch(e){cfg.paddle_det_limit=960}
     cfg.table_convert = !!document.getElementById("cfgTableConvert").checked;
   }catch(e){/* element missing -> skip */}
   try{
@@ -626,31 +689,61 @@ function pickFile(inputId){apiPost("/api/pick",{kind:"file",title:"选择文件"
 function pickDir(inputId){apiPost("/api/pick",{kind:"dir",title:"选择目录"}).then(function(res){if(res&&res.ok&&!res.cancelled&&res.path){document.getElementById(inputId).value=res.path;toast("已选择目录","ok")}else if(res&&res.cancelled){toast("已取消选择","warn")}})}
 /* ===== 转换页 ===== */
 var convertPollTimer=null;
-function renderConvert(){var _dEl=document.getElementById("cvtDpi");if(_dEl&&cfg.dpi!==undefined&&cfg.dpi!==null&&cfg.dpi!=="")_dEl.value=cfg.dpi;document.getElementById("cvtExclude").value=(cfg.exclude_pages||[]).join(",")||"";var sel=document.getElementById("cvtModel");sel.innerHTML="";models.forEach(function(m){var o=document.createElement("option");o.value=m.key;o.textContent=m.key+" - "+m.name;sel.appendChild(o)});sel.value=cfg.selected_model||"";applyModelWorkers();var pdf=document.getElementById("cvtPdf");if(pdf.value){var hint=document.getElementById("cvtPdfHint");if(!pdf.value.toLowerCase().endsWith(".pdf")){hint.textContent="\u26a0 \u6587\u4ef6\u540e\u7f00\u4e0d\u662f .pdf";hint.style.color="var(--red)"}else{hint.textContent="";hint.style.color=""}}}
+// 批量识别队列：{path, status:'pending'|'running'|'done'|'fail', message}
+var convertQueue=[];
+var convertBatchRunning=false;
+var convertBatchAbort=false;
+var convertPromptResolve=null;
+function sleepMs(ms){return new Promise(function(r){setTimeout(r,ms)})}
+function converterr(msg){toast(msg,"fail");addLog(msg,"log-err")}
+function joinOutDir(base,name){if(!base)return"";var sep=base.indexOf("\\")>=0?"\\":"/";return base.replace(/[\\/]+$/,"")+sep+name}
+function syncConvertPdfInput(){var el=document.getElementById("cvtPdf");if(el)el.value=convertQueue.length?convertQueue[0].path:"";var hint=document.getElementById("cvtPdfHint");if(hint){var p=el?el.value:"";if(p&&!p.toLowerCase().endsWith(".pdf")){hint.textContent="\u26a0 \u6587\u4ef6\u540e\u7f00\u4e0d\u662f .pdf";hint.style.color="var(--red)"}else{hint.textContent="";hint.style.color=""}}updateCvtCorrectHint(null)}
+function renderConvertQueue(){var list=document.getElementById("cvtPdfList"),cnt=document.getElementById("cvtQueueCount");if(cnt)cnt.textContent=convertQueue.length?("\u5171 "+convertQueue.length+" \u672c"):"";if(!list)return;if(!convertQueue.length){list.innerHTML='<div class="empty-state">\u672a\u6dfb\u52a0\u6587\u4ef6\u3002\u5355\u672c\u53ef\u76f4\u63a5\u300c\u9009\u62e9\u6587\u4ef6\u300d\uff0c\u591a\u672c\u70b9\u300c\u6279\u91cf\u6dfb\u52a0\u300d\u3002</div>';syncConvertPdfInput();return}var labels={pending:"\u7b49\u5f85",running:"\u8bc6\u522b\u4e2d\u2026",done:"\u5b8c\u6210",fail:"\u5931\u8d25"};var colors={pending:"var(--text-dim)",running:"var(--accent)",done:"var(--green)",fail:"var(--red)"};list.innerHTML="";convertQueue.forEach(function(item,i){var row=document.createElement("div");row.className="merge-file-row";var st=item.status||"pending";var msg=item.message?(' title="'+escH(item.message)+'"'):"";var ops='<span class="mfi" style="color:'+(colors[st]||"var(--text-dim)")+';"'+msg+'>'+(labels[st]||st)+'</span>';if(!convertBatchRunning)ops+='<button class="btn-small del-btn" onclick="removeConvertQueueItem('+i+')" title="\u79fb\u9664">\u2715</button>';row.innerHTML='<span class="mfi">'+(i+1)+'</span><span class="mfn" title="'+escH(item.path)+'">'+escH(basename(item.path))+'</span><span class="mops">'+ops+'</span>';list.appendChild(row)});syncConvertPdfInput()}
+function queueAddPaths(paths,replace){if(replace)convertQueue=[];var added=0;(paths||[]).forEach(function(p){if(!p||!p.toLowerCase().endsWith(".pdf"))return;var dup=convertQueue.some(function(it){return it.path===p});if(dup)return;convertQueue.push({path:p,status:"pending",message:""});added++});renderConvertQueue();return added}
+function removeConvertQueueItem(idx){if(convertBatchRunning)return;if(idx<0||idx>=convertQueue.length)return;convertQueue.splice(idx,1);renderConvertQueue()}
+function clearConvertQueue(){if(convertBatchRunning){toast("\u8f6c\u6362\u8fdb\u884c\u4e2d\uff0c\u4e0d\u80fd\u6e05\u7a7a\u5217\u8868","warn");return}convertQueue=[];renderConvertQueue()}
+function renderConvert(){var _dEl=document.getElementById("cvtDpi");if(_dEl&&cfg.dpi!==undefined&&cfg.dpi!==null&&cfg.dpi!=="")_dEl.value=cfg.dpi;var _exCfg=cfg.exclude_pages;document.getElementById("cvtExclude").value=Array.isArray(_exCfg)?(_exCfg.join(",")||""):(_exCfg==null?"":String(_exCfg));var sel=document.getElementById("cvtModel");sel.innerHTML="";models.forEach(function(m){var o=document.createElement("option");o.value=m.key;o.textContent=m.key+" - "+m.name;sel.appendChild(o)});sel.value=cfg.selected_model||"";applyModelWorkers();renderConvertQueue();var pdf=document.getElementById("cvtPdf");if(pdf.value){var hint=document.getElementById("cvtPdfHint");if(!pdf.value.toLowerCase().endsWith(".pdf")){hint.textContent="\u26a0 \u6587\u4ef6\u540e\u7f00\u4e0d\u662f .pdf";hint.style.color="var(--red)"}else{hint.textContent="";hint.style.color=""}}}
 function applyModelWorkers(){var sel=document.getElementById("cvtModel"),wEl=document.getElementById("cvtWorkers");if(!sel||!wEl)return;var key=sel.value,info=(cfg.model_choices||{})[key]||{},w=parseInt(info.workers,10);if(!isNaN(w)&&w>=1&&w<=64)wEl.value=w}
 function onCvtModelChange(){applyModelWorkers()}
-function pickPdf(){apiPost("/api/pick",{kind:"file",filter:"pdf",title:"\u9009\u62e9 PDF \u6587\u4ef6"}).then(function(res){if(res&&res.ok&&!res.cancelled&&res.path){document.getElementById("cvtPdf").value=res.path;var hint=document.getElementById("cvtPdfHint");if(!res.path.toLowerCase().endsWith(".pdf")){hint.textContent="\u26a0 \u6587\u4ef6\u540e\u7f00\u4e0d\u662f .pdf";hint.style.color="var(--red)"}else{hint.textContent=""}}else if(res&&res.cancelled){toast("\u5df2\u53d6\u6d88\u9009\u62e9","warn")}})}
+function pickPdf(){apiPost("/api/pick",{kind:"file",filter:"pdf",title:"\u9009\u62e9 PDF \u6587\u4ef6"}).then(function(res){if(res&&res.ok&&!res.cancelled&&res.path){queueAddPaths([res.path],true);toast("\u5df2\u9009\u62e9\u6587\u4ef6","ok")}else if(res&&res.cancelled){toast("\u5df2\u53d6\u6d88\u9009\u62e9","warn")}else if(res&&res.error){toast("\u9009\u62e9\u5931\u8d25: "+res.error,"fail")}})}
+function pickPdfs(){apiPost("/api/pick",{kind:"file",filter:"pdf",multiple:true,title:"\u6279\u91cf\u9009\u62e9 PDF \u6587\u4ef6"}).then(function(res){if(res&&res.ok&&!res.cancelled&&res.paths){var n=queueAddPaths(res.paths,false);toast("\u5df2\u6dfb\u52a0 "+n+" \u672c\u56fe\u4e66","ok")}else if(res&&res.cancelled){toast("\u5df2\u53d6\u6d88\u9009\u62e9","warn")}else if(res&&res.error){toast("\u9009\u62e9\u5931\u8d25: "+res.error,"fail")}})}
 function pickOutDir(){apiPost("/api/pick",{kind:"dir",title:"\u9009\u62e9\u8f93\u51fa\u76ee\u5f55"}).then(function(res){if(res&&res.ok&&!res.cancelled&&res.path){document.getElementById("cvtOutDir").value=res.path;toast("\u5df2\u9009\u62e9\u76ee\u5f55","ok")}else if(res&&res.cancelled){toast("\u5df2\u53d6\u6d88\u9009\u62e9","warn")}})}
-function collectConvertParams(){var pdf=document.getElementById("cvtPdf").value.trim();if(!pdf)return{error:"\u8bf7\u5148\u9009\u62e9 PDF \u6587\u4ef6"};if(!pdf.toLowerCase().endsWith(".pdf"))return{error:"\u6587\u4ef6\u540e\u7f00\u4e0d\u662f .pdf\uff0c\u8bf7\u9009\u62e9\u6b63\u786e\u7684 PDF"};var engine=document.getElementById("cvtEngine").value;var workers=parseInt(document.getElementById("cvtWorkers").value,10);var timeout=parseInt(document.getElementById("cvtTimeout").value,10);if(isNaN(workers)||workers<1){var _k=document.getElementById("cvtModel").value,_m=(cfg.model_choices||{})[_k]||{},_w=parseInt(_m.workers,10);workers=isNaN(_w)||_w<1?3:_w}if(isNaN(timeout)||timeout<30)timeout=600;var _dpiVal=parseInt(document.getElementById("cvtDpi").value,10);return{pdf:pdf,dpi:isNaN(_dpiVal)?null:_dpiVal,model:document.getElementById("cvtModel").value,engine:engine,workers:workers,timeout:timeout,thinking:document.getElementById("cvtThinking").checked,title:document.getElementById("cvtTitle").value.trim(),author:document.getElementById("cvtAuthor").value.trim(),lang:document.getElementById("cvtLang").value.trim()||"zh-CN",out_dir:document.getElementById("cvtOutDir").value.trim(),epub_path:"",exclude:document.getElementById("cvtExclude").value.trim()}}
-function setConvertBusy(busy){var start=document.getElementById("cvtStartBtn"),stop=document.getElementById("cvtStopBtn");if(busy){start.disabled=true;start.classList.add("running");start.textContent="\u8f6c\u6362\u4e2d\u2026";stop.style.display="";stop.disabled=false}else{start.disabled=false;start.classList.remove("running");start.textContent="\u5f00\u59cb\u8f6c\u6362";stop.style.display="none";stop.disabled=true}}
-function startConvert(){var params=collectConvertParams();if(params.error){toast(params.error,"warn");return}setConvertBusy(true);var log=document.getElementById("convertLog");log.textContent="";addLog("\u542f\u52a8\u8f6c\u6362: "+params.pdf,"log-info");apiPost("/api/convert/start",params).then(function(res){if(res&&res.ok){toast("\u8f6c\u6362\u5df2\u542f\u52a8","ok");addLog("\u8f6c\u6362\u5df2\u542f\u52a8","log-ok");startPollConvert()}else{var msg=res&&res.error?res.error:"\u542f\u52a8\u5931\u8d25";toast(msg,"fail");addLog("\u542f\u52a8\u5931\u8d25: "+msg,"log-err");setConvertBusy(false)}})}
-function startPollConvert(){if(convertPollTimer)clearInterval(convertPollTimer);convertPollTimer=setInterval(pollConvertStatus,500)}
+function collectConvertParams(){var pdf=document.getElementById("cvtPdf").value.trim();if(!pdf)return{error:"\u8bf7\u5148\u9009\u62e9 PDF \u6587\u4ef6"};if(!pdf.toLowerCase().endsWith(".pdf"))return{error:"\u6587\u4ef6\u540e\u7f00\u4e0d\u662f .pdf\uff0c\u8bf7\u9009\u62e9\u6b63\u786e\u7684 PDF"};var engine=document.getElementById("cvtEngine").value;var workers=parseInt(document.getElementById("cvtWorkers").value,10);var timeout=parseInt(document.getElementById("cvtTimeout").value,10);if(isNaN(workers)||workers<1){var _k=document.getElementById("cvtModel").value,_m=(cfg.model_choices||{})[_k]||{},_w=parseInt(_m.workers,10);workers=isNaN(_w)||_w<1?3:_w}if(isNaN(timeout)||timeout<30)timeout=600;var _dpiVal=parseInt(document.getElementById("cvtDpi").value,10);var _ex=document.getElementById("cvtExclude").value.trim();return{pdf:pdf,dpi:isNaN(_dpiVal)?null:_dpiVal,model:document.getElementById("cvtModel").value,engine:engine,workers:workers,timeout:timeout,thinking:document.getElementById("cvtThinking").checked,title:document.getElementById("cvtTitle").value.trim(),author:document.getElementById("cvtAuthor").value.trim(),lang:document.getElementById("cvtLang").value.trim()||"zh-CN",out_dir:document.getElementById("cvtOutDir").value.trim(),epub_path:"",exclude:_ex||null}}
+function setConvertBusy(busy,label){var start=document.getElementById("cvtStartBtn"),stop=document.getElementById("cvtStopBtn"),clr=document.getElementById("cvtQueueClearBtn");if(busy){start.disabled=true;start.classList.add("running");start.textContent=label||"\u8f6c\u6362\u4e2d\u2026";stop.style.display="";stop.disabled=false;if(clr)clr.disabled=true}else{start.disabled=false;start.classList.remove("running");start.textContent="\u5f00\u59cb\u8f6c\u6362";stop.style.display="none";stop.disabled=true;if(clr)clr.disabled=false}renderConvertQueue()}
+function startConvert(){if(convertBatchRunning){toast("\u5df2\u6709\u8f6c\u6362\u5728\u8fd0\u884c","warn");return}var params=collectConvertParams();if(params.error){toast(params.error,"warn");return}if(!convertQueue.length){queueAddPaths([params.pdf],true)}if(convertQueue.length>1&&!confirm("\u5c06\u6309\u5217\u8868\u987a\u5e8f\u9010\u672c\u8bc6\u522b "+convertQueue.length+" \u672c\u56fe\u4e66\uff0c\u662f\u5426\u7ee7\u7eed\uff1f"))return;runConvertBatch(params)}
+async function runConvertBatch(baseParams){convertBatchRunning=true;convertBatchAbort=false;var total=convertQueue.length,ok=0,fail=0,batch=total>1,outBase=(baseParams.out_dir||"").replace(/[\\/]+$/,""),usedStem={};var log=document.getElementById("convertLog");if(log)log.textContent="";addLog(batch?("\u5f00\u59cb\u6279\u91cf\u8f6c\u6362\uff1a\u5171 "+total+" \u672c"):("\u542f\u52a8\u8f6c\u6362: "+baseParams.pdf),"log-info");for(var idx=0;idx<convertQueue.length;idx++){if(convertBatchAbort)break;var item=convertQueue[idx];item.status="running";item.message="";setConvertBusy(true,batch?("\u6279\u91cf\u8f6c\u6362 "+(idx+1)+"/"+total+"\u2026"):"\u8f6c\u6362\u4e2d\u2026");addLog((batch?("["+(idx+1)+"/"+total+"] "):"")+"\u5f00\u59cb\u8f6c\u6362: "+item.path,"log-info");var params=Object.assign({},baseParams,{pdf:item.path});if(batch){params.title="";if(outBase){var stem=basename(item.path).replace(/\.pdf$/i,"");var sk=stem.toLowerCase();var sn=(usedStem[sk]||0)+1;usedStem[sk]=sn;params.out_dir=joinOutDir(outBase,stem+(sn>1?(" ("+sn+")"):""))}}var res=await apiPost("/api/convert/start",params);if(!res||!res.ok){item.status="fail";item.message=(res&&res.error)||"\u542f\u52a8\u5931\u8d25";fail++;converterr((batch?("["+(idx+1)+"/"+total+"] "):"")+"\u542f\u52a8\u5931\u8d25: "+item.message);renderConvertQueue();continue}var result=await waitConvertCompletion();if(convertBatchAbort||result.aborted){item.status="fail";item.message="\u5df2\u505c\u6b62";fail++;break}if(result.ok){item.status="done";item.message=result.epub||"\u5b8c\u6210";ok++;var msg=(batch?("["+(idx+1)+"/"+total+"] "):"")+"\u8f6c\u6362\u5b8c\u6210"+(result.epub?("\uff1a"+result.epub):"");addLog(msg,"log-ok");toast(msg,"ok")}else{item.status="fail";item.message=result.error||"\u8f6c\u6362\u5931\u8d25";fail++;converterr((batch?("["+(idx+1)+"/"+total+"] "):"")+"\u8f6c\u6362\u5931\u8d25: "+item.message)}renderConvertQueue()}convertBatchRunning=false;setConvertBusy(false);if(convertBatchAbort){toast("\u6279\u91cf\u8f6c\u6362\u5df2\u505c\u6b62","warn");addLog("\u6279\u91cf\u8f6c\u6362\u5df2\u505c\u6b62","log-warn")}else if(batch){var summary="\u6279\u91cf\u8f6c\u6362\u5b8c\u6210\uff1a\u6210\u529f "+ok+" \u672c\uff0c\u5931\u8d25 "+fail+" \u672c";toast(summary,fail?"warn":"ok",6000);addLog(summary,fail?"log-warn":"log-ok")}}
+function waitConvertCompletion(){return new Promise(function(resolve){(async function(){var abortAt=0;while(true){await sleepMs(500);if(convertBatchAbort&&!abortAt)abortAt=Date.now();var res=await apiGet("/api/convert/status");if(!res||!res.ok){if(abortAt&&Date.now()-abortAt>10000){resolve({ok:false,aborted:true,error:"\u5df2\u505c\u6b62"});return}continue}renderConvertStatus(res);renderConvertLog(res.lines||[]);if(abortAt){if(!res.running||Date.now()-abortAt>10000){resolve({ok:false,aborted:true,error:"\u5df2\u505c\u6b62"});return}continue}if(res.prompt){await waitConvertPrompt(res.prompt);continue}if(res.running)continue;resolve({ok:res.success===true,error:res.error||"",epub:res.epub_path||""});return}})()})}
+function waitConvertPrompt(p){return new Promise(function(resolve){convertPromptResolve=resolve;showConvertPrompt(p)})}
+function startPollConvert(){if(convertPollTimer)clearInterval(convertPollTimer);convertPollTimer=setInterval(function(){},500)}
 function stopPollConvert(){if(convertPollTimer){clearInterval(convertPollTimer);convertPollTimer=null}}
-function pollConvertStatus(){apiGet("/api/convert/status").then(function(res){if(!res||!res.ok)return;renderConvertLog(res.lines||[]);if(res.prompt){showConvertPrompt(res.prompt);stopPollConvert();return}if(res.running)return;stopPollConvert();setConvertBusy(false);if(res.done&&res.success===true){var ep=res.epub_path||"";var msg="\u8f6c\u6362\u5b8c\u6210";if(ep)msg+="\uff1a"+ep;toast(msg,"ok");addLog(msg,"log-ok");var log=document.getElementById("convertLog");log.textContent+="\n\u2714 "+msg+"\n"}else if(res.done&&res.success===false){var errmsg=res.error||"\u8f6c\u6362\u5931\u8d25";toast(errmsg,"fail");addLog("\u8f6c\u6362\u5931\u8d25: "+errmsg,"log-err")}})}
-function showConvertPrompt(p){var bg=document.getElementById("convertPromptBg");if(!bg)return;document.getElementById("convertPromptQuestion").textContent=p.question||"\u8bf7\u9009\u62e9\u64cd\u4f5c";var box=document.getElementById("convertPromptBtns");box.innerHTML="";(p.options||[]).forEach(function(o){var b=document.createElement("button");b.className=o.value===p.default?"btn-start":"btn-small";b.textContent=o.label||o.value;b.style.cssText="padding:10px 14px;font-size:13px;cursor:pointer;";b.onclick=function(){apiPost("/api/convert/prompt",{choice:o.value}).then(function(res){if(res&&res.ok){bg.style.display="none";addLog("\u5df2\u9009\u62e9: "+(o.label||o.value),"log-info");startPollConvert()}else{toast((res&&res.error)||"\u56de\u7b54\u5931\u8d25","fail");startPollConvert()}})};box.appendChild(b)});bg.style.display="flex"}
-function renderConvertLog(lines){var el=document.getElementById("convertLog");if(!lines.length)return;el.textContent=lines.join("\n");el.scrollTop=el.scrollHeight}
-function stopConvert(){apiPost("/api/convert/stop").then(function(res){if(res&&res.ok){toast("\u5df2\u8bf7\u6c42\u505c\u6b62","warn");addLog("\u5df2\u8bf7\u6c42\u505c\u6b62\u8f6c\u6362","log-warn");var bg=document.getElementById("convertPromptBg");if(bg)bg.style.display="none";setConvertBusy(false);stopPollConvert()}else{var msg=res&&res.error?res.error:"\u505c\u6b62\u5931\u8d25";toast(msg,"fail")}})}
+function showConvertPrompt(p){var bg=document.getElementById("convertPromptBg");if(!bg){if(convertPromptResolve){var rr=convertPromptResolve;convertPromptResolve=null;rr(false)}return}document.getElementById("convertPromptQuestion").textContent=p.question||"\u8bf7\u9009\u62e9\u64cd\u4f5c";var box=document.getElementById("convertPromptBtns");box.innerHTML="";(p.options||[]).forEach(function(o){var b=document.createElement("button");b.className=o.value===p.default?"btn-start":"btn-small";b.textContent=o.label||o.value;b.style.cssText="padding:10px 14px;font-size:13px;cursor:pointer;";b.onclick=function(){apiPost("/api/convert/prompt",{choice:o.value}).then(function(res){if(res&&res.ok){bg.style.display="none";addLog("\u5df2\u9009\u62e9: "+(o.label||o.value),"log-info");if(convertPromptResolve){var r=convertPromptResolve;convertPromptResolve=null;r(true)}}else{toast((res&&res.error)||"\u56de\u7b54\u5931\u8d25","fail")}})};box.appendChild(b)});bg.style.display="flex"}
+function renderConvertLog(lines){var el=document.getElementById("convertLog");if(!el||!lines||!lines.length)return;el.textContent=lines.join("\n")}
+/* 界面只显示「一条进度条 + 一条消息」；其余输出在本地日志文件里 */
+function fmtEtaDur(s){s=Math.max(0,Math.round(Number(s)||0));if(s<60)return s+"\u79d2";if(s<3600)return Math.floor(s/60)+"\u5206"+String(s%60).padStart(2,"0")+"\u79d2";return Math.floor(s/3600)+"\u5c0f\u65f6"+String(Math.floor((s%3600)/60)).padStart(2,"0")+"\u5206";}
+function fmtEtaClock(ts){var d=new Date(Number(ts)*1000);if(isNaN(d.getTime()))return "-";return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");}
+// \u9884\u8ba1\u5b8c\u6210\u65f6\u95f4\uff082026-10-21\uff09\uff1a\u5269\u4f59\u65f6\u957f + \u9884\u8ba1\u5b8c\u6210\u65f6\u523b\uff08\u6309 eta_at \u5012\u63a8\uff0c\u672c\u5730\u4f1a\u81ea\u884c\u5012\u8ba1\u65f6\uff09
+function fmtEtaText(pg){if(!pg)return "";var at=Number(pg.eta_at),left=Number(pg.eta_sec);if(isFinite(at)&&at>0){var rem=Math.max(0,Math.round(at-Date.now()/1000));return "  \u9884\u8ba1\u5269\u4f59 "+fmtEtaDur(rem)+"\uff08\u7ea6 "+fmtEtaClock(at)+" \u5b8c\u6210\uff09";}if(isFinite(left)&&left>0)return "  \u9884\u8ba1\u5269\u4f59 "+fmtEtaDur(left);return "";}
+function renderConvertStatus(res){if(!res)return;var bar=document.getElementById("convertBar"),msg=document.getElementById("convertMsg"),lp=document.getElementById("convertLogPath");var pg=res.progress||{},pct=0;if(typeof pg.percent==="number"&&!isNaN(pg.percent))pct=pg.percent;else if(pg.done&&pg.total)pct=pg.done/pg.total*100;if(pct<0)pct=0;if(pct>100)pct=100;var text=res.message||"";if(!text&&res.running)text="转换进行中…";if(!text&&res.done)text=res.success?"转换完成":"转换结束";if(res.error)text=res.error;if(bar){bar.style.width=pct.toFixed(1)+"%";bar.className="prog-fill"+(res.error?" err":((res.done&&res.success)?" done":""))}if(res.running)text=text+fmtEtaText(pg);if(msg){msg.textContent=text;msg.className="prog-msg"+(res.error?" err":((res.done&&res.success)?" ok":""))}if(lp)lp.textContent=res.log_path||"（暂无）";updateCvtCorrectHint(res)}
+function updateCvtCorrectHint(res){var el=document.getElementById("cvtCorrectHint");if(!el)return;var c=document.getElementById("cvtPdf"),p=c&&c.value?c.value.trim():"";if(!p){el.textContent="当前没有选中的 PDF 文件，请先在「转换」页选择文件。";return}el.textContent=(res&&res.running?"当前正在转换：":"当前转换文件：")+p+(res&&res.running?"（识别完成的页面会实时进入矫正界面）":"")}
+function openConvertLog(){apiGet("/api/convert/status").then(function(res){if(!res||!res.ok||!res.log_path){toast("暂无日志文件","warn");return}apiPost("/api/open-log",{path:res.log_path}).then(function(r){if(r&&r.ok)toast("已打开日志","ok");else toast((r&&r.error)||"打开日志失败","fail")})})}
+function stopConvert(){convertBatchAbort=true;if(convertPromptResolve){var r=convertPromptResolve;convertPromptResolve=null;r(false)}var bg=document.getElementById("convertPromptBg");if(bg)bg.style.display="none";apiPost("/api/convert/stop").then(function(res){if(res&&res.ok){toast("\u5df2\u8bf7\u6c42\u505c\u6b62","warn");addLog("\u5df2\u8bf7\u6c42\u505c\u6b62\u8f6c\u6362","log-warn");if(!convertBatchRunning)setConvertBusy(false)}else{var msg=res&&res.error?res.error:"\u505c\u6b62\u5931\u8d25";toast(msg,"fail")}})}
 /* ===== 矫正界面（多实例） ===== */
 var correctPollTimer=null;
 var correctInstances=[];
 var selectedCorrectId=null;
 function setCorrectBusy(busy){var start=document.getElementById("crStartBtn"),stop=document.getElementById("crStopBtn");if(busy){start.disabled=true;start.classList.add("running");start.textContent="矫正中…";stop.style.display="";stop.disabled=false}else{start.disabled=false;start.classList.remove("running");start.textContent="启动矫正";stop.style.display="none";stop.disabled=true}}
-function startCorrect(){var pdf=document.getElementById("cvtPdf").value.trim();var engine=document.getElementById("cvtEngine").value;var params={pdf:pdf||null,engine:engine||null,title:document.getElementById("cvtTitle").value.trim(),author:document.getElementById("cvtAuthor").value.trim(),lang:document.getElementById("cvtLang").value.trim()||"zh-CN"};setCorrectBusy(true);var log=document.getElementById("correctLog");log.textContent="";addLog("启动矫正: "+(pdf||"无文件启动"),"log-info");apiPost("/api/correct/start",params).then(function(res){if(res&&res.ok){toast("矫正已启动","ok");addLog("矫正已启动","log-ok");startPollCorrect()}else{var msg=res&&res.error?res.error:"启动失败";toast(msg,"fail");addLog("启动失败: "+msg,"log-err");setCorrectBusy(false)}})}
+function correctPdfPath(){var el=document.getElementById("crPdf"),p=el&&el.value?el.value.trim():"";if(!p){var c=document.getElementById("cvtPdf");p=c&&c.value?c.value.trim():""}return p}
+function pickCorrectPdf(){apiPost("/api/pick",{kind:"file",filter:"pdf",title:"选择 PDF 文件"}).then(function(res){if(res&&res.ok&&!res.cancelled&&res.path){document.getElementById("crPdf").value=res.path;toast("已选择文件","ok")}else if(res&&res.cancelled){toast("已取消选择","warn")}})}
+function useConvertingPdf(){var c=document.getElementById("cvtPdf"),p=c&&c.value?c.value.trim():"";if(!p){toast("当前没有选中的 PDF 文件","warn");return}document.getElementById("crPdf").value=p;toast("已填入当前转换文件","ok")}
+function startCorrect(){startCorrectInternal(false)}
+function startCorrectFromConvert(){startCorrectInternal(true)}
+function startCorrectInternal(live){var pdf=live?((document.getElementById("cvtPdf")||{}).value||"").trim():correctPdfPath();if(!pdf){toast(live?"当前没有正在转换的 PDF 文件":"请先选择 PDF 文件","warn");return}if(!pdf.toLowerCase().endsWith(".pdf")){toast("文件后缀不是 .pdf，请选择正确的 PDF","warn");return}var engineEl=document.getElementById("cvtEngine"),titleEl=document.getElementById("cvtTitle"),authorEl=document.getElementById("cvtAuthor"),langEl=document.getElementById("cvtLang");var params={pdf:pdf,engine:(engineEl&&engineEl.value)||null,title:titleEl?titleEl.value.trim():"",author:authorEl?authorEl.value.trim():"",lang:(langEl&&langEl.value.trim())||"zh-CN",live:!!live};setCorrectBusy(true);var log=document.getElementById("correctLog");if(log)log.textContent="";addLog((live?"启动矫正（跟随转换）: ":"启动矫正: ")+pdf,"log-info");apiPost("/api/correct/start",params).then(function(res){if(res&&res.ok){toast("矫正已启动","ok");addLog("矫正已启动","log-ok");startPollCorrect()}else{var msg=res&&res.error?res.error:"启动失败";toast(msg,"fail");addLog("启动失败: "+msg,"log-err");setCorrectBusy(false)}})}
 function startPollCorrect(){if(correctPollTimer)clearInterval(correctPollTimer);correctPollTimer=setInterval(pollCorrectStatus,500)}
 function stopPollCorrect(){if(correctPollTimer){clearInterval(correctPollTimer);correctPollTimer=null}}
 function renderCorrectSel(instances){var sel=document.getElementById("correctSel");if(!sel)return;var cnt=document.getElementById("correctCount");if(cnt)cnt.textContent="矫正实例："+instances.length;if(!instances.length){sel.style.display="none";selectedCorrectId=null;return}if(instances.length===1){sel.style.display="none";selectedCorrectId=instances[0].id;return}sel.style.display="";var prev=selectedCorrectId;sel.innerHTML="";instances.slice().reverse().forEach(function(inst){var o=document.createElement("option");o.value=inst.id;o.textContent=(inst.pdf?basename(inst.pdf):"无文件")+"（"+(inst.engine||"")+"："+(inst.port||"-")+"）"+(inst.running?"":"[已退出]");sel.appendChild(o)});if(prev){sel.value=prev}selectedCorrectId=sel.value}
 function selectCorrect(){var sel=document.getElementById("correctSel");if(!sel||!sel.value)return;selectedCorrectId=sel.value;for(var i=0;i<correctInstances.length;i++){if(correctInstances[i].id===selectedCorrectId){renderCorrectLog(correctInstances[i].lines||[]);break}}}
-function pollCorrectStatus(){apiGet("/api/correct/status").then(function(res){if(!res||!res.ok)return;correctInstances=res.instances||[];renderCorrectSel(correctInstances);var inst=null;for(var i=0;i<correctInstances.length;i++){if(correctInstances[i].id===selectedCorrectId){inst=correctInstances[i];break}}if(!inst&&correctInstances.length){inst=correctInstances[correctInstances.length-1];selectedCorrectId=inst.id;var selEl=document.getElementById("correctSel");if(selEl&&selEl.style.display!=="none")selEl.value=inst.id}if(inst){renderCorrectLog(inst.lines||[])}var running=false;for(var j=0;j<correctInstances.length;j++){if(correctInstances[j].running){running=true;break}}if(!running){stopPollCorrect();setCorrectBusy(false)}})}
+function pollCorrectStatus(){apiGet("/api/correct/status").then(function(res){if(!res||!res.ok)return;correctInstances=res.instances||[];renderCorrectSel(correctInstances);var inst=null;for(var i=0;i<correctInstances.length;i++){if(correctInstances[i].id===selectedCorrectId){inst=correctInstances[i];break}}if(!inst&&correctInstances.length){inst=correctInstances[correctInstances.length-1];selectedCorrectId=inst.id;var selEl=document.getElementById("correctSel");if(selEl&&selEl.style.display!=="none")selEl.value=inst.id}if(inst){renderCorrectLog(inst.lines||[]);renderCorrectMsg(inst)}var running=false;for(var j=0;j<correctInstances.length;j++){if(correctInstances[j].running){running=true;break}}if(!running){stopPollCorrect();setCorrectBusy(false)}})}
+function renderCorrectMsg(inst){var el=document.getElementById("correctMsg");if(!el)return;if(!inst){el.textContent="等待矫正任务…";el.className="prog-msg";return}var lines=inst.lines||[],last=lines.length?lines[lines.length-1]:"";var txt=inst.running?("矫正运行中"+(inst.url?("（"+inst.url+"）"):"")):(last||"矫正已结束");el.textContent=txt;el.className="prog-msg"+(inst.running?"":" ok")}
 function renderCorrectLog(lines){var el=document.getElementById("correctLog");if(!lines.length)return;el.textContent=lines.join("\n");el.scrollTop=el.scrollHeight}
 function stopCorrect(){apiPost("/api/correct/stop",{id:selectedCorrectId||undefined}).then(function(res){if(res&&res.ok){toast("已请求停止","warn");addLog("已请求停止矫正","log-warn")}else{var msg=res&&res.error?res.error:"停止失败";toast(msg,"fail")}})}
 /* ===== EPUB 编辑（独立进程，单实例） ===== */
@@ -683,8 +776,8 @@ function stopMerge(){apiPost("/api/tools/merge/stop").then(function(res){if(res&
 function clearCaches(){var scopes=[];if(document.getElementById("ccPreview").checked)scopes.push("preview");if(document.getElementById("ccSplit").checked)scopes.push("split");if(document.getElementById("ccTmp").checked)scopes.push("tmp");if(!scopes.length){toast("请至少选择一项清除范围","warn");return}var btn=document.getElementById("ccClearBtn"),out=document.getElementById("ccResult");btn.disabled=true;btn.textContent="清除中…";apiPost("/api/cache/clear",{scopes:scopes}).then(function(res){btn.disabled=false;btn.textContent="清除缓存";if(res&&res.ok){var mb=(res.freed/1048576).toFixed(1);out.textContent="已清除预览 "+res.counts.preview+" 项、分割图 "+res.counts.split+" 项、临时 "+res.counts.tmp+" 项，释放 "+mb+" MB";toast("缓存已清除","ok")}else{var msg=res&&res.error?res.error:"清除失败";out.textContent=msg;toast(msg,"fail")}})}
 function createBackup(){var params={include_history_images:document.getElementById("bkImages").checked,include_epubs:document.getElementById("bkEpubs").checked};var btn=document.getElementById("bkBtn"),out=document.getElementById("bkResult");btn.disabled=true;btn.textContent="备份中…";apiPost("/api/backup/create",params).then(function(res){btn.disabled=false;btn.textContent="立即备份";if(res&&res.ok){var mb=(res.size/1048576).toFixed(1);out.textContent="已备份 "+res.files+" 个文件："+res.path+"（"+mb+" MB）";toast("备份完成","ok")}else{var msg=res&&res.error?res.error:"备份失败";out.textContent=msg;toast(msg,"fail")}})}
 /* ===== 历史记录页 ===== */
-var historyLoaded=false;
-function renderHistory(){apiGet("/api/history").then(function(res){if(!res||!res.ok){toast("加载历史记录失败","fail");return}historyLoaded=true;var tbody=document.getElementById("historyTbody");var entries=res.entries||[];if(!entries.length){tbody.innerHTML='<tr><td colspan="6" class="empty-state">暂无历史记录</td></tr>';return}tbody.innerHTML="";entries.forEach(function(e){var tr=document.createElement("tr");var title=escH(e.display_name||e.name||(e.pdf?basename(e.pdf):"(未命名)"));var pdf=escH(e.pdf?basename(e.pdf):"");var upd=escH(e.updated||"");var pages=e.pages!=null?e.pages:"";var pr=e.last_proofread_page!=null?e.last_proofread_page:"";tr.innerHTML='<td>'+title+'</td><td style="font-size:12px;">'+pdf+'</td><td style="font-size:12px;">'+upd+'</td><td>'+pages+'</td><td>'+pr+'</td>';var ops=document.createElement("td");ops.style.cssText="white-space:nowrap;";var openBtn=document.createElement("button");openBtn.className="btn-small";openBtn.textContent="矫正";openBtn.onclick=function(){openHistoryCorrect(e)};var renBtn=document.createElement("button");renBtn.className="btn-small";renBtn.textContent="重命名";renBtn.style.cssText="margin-left:6px;";renBtn.onclick=function(){renameHistory(e)};var delBtn=document.createElement("button");delBtn.className="btn-small";delBtn.textContent="删除";delBtn.style.cssText="margin-left:6px;color:var(--red);border-color:var(--red);";delBtn.onclick=function(){deleteHistory(e)};var expBtn=document.createElement("button");expBtn.className="btn-small";expBtn.textContent="导出";expBtn.title="导出该版本为备份 ZIP（含内嵌预览图，保存到程序 data/data 目录），可在矫正界面「导入」恢复";expBtn.style.cssText="margin-left:6px;";expBtn.onclick=function(){exportHistory(e)};var saveAsSel=document.createElement("select");saveAsSel.className="btn-small";saveAsSel.style.cssText="margin-left:6px;height:26px;";saveAsSel.title="另存为：选择格式后弹窗选保存位置（TXT / MD / DOCX / EPUB）";var so0=document.createElement("option");so0.value="";so0.textContent="另存为 ▾";saveAsSel.appendChild(so0);[["txt","txt"],["md","md"],["docx","docx"],["epub","epub"]].forEach(function(f){var o=document.createElement("option");o.value=f[0];o.textContent="导出 "+f[1].toUpperCase();saveAsSel.appendChild(o)});saveAsSel.onchange=function(){var f=saveAsSel.value;saveAsSel.value="";if(f){exportHistorySaveAs(e,f)}};ops.appendChild(openBtn);ops.appendChild(renBtn);ops.appendChild(expBtn);ops.appendChild(saveAsSel);ops.appendChild(delBtn);tr.appendChild(ops);tbody.appendChild(tr)})})}
+var historyLoaded=false, historySearchKeyword="";
+function renderHistory(){apiGet("/api/history").then(function(res){if(!res||!res.ok){toast("加载历史记录失败","fail");return}historyLoaded=true;var tbody=document.getElementById("historyTbody");var entries=(res.entries||[]).slice();var kw=(historySearchKeyword||"").trim();if(kw){var kl=kw.toLowerCase();entries=entries.filter(function(e){var title=(e.display_name||e.name||(e.pdf?basename(e.pdf):""))||"";var pdf=(e.pdf?basename(e.pdf):"")||"";var id=(e.id||"");return title.toLowerCase().indexOf(kl)>=0||pdf.toLowerCase().indexOf(kl)>=0||id.toLowerCase().indexOf(kl)>=0})}var searchClear=document.getElementById("historySearchClear");if(searchClear)searchClear.style.display=kw?"":"none";if(!entries.length){tbody.innerHTML=kw?'<tr><td colspan="6" class="empty-state">无匹配结果</td></tr>':'<tr><td colspan="6" class="empty-state">暂无历史记录</td></tr>';return}tbody.innerHTML="";entries.forEach(function(e){var tr=document.createElement("tr");var title=escH(e.display_name||e.name||(e.pdf?basename(e.pdf):"(未命名)"));var pdf=escH(e.pdf?basename(e.pdf):"");var upd=escH(e.updated||"");var pages=e.pages!=null?e.pages:"";var pr=e.last_proofread_page!=null?e.last_proofread_page:"";tr.innerHTML='<td>'+title+'</td><td style="font-size:12px;">'+pdf+'</td><td style="font-size:12px;">'+upd+'</td><td>'+pages+'</td><td>'+pr+'</td>';var ops=document.createElement("td");ops.style.cssText="white-space:nowrap;";var openBtn=document.createElement("button");openBtn.className="btn-small";openBtn.textContent="矫正";openBtn.onclick=function(){openHistoryCorrect(e)};var renBtn=document.createElement("button");renBtn.className="btn-small";renBtn.textContent="重命名";renBtn.style.cssText="margin-left:6px;";renBtn.onclick=function(){renameHistory(e)};var delBtn=document.createElement("button");delBtn.className="btn-small";delBtn.textContent="删除";delBtn.style.cssText="margin-left:6px;color:var(--red);border-color:var(--red);";delBtn.onclick=function(){deleteHistory(e)};var expBtn=document.createElement("button");expBtn.className="btn-small";expBtn.textContent="导出";expBtn.title="导出该版本为备份 ZIP（含内嵌预览图，保存到程序 data/data 目录），可在矫正界面「导入」恢复";expBtn.style.cssText="margin-left:6px;";expBtn.onclick=function(){exportHistory(e)};var saveAsSel=document.createElement("select");saveAsSel.className="btn-small";saveAsSel.style.cssText="margin-left:6px;height:26px;";saveAsSel.title="另存为：选择格式后弹窗选保存位置（TXT / MD / DOCX / EPUB）";var so0=document.createElement("option");so0.value="";so0.textContent="另存为 ▾";saveAsSel.appendChild(so0);[["txt","txt"],["md","md"],["docx","docx"],["epub","epub"]].forEach(function(f){var o=document.createElement("option");o.value=f[0];o.textContent="导出 "+f[1].toUpperCase();saveAsSel.appendChild(o)});saveAsSel.onchange=function(){var f=saveAsSel.value;saveAsSel.value="";if(f){exportHistorySaveAs(e,f)}};ops.appendChild(openBtn);ops.appendChild(renBtn);ops.appendChild(expBtn);ops.appendChild(saveAsSel);ops.appendChild(delBtn);tr.appendChild(ops);tbody.appendChild(tr)})})}
 function openHistoryCorrect(e){apiPost("/api/correct/start",{pdf:e.pdf||null,history_id:e.id}).then(function(res){if(res&&res.ok){toast("矫正已启动","ok")}else{var msg=res&&res.error?res.error:"启动失败";toast(msg,"fail")}})}
 function exportHistory(e){apiPost("/api/history/export/backup",{ids:[e.id||""]}).then(function(res){if(res&&res.ok){toast("已导出备份："+(res.path||""),"ok")}else{toast((res&&res.error)||"导出失败","fail")}})}
 function exportHistorySaveAs(e,fmt){var extMap={txt:".txt",md:".md",docx:".docx",epub:".epub"};var ftMap={txt:[["文本文件","*.txt"],["所有文件","*.*"]],md:[["Markdown 文件","*.md"],["所有文件","*.*"]],docx:[["Word 文档","*.docx"],["所有文件","*.*"]],epub:[["EPUB 电子书","*.epub"],["所有文件","*.*"]]};function _p2(n){return(n<10?"0":"")+n}var d=new Date();var stamp=""+d.getFullYear()+_p2(d.getMonth()+1)+_p2(d.getDate())+_p2(d.getHours())+_p2(d.getMinutes())+_p2(d.getSeconds());var t=(e.display_name||e.name||(e.pdf?basename(e.pdf):"历史")||"历史").replace(/\.[^.]+$/,"");var def=t+"_"+stamp+(extMap[fmt]||".txt");apiPost("/api/pick",{kind:"save",title:"导出为 "+(fmt||"").toUpperCase(),default:def,ext:extMap[fmt]||".txt",filetypes:ftMap[fmt]||[["所有文件","*.*"]]}).then(function(r){if(!r)return;if(r.cancelled){toast("已取消保存","warn");return}if(r.error){toast(r.error,"fail");return}var path=r.path;apiPost("/api/history/export/file",{id:e.id||"",format:fmt,save_path:path}).then(function(res){if(res&&res.ok){toast("已导出："+(res.path||""),"ok")}else{toast((res&&res.error)||"导出失败","fail")}})})}
@@ -706,6 +799,7 @@ setInterval(function(){fetch("/api/ping").catch(function(){})},30000);
 window.addEventListener("pagehide",function(){stopPollConvert();stopPollCorrect();stopPollMerge();stopPollEpubEdit();navigator.sendBeacon("/api/bye")});
 window.addEventListener("pageshow",function(){fetch("/api/ping").catch(function(){})});
 (function(){var bg=document.getElementById("renameModalBg");if(!bg)return;bg.addEventListener("mousedown",function(ev){if(ev.target===bg)closeRenameModal()});var ok=document.getElementById("renameOkBtn");if(ok)ok.addEventListener("click",submitRename);var cancel=document.getElementById("renameCancelBtn");if(cancel)cancel.addEventListener("click",closeRenameModal);document.addEventListener("keydown",function(ev){var m=document.getElementById("renameModalBg");if(!m||m.style.display==="none")return;if(ev.key==="Escape"){ev.preventDefault();closeRenameModal()}else if(ev.key==="Enter"){ev.preventDefault();submitRename()}})})();
+function clearHistorySearch(){var inp=document.getElementById("historySearchInput");if(inp){inp.value="";historySearchKeyword="";}var btn=document.getElementById("historySearchClear");if(btn)btn.style.display="none";renderHistory()}(function(){var inp=document.getElementById("historySearchInput");if(inp){inp.addEventListener("input",function(){historySearchKeyword=inp.value;var btn=document.getElementById("historySearchClear");if(btn)btn.style.display=historySearchKeyword.trim()?"":"none";renderHistory()})}})();
 fetchConfig().then(function(){fetchStatus()});
 </script>
 </body>
@@ -755,6 +849,12 @@ _BOOL_FALSE_WORDS = ("false", "0", "off", "no")
 # 时（种子键尚未写回、或外部精简过的配置）一律按 True 处理。
 _PADDLE_MERGE_LINES_DEFAULT = True
 
+# paddle_det_limit（PaddleOCR 检测阶段最长边上限）缺省值：960，0=关闭。
+# 与 paddleocrmanage._DEFAULT_DET_LIMIT 保持一致，保证 GET /api/config 下发确定初值。
+_PADDLE_DET_LIMIT_DEFAULT = 960
+_PADDLE_DET_LIMIT_MIN = 64
+_PADDLE_DET_LIMIT_MAX = 4000
+
 
 def _parse_bool_arg(value) -> bool | None:
     """解析布尔型配置值：合法返回 True/False，非法返回 None。
@@ -781,6 +881,22 @@ def _paddle_merge_lines_value(cfg) -> bool:
         return _PADDLE_MERGE_LINES_DEFAULT
     parsed = _parse_bool_arg(raw)
     return _PADDLE_MERGE_LINES_DEFAULT if parsed is None else parsed
+
+
+def _paddle_det_limit_value(cfg) -> int:
+    """取配置里的 paddle_det_limit；缺失/非法/负数回退 960，超上限截断。"""
+    if not isinstance(cfg, dict):
+        return _PADDLE_DET_LIMIT_DEFAULT
+    raw = cfg.get("paddle_det_limit")
+    if raw is None:
+        return _PADDLE_DET_LIMIT_DEFAULT
+    try:
+        limit = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return _PADDLE_DET_LIMIT_DEFAULT
+    if limit < 0:
+        return _PADDLE_DET_LIMIT_DEFAULT
+    return min(limit, _PADDLE_DET_LIMIT_MAX)
 
 
 # 仓库根目录：开发环境用 sys.executable 跑 mian.py 时定位脚本路径
@@ -850,11 +966,13 @@ def _correct_argv(
     out_dir: str | None = None,
     epub_path: str | None = None,
     correct_timeout: int | None = None,
+    live: bool = False,
 ) -> list[str]:
     """组装「correct」子命令的 argv。pdf 可为 None（无文件启动）。
 
     history_id 非 None 时追加 --history-id（矫正侧从历史恢复内容，键为
     correctmanage 历史条目的 id 字段）。
+    live=True 时追加 --live-ocr（矫正界面跟随 OCR 进度，识别完成的页面实时出现）。
     """
     if getattr(sys, "frozen", False):
         argv = [sys.executable, "correct"]
@@ -878,6 +996,9 @@ def _correct_argv(
         argv += ["--epub-path", epub_path]
     if correct_timeout is not None:
         argv += ["--correct-timeout", str(correct_timeout)]
+    if live:
+        # 跟随 OCR 进度：识别完成的页面实时进入矫正界面
+        argv += ["--live-ocr"]
     return argv
 
 
@@ -946,6 +1067,33 @@ def _probe_correct_ui(port: int) -> bool:
         return False
 
 
+def _parse_progress_marker(payload_text: str) -> dict | None:
+    """解析子进程进度标记载荷（JSON）→ dict；损坏返回 None。
+
+    载荷形如 {"stage": "ocr", "message": "正在识别 3/10 页（30%）",
+    "done": 3, "total": 10, "percent": 30.0}。
+    """
+    try:
+        data = json.loads((payload_text or "").strip() or "{}")
+    except Exception:  # noqa: BLE001  载荷损坏不阻断转换
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_task_log(st: dict, text: str) -> None:
+    """把子进程原始输出写入本次任务的本地日志文件（失败静默）。
+
+    st 里的 "log_writer" 由 /api/convert/start 创建（logmanage.TaskLog）。
+    """
+    writer = st.get("log_writer")
+    if writer is None or not text:
+        return
+    try:
+        writer.write(text)
+    except Exception:  # noqa: BLE001  日志失败不能影响转换
+        pass
+
+
 def _convert_monitor(st: dict, proc) -> None:
     """转换子进程监控线程：流式收集 stdout 日志，进程结束后写完成状态。
 
@@ -979,6 +1127,8 @@ def _convert_monitor(st: dict, proc) -> None:
 
     def _handle_line(text: str) -> None:
         marker = text.strip()
+        # 全部原始输出写入本次任务的本地日志文件（界面只显示进度条+一条消息）
+        _write_task_log(st, text)
         if marker.startswith(_PROMPT_MARKER):
             payload_text = marker[len(_PROMPT_MARKER) :].strip()
             try:
@@ -1000,6 +1150,27 @@ def _convert_monitor(st: dict, proc) -> None:
                 st["lines"].append("—— 需要选择：请在弹出的窗口中选择操作 ——")
                 if len(st["lines"]) > _CONVERT_MAX_LINES:
                     del st["lines"][: len(st["lines"]) - _CONVERT_MAX_LINES]
+            return
+        if marker.startswith(_PROGRESS_MARKER):
+            # 结构化进度标记：解析为「阶段 + 一条消息 + 进度百分比」，
+            # 不进界面日志区（避免刷屏），只更新状态。
+            payload = _parse_progress_marker(marker[len(_PROGRESS_MARKER) :])
+            if payload:
+                with st["lock"]:
+                    st["stage"] = payload.get("stage") or ""
+                    msg = payload.get("message") or ""
+                    if msg:
+                        st["message"] = msg
+                    st["progress"] = {
+                        "done": payload.get("done"),
+                        "total": payload.get("total"),
+                        "percent": payload.get("percent"),
+                        # ETA（2026-10-21）：动态预计完成时间（子进程上报）
+                        "eta_sec": payload.get("eta_sec"),
+                        "eta_total_sec": payload.get("eta_total_sec"),
+                        "eta_at": payload.get("eta_at"),
+                        "elapsed_sec": payload.get("elapsed_sec"),
+                    }
             return
         with st["lock"]:
             st["lines"].append(text)
@@ -1044,6 +1215,7 @@ def _convert_monitor(st: dict, proc) -> None:
                 if epub_path:
                     st["success"] = True
                     st["epub_path"] = epub_path
+                    st["message"] = f"转换完成：{epub_path}"
                 else:
                     # rc=0 但没有 Done 行：通常是被用户取消（pdf_to_epub 返回
                     # cancelled，主流程打印「已取消」）
@@ -1053,9 +1225,11 @@ def _convert_monitor(st: dict, proc) -> None:
                     st["error"] = (
                         "已取消" if cancelled else ("；".join(tail) if tail else "未生成 EPUB")
                     )
+                    st["message"] = st["error"]
             else:
                 tail = [ln for ln in st["lines"][-3:] if ln.strip()]
                 st["error"] = "；".join(tail) if tail else "转换进程异常退出"
+                st["message"] = st["error"]
     except Exception as e:  # noqa: BLE001  监控线程异常不崩溃服务
         with st["lock"]:
             st["running"] = False
@@ -1064,6 +1238,15 @@ def _convert_monitor(st: dict, proc) -> None:
             if has_prompt:
                 st["prompt"] = None
             st["error"] = str(e)
+            st["message"] = str(e)
+    finally:
+        # 关闭本次任务的日志文件（内容已落盘）
+        writer = st.get("log_writer")
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _correct_instances(state: dict) -> list:
@@ -1508,6 +1691,7 @@ class _GuiHandler(BaseHTTPRequestHandler):
             # paddle_merge_lines 缺省时按默认 True 下发，前端复选框才有确定初值
             cfg = dict(cfg)
             cfg["paddle_merge_lines"] = _paddle_merge_lines_value(cfg)
+            cfg["paddle_det_limit"] = _paddle_det_limit_value(cfg)
             # table_convert 缺省时按默认 True 下发，前端复选框才有确定初值
             _tc = cfg.get("table_convert")
             cfg["table_convert"] = True if _tc is None else (_parse_bool_arg(_tc) is not False)
@@ -1713,6 +1897,26 @@ class _GuiHandler(BaseHTTPRequestHandler):
                         )
                         return
                     body[_bool_key] = parsed
+            if "paddle_det_limit" in body:
+                # 检测最长边上限：0=关闭（按原图分辨率检测），否则 64-4000
+                try:
+                    _limit = int(str(body.get("paddle_det_limit")).strip())
+                except (TypeError, ValueError):
+                    _limit = -1
+                if _limit != 0 and not (
+                    _PADDLE_DET_LIMIT_MIN <= _limit <= _PADDLE_DET_LIMIT_MAX
+                ):
+                    self._send(
+                        400,
+                        self._json(
+                            {
+                                "ok": False,
+                                "error": "paddle_det_limit 仅接受 0（关闭）或 64-4000 的整数",
+                            }
+                        ),
+                    )
+                    return
+                body["paddle_det_limit"] = _limit
             cfg.update(body)
             cfg = configmanage.validate_and_patch_config(cfg)
             with configmanage._CFG_LOCK:
@@ -1925,6 +2129,13 @@ class _GuiHandler(BaseHTTPRequestHandler):
             if cv["running"]:
                 self._send(409, self._json({"ok": False, "error": "已有转换在运行"}))
                 return
+            # 关闭上一次的日志文件（若有），本次重新建一个
+            old_writer = cv.get("log_writer")
+            if old_writer is not None:
+                try:
+                    old_writer.close()
+                except Exception:  # noqa: BLE001
+                    pass
             cv["lines"] = []
             cv["done"] = False
             cv["success"] = False
@@ -1933,6 +2144,20 @@ class _GuiHandler(BaseHTTPRequestHandler):
             cv["error"] = None
             cv["prompt"] = None
             cv["running"] = True
+            # 界面只显示「一条进度条 + 一条消息」：其余输出写入本地日志文件
+            cv["message"] = "转换已启动"
+            cv["stage"] = ""
+            cv["progress"] = {"done": 0, "total": 0, "percent": 0}
+            log_path = ""
+            try:
+                from logmanage import TaskLog, task_log_path
+
+                log_path = str(task_log_path("convert"))
+                cv["log_path"] = log_path
+                cv["log_writer"] = TaskLog(log_path)
+            except Exception:  # noqa: BLE001  日志文件建不了不影响转换
+                cv["log_path"] = ""
+                cv["log_writer"] = None
         argv = _convert_argv(
             pdf,
             dpi=dpi,
@@ -1959,6 +2184,10 @@ class _GuiHandler(BaseHTTPRequestHandler):
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUNBUFFERED"] = "1"
             env["PTOE_UI_PROMPT"] = "1"
+            # PTOE_UI_PROGRESS=1：子进程按阶段打印结构化进度标记
+            # （__PTOE_PROGRESS__{json}），界面据此渲染「一条进度条 + 一条消息」，
+            # 子进程终端不再重复打印逐页进度条。
+            env["PTOE_UI_PROGRESS"] = "1"
             kwargs = {
                 "stdin": subprocess.PIPE,
                 "stdout": subprocess.PIPE,
@@ -1998,7 +2227,11 @@ class _GuiHandler(BaseHTTPRequestHandler):
         )
 
     def _api_convert_status(self) -> None:
-        """GET /api/convert/status：转换进度快照（运行中/完成/日志/结果/待答询问）。"""
+        """GET /api/convert/status：转换进度快照（运行中/完成/进度/结果/待答询问）。
+
+        界面只显示「一条进度条 + 一条消息」：message/stage/progress 是
+        结构化进度，完整输出在本地日志文件里（log_path）。
+        """
         cv = self.server.state["convert"]
         with cv["lock"]:
             self._send(
@@ -2014,6 +2247,11 @@ class _GuiHandler(BaseHTTPRequestHandler):
                         "error": cv["error"],
                         "epub_path": cv["epub_path"],
                         "prompt": cv["prompt"],
+                        # —— 新增：界面用的一行状态 ——
+                        "message": cv.get("message") or "",
+                        "stage": cv.get("stage") or "",
+                        "progress": cv.get("progress") or {},
+                        "log_path": cv.get("log_path") or "",
                     }
                 ),
             )
@@ -2084,7 +2322,44 @@ class _GuiHandler(BaseHTTPRequestHandler):
             cv["success"] = False
             cv["error"] = "已手动停止"
             cv["prompt"] = None
+            cv["message"] = "已手动停止"
         self._send(200, self._json({"ok": True, "message": "已请求停止"}))
+
+    def _api_open_log(self, body) -> None:
+        """POST /api/open-log：用系统默认程序打开本地日志文件。
+
+        body: {"path": "..."}。仅允许打开 logs/ 目录下的日志文件。
+        """
+        if not isinstance(body, dict):
+            self._send(400, self._json({"ok": False, "error": "无效的 JSON"}))
+            return
+        path = body.get("path")
+        if not path or not isinstance(path, str):
+            self._send(400, self._json({"ok": False, "error": "path 必须是字符串"}))
+            return
+        try:
+            from logmanage import logs_dir
+
+            allowed = os.path.realpath(logs_dir())
+            real = os.path.realpath(path)
+            if os.path.commonpath([allowed, real]) != allowed:
+                self._send(400, self._json({"ok": False, "error": "只能打开日志目录下的文件"}))
+                return
+            if not os.path.isfile(real):
+                self._send(404, self._json({"ok": False, "error": "日志文件不存在"}))
+                return
+        except Exception as e:
+            self._send(400, self._json({"ok": False, "error": f"无效的日志路径：{e}"}))
+            return
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(real)  # noqa: S606  Windows 默认程序打开
+            else:
+                subprocess.Popen(["xdg-open", real])
+        except Exception as e:
+            self._send(500, self._json({"ok": False, "error": f"打开失败：{e}"}))
+            return
+        self._send(200, self._json({"ok": True, "path": real}))
 
     # -- 矫正界面 --
 
@@ -2133,15 +2408,15 @@ class _GuiHandler(BaseHTTPRequestHandler):
             return
         st = self.server.state
         cv = st["convert"]
-        with cv["lock"]:
-            if cv["running"]:
-                self._send(409, self._json({"ok": False, "error": "已有转换在运行"}))
-                return
+        # 注意：允许「转换进行中」启动矫正（转换与矫正已分离），
+        # 转换中的 PDF 可用 live 模式跟随 OCR 进度实时进入矫正界面。
+        live = bool(body.get("live")) and bool(pdf)
         inst = {
             "id": uuid.uuid4().hex[:12],
             "pdf": pdf or None,
             "history_id": history_id or None,
             "engine": engine,
+            "live": live,
             "proc": None,
             "port": None,
             "url": None,
@@ -2159,6 +2434,7 @@ class _GuiHandler(BaseHTTPRequestHandler):
             out_dir=body.get("out_dir"),
             epub_path=body.get("epub_path"),
             correct_timeout=correct_timeout,
+            live=live,
         )
         try:
             env = dict(os.environ)
@@ -2978,6 +3254,9 @@ class _GuiHandler(BaseHTTPRequestHandler):
         if path == "/api/convert/stop":
             self._api_convert_stop()
             return
+        if path == "/api/open-log":
+            self._api_open_log(body)
+            return
         if path == "/api/correct/start":
             self._api_correct_start(body)
             return
@@ -3340,6 +3619,12 @@ def gui_serve(
             "epub_path": None,
             "error": None,
             "prompt": None,
+            # 界面只显示「一条进度条 + 一条消息」：其余输出写本地日志文件
+            "message": "",
+            "stage": "",
+            "progress": {"done": 0, "total": 0, "percent": 0},
+            "log_path": "",
+            "log_writer": None,
         },
         "correct_instances": [],
         "merge": {

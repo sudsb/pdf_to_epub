@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import re
@@ -285,7 +287,7 @@ class TestOcrResume(unittest.TestCase):
         llamamanage.set_engine(self._orig_engine)
 
     def _split(self):
-        return mian.split_pdf_to_images(self._pdf, dpi=100, fmt="png")
+        return mian.split_pdf_to_images(self._pdf, dpi=mian.resolve_dpi(None), fmt="png")
 
     def _write_progress(self, img_dir, pages, status="running"):
         import json
@@ -295,7 +297,7 @@ class TestOcrResume(unittest.TestCase):
             json.dumps(
                 {
                     "pdf": str(self._pdf.resolve()),
-                    "dpi": 100,
+                    "dpi": mian.resolve_dpi(None),
                     "model_key": "HY",
                     "total": 3,
                     "status": status,
@@ -805,6 +807,83 @@ class TestConfigSetPaddleMergeLines(unittest.TestCase):
         self.assertIsNone(mian._parse_bool_arg("2"))
 
 
+class TestConfigSetPaddleDetLimit(unittest.TestCase):
+    """mian.py `config set paddle_det_limit`：白名单 + 0/64-4000 校验（2026-10）。
+
+    隔离方式与 TestConfigSetPaddleMergeLines 一致（临时 _CONFIG_PATH + 真实存在的
+    llama_server/models_dir 路径，避免 get_config 弹窗卡住）。
+    """
+
+    def setUp(self):
+        import configmanage
+
+        self._tmp = Path(tempfile.mkdtemp(prefix="test_mian_det_"))
+        self._exe = self._tmp / "llama-server.exe"
+        self._exe.write_bytes(b"stub")
+        self._cfg_path = self._tmp / "config.json"
+        base = configmanage.validate_and_patch_config(
+            {
+                "llama_server": str(self._exe),
+                "models_dir": str(self._tmp),
+                "engine": "llama",
+                "selected_model": "HY",
+                "model_choices": {"HY": {"name": "H.gguf", "mmproj": "H.mmproj"}},
+            }
+        )
+        self._cfg_path.write_text(
+            json.dumps(base, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        self._orig_cfg_path = configmanage._CONFIG_PATH
+        configmanage._CONFIG_PATH = str(self._cfg_path)
+
+    def tearDown(self):
+        import configmanage
+
+        configmanage._CONFIG_PATH = self._orig_cfg_path
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _stored(self):
+        """读回临时 config.json 里的 paddle_det_limit 原始值。"""
+        return json.loads(self._cfg_path.read_text(encoding="utf-8")).get(
+            "paddle_det_limit"
+        )
+
+    def _run(self, argv):
+        import contextlib
+        import io
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = mian.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_set_accepts_zero_and_range_and_stores_int(self):
+        """0（关闭）与 64-4000 区间 → 退出 0，落盘为真正的 int（不是字符串）。"""
+        for raw, expect in (("0", 0), ("960", 960), ("64", 64), ("4000", 4000)):
+            rc, _out, err = self._run(["config", "set", "paddle_det_limit", raw])
+            self.assertEqual(rc, 0, f"值 {raw!r} 应被接受: {err}")
+            stored = self._stored()
+            self.assertIsInstance(stored, int, f"值 {raw!r} 应落盘为 int")
+            self.assertEqual(stored, expect)
+
+    def test_set_invalid_value_reports_chinese_error_and_does_not_write(self):
+        """非法值（负数/过小/过大/非数字）→ stderr 中文提示 + 退出 1，文件不改。"""
+        before = self._cfg_path.read_text(encoding="utf-8")
+        for raw in ("-1", "63", "4001", "abc", ""):
+            rc, _out, err = self._run(["config", "set", "paddle_det_limit", raw])
+            self.assertEqual(rc, 1, f"值 {raw!r} 应被拒绝")
+            self.assertIn("paddle_det_limit 仅接受", err, f"值 {raw!r} 缺中文提示")
+            self.assertEqual(
+                self._cfg_path.read_text(encoding="utf-8"), before, "非法值不得写盘"
+            )
+
+    def test_default_dpi_is_200(self):
+        """2026-10 起缺省 200dpi；resolve_dpi 未给默认值时同样回退 200。"""
+        self.assertEqual(mian.resolve_dpi(None), 200)
+        self.assertEqual(mian.resolve_dpi("abc"), 200)
+        self.assertEqual(mian.resolve_dpi(150), 150)
+
+
 class TestCleanSubcommand(unittest.TestCase):
     """mian.py clean / 简称 cl（2026-10-18）：页范围解析 + 路由到 headless 清理。"""
 
@@ -902,6 +981,50 @@ class TestCleanSubcommand(unittest.TestCase):
             correctmanage._history_entries = orig
         self.assertEqual(rc, 0)
         self.assertIn("hist_1", out.getvalue())
+
+
+class TestProgressMarker(unittest.TestCase):
+    """进度标记（GUI 模式）：转换子进程向界面报告阶段/消息/百分比。
+
+    界面据此渲染「一条进度条 + 一条消息」；非 GUI 模式（终端）不打印标记行，
+    终端只保留一条原地刷新的进度条。
+    """
+
+    def test_emit_progress_silent_without_env(self):
+        """非 GUI 模式：_emit_progress 静默（不污染终端输出）。"""
+        env = dict(os.environ)
+        env.pop(mian._UI_PROGRESS_ENV, None)
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True):
+            with contextlib.redirect_stdout(buf):
+                mian._emit_progress("ocr", "正在识别", done=1, total=4)
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_emit_progress_prints_marker_in_gui_mode(self):
+        """GUI 模式：打印 __PTOE_PROGRESS__ 标记行（JSON 载荷）。"""
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, {mian._UI_PROGRESS_ENV: "1"}):
+            with contextlib.redirect_stdout(buf):
+                mian._emit_progress(
+                    "ocr", "正在识别 1/4 页", done=1, total=4, percent=25.0
+                )
+        out = buf.getvalue()
+        self.assertIn(mian._PROGRESS_MARKER, out)
+        payload = json.loads(out.split(mian._PROGRESS_MARKER, 1)[1].strip())
+        self.assertEqual(payload["stage"], "ocr")
+        self.assertEqual(payload["message"], "正在识别 1/4 页")
+        self.assertEqual(payload["done"], 1)
+        self.assertEqual(payload["total"], 4)
+        self.assertEqual(payload["percent"], 25.0)
+
+    def test_gui_progress_mode_reads_env(self):
+        """_gui_progress_mode 依据 PTOE_UI_PROGRESS 环境变量判定。"""
+        with mock.patch.dict(os.environ, {mian._UI_PROGRESS_ENV: "1"}):
+            self.assertTrue(mian._gui_progress_mode())
+        env = dict(os.environ)
+        env.pop(mian._UI_PROGRESS_ENV, None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertFalse(mian._gui_progress_mode())
 
 
 if __name__ == "__main__":

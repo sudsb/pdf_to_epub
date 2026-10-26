@@ -1,72 +1,63 @@
 {
-  "llama_server": "E:/xox/Tools/llama13/llama-server.exe",
-  "models_dir": "E:/model",
+  "llama_server": "E:/xox/Tools/llama-c/llama-server.exe",
+  "models_dir": "E:/xox/Tools/llama-c/models",
   "model_choices": {
     "HY": {
-      "name": "huiyuan/HunyuanOCR.BF16.gguf",
-      "mmproj": "huiyuan/HunyuanOCR.mmproj-bf16.gguf",
-      "workers": 4
+      "name": "HunyuanOCR.BF16.gguf",
+      "mmproj": "HunyuanOCR.mmproj-bf16.gguf",
+      "workers": 2
     },
     "QWEN.8": {
-      "name": "qwen3.5/Qwen3.5-0.8B-BF16.gguf",
-      "mmproj": "qwen3.5/0.8b_mmproj-F16.gguf",
-      "workers": 4
+      "name": "Qwen3.5-0.8B-Q8_0.gguf",
+      "mmproj": "0.8b_mmproj-F16.gguf",
+      "workers": 6
     },
     "QWEN2": {
-      "name": "qwen3.5/Qwen3.5-2B-BF16.gguf",
-      "mmproj": "qwen3.5/2b_mmproj-F16.gguf",
+      "name": "Qwen3.5-2B-Q8_0.gguf",
+      "mmproj": "2b_mmproj-F16.gguf",
       "workers": 4
     },
+    "QWEN4": {
+      "name": "Qwen3.5-4B-Q8_0.gguf",
+      "mmproj": "4b_mmproj-F16.gguf",
+      "workers": 3
+    },
     "PD": {
-      "name": "paddleocr/PaddleOCR-VL-1.6-GGUF.gguf",
-      "mmproj": "paddleocr/PaddleOCR-VL-1.6-GGUF-mmproj.gguf",
+      "name": "PaddleOCR-VL-1.6-GGUF.gguf",
+      "mmproj": "PaddleOCR-VL-1.6-GGUF-mmproj.gguf",
       "workers": 4
     },
     "ULQ8": {
-      "name": "Unlimited/Unlimited-OCR-Q8_0.gguf",
-      "mmproj": "Unlimited/mmproj-Unlimited-OCR-F16.gguf",
-      "workers": 4
+      "name": "Unlimited-OCR-Q8_0.gguf",
+      "mmproj": "mmproj-Unlimited-OCR-F16.gguf",
+      "workers": 3
     },
-    "DOTS8": {
-      "name": "dots/dots.ocr.Q8_0.gguf",
-      "mmproj": "dots/dots.ocr.mmproj-Q8_0.gguf",
-      "workers": 4
-    },
-    "glm8": {
-      "name": "glm/GLM-OCR-Q8_0.gguf",
-      "mmproj": "glm/GLM-OCR.mmproj-f16.gguf",
-      "workers": 4
-    },
-    "glm16": {
-      "name": "glm/GLM-OCR-f16.gguf",
-      "mmproj": "glm/GLM-OCR.mmproj-f16.gguf",
-      "workers": 4
-    },
-    "q34": {
-      "name": "qwenvl/Qwen3VL-4B-Instruct-Q8_0.gguf",
-      "mmproj": "qwenvl/mmproj-Qwen3VL-4B-Instruct-F16.gguf",
-      "workers": 4
-    },
-    "qwen4": {
-      "name": "qwen3.5/Qwen3.5-4B-Q8_0.gguf",
-      "mmproj": "qwen3.5/4b_mmproj-F16.gguf",
-      "workers": 4
+    "ULQ4": {
+      "name": "Unlimited-OCR-Q4_K_S.gguf",
+      "mmproj": "mmproj-Unlimited-OCR-F16.gguf",
+      "workers": 5
     }
   },
-  "selected_model": "DOTS8",
-  "ocr_prompt": "OCR this image,Output the original text in its original format without any missing or omitted characters. Reply in Simplified Chinese",
+  "proofread": {
+    "similarity_min": 0.6,
+    "score_min": 0.4,
+    "max_cand_cache": 2000,
+    "enable_llm": false,
+    "enable_legacy_rules": false,
+    "llm_model": "HY",
+    "llm_timeout": 3
+  },
   "llama_server_args": {
     "host": "127.0.0.1",
     "port": "8080",
     "temperature": "0",
     "repeat_penalty": "1.1",
-    "parallel": "2",
+    "parallel": "4",
     "cache_type_k": "q8_0",
     "cache_type_v": "q8_0",
     "log_verbosity": "0",
     "max_tokens": "8192",
     "ctx_size": "16384",
-    "flash_attn": "0",
     "ctx_checkpoints": "0",
     "cache_ram": "0",
     "recycle_every": "0",
@@ -75,24 +66,18 @@
     "ubatch_size": "0",
     "cache_reuse": "0"
   },
-  "proofread": {
-    "similarity_min": 0.67,
-    "score_min": 0.4,
-    "max_cand_cache": 2000,
-    "max_replacement_combinations": 20,
-    "auto_fix_score": 0.85,
-    "enable_llm": true,
-    "enable_legacy_rules": false,
-    "llm_model": "HY",
-    "llm_timeout": 3
-  },
-  "engine": "paddle",
+  "engine": "llama",
+  "paddle_merge_lines": true,
+  "paddle_det_limit": 960,
+  "table_convert": true,
+  "proofread_engine": "llama",
   "vllm_server": "",
   "vllm_server_args": {
     "host": "127.0.0.1",
     "port": "8000",
     "omni": "1",
     "trust_remote_code": "1",
+    "kv_cache_dtype": "fp8",
     "served_model_name": "",
     "max_model_len": "",
     "gpu_memory_utilization": "",
@@ -101,242 +86,137 @@
     "mm_proj_config": "",
     "mm_processor_config": "",
     "deploy_config": "",
-    "extra_args": "",
-    "kv_cache_dtype": "fp8"
+    "extra_args": ""
   },
-  "shortcuts": {
-    "bold": "Ctrl+B",
-    "italic": "Ctrl+I",
-    "heading": "Ctrl+1",
-    "p": "Ctrl+2",
-    "note": "Ctrl+Shift+N",
-    "align_left": "Ctrl+ArrowLeft",
-    "align_center": "Ctrl+ArrowUp",
-    "align_right": "Ctrl+ArrowRight",
-    "centerbold": "Alt+B",
-    "merge": "Alt+G",
-    "popup": "F5",
-    "marker_full": "Ctrl+Shift+F",
-    "marker_note": "Ctrl+Shift+M",
-    "marker_join": "Ctrl+Shift+J",
-    "marker_page": "Ctrl+Shift+P",
-    "underline": "",
-    "strike": "",
-    "charbox": "",
-    "shade": "",
-    "highlight": "",
-    "sup": "",
-    "sub": "",
-    "search": "Ctrl+F",
-    "clean": "Ctrl+Shift+C",
-    "convert_t2s": "Ctrl+Shift+T",
-    "convert_s2t": "Ctrl+Shift+Y",
-    "toggle_md": "",
-    "undo": "Ctrl+Z",
-    "redo": "Ctrl+Y",
-    "history": "Ctrl+H",
-    "export": "Ctrl+E",
-    "save": "Ctrl+S",
-    "stage": "",
-    "finish": "Ctrl+Enter",
-    "jump": "Ctrl+G",
-    "help": "F1",
-    "settings": "Ctrl+Shift+O",
-    "proofread_correct": "Ctrl+K",
-    "proofread_reocr": "Ctrl+Shift+S",
-    "proofread_apply": "Ctrl+Shift+A",
-    "proofread_clear": "Ctrl+Shift+X",
-    "proofread_revert": "Ctrl+Shift+Z",
-    "proofread_accept": "Shift+ArrowUp",
-    "proofread_ignore": "Shift+ArrowDown"
+  "shortcuts": {},
+  "mouse_shortcuts": {},
+  "auto_save": {
+    "enabled": true,
+    "interval_minutes": 5,
+    "new_backup": true
   },
-  "format_rules": [
+  "format_rules": [],
+  "replace_rules": [
     {
-      "id": "8411f14d397b4fc2ad4481207e10c3f5",
-      "name": "标注",
-      "mode": "first",
-      "conditions": [
-        {
-          "type": "regex",
-          "pattern": "([\\s\\S]*)([\\(（]\\s*.+\\s*年\\s*.*?[日月]\\s*[\\）)])([\\s\\S]*?)(毛\\s*泽\\s*东[\\s\\S]*刊\\s*印[\\s\\S]*?)?(注[\\s]*释)([\\s\\S]*)",
-          "scope": "page",
-          "formats": [],
-          "target": "match",
-          "group_formats": [
-            [
-              "align_center",
-              "heading1"
-            ],
-            [
-              "align_center"
-            ],
-            [
-              "p"
-            ],
-            [
-              "align_right",
-              "p"
-            ],
-            [
-              "bold",
-              "align_left",
-              "p"
-            ],
-            [
-              "note"
-            ]
-          ]
-        }
-      ]
+      "id": "br1",
+      "name": "去括号保留内容",
+      "pattern": "[（(]([^（）()]*)[）)]",
+      "flags": "g",
+      "keep_groups": [
+        1
+      ],
+      "replacement": "",
+      "builtin": true,
+      "enabled": true
     },
     {
-      "id": "8bd703066dd548e1ab92cc688438fb52",
-      "name": "标",
-      "mode": "all",
-      "conditions": [
-        {
-          "type": "regex",
-          "pattern": "([\\s\\S]*)([\\(（]\\s*.+\\s*年\\s*.*?[日月]\\s*[\\）)])([\\s\\S]*?)",
-          "scope": "page",
-          "formats": [],
-          "target": "match",
-          "group_formats": [
-            [
-              "align_center",
-              "heading1"
-            ],
-            [
-              "align_center",
-              "p"
-            ],
-            [
-              "p"
-            ]
-          ]
-        }
-      ]
+      "id": "br2",
+      "name": "圈码去括号",
+      "pattern": "[〔\\[［【](\\d+)[〕\\]］】]",
+      "flags": "g",
+      "keep_groups": [
+        1
+      ],
+      "replacement": "",
+      "builtin": true,
+      "enabled": true
     },
     {
-      "id": "c4d053c8b0dc4c238233a0bba05401b9",
-      "name": "注",
-      "mode": "all",
-      "conditions": [
-        {
-          "type": "regex",
-          "pattern": "([\\s\\S]*)(注\\s*释)([\\s\\S]*)",
-          "scope": "page",
-          "formats": [],
-          "target": "match",
-          "group_formats": [
-            [],
-            [
-              "bold",
-              "align_left",
-              "p"
-            ],
-            [
-              "align_left",
-              "note"
-            ]
-          ]
-        }
-      ]
+      "id": "br3",
+      "name": "空括号删除",
+      "pattern": "([（(])\\s*([）)])",
+      "flags": "g",
+      "keep_groups": [],
+      "replacement": "",
+      "builtin": true,
+      "enabled": false
     },
     {
-      "id": "cb9a2f170f17426fb6d694c04c7d1fca",
-      "name": "注释",
-      "mode": "all",
-      "conditions": [
-        {
-          "type": "regex",
-          "pattern": "[\\s\\S]*",
-          "scope": "page",
-          "formats": [
-            "no_bold",
-            "note"
-          ],
-          "target": "match"
-        }
-      ]
-    },
-    {
-      "id": "71d33466a5c748678357a2c615cef67e",
-      "name": "中标",
-      "mode": "first",
-      "conditions": [
-        {
-          "type": "contains",
-          "pattern": "",
-          "scope": "selection",
-          "formats": [
-            "align_center",
-            "heading1"
-          ],
-          "target": "match"
-        }
-      ]
+      "id": "br4",
+      "name": "连续标点压缩",
+      "pattern": "([，。！？；：、]{2,})",
+      "flags": "g",
+      "keep_groups": [],
+      "replacement": "，",
+      "builtin": true,
+      "enabled": false
     }
   ],
+  "correction_format": {
+    "enabled": false,
+    "strip_markdown": true,
+    "strip_latex": true,
+    "remove_formula": false,
+    "custom_rules": []
+  },
   "fonts": {
     "body": "",
     "heading": "",
     "note": "",
     "citation": ""
   },
-  "image_preprocess": {
-    "enabled": true,
-    "gray": true,
-    "denoise": false,
-    "sharpen": true,
-    "binarize": false,
-    "workers": 8
-  },
-  "citationItalicEnabled": false,
-  "exclude_pages": [],
-  "browser": "D:/min/min.exe",
-  "gui_display": "pywebview",
-  "tabs_position": "top",
-  "window_maximized": true,
+  "citationItalicEnabled": true,
   "ui_settings": {
     "tip_delay": 600,
-    "err_hover_delay": 500,
+    "err_hover_delay": 1500,
+    "brush_merge_delay": 800,
+    "brush_merge_on_leave": true,
     "editor_font_size": 14,
     "img_mode": "",
     "rule_all_pages_confirm": true,
     "popup_row1": [
       "bold",
       "italic",
+      "underline",
+      "underdot",
+      "wavy",
+      "double",
+      "overline",
+      "emphasis",
+      "strike",
+      "charbox",
+      "shade",
+      "highlight_green",
+      "highlight_blue",
+      "highlight_pink",
+      "highlight_orange",
+      "highlight_purple",
+      "ruby",
+      "paint",
+      "remove"
+    ],
+    "popup_row2": [
       "heading",
       "p",
       "note",
       "citation",
-      "paint",
-      "remove"
-    ],
-    "popup_rule_count": 5,
-    "popup_row2": [
       "align_left",
       "align_center",
       "align_right",
+      "align_lines",
       "centerbold",
       "merge",
       "sup",
-      "underdot",
-      "highlight",
+      "sub",
       "table",
       "table2text"
     ],
-    "proofread_batch_pages": 1,
+    "popup_rule_count": 5,
+    "proofread_batch_pages": 0,
+    "proofread_auto_jump": true,
     "undo_depth": 100,
-    "show_line_numbers": true,
-    "line_num_size": "small",
+    "search_max_results": 200,
+    "show_line_numbers": false,
+    "line_num_size": "large",
     "text_justify": true,
-    "brush_merge_delay": 800,
     "clean_punctuation": true,
     "clean_symbols": true,
     "clean_md_tags": true,
     "clean_html_tags": true,
     "clean_paragraphs": false,
+    "clean_blank_lines": false,
+    "clean_spaces": false,
+    "clean_spaces_keep_word_gap": true,
     "clean_symbol_map": [
       [
         "[",
@@ -355,8 +235,6 @@
         "～"
       ]
     ],
-    "brush_merge_on_leave": true,
-    "proofread_auto_jump": true,
     "clean_digit_punct": true,
     "clean_digit_punct_map": [
       [
@@ -384,41 +262,25 @@
         "."
       ]
     ],
-    "search_max_results": 200,
     "tbl_popup_menu": false,
     "tbl_ctx_menu": false,
-    "tbl_tbl_menu": false,
-    "clean_blank_lines": false
+    "tbl_tbl_menu": false
   },
-  "proofread_engine": "llama",
-  "mouse_shortcuts": {},
-  "replace_rules": [
-    {
-      "id": "r6b25222a",
-      "name": "坏正则",
-      "pattern": "[（(]([^（）()]*)[）)]",
-      "flags": "g",
-      "keep_groups": [],
-      "replacement": "",
-      "builtin": false,
-      "enabled": true
-    }
-  ],
-  "auto_save": {
-    "enabled": true,
-    "interval_minutes": 5,
-    "new_backup": true
+  "image_preprocess": {
+    "enabled": false,
+    "gray": true,
+    "denoise": true,
+    "sharpen": true,
+    "binarize": false,
+    "workers": 0
   },
-  "paddle_merge_lines": true,
-  "dpi": 100,
+  "exclude_pages": [],
+  "dpi": 200,
   "ocr_batch_size": 0,
   "ocr_group_by_size": true,
-  "correction_format": {
-    "enabled": false,
-    "strip_markdown": true,
-    "strip_latex": true,
-    "remove_formula": false,
-    "custom_rules": []
-  },
-  "table_convert": true
+  "browser": "",
+  "gui_display": "pywebview",
+  "tabs_position": "top",
+  "window_maximized": true,
+  "selected_model": "HY"
 }

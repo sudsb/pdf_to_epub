@@ -504,10 +504,18 @@
   }
 
   // ---------- 行内格式（8 类 span 类，与 EPUB 导出白名单一致的类名） ----------
-  const INLINE_CLASSES = ['ptoe-underline', 'ptoe-underdot', 'ptoe-strike', 'ptoe-charbox', 'ptoe-shade', 'ptoe-highlight', 'ptoe-sup', 'ptoe-sub'];
+  const INLINE_CLASSES = ['ptoe-underline', 'ptoe-underdot', 'ptoe-strike', 'ptoe-charbox', 'ptoe-shade', 'ptoe-highlight', 'ptoe-sup', 'ptoe-sub',
+    // 2026-10-21 新增：波浪线 / 双下划线 / 上划线 / 着重号 / 多色突显 / 拼音注音
+    'ptoe-wavy', 'ptoe-double', 'ptoe-overline', 'ptoe-emphasis',
+    'ptoe-highlight-green', 'ptoe-highlight-blue', 'ptoe-highlight-pink', 'ptoe-highlight-orange', 'ptoe-highlight-purple',
+    'ptoe-ruby'];
   const INLINE_CLASS_LABEL = {
     underline: '下划线', underdot: '下加点', strike: '删除线', charbox: '字符边框',
-    shade: '底纹', highlight: '突显', sup: '上标', sub: '下标'
+    shade: '底纹', highlight: '突显', sup: '上标', sub: '下标',
+    // 2026-10-21 新增
+    wavy: '波浪线', double: '双下划线', overline: '上划线', emphasis: '着重号',
+    'highlight-green': '突显·绿', 'highlight-blue': '突显·蓝', 'highlight-pink': '突显·粉',
+    'highlight-orange': '突显·橙', 'highlight-purple': '突显·紫', ruby: '拼音注音'
   };
   // 上/下标互斥：同一区域不能同时是上标和下标
   const INLINE_MUTEX = {
@@ -957,6 +965,11 @@ const clone = range.cloneRange();
       case 'sub': applyInlineClass(body, i, 'ptoe-sub'); break;
       case 'highlight': applyInlineClass(body, i, 'ptoe-highlight'); break;
       case 'underdot': applyInlineClass(body, i, 'ptoe-underdot'); break;
+      // 2026-10-21 新增行内格式
+      case 'wavy': applyInlineClass(body, i, 'ptoe-wavy'); break;
+      case 'double': applyInlineClass(body, i, 'ptoe-double'); break;
+      case 'overline': applyInlineClass(body, i, 'ptoe-overline'); break;
+      case 'emphasis': applyInlineClass(body, i, 'ptoe-emphasis'); break;
       default: break;
     }
   }
@@ -1328,8 +1341,19 @@ const clone = range.cloneRange();
   // ---------- 选中文字快捷菜单 ----------
   let _popupBuilt = false;
   let suppressPopupUntilTs = 0; // 操作按钮点击后窗口内不弹菜单（防误弹）
+  let dragActive = false;       // 拖拽态（文字/图片）：拖拽期间及松手后不弹选中菜单
   function hidePopup() {
     if (popup) { popup.hidden = true; popup.style.display = 'none'; }
+  }
+  function beginDragPopup() {
+    dragActive = true;
+    hidePopup();
+  }
+  function endDragPopup() {
+    if (!dragActive) return;
+    dragActive = false;
+    suppressPopupUntilTs = performance.now() + 300; // 松手后的 mouseup 不再弹菜单
+    hidePopup();
   }
   function buildPopup() {
     if (_popupBuilt || !popup) return;
@@ -1393,6 +1417,7 @@ const clone = range.cloneRange();
     return null;
   }
   function maybeShowPopup() {
+    if (dragActive) { hidePopup(); return; } // 拖拽中不弹选中菜单
     if (performance.now() < suppressPopupUntilTs) return;
     const sel = window.getSelection();
     if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { hidePopup(); return; }
@@ -1592,6 +1617,16 @@ const clone = range.cloneRange();
     });
   }
   // addBtn/saveBtn 已由 data-op 委托覆盖（removeArticle 的「取消一级标题」按钮仍行内直绑）
+
+  // ----- 拖拽态：文字/图片拖拽期间及松手后不弹选中菜单 -----
+  document.addEventListener('dragstart', function (e) {
+    const t = e.target;
+    if (!t || !t.closest || !t.closest('.art-body')) return;
+    beginDragPopup();
+  });
+  // drop 里源节点可能被移除，dragend 不保证派发；drop/dragend 双重兜底
+  document.addEventListener('drop', function () { endDragPopup(); }, true);
+  document.addEventListener('dragend', function () { endDragPopup(); });
 
   // ----- 选中文字快捷菜单 -----
   document.addEventListener('mouseup', maybeShowPopup);

@@ -100,19 +100,39 @@ def _atomic_write_json(path: str, obj: dict) -> None:
 POPUP_ELIGIBLE_OPS = [
     "bold", "italic", "underline", "underdot", "strike", "highlight", "charbox", "shade",
     "sup", "sub", "heading", "p", "remove", "note", "citation",
-    "align_left", "align_center", "align_right", "centerbold",
+    "align_left", "align_center", "align_right", "align_lines", "centerbold",
     "flush", "indent", "strip_ws", "merge",
     "marker_full", "marker_note", "marker_join", "marker_page",
     "charformat",  # 字符格式（打开字体/字号/颜色弹窗；有 OPS 中文标签与 OP_ICON 字形）
     "table",  # 转成表格（把选中文字转成原生表格；手动档，见 /api/table_convert）
     "table2text",  # 表格转文本（把光标所在表格还原成 Markdown 管道文字；手动档，见 /api/table_to_text）
     "paint",  # 格式刷（特殊按钮，非 OPS 项）
+    # 文字包围（2026-10-21）：波浪线/双下划线/上划线/着重号/多色突显/拼音注音
+    "wavy", "double", "overline", "emphasis",
+    "highlight_green", "highlight_blue", "highlight_pink", "highlight_orange", "highlight_purple",
+    "ruby",
+    # LaTeX 公式（2026-10-21）：插入公式（KaTeX 渲染成 MathML，导出 EPUB 仍可显示）
+    "latex",
 ]
-POPUP_ROW1_DEFAULT = ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"]
+POPUP_ROW1_DEFAULT = [
+    "bold", "italic",
+    # 文字包围（2026-10-21）：下划线/下加点/波浪线/双下划线/上划线/着重号/删除线/
+    # 字符边框/底纹/多色突显/拼音注音（行内格式归第一行）
+    "underline", "underdot", "wavy", "double", "overline", "emphasis",
+    "strike", "charbox", "shade",
+    "highlight_green", "highlight_blue", "highlight_pink", "highlight_orange", "highlight_purple",
+    "ruby",
+    "paint", "remove",
+]
 POPUP_ROW2_DEFAULT = [
+    "heading",
+    "p",
+    "note",
+    "citation",
     "align_left",
     "align_center",
     "align_right",
+    "align_lines",
     "centerbold",
     "merge",
     "sup",
@@ -146,6 +166,13 @@ CLEAN_SETTINGS_DEFAULTS = {
     "clean_html_tags": True,
     "clean_paragraphs": False,
     "clean_digit_punct": True,
+    # clean_spaces：去除段落内的空白（空格/制表符/全角空格等），并把 OCR
+    # 软换行合并回自然段（浏览器会把换行渲染成词间空隙）。ptoe-align-lines
+    # 逐行段落保留换行。默认关（保守）。
+    "clean_spaces": False,
+    # clean_spaces_keep_word_gap：clean_spaces 开启时，是否保留英文单词之间的
+    # 单个空格（hello world 不会被粘成 helloworld）。默认 True。
+    "clean_spaces_keep_word_gap": True,
     # clean_blank_lines：导出时清理空白行（空段落 / 仅空白、<br>、&nbsp;、全角空格的段落），
     # 默认关（保守，不改变既有导出的换行密度）。2026-10 新增，作用于 TXT/MD/DOCX/EPUB
     # 的导出阶段（导出前删除空白段落），与 clean_paragraphs（段合并）相互独立。
@@ -305,6 +332,15 @@ DEFAULT_CONFIG = {
     # 换行分隔）；false = 保留逐行原样（每行一行）。关闭后在配置界面/GUI 复选框
     # 或 `mian.py config set paddle_merge_lines false` 切换。
     "paddle_merge_lines": True,
+    # PaddleOCR 检测阶段最长边上限（仅 engine=paddle 时生效，2026-10）。
+    # 检测耗时与输入像素数成正比，而识别阶段会把每条文本行统一缩到 48px 高，
+    # 所以「检测降分辨率、识别仍取原图裁剪」几乎不增加总耗时（实测密排书
+    # 200dpi：det 原生 143ms → 960 时 41ms，整页 656ms → 522ms）。
+    # 960（默认）= 200dpi A4 正文行高约 20px，实测相对 CER 0.85%；
+    # 0 = 关闭（按原图分辨率检测，300dpi 以上或超小字建议关闭或调大）；
+    # 建议映射：150dpi→960~1280，200dpi→960~1280，300dpi→1280~1600。
+    # 可经 `mian.py config set paddle_det_limit 1280` 或设置页调整。
+    "paddle_det_limit": 960,
     # 识别文字表格并转成程序原生表格（HTML <table>），默认开（2026-10-17）。
     # 关掉后识别文本里的 Markdown/画框表格保持原文不转换；可经设置页复选框、
     # `mian.py config set table_convert false` 或 config.json 顶层同名键切换。
@@ -467,7 +503,8 @@ DEFAULT_CONFIG = {
         # clean_symbols：扩展符号归一化（引号/括号/省略号/破折号/波浪号）+ 省略号长度归一，默认开。
         # clean_md_tags：剥离残留 markdown 标签（**、*、~~、` 等），默认开。
         # clean_html_tags：剥离非白名单 html 标签，保留 strong/em/span/br/img 等，默认开。
-        # clean_paragraphs：段落合并优化（空白行折叠/相邻短段合并），默认关（保守）。
+        # clean_paragraphs：段落合并优化（相邻短段合并；合并成功后自动清理
+        #   合并段的段内空白，即使 clean_spaces 关闭也生效），默认关（保守）。
         "clean_punctuation": True,
         "clean_symbols": True,
         "clean_md_tags": True,
@@ -476,6 +513,13 @@ DEFAULT_CONFIG = {
         # clean_blank_lines：导出时清理空白行（空段落 / 仅空白、<br>、&nbsp;、全角空格），
         # 默认关。作用在导出阶段（TXT/MD/DOCX/EPUB），与 clean_paragraphs（相邻短段合并）独立。
         "clean_blank_lines": False,
+        # clean_spaces：去除段落内的空白（空格/制表符/全角空格等），并把 OCR 软换行
+        #   合并回自然段（ptoe-align-lines 逐行段落保留换行），默认关（保守）。
+        #   2026-10-21 新增。
+        # clean_spaces_keep_word_gap：上面开关开启时，是否保留英文单词之间的单个空格
+        #   （hello world 不被粘成 helloworld），默认开。
+        "clean_spaces": False,
+        "clean_spaces_keep_word_gap": True,
         "clean_symbol_map": CLEAN_SYMBOL_MAP_DEFAULT,
         # clean_digit_punct：数字/字母里夹的中文标点换英文（1。2→1.2 / H，W→H,W / 1。→1.），
         #   并清理数字间/单字母间空格（1 2→12、M a r x→Marx，英文短语保留），默认开
@@ -509,10 +553,12 @@ DEFAULT_CONFIG = {
     # 从 config.json 读取时由 parse_exclude_spec 处理字符串/列表兼容；
     # CLI --exclude 优先于配置文件。
     "exclude_pages": [],
-    # 转换默认 DPI（2026-10）：持久化的原始分辨率数值（非档位），默认 100。
+    # 转换默认 DPI（2026-10）：持久化的原始分辨率数值（非档位），默认 200。
+    # 实测（密排扫描书 200dpi 语料）：200dpi 相对 100dpi 只多 28% 耗时，
+    # 但相对 CER 从 2.48% 降到 0.85%（det 960 时），批量书收益远大于代价。
     # CLI --dpi 仍接受档位 0-4（100/150/200/300/600）或该范围内的原始数值；
     # 未显式指定时回退到此键。GUI 转换页开始转换时把所选 DPI 写回此键。
-    "dpi": 100,
+    "dpi": 200,
     # OCR 批处理调度（2026-10）：
     # ocr_batch_size：每波提交的请求数上限（0=自动=并发数 max_workers）；设为 1
     #   即完全串行调度（显存紧张/长书稳定优先时使用）。防止一次性把整本书的

@@ -13,7 +13,7 @@ let _scrollDir = 1, _viewportY = 0, _lastLo = 0; // 最近一次滚动方向（1
 const OPS = [
   ['bold','粗体'], ['italic','斜体'], ['heading','标题'], ['p','正文'],
   ['remove','清除格式'], ['note','注释'], ['citation','引用'],
-  ['align_left','居左'], ['align_center','居中'], ['align_right','居右'],
+  ['align_left','居左'], ['align_center','居中'], ['align_right','居右'], ['align_lines','多行对齐'],
   ['centerbold','居中加粗'], ['merge','合并段落'], ['popup','弹出菜单'],
   ['marker_full','全文标记'], ['marker_note','注释标记'], ['marker_join','段落标记'],
   ['marker_page','换页标记'],
@@ -21,6 +21,10 @@ const OPS = [
   // 新增内联格式（2026-09）；underdot 与 strip_ws 为选中菜单新增功能（2026-10）
   ['underline','下划线'], ['underdot','下加点'], ['strike','删除线'], ['charbox','字符边框'],
   ['shade','底纹'], ['highlight','突显'], ['sup','上标'], ['sub','下标'],
+  // 文字包围（2026-10-21 新增行内格式）：波浪线/双下划线/上划线/着重号/多色突显/拼音注音
+  ['wavy','波浪线'], ['double','双下划线'], ['overline','上划线'], ['emphasis','着重号'],
+  ['highlight_green','突显·绿'], ['highlight_blue','突显·蓝'], ['highlight_pink','突显·粉'],
+  ['highlight_orange','突显·橙'], ['highlight_purple','突显·紫'], ['ruby','拼音注音'],
   ['charformat','字符格式'],
   ['strip_ws','去空'],
   // 工具操作（无需 currentEditable，直接调用）
@@ -31,12 +35,15 @@ const OPS = [
   ['proofread_correct','校正'], ['proofread_reocr','重识别'], ['proofread_apply','应用'],
   ['proofread_clear','清除标注'], ['proofread_revert','回退'],
   ['proofread_accept', '采纳纠错'], ['proofread_ignore', '忽略纠错'],
+  ['proofread_next_page_error', '下一处错误（跨页）'], ['proofread_prev_page_error', '上一处错误（跨页）'],
   ['insert_table', '插入表格'], ['insert_caption', '插入题注'],
   ['table','转成表格'],
   ['table2text','表格转文本'],
   ['cmdline', '命令行'],
   ['copy_format', '格式复制'], ['copy_text', '纯文本复制'],
   ['paste_format', '格式粘贴'], ['paste_text', '纯文本粘贴'],
+  // LaTeX 公式（2026-10-21）：KaTeX 渲染为 MathML 存进正文，导出 EPUB 仍可显示
+  ['latex', '公式'],
 ];
 // 增强格式刷（功能刷）：Shift+Ctrl+1..0 武装；点击段落即把功能应用到该段（可混合多个）。
 // glyph 用于光标旁悬浮小字；key 为快捷键数字。applyOp 支持的 op 才能作为功能刷。
@@ -72,24 +79,32 @@ const OP_ICON = {
   bold:'<span class="ic-b">粗</span>', italic:'<span class="ic-i">斜</span>',
   heading:'<span class="ic-h">标</span>', p:'<span class="ic-p">正</span>',
   remove:'<span class="ic-t">清</span>', note:'注', citation:'引',
-  align_left:'左', align_center:'中', align_right:'右',
+  align_left:'左', align_center:'中', align_right:'右', align_lines:'齐',
   centerbold:'中粗', merge:'合',
   marker_full:'篇', marker_note:'释', marker_join:'段', marker_page:'页',
   // 候选池其余操作字形（2026-10 补齐，全部单字且互不重复）
   underline:'线', underdot:'点', strike:'删', highlight:'突', charbox:'框', shade:'底',
   flush:'顶', indent:'缩', strip_ws:'空',
-  sup:'上', sub:'下', charformat:'格', table:'表', table2text:'文'
+  sup:'上', sub:'下', charformat:'格', table:'表', table2text:'文',
+  // 2026-10-21 新增行内格式字形（单字且互不重复）
+  wavy:'波', double:'双', overline:'横', emphasis:'着',
+  highlight_green:'绿', highlight_blue:'蓝', highlight_pink:'粉',
+  highlight_orange:'橙', highlight_purple:'紫', ruby:'音',
+  // LaTeX 公式（2026-10-21）
+  latex:'式'
 };
 const OP_TIP = {
   bold:'粗体', italic:'斜体', heading:'标题（循环 H1→H6→正文）', p:'正文',
   remove:'清除格式', note:'注释格式（整段小字）', citation:'引用格式（整段斜体，独立字体默认宋体）',
-  align_left:'居左', align_center:'居中', align_right:'居右',
-  centerbold:'居中加粗（转为正文段落并居中加粗）', merge:'合并选中段落', popup:'弹出选中菜单',
+  align_left:'居左', align_center:'居中', align_right:'居右', align_lines:'多行对齐（按最长行对齐，空格两端分别对齐）',
+  centerbold:'居中加粗（转为正文段落并居中加粗）', merge:'合并选中段落（合并后自动清理段内空白）', popup:'弹出选中菜单',
   marker_full:'全文标记（文章到此结束，开新页）',
   marker_note:'注释标记（由对应注释段落替换）',
   marker_join:'段落标记（段首合上段，段尾合下段）',
   marker_page:'换页标记（从此处之后的内容显示在新的一页）',
   proofread_accept: '采纳纠错（替换为候选字）', proofread_ignore: '忽略纠错（消除标注）',
+  proofread_next_page_error: '跳到下一处有错误的页并定位首个错误（跨页）',
+  proofread_prev_page_error: '跳到上一处有错误的页并定位首个错误（跨页）',
   insert_table: '插入表格（行列可设，默认 3 行 × 4 列，可选手表头）',
   table: '转成表格（把选中文字转成原生表格；支持无竖线的空格/制表符对齐列）',
   table2text: '表格转文本（把光标所在表格还原成 Markdown 管道文字；光标不在表格内则转当前页全部表格）',
@@ -101,7 +116,13 @@ const OP_TIP = {
   // 新增内联格式提示
   underline:'下划线', underdot:'下加点', strike:'删除线', charbox:'字符边框',
   shade:'底纹', highlight:'突显', sup:'上标', sub:'下标',
+  // 2026-10-21 新增行内格式提示
+  wavy:'波浪线', double:'双下划线', overline:'上划线', emphasis:'着重号',
+  highlight_green:'突显（绿）', highlight_blue:'突显（蓝）', highlight_pink:'突显（粉）',
+  highlight_orange:'突显（橙）', highlight_purple:'突显（紫）',
+  ruby:'拼音注音（给选中文字加注音，注音内容存进 span 的 data-rt）',
   charformat:'字符格式（为选中文字设置字体 / 字号 / 颜色）',
+  latex:'插入 LaTeX 公式（KaTeX 渲染成 MathML；导出 EPUB 后照常显示，导出 Word/Markdown 为 $公式$）',
 };
 const DEFAULTS = {
   bold:'Ctrl+B', italic:'Ctrl+I', heading:'Ctrl+1', p:'Ctrl+0',
@@ -112,6 +133,9 @@ const DEFAULTS = {
   marker_page:'Ctrl+Shift+P',
   // 新增内联格式默认快捷键（空 = 未绑定，用户可在设置中自行绑定，避免冲突浏览器键）
   underline:'', underdot:'', strike:'', charbox:'', shade:'', highlight:'', sup:'', sub:'',
+  // 文字包围格式（2026-10-21）：同样默认不绑定
+  wavy:'', double:'', overline:'', emphasis:'',
+  highlight_green:'', highlight_blue:'', highlight_pink:'', highlight_orange:'', highlight_purple:'', ruby:'',
   charformat:'', strip_ws:'',
   // 工具操作默认快捷键
   search:'Ctrl+F', clean:'Ctrl+Shift+C', convert_t2s:'Ctrl+Shift+T', convert_s2t:'Ctrl+Shift+Y',
@@ -121,10 +145,13 @@ const DEFAULTS = {
   proofread_correct:'Ctrl+K', proofread_reocr:'Ctrl+Shift+R', proofread_apply:'Ctrl+Shift+A',
   proofread_clear:'Ctrl+Shift+X', proofread_revert:'Ctrl+Shift+Z',
   proofread_accept: 'Enter', proofread_ignore: 'Escape',
+  proofread_next_page_error: 'Ctrl+PageDown', proofread_prev_page_error: 'Ctrl+PageUp',
   insert_table: 'Ctrl+Alt+T',
   insert_caption: 'Ctrl+Alt+G', // 2026-10-01：Alt+G 已被「合并段落」占用，改用带 Ctrl 的组合
   cmdline: 'Ctrl+;',
   copy_format: '', copy_text: '', paste_format: '', paste_text: '',
+  // LaTeX 公式（2026-10-21）：默认不绑定
+  latex: '',
 };
 // 混合格式刷默认快捷键：直接启用默认混合组合（可在「快捷键」设置中自定义）
 const BRUSH_MIX_DEFAULT = ['merge', 'heading'];
@@ -139,6 +166,25 @@ const MOUSE_GESTURES = [
 ];
 // 中键单击默认执行「加粗」：轻点即给光标/选区套一个最常用的行内格式（用户可在设置中改绑）。
 const MOUSE_DEFAULTS = { bold:'Middle+Click', align_center:'Middle+Up', align_left:'Middle+Left', align_right:'Middle+Right' };
+// 鼠标侧键（X1/X2）：可作为快捷键绑定到任意操作（与键盘组合键同一套绑定表）。
+// DOM button 编号：0 左 / 1 中 / 2 右 / 3 侧键1(X1) / 4 侧键2(X2)。
+// 绑定名沿用 X11 按钮编号习惯（Mouse4=X1、Mouse5=X2）；只存字符串，服务端原样持久化。
+const MOUSE_SIDE_BUTTONS = [
+  ['Mouse4', '侧键1（后退）', 3],
+  ['Mouse5', '侧键2（前进）', 4],
+];
+// 悬浮菜单（选中文字后的快捷菜单 #popup）允许触发的鼠标键：仅左键(0)与右键(2)。
+// 中键(1)专用于「上/下/左/右」滑动手势，落在菜单上时必须忽略 —— 否则手势会误触发
+// 菜单里的格式操作（用户报告）。侧键(3/4)同理：菜单不响应，只走全局侧键快捷键。
+const POPUP_ACT_BUTTONS = [0, 2];
+// 事件是否允许触发悬浮菜单操作：仅左键/右键
+function _popupActAllowed(e) { return !!e && POPUP_ACT_BUTTONS.indexOf(e.button) !== -1; }
+// 事件是否为鼠标侧键 → {name, label}；非侧键返回 null
+function _sideButtonOf(e) {
+  if (!e) return null;
+  for (const [name, label, btn] of MOUSE_SIDE_BUTTONS) if (e.button === btn) return { name: name, label: label };
+  return null;
+}
 let mouseBindings = loadMouseBindings();
 let mouseCapturingOp = null;   // 正在等待中键滑动绑定的操作（null = 未捕获）
 let pages = [];
@@ -157,6 +203,7 @@ const host = document.getElementById('pages');
 const popup = document.getElementById('popup');
 let capturingOp = null;
 let suppressPopupUntil = 0;  // 操作按钮点击后的抑制窗口：选中菜单不再自动弹出
+let _dragUiActive = false;   // 拖拽态（文字/图片/整段/尺寸手柄等）：拖拽期间不弹选中菜单
 const tipEl = document.getElementById('tip');   // 全局延迟提示（悬停超时后显示）
 let tipTimer = null;                             // 提示显示计时器
 let tipAnchor = null;                            // 当前悬停元素（供定时器回调定位）
@@ -205,15 +252,23 @@ function searchMaxResults() {
 // correct_pages 每运行随机端口 → localStorage 按 origin 隔离每次失效，
 // 故以内存 uiSettings 为准、服务端为准，localStorage 仅作加载前的同步兜底。
 // 弹出菜单可选操作池（与后端 correctmanage.POPUP_ELIGIBLE_OPS 保持一致；paint = 格式刷，不在 OPS 数组中）
-const POPUP_ELIGIBLE_OPS = ['bold','italic','underline','underdot','strike','highlight','charbox','shade','sup','sub','heading','p','remove','note','citation','align_left','align_center','align_right','centerbold','flush','indent','strip_ws','merge','marker_full','marker_note','marker_join','marker_page','charformat','table','table2text','paint'];
+const POPUP_ELIGIBLE_OPS = ['bold','italic','underline','underdot','strike','highlight','charbox','shade','sup','sub','heading','p','remove','note','citation','align_left','align_center','align_right','align_lines','centerbold','flush','indent','strip_ws','merge','marker_full','marker_note','marker_join','marker_page','charformat','table','table2text','paint',
+  // 文字包围（2026-10-21）：波浪线/双下划线/上划线/着重号/多色突显/拼音注音
+  'wavy','double','overline','emphasis','highlight_green','highlight_blue','highlight_pink','highlight_orange','highlight_purple','ruby',
+  // LaTeX 公式（2026-10-21）：插入公式（KaTeX → MathML）
+  'latex'];
 const UI_SETTINGS_DEFAULTS = { tip_delay: 600, err_hover_delay: 1500, brush_merge_delay: 800, brush_merge_on_leave: true, editor_font_size: 14, img_mode: '', rule_all_pages_confirm: true,
-  popup_row1: ['bold','italic','heading','p','note','citation','paint','remove'],
-  popup_row2: ['align_left','align_center','align_right','centerbold','merge','sup','sub','table','table2text'],
+  popup_row1: ['bold','italic','underline','underdot','wavy','double','overline','emphasis','strike','charbox','shade','highlight_green','highlight_blue','highlight_pink','highlight_orange','highlight_purple','ruby','paint','remove'],
+  popup_row2: ['heading','p','note','citation','align_left','align_center','align_right','align_lines','centerbold','merge','sup','sub','table','table2text'],
   popup_rule_count: 5, proofread_batch_pages: 0, proofread_auto_jump: true, undo_depth: 100, show_line_numbers: false,
   search_max_results: 200,
   line_num_size: 'large', text_justify: true,
   clean_punctuation: true, clean_symbols: true, clean_md_tags: true, clean_html_tags: true, clean_paragraphs: false,
   clean_digit_punct: true,
+  // 清理段落内空白（2026-10-21）：删空格/制表符/全角空格，换行符保留；默认关（保守）
+  clean_spaces: false,
+  // 清理段落内空白时是否保留英文单词之间的单个空格（hello world 不被粘连）
+  clean_spaces_keep_word_gap: true,
   // 导出时清理空白行（2026-10）：删空段落、连续空行合并为一个；仅作用于导出，默认关。
   clean_blank_lines: false,
   clean_symbol_map: [['[','【'],[']','】'],['--','——'],['~','～']],
@@ -304,6 +359,10 @@ async function loadUiSettingsFromServer() {
       if (cdp) cdp.checked = !!uiBool('clean_digit_punct', true);
       const cbl = document.getElementById('cleanBlankLinesChk');
       if (cbl) cbl.checked = !!uiBool('clean_blank_lines', false);
+      const csp = document.getElementById('cleanSpacesChk');
+      if (csp) csp.checked = !!uiBool('clean_spaces', false);
+      const cspg = document.getElementById('cleanSpacesGapChk');
+      if (cspg) cspg.checked = !!uiBool('clean_spaces_keep_word_gap', true);
       const sme = document.getElementById('cleanSymbolMapEditor');
       if (sme) sme.value = formatSymbolMap(uiSettings.clean_symbol_map || UI_SETTINGS_DEFAULTS.clean_symbol_map);
       const dpe = document.getElementById('cleanDigitPunctMapEditor');
@@ -345,6 +404,9 @@ function saveUIMirror() {
     localStorage.setItem('ptoe_clean_digit_punct', uiSettings.clean_digit_punct ? '1' : '0');
     // 导出时清理空白行（2026-10）：'1'/'0'（uiBool 读 'ptoe_'+key）
     localStorage.setItem('ptoe_clean_blank_lines', uiSettings.clean_blank_lines ? '1' : '0');
+    // 清理段落内空白（2026-10-21）：'1'/'0'（uiBool 读 'ptoe_'+key）
+    localStorage.setItem('ptoe_clean_spaces', uiSettings.clean_spaces ? '1' : '0');
+    localStorage.setItem('ptoe_clean_spaces_keep_word_gap', uiSettings.clean_spaces_keep_word_gap ? '1' : '0');
     // 符号映射表（2026-10-16）：JSON 数组
     localStorage.setItem('ptoe_clean_symbol_map', JSON.stringify(uiSettings.clean_symbol_map || UI_SETTINGS_DEFAULTS.clean_symbol_map));
     // 数字标点映射表（2026-10-18）：JSON 数组
@@ -580,7 +642,7 @@ function _multiSelUpdateStatus() {
 
 // 弹窗开着时不响应 Esc 清除（各弹窗自己的 Esc/关闭优先）
 function _multiSelAnyModalOpen() {
-  const ids = ['modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','charFormatModalBg','finishModalBg','finishConfirmBg','formatRulesModalBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg','replaceRulesModalBg','rrEditModalBg','cmdBar'];
+  const ids = ['modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','charFormatModalBg','rubyModalBg','latexModalBg','finishModalBg','finishConfirmBg','formatRulesModalBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg','replaceRulesModalBg','rrEditModalBg','cmdBar'];
   for (let k = 0; k < ids.length; k++) {
     const el = document.getElementById(ids[k]);
     if (el && (el.style.display === 'flex' || el.classList.contains('cmd-open'))) return true;
@@ -1247,6 +1309,60 @@ function rebuildPrefix() {
 }
 function prefixTop(i) { return i <= 0 ? 0 : (prefixH[i] != null ? prefixH[i] : i * est); }
 function totalHeight() { return prefixTop(pages.length); }
+
+// ---------------------------------------------------------------------------
+// 实时跟随 OCR 进度（2026-10-21）
+//   转换与矫正分离后，转换进行中也能启动矫正界面：识别完成的页面由服务端
+//   写入 state['pages']，前端按版本号增量拉取（/api/live_status?since=N）
+//   并追加到编辑器尾部——不必等整本转换结束就能开始校对。
+// ---------------------------------------------------------------------------
+let _liveVersion = 0;
+let _liveTimer = null;
+let _liveTotal = 0;
+
+function startLiveOcrPolling(version, total) {
+  _liveVersion = version || 0;
+  _liveTotal = total || 0;
+  if (_liveTimer) return;
+  _liveTimer = setInterval(pollLiveOcr, 2500);
+  pollLiveOcr();
+}
+
+async function pollLiveOcr() {
+  try {
+    const res = await fetchJSON('/api/live_status?since=' + _liveVersion);
+    if (!res || !res.ok) return;
+    if (typeof res.version === 'number') _liveVersion = res.version;
+    if (res.total) _liveTotal = res.total;
+    const added = res.added || [];
+    if (added.length) appendLivePages(added);
+  } catch (e) { /* 忽略：下一轮继续 */ }
+}
+
+function appendLivePages(added) {
+  let n = 0;
+  for (const it of added) {
+    const pno = Number(it && it.page);
+    if (!pno) continue;
+    let dup = false;
+    for (let i = 0; i < pages.length; i++) {
+      if (pages[i].page === pno) { dup = true; break; }
+    }
+    if (dup) continue;
+    const html = (it && it.text) || '';
+    pages.push({ page: pno, text: html });
+    const idx = pages.length - 1;
+    heights.push(0);
+    contentMap.set(idx, html);
+    if (mdMode) { try { mdSourceMap.set(idx, htmlToMd(html)); } catch (e) {} }
+    n++;
+  }
+  if (!n) return;
+  rebuildPrefix();
+  updateViewport();
+  setStatus('已加载 ' + pages.length + ' 页（新增 ' + n + ' 页）');
+  showToast('新增 ' + n + ' 页识别结果', 'ok');
+}
 
 function updateStatus() {
   updatePrCount();
@@ -1956,8 +2072,8 @@ function convertSelectionToColumns() {
   // 选区 → 块集合（与「合并段落」同一套边界解析）
   const startNode = range.startContainer.nodeType === 3 ? range.startContainer.parentElement : range.startContainer;
   const endNode = range.endContainer.nodeType === 3 ? range.endContainer.parentElement : range.endContainer;
-  let startBlock = (startNode && startNode.closest) ? (startNode.closest('p,div,h1,h2,h3,h4,h5,h6') || null) : null;
-  let endBlock = (endNode && endNode.closest) ? (endNode.closest('p,div,h1,h2,h3,h4,h5,h6') || null) : null;
+  let startBlock = (startNode && startNode.closest) ? (startNode.closest(BLOCK_SEL) || null) : null;
+  let endBlock = (endNode && endNode.closest) ? (endNode.closest(BLOCK_SEL) || null) : null;
   if (startBlock === ed) startBlock = null;
   if (endBlock === ed) endBlock = null;
   const blocks = _blocksBetween(ed, startBlock, endBlock);
@@ -2920,6 +3036,7 @@ function _ensureTblResizeLayer() {
     if (ev.button !== 0) return; // 只认左键：中键/右键落在手柄上也不起手（2026-10）
     ev.preventDefault();
     ev.stopPropagation();
+    _beginDragUi(); // 尺寸拖拽期间不弹选中文字菜单
     const table = _tblKey.table;
     const i = _tblKey.i;
     const tRect = table.getBoundingClientRect();
@@ -2963,6 +3080,7 @@ function _ensureTblResizeLayer() {
       if (ed) { syncContent(ed); markDirty(i); scheduleRemeasure(i); }
       histEnd(before, '表格-尺寸');
       _tblRepositionBar(); // 尺寸变化后操作条/手柄层需按新几何重新定位
+      _endDragUi(); // 拖拽结束后的 mouseup 不再弹选中菜单
     }
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
@@ -3484,11 +3602,13 @@ function openCrop(row, i) {
   let drag = null; // {type:'move'|'resize', h?, sx, sy, ox, oy, ow, oh}
   box.addEventListener('mousedown', (ev) => {
     ev.preventDefault(); ev.stopPropagation();
+    _beginDragUi(); // 裁剪拖拽期间不弹选中文字菜单
     drag = { type: 'move', sx: ev.clientX, sy: ev.clientY, ox: cur.x, oy: cur.y };
   });
   box.querySelectorAll('.crop-handle').forEach((hEl) => {
     hEl.addEventListener('mousedown', (ev) => {
       ev.preventDefault(); ev.stopPropagation();
+      _beginDragUi();
       drag = {
         type: 'resize', h: hEl.classList[1],
         sx: ev.clientX, sy: ev.clientY,
@@ -3519,7 +3639,7 @@ function openCrop(row, i) {
     }
     renderBox();
   }
-  function onUp() { drag = null; }
+  function onUp() { drag = null; _endDragUi(); }
   function closeCrop() {
     window.removeEventListener('mousemove', onMove);
     window.removeEventListener('mouseup', onUp);
@@ -3623,6 +3743,18 @@ let _dragImgEd = null;    // 被拖块所在的编辑区
 let _dragBlkHtml = null;  // 被拖的整段 HTML（保留 class/data-*）
 let _dragBlkNodes = null; // 被拖的整段节点（同文档移动时删除原块）
 let _dragBlkEd = null;    // 整段来源编辑区
+// 拖拽态：拖拽期间不弹选中文字菜单（文字/图片/整段拖拽共用）。松手后 300ms 内也
+// 不弹——浏览器可能在 drop/dragend 之后补发 mouseup，菜单会遮住刚放下的内容。
+function _beginDragUi() {
+  _dragUiActive = true;
+  hidePopup();
+}
+function _endDragUi() {
+  if (!_dragUiActive) return;
+  _dragUiActive = false;
+  suppressPopupUntil = performance.now() + 300;
+  hidePopup();
+}
 // 选区是否正好覆盖一个/多个完整块（p/div/h1-6）：是则返回同级块数组，否则 null。
 // 只接管「整段」拖拽；部分选区（普通文字拖动）交回浏览器原生处理。
 function _dragWholeBlocks(ed) {
@@ -3655,14 +3787,15 @@ document.addEventListener('dragstart', function (e) {
   const t = e.target;
   if (!t || !t.closest) return;
   const ed = t.closest('.editable');
-  if (t.tagName === 'IMG' && ed) {
+  if (!ed) return;
+  _beginDragUi(); // 编辑区内起拖：立刻收起选中菜单，拖拽期间不再弹出
+  if (t.tagName === 'IMG') {
     _dragImgBlock = t.closest('p.ptoe-img-full, p.ptoe-img-fit') || t;
     _dragImgEd = ed;
     e.dataTransfer.effectAllowed = 'move';
     e.dataTransfer.setData('text/plain', t.src); // 非空数据才能启动拖拽（勿 preventDefault）
     return;
   }
-  if (!ed) return;
   const blocks = _dragWholeBlocks(ed);
   if (!blocks) return;
   _dragBlkNodes = blocks;
@@ -3775,6 +3908,11 @@ document.addEventListener('drop', function (e) {
     _dragImgEd = null;
   }
 });
+// 拖拽结束（drop）：源节点可能在 drop 里被移除，dragend 不保证再派发；在 drop 阶段
+// 兜底退出拖拽态（文字/图片/整段拖拽都会经过这里）。
+document.addEventListener('drop', function () {
+  _endDragUi();
+}, true);
 // 拖拽被取消（Esc/移出窗口）时清理状态，避免残留影响下一次拖拽
 document.addEventListener('dragend', function () {
   _dragImgBlock = null;
@@ -3782,6 +3920,7 @@ document.addEventListener('dragend', function () {
   _dragBlkHtml = null;
   _dragBlkNodes = null;
   _dragBlkEd = null;
+  _endDragUi();
 });
 // 文字拖放落点脉冲（2026-10）：原生文字拖放行为不变，仅在落点块上播一次背景脉冲。
 // 图片拖放走上方专用路径（clone 已单独脉冲），这里跳过；OS 文件拖放不落在块内也不闪。
@@ -4048,30 +4187,48 @@ function updateViewport() {
   updatePagePos();
 }
 // ---------- 多行/多块选择辅助与格式应用 ----------
+// 块级元素口径（2026-10-21）：表格单元格里的裸文本没有 p/div 包裹，旧实现
+// closest 只找 p/div/hN → 命中 .editable（或 null），_blocksBetween 返回 []，
+// 工具栏所有格式化对单元格文字静默不生效。这里把 td/th 也作为块候选：
+//   - 单元格内已有段落元素 → 段落才是块（避免给 <p> 再套一层 <p>）；
+//   - 单元格内只有裸文本 → 单元格本身作为块（格式落在单元格/其文本上）。
+// 保存清洗时单元格只保留 align/valign 类，段落级格式（注释/引用/缩进）会由
+// _paragraphCarrier 先包一层 <p>，保证存档/导出后仍然存在。
+const BLOCK_SEL = 'p,div,h1,h2,h3,h4,h5,h6,td,th';
+function _isCellEl(el) {
+  return !!el && (el.tagName === 'TD' || el.tagName === 'TH');
+}
+function _cellHasBlockChild(cell) {
+  return !!cell && _isCellEl(cell) && !!cell.querySelector('p,div,h1,h2,h3,h4,h5,h6');
+}
+// 统一收集可格式化块（文档序）。单元格内已有段落时跳过单元格本身，避免同一
+// 段文字被当成「单元格 + 段落」两块重复应用。
+function _collectBlockEls(root) {
+  const out = [];
+  if (!root) return out;
+  let walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+    acceptNode: function(n) {
+      return /^(P|DIV|H[1-6]|TD|TH)$/.test(n.tagName) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+    }
+  });
+  let cur = walker.nextNode();
+  while (cur) {
+    if (cur !== root && !(_isCellEl(cur) && _cellHasBlockChild(cur))) out.push(cur);
+    cur = walker.nextNode();
+  }
+  return out;
+}
 function _blocksBetween(ed, startBlock, endBlock) {
   // 边界解析失败（选区锚点在 ed 之外，_boundaryBlockInRange 返回 null）→ 不做任何应用，
   // 防止「选中段落却整页生效」（2026-09-24）。
   if (startBlock === null || endBlock === null) return [];
-  const blocks = [];
-  let walker = document.createTreeWalker(ed, NodeFilter.SHOW_ELEMENT, {
-    acceptNode: function(n) {
-      const tag = n.tagName;
-      return /^(P|DIV|H[1-6])$/.test(tag) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
-    }
-  });
-  let cur = walker.nextNode();
-  let started = false;
+  const all = _collectBlockEls(ed);
   // 选区起点/终点可能是 .editable 直属文本节点（startBlock/endBlock 回退为 ed）：
-  // 此时 walker 遍历从 ed 的子节点开始，cur 永不 === ed，若仍以 startBlock===ed 判定
-  // 会导致 blocks 恒为空、多块格式化全部失效——这里把 startBlock 置空改从首块收集。
-  if (startBlock === ed) startBlock = null;
-  while (cur) {
-    if (!startBlock || cur === startBlock) started = true;
-    if (started) blocks.push(cur);
-    if (cur === endBlock) break;
-    cur = walker.nextNode();
-  }
-  return blocks;
+  // 这时从首块/末块收集（保留旧行为，避免多块格式化全部失效）。
+  const si = startBlock === ed ? 0 : all.indexOf(startBlock);
+  const ei = endBlock === ed ? all.length - 1 : all.indexOf(endBlock);
+  if (si < 0 || ei < 0 || ei < si) return [];
+  return all.slice(si, ei + 1);
 }
 
 // 选区边界落在 .editable 直属文本节点（块间空白，编辑/历史往返后常见）时的块解析：
@@ -4084,8 +4241,10 @@ function _blocksBetween(ed, startBlock, endBlock) {
 function _boundaryBlockInRange(ed, node, isEnd) {
   if (!node || !ed.contains(node)) return null; // 选区锚点不在编辑区内 → 不可解析
   const el = node.nodeType === 3 ? node.parentElement : node;
-  const b = (el && el.closest) ? el.closest('p,div,h1,h2,h3,h4,h5,h6') : null;
-  if (b && b !== ed && ed.contains(b)) return b;
+  const b = (el && el.closest) ? el.closest(BLOCK_SEL) : null;
+  // 单元格内已有段落时，裸文本（如 <td>\n<p>…</p></td> 的换行）不属于任何段，
+  // closest 命中的 td 已被 _collectBlockEls 排除 → 返回 null 短路，避免格式落到整格。
+  if (b && b !== ed && ed.contains(b) && !(_isCellEl(b) && _cellHasBlockChild(b))) return b;
   // 无法解析为真实块（node 即 .editable 自身、或 closest 命中 ed）→ 返回 null 让
   // _blocksBetween 短路返回空：宁可本操作不生效，也不把格式铺满整页所有段落
   // （2026-10 修复：双击段落间距/空白时 target=ed，曾导致整页被格式化）。
@@ -4095,8 +4254,8 @@ function _boundaryBlockInRange(ed, node, isEnd) {
   let t = isEnd ? w.previousNode() : w.nextNode();
   while (t) {
     const p = t.parentElement;
-    const bb = (p && p.closest) ? p.closest('p,div,h1,h2,h3,h4,h5,h6') : null;
-    if (bb && bb !== ed && ed.contains(bb)) return bb;
+    const bb = (p && p.closest) ? p.closest(BLOCK_SEL) : null;
+    if (bb && bb !== ed && ed.contains(bb) && !(_isCellEl(bb) && _cellHasBlockChild(bb))) return bb;
     t = isEnd ? w.previousNode() : w.nextNode();
   }
   return null; // 相邻文本节点均无真实块 → 不可解析（同上一分支，短路防整页）
@@ -4258,6 +4417,38 @@ function _toBodyParagraph(block) {
   unwrapSpans(p, 'ptoe-align-right', whole);
   return p;
 }
+// 段落级格式的承载元素（2026-10-21）：表格单元格的裸文本没有段落元素，而保存
+// 清洗只保留单元格上的 align/valign 类（注释/引用/缩进/标题类会被丢弃）。
+// 这里把裸文本就地包进 <p>，返回该 <p> 作为格式落点；已有段落时直接用该段。
+// 注意：只在「整块/折叠」语义下调用。部分选区仍按行内 span 处理，不能改变
+// 单元格结构（否则会把选区与行内格式一起打断）。
+function _paragraphCarrier(block) {
+  if (!_isCellEl(block)) return block;
+  if (_cellHasBlockChild(block)) {
+    return block.querySelector('p,div,h1,h2,h3,h4,h5,h6') || block;
+  }
+  const p = document.createElement('p');
+  while (block.firstChild) p.appendChild(block.firstChild);
+  block.appendChild(p);
+  return p;
+}
+// 清除块上的文本格式类 / 段落设置属性（表格单元格分支复用）。
+// 保留图片段落布局类与题注类：它们不是文本格式（与 remove 原逻辑一致）。
+function _stripBlockTextFormat(block) {
+  if (!block || !block.classList) return block;
+  const keepClasses = [];
+  for (const c of block.classList) {
+    if (c.indexOf('ptoe-img-') === 0 || c === CAPTION_CLASS) keepClasses.push(c);
+  }
+  for (const c of ['ptoe-note', 'ptoe-citation', 'ptoe-align-left', 'ptoe-align-center',
+                   'ptoe-align-right', 'ptoe-align-lines', 'ptoe-flush', 'ptoe-indent']) {
+    block.classList.remove(c);
+  }
+  for (const c of keepClasses) block.classList.add(c);
+  for (const a of _IND_ATTRS) block.removeAttribute(a);
+  if (block.hasAttribute('style')) block.removeAttribute('style');
+  return block;
+}
 
 function toggleNote(ed) {
   // 注释：块级切换 ptoe-note；规则引擎「匹配对象/分组」路径会把注释落成行内
@@ -4273,25 +4464,27 @@ function toggleNote(ed) {
   const multi = _selectionMultiBlock(ed);
   histRun('注释格式', [i], function () {
     applyToSelectedBlocks(ed, function (block, range) {
-      if (multi) { block.classList.toggle('ptoe-note'); return; }
+      // 多块选区（Ctrl+点击）也可能是表格裸文本单元格：段落级类同样要先包 <p>。
+      if (multi) { _paragraphCarrier(block).classList.toggle('ptoe-note'); return; }
       const r = (range && !range.collapsed) ? range : (function () {
         const rr = document.createRange();
         rr.selectNodeContents(block);
         return rr;
       })();
-      if (r.collapsed) { block.classList.toggle('ptoe-note'); return; }
-      const whole = document.createRange();
-      whole.selectNodeContents(block);
-      if (r.compareBoundaryPoints(Range.START_TO_START, whole) === 0 &&
-          r.compareBoundaryPoints(Range.END_TO_END, whole) === 0) {
+      if (r.collapsed) { _paragraphCarrier(block).classList.toggle('ptoe-note'); return; }
+      if (_isWholeBlockRange(block, r)) {
         // 整块选区：块内已有规则行内注释 span → 先解包关闭（块级类一并清）。
         // 否则「规则套上的注释」整块选中点注释时关不掉，反而整块再叠一层块级注释
         // （2026-09-13 修复意图的漏网分支；部分选区分支早已正确处理）。
-        if (unwrapSpans(block, 'ptoe-note', whole) > 0) {
-          block.classList.remove('ptoe-note');
+        // 单元格裸文本 → 先把内容包成 <p> 再落块级类（保存后不丢）。
+        const target = _paragraphCarrier(block);
+        const cwhole = document.createRange();
+        cwhole.selectNodeContents(target);
+        if (unwrapSpans(target, 'ptoe-note', cwhole) > 0) {
+          target.classList.remove('ptoe-note');
           return;
         }
-        block.classList.toggle('ptoe-note');
+        target.classList.toggle('ptoe-note');
         return;
       }
       // 部分选区：已有行内注释 → 解包关闭（块级注释类一并清掉）；否则包裹选中文字
@@ -4308,7 +4501,11 @@ function toggleNote(ed) {
 
 // ---------- 新增内联格式工具（2026-09） ----------
 // 8 种内联 span 类：下划线、下加点、删除线、字符边框、底纹、突显、上标、下标
-const INLINE_CLASSES = ['ptoe-underline','ptoe-underdot','ptoe-strike','ptoe-charbox','ptoe-shade','ptoe-highlight','ptoe-sup','ptoe-sub'];
+const INLINE_CLASSES = ['ptoe-underline','ptoe-underdot','ptoe-strike','ptoe-charbox','ptoe-shade','ptoe-highlight','ptoe-sup','ptoe-sub',
+  // 2026-10-21 新增：波浪线 / 双下划线 / 上划线 / 着重号 / 多色突显 / 拼音注音
+  'ptoe-wavy','ptoe-double','ptoe-overline','ptoe-emphasis',
+  'ptoe-highlight-green','ptoe-highlight-blue','ptoe-highlight-pink','ptoe-highlight-orange','ptoe-highlight-purple',
+  'ptoe-ruby'];
 // 「清除格式」需要解包的行内类：8 项字符格式 + 规则引擎落在行内的注释 span
 // （2026-09-13 修复：规则「匹配对象」路径的 note 是 <span class="ptoe-note">，
 //  原先只解包 8 类 → 规则套上的注释文本点「清除格式」清不掉）
@@ -4320,13 +4517,26 @@ const INLINE_CLASSES = ['ptoe-underline','ptoe-underdot','ptoe-strike','ptoe-cha
 const INLINE_TEXT_CLASSES = ['ptoe-note', 'ptoe-citation', 'ptoe-align-left', 'ptoe-align-center', 'ptoe-align-right'].concat(INLINE_CLASSES);
 const INLINE_CLASS_LABEL = {
   underline:'下划线', underdot:'下加点', strike:'删除线', charbox:'字符边框',
-  shade:'底纹', highlight:'突显', sup:'上标', sub:'下标'
+  shade:'底纹', highlight:'突显', sup:'上标', sub:'下标',
+  // 2026-10-21 新增
+  wavy:'波浪线', double:'双下划线', overline:'上划线', emphasis:'着重号',
+  'highlight-green':'突显·绿', 'highlight-blue':'突显·蓝', 'highlight-pink':'突显·粉',
+  'highlight-orange':'突显·橙', 'highlight-purple':'突显·紫', ruby:'拼音注音'
 };
 // 上/下标互斥：同一区域不能同时是上标和下标
 const INLINE_MUTEX = {
   'ptoe-sup': ['ptoe-sup','ptoe-sub'],
   'ptoe-sub': ['ptoe-sup','ptoe-sub']
 };
+// op id → 行内 class（单一事实源：INLINE_CLASSES）
+// 多色突显的 op id 用下划线（highlight_green，与 OPS/OP_ICON/OP_TIP 的键一致），
+// 而 class 用连字符（ptoe-highlight-green，与后端 sanitize/规则引擎一致）→ 这里做一次映射。
+// 返回 null 表示该 op 不是行内格式（块级/工具操作）。
+function _opInlineClass(op) {
+  if (!op) return null;
+  const cls = 'ptoe-' + String(op).replace(/_/g, '-');
+  return INLINE_CLASSES.indexOf(cls) >= 0 ? cls : null;
+}
 // 对齐类（块级与行内共用）：行内对齐互斥 = 同向解包关闭 + 换向先解包其余两类
 const ALIGN_CLASSES = ['ptoe-align-left', 'ptoe-align-center', 'ptoe-align-right'];
 // 格式刷捕获/应用的行内类：8 种字符类 + 行内注释/引用 + 行内对齐
@@ -4568,14 +4778,26 @@ const DIVIDER_STYLES = {
   dashed: 'ptoe-divider-dashed',
   dotted: 'ptoe-divider-dotted',
   double: 'ptoe-divider-double',
+  // —— 花样分割符号（2026-10-21）：非线条型，用装饰字形排成分隔 ——
+  stars: 'ptoe-divider-stars',
+  diamonds: 'ptoe-divider-diamonds',
+  circles: 'ptoe-divider-circles',
+  flowers: 'ptoe-divider-flowers',
+  snow: 'ptoe-divider-snow',
+  wave: 'ptoe-divider-wave',
+  note: 'ptoe-divider-note',
+  leaf: 'ptoe-divider-leaf',
 };
-const DIVIDER_GLYPHS = { solid: '─', dashed: '╌', dotted: '┈', double: '═' };
+const DIVIDER_GLYPHS = { solid: '─', dashed: '╌', dotted: '┈', double: '═', stars: '★', diamonds: '◆', circles: '●', flowers: '❀', snow: '❄', wave: '≈', note: '※', leaf: '❦' };
+// 字形个数：线条型 8 个、花样型 5 个（须与后端 correctmanage.DIVIDER_GLYPHS 一致）
+const DIVIDER_COUNTS = { solid: 8, dashed: 8, dotted: 8, double: 8, stars: 5, diamonds: 5, circles: 5, flowers: 5, snow: 5, wave: 5, note: 5, leaf: 5 };
 const DIVIDER_DEFAULT_STYLE = 'solid';
-const DIVIDER_STYLE_LABEL = { solid: '直线', dashed: '线段', dotted: '点线', double: '双线' };
-// 字形串：恒 8 个字符（视觉宽度一致）
+const DIVIDER_STYLE_LABEL = { solid: '直线', dashed: '线段', dotted: '点线', double: '双线', stars: '星形', diamonds: '菱形', circles: '圆点', flowers: '花纹', snow: '雪花', wave: '波浪', note: '注记', leaf: '叶形' };
+// 字形串：线条型 8 个字符、花样型 5 个（视觉宽度一致）
 function dividerGlyph(style) {
   const ch = DIVIDER_GLYPHS[style] || DIVIDER_GLYPHS[DIVIDER_DEFAULT_STYLE];
-  return new Array(9).join(ch);
+  const n = DIVIDER_COUNTS[style] || DIVIDER_COUNTS[DIVIDER_DEFAULT_STYLE];
+  return new Array(n + 1).join(ch);
 }
 // 规范段落 HTML：<p class="ptoe-divider ptoe-divider-solid">────────</p>
 function buildDividerHtml(style) {
@@ -4608,6 +4830,13 @@ function _charTargetRange(block, range) {
   const total = (block.textContent || '').length;
   if (snap && total > 0 && snap.start === 0 && snap.end >= total) return whole;
   return range;
+}
+// 选区是否覆盖整块（或折叠）。统一走文本偏移，避免 compareBoundaryPoints 在
+// 不同引擎里对「等价位置」判断不一致（jsdom 下整格选区会被误判为部分选区，
+// 导致注释/引用退化成行内 span；2026-10-21 表格内实测）。
+function _isWholeBlockRange(block, range) {
+  if (!range || range.collapsed) return true;
+  return _charTargetRange(block, range) !== range;
 }
 // 边界 (container, offset) 是否严格位于 span 内部
 function _pointStrictlyInside(sp, container, offset) {
@@ -4737,18 +4966,9 @@ function applyCharStyleToBlock(block, range, decls) {
   }
   return block.innerHTML !== before;
 }
-// 块集合（p/div/h1-h6，与 _blocksBetween 同一口径；含表格内块）
+// 块集合（p/div/h1-h6/单元格，与 _blocksBetween 同一口径；含表格内裸文本单元格）
 function _editableCharBlocks(root) {
-  const out = [];
-  if (!root) return out;
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
-    acceptNode: function (n) {
-      return /^(P|DIV|H[1-6])$/.test(n.tagName) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
-    }
-  });
-  let cur = walker.nextNode();
-  while (cur) { out.push(cur); cur = walker.nextNode(); }
-  return out;
+  return _collectBlockEls(root);
 }
 // 取 ed 内纵坐标离 y 最近的真实块（双击落在段落间距/空白、target=.editable 时吸附最近段落用）
 function _nearestBlockAtY(ed, y) {
@@ -4772,9 +4992,243 @@ function _wholeBlockRange(block) {
 
 // 应用/切换内联 class（用于 toolbar/menu/brush/rules）
 // opts.toggle: true = 用户交互切换（已有则解包），false = 规则路径强制应用（无则包裹，有则保留）
+// 文字包围格式应用（2026-10-21）：波浪线/双下划线/上划线/着重号/多色突显/拼音注音
+// 拼音注音需要用户输入注音内容 → 存进 span 的 data-rt 属性（后端 sanitize 会规范化）
+// 拼音注音弹窗（2026-10-21）：内嵌浏览器（WebView2）不保证支持 window.prompt，
+// 因此用应用内弹窗输入注音内容（存进 span 的 data-rt 属性）
+let _rubyTargetEditable = null;
+// 注音弹窗打开时的选区快照：弹窗输入会清掉编辑区选区（点击非编辑区元素 → 选区落到 body），
+// 导致「确定」时选中的文字已经没了。悬浮菜单触发时尤其明显（菜单按钮 mousedown 已 preventDefault，
+// 但点击弹窗输入框仍会清选区）→ 打开时快照 range，应用前恢复。
+let _rubySavedRange = null;
+function _captureSelRange(ed) {
+  try {
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return null;
+    const r = sel.getRangeAt(0);
+    if (!ed || !ed.contains(r.commonAncestorContainer)) return null;
+    return r.cloneRange();
+  } catch (e) { return null; }
+}
+function _restoreSelRange(r) {
+  if (!r) return;
+  try {
+    const sel = window.getSelection();
+    if (!sel) return;
+    if (!r.startContainer || !r.startContainer.isConnected) return;
+    sel.removeAllRanges();
+    sel.addRange(r);
+  } catch (e) { /* 忽略：恢复失败时按无选区处理 */ }
+}
+function openRubyModal(ed) {
+  const bg = document.getElementById('rubyModalBg');
+  const inp = document.getElementById('rubyInput');
+  if (!bg || !inp) { showToast('注音弹窗不可用', 'warn'); return; }
+  _rubyTargetEditable = ed || null;
+  _rubySavedRange = _captureSelRange(ed);
+  inp.value = '';
+  bg.style.display = 'flex';
+  try { inp.focus(); } catch (e) { /* 忽略：焦点失败不影响输入 */ }
+}
+function closeRubyModal() {
+  const bg = document.getElementById('rubyModalBg');
+  if (bg) bg.style.display = 'none';
+  _rubyTargetEditable = null;
+  _rubySavedRange = null;
+}
+function applyRubyModal() {
+  const inp = document.getElementById('rubyInput');
+  const ed = _rubyTargetEditable;
+  const rt = String((inp && inp.value) || '').replace(/[\r\n]/g, ' ').trim().slice(0, 32);
+  const saved = _rubySavedRange;
+  closeRubyModal();
+  if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
+  if (!rt) { showToast('未输入注音，已取消', 'warn'); return; }
+  _restoreSelRange(saved);
+  applyInlineClass(ed, 'ptoe-ruby', {toggle:true, attrs:{'data-rt': rt}});
+}
+function applyWrapFormat(ed, wrap) {
+  if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
+  if (wrap === 'ruby') { openRubyModal(ed); return; }
+  applyInlineClass(ed, 'ptoe-' + wrap, {toggle:true});
+}
+// ============================================================================
+// LaTeX 公式（2026-10-21）
+//
+// 载体 = <math> 元素（MathML）。用 KaTeX 的 output:'mathml' 模式渲染：
+//     <math xmlns="…" alttext="E=mc^2" display="inline">
+//       <semantics><mrow>…</mrow><annotation encoding="application/x-tex">…</annotation></semantics>
+//     </math>
+// 为什么用 MathML 而不是 KaTeX 的 HTML 模式：HTML 模式依赖 KaTeX 的 CSS +
+// 一整套 webfont（离线环境拿不到字体 → 公式显示成方块）；MathML 由浏览器/EPUB
+// 阅读器原生渲染，零外部依赖。
+// 各端表现：
+//   - 编辑器：Chromium（WebView2）原生渲染 MathML，公式所见即所得；
+//   - 导出 EPUB：<math> 原样进 XHTML → EPUB 3 阅读器照常显示；
+//   - 导出 DOCX/MD/TXT：无 MathML 概念 → 后端取 alttext 里的源码，输出 $公式$；
+//   - 后端白名单：rulemanage.MATHML_TAGS / MATHML_ATTRS（保存清洗与规则引擎同口径）。
+// ============================================================================
+const LATEX_MATHML_NS = 'http://www.w3.org/1998/Math/MathML';
+let _latexTargetEditable = null;   // 目标编辑区
+let _latexSavedRange = null;       // 打开弹窗时的选区快照（弹窗会清掉选区）
+let _latexEditMath = null;         // 正在编辑的既有 <math> 元素（null = 新插入）
+
+// KaTeX 是否可用（ui/vendor/katex.min.js 由服务端随包提供，离线可用）
+function latexKatexReady() {
+  return typeof window !== 'undefined' && !!window.katex &&
+    typeof window.katex.renderToString === 'function';
+}
+// HTML 文本转义（写入 alttext 用）
+function _latexEsc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+// LaTeX 源码 → <math …>…</math> 字符串；失败抛 Error（message 为可读原因）
+function latexMathML(tex, displayMode) {
+  if (!latexKatexReady()) throw new Error('KaTeX 库未加载（ui/vendor/katex.min.js 缺失）');
+  let out;
+  try {
+    out = window.katex.renderToString(tex, {
+      output: 'mathml',
+      displayMode: !!displayMode,
+      throwOnError: true,
+    });
+  } catch (e) {
+    throw new Error((e && e.message) ? String(e.message) : '公式语法错误');
+  }
+  const m = /<math\b[\s\S]*?<\/math>/.exec(out);
+  if (!m) throw new Error('公式渲染结果异常');
+  let math = m[0];
+  // 补 alttext（LaTeX 源码，供导出 DOCX/MD/TXT 与无障碍阅读器使用）
+  // 与 display（inline / block）；已有则不重复写。
+  const open = /<math\b([^>]*)>/.exec(math);
+  let attrs = open ? (open[1] || '') : '';
+  if (!/\balttext\s*=/.test(attrs)) attrs += ' alttext="' + _latexEsc(tex) + '"';
+  if (!/\bdisplay\s*=/.test(attrs)) attrs += ' display="' + (displayMode ? 'block' : 'inline') + '"';
+  math = math.replace(/<math\b([^>]*)>/, '<math' + attrs + '>');
+  return math;
+}
+// 选区所在（或所含）的 <math> 元素；没有则 null
+function _latexMathOfRange(range) {
+  if (!range) return null;
+  const nodes = [range.startContainer, range.endContainer, range.commonAncestorContainer];
+  for (let k = 0; k < nodes.length; k++) {
+    let n = nodes[k];
+    if (!n) continue;
+    if (n.nodeType === 3) n = n.parentElement;
+    if (n && n.closest) {
+      const m = n.closest('math');
+      if (m) return m;
+    }
+  }
+  return null;
+}
+function openLatexModal(ed) {
+  const bg = document.getElementById('latexModalBg');
+  const inp = document.getElementById('latexInput');
+  if (!bg || !inp) { showToast('公式弹窗不可用', 'warn'); return; }
+  if (!latexKatexReady()) { showToast('公式功能不可用：未找到 KaTeX 库', 'fail'); return; }
+  _latexTargetEditable = ed || null;
+  // 选区快照：弹窗输入会清掉编辑区选区（点输入框 → 选区落到 body）
+  _latexSavedRange = _captureSelRange(ed);
+  // 编辑既有公式：光标/选区落在某个 <math> 内 → 进入编辑模式
+  _latexEditMath = _latexMathOfRange(_latexSavedRange);
+  const disp = document.getElementById('latexDisplay');
+  if (_latexEditMath) {
+    inp.value = _latexEditMath.getAttribute('alttext') || '';
+    if (disp) disp.checked = (_latexEditMath.getAttribute('display') || 'inline') === 'block';
+  } else {
+    inp.value = '';
+    if (disp) disp.checked = false;
+  }
+  bg.style.display = 'flex';
+  renderLatexPreview();
+  try { inp.focus(); } catch (e) { /* 忽略：焦点失败不影响输入 */ }
+}
+function closeLatexModal() {
+  const bg = document.getElementById('latexModalBg');
+  if (bg) bg.style.display = 'none';
+  _latexTargetEditable = null;
+  _latexSavedRange = null;
+  _latexEditMath = null;
+}
+// 弹窗内实时预览（用同一套 MathML 输出，所见即所得）
+function renderLatexPreview() {
+  const box = document.getElementById('latexPreview');
+  const inp = document.getElementById('latexInput');
+  const disp = document.getElementById('latexDisplay');
+  if (!box || !inp) return;
+  const tex = String(inp.value || '').trim();
+  if (!tex) { box.innerHTML = '<span class="latex-preview-empty">（预览区）</span>'; return; }
+  try {
+    box.innerHTML = latexMathML(tex, disp && disp.checked);
+  } catch (e) {
+    box.innerHTML = '<span class="latex-preview-error">' + esc((e && e.message) || '公式语法错误') + '</span>';
+  }
+}
+function applyLatexModal() {
+  const inp = document.getElementById('latexInput');
+  const disp = document.getElementById('latexDisplay');
+  const ed = _latexTargetEditable;
+  const saved = _latexSavedRange;
+  const editMath = _latexEditMath;
+  const tex = String((inp && inp.value) || '').replace(/[\r\n]/g, ' ').trim();
+  closeLatexModal();
+  if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
+  if (!tex) { showToast('未输入公式内容，已取消', 'warn'); return; }
+  let math;
+  try { math = latexMathML(tex, disp && disp.checked); }
+  catch (e) { showToast('公式无法解析：' + ((e && e.message) || '语法错误'), 'fail'); return; }
+  const row = ed.closest('.page-row');
+  const i = row ? Number(row.dataset.i) : -1;
+  histRun(editMath ? '编辑公式' : '插入公式', [i], function () {
+    if (editMath && editMath.isConnected) {
+      // 编辑既有公式：整体替换其内容与属性
+      const tmp = document.createElement('div');
+      tmp.innerHTML = math;
+      const fresh = tmp.firstElementChild;
+      if (fresh) {
+        editMath.replaceWith(fresh);
+      }
+    } else {
+      // 新插入：替换当前选区（无选区则插到光标处）
+      _restoreSelRange(saved);
+      const sel = window.getSelection();
+      let range = null;
+      if (sel && sel.rangeCount) {
+        const r = sel.getRangeAt(0);
+        if (ed.contains(r.commonAncestorContainer)) range = r;
+      }
+      if (!range) {
+        range = document.createRange();
+        const block = ed.querySelector('p,div,h1,h2,h3,h4,h5,h6') || ed;
+        range.selectNodeContents(block);
+        range.collapse(false);
+      }
+      const tmp = document.createElement('div');
+      tmp.innerHTML = math;
+      const fresh = tmp.firstElementChild;
+      if (fresh) {
+        range.deleteContents();
+        range.insertNode(fresh);
+        // 光标移到公式之后
+        range.setStartAfter(fresh);
+        range.collapse(true);
+        const sel2 = window.getSelection();
+        if (sel2) { sel2.removeAllRanges(); sel2.addRange(range); }
+      }
+    }
+    syncContent(ed);
+    if (row) { markDirty(i); scheduleRemeasure(i); }
+  });
+  showToast(editMath ? '公式已更新' : '已插入公式', 'ok');
+}
 function applyInlineClass(ed, cls, opts) {
   opts = opts || {};
   const toggle = !!opts.toggle;
+  // 额外属性（2026-10-21）：拼音注音需要 data-rt 承载注音内容
+  const extraAttrs = opts.attrs || null;
   const row = ed.closest('.page-row');
   const i = row ? Number(row.dataset.i) : -1;
   const label = INLINE_CLASS_LABEL[cls.replace('ptoe-', '')] || cls;
@@ -4824,7 +5278,7 @@ function applyInlineClass(ed, cls, opts) {
           unwrapSpans(block, cls, snap ? _rangeFromOffsets(block, snap) : range);
         } else {
           const rr = snap ? _rangeFromOffsets(block, snap) : range;
-          if (rr) wrapRange(block, rr, cls);
+          if (rr) wrapRange(block, rr, cls, extraAttrs);
         }
       } else {
         // 规则应用模式：仅在选区内无该 class 时包裹（不解包）
@@ -4843,7 +5297,7 @@ function applyInlineClass(ed, cls, opts) {
           }
         }
         if (!hasIntersect && rr) {
-          wrapRange(block, rr, cls);
+          wrapRange(block, rr, cls, extraAttrs);
         }
       }
     });
@@ -4855,7 +5309,7 @@ function applyInlineClass(ed, cls, opts) {
 // 把单个 block 的 range 包裹为 span.cls
 // 优先尝试整体包裹（extractContents + insertNode）；
 // 若 range 跨越嵌套元素/图片导致异常，回退到逐文本节点包裹
-function wrapRange(block, range, cls) {
+function wrapRange(block, range, cls, attrs) {
   // 折叠选区（只有光标、没有选中文字）：按"光标所在整块"包裹，与「清除格式」的折叠语义一致
   // （见 applyToSelectedBlocks 的 collapsed 分支）。原实现直接 extractContents()：
   // 折叠时提取到空片段 → 插入一个空 <span class="ptoe-xxx">，表现为"点了格式按钮
@@ -4869,6 +5323,7 @@ function wrapRange(block, range, cls) {
     const frag = clone.extractContents();
     const span = document.createElement('span');
     span.className = cls;
+    if (attrs) Object.keys(attrs).forEach(function (k) { span.setAttribute(k, attrs[k]); });
     span.appendChild(frag);
     clone.insertNode(span);
     // 恢复/扩展选区覆盖新插入的 span
@@ -4907,6 +5362,7 @@ function wrapRange(block, range, cls) {
       const segFrag = segRange.extractContents();
       const s = document.createElement('span');
       s.className = cls;
+      if (attrs) Object.keys(attrs).forEach(function (k) { s.setAttribute(k, attrs[k]); });
       s.appendChild(segFrag);
       segRange.insertNode(s);
     }
@@ -4928,17 +5384,18 @@ function toggleCitation(ed) {
         rr.selectNodeContents(block);
         return rr;
       })();
-      if (r.collapsed) { block.classList.toggle('ptoe-citation'); return; }
-      const whole = document.createRange();
-      whole.selectNodeContents(block);
-      if (r.compareBoundaryPoints(Range.START_TO_START, whole) === 0 &&
-          r.compareBoundaryPoints(Range.END_TO_END, whole) === 0) {
+      if (r.collapsed) { _paragraphCarrier(block).classList.toggle('ptoe-citation'); return; }
+      if (_isWholeBlockRange(block, r)) {
         // 整块选区：块内已有规则行内引用 span → 先解包关闭（与 toggleNote 同构）
-        if (unwrapSpans(block, 'ptoe-citation', whole) > 0) {
-          block.classList.remove('ptoe-citation');
+        // 单元格裸文本 → 先包 <p>，避免保存清洗丢掉单元格上的引用类。
+        const target = _paragraphCarrier(block);
+        const cwhole = document.createRange();
+        cwhole.selectNodeContents(target);
+        if (unwrapSpans(target, 'ptoe-citation', cwhole) > 0) {
+          target.classList.remove('ptoe-citation');
           return;
         }
-        block.classList.toggle('ptoe-citation');
+        target.classList.toggle('ptoe-citation');
         return;
       }
       // 部分选区：已有行内引用 → 解包（关闭）；否则包裹选中文字
@@ -4957,17 +5414,156 @@ function cycleHeading(ed) {
   const i = row ? Number(row.dataset.i) : -1;
   histRun('标题', [i], function () {
     applyToSelectedBlocks(ed, function(block) {
-      const tag = block.tagName.toLowerCase();
+      // 单元格裸文本：先包 <p> 再循环标题级别（不能把 td 转成 hN —— 会毁表）。
+      const target = _paragraphCarrier(block);
+      const tag = target.tagName.toLowerCase();
       let next;
       if (tag === 'p' || tag === 'div') next = 'h1';
       else if (/^h[1-5]$/.test(tag)) next = 'h' + (parseInt(tag[1], 10) + 1);
       else next = 'p';
-      _convertBlockTag(block, next);
+      _convertBlockTag(target, next);
     });
     syncContent(ed);
     if (row) { markDirty(i); scheduleRemeasure(i); }
   });
 }
+// 多行对齐标记类（与后端白名单同名，见 correctmanage/htmlmanage 的 _ALIGN_LINES_CLASS）
+const ALIGN_LINES_CLASS = 'ptoe-align-lines';
+// 多行文本对齐：以选中行中最长行为基准；含空格的行，空格左右内容分别靠两端对齐，
+// 中间以 &nbsp; 填充；最长行不补齐（只把行内空白统一成 &nbsp;，列宽不变）。
+// 2026-10-20 重写（旧实现三处毛病）：
+//  1) 宽度按「字符数」算——中文/全角占 2 列，按字符数补齐会让中文行左右错位
+//     （用户报的现象：多行文本左右两侧对不齐）；
+//  2) 整体覆写 innerHTML——行内加粗/斜体/标记 span 全丢，文本里的 '<' 还会被当标签解析；
+//  3) 半角空格会被 HTML 折叠成一格、被导出时的空白清理吃掉——填充必须用 &nbsp;（U+00A0）。
+function alignLines(ed) {
+  const row = ed.closest('.page-row');
+  const i = row ? Number(row.dataset.i) : -1;
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+    showToast('请先选中要对齐的多行文本', 'warn');
+    return;
+  }
+  const range = sel.getRangeAt(0);
+  const startBlock = _boundaryBlockInRange(ed, range.startContainer, false);
+  const endBlock = _boundaryBlockInRange(ed, range.endContainer, true);
+  const blocks = _blocksBetween(ed, startBlock, endBlock);
+  if (blocks.length < 2) {
+    showToast('请选中两行及以上文本进行对齐', 'warn');
+    return;
+  }
+  const NBSP = '\u00a0';
+  // 逐块解析：块开标签后有补的 \n（块间换行约定，见 _ensureBlockNewlines），
+  // 首尾空白不参与对齐计算，只按「首个空白串」切分左右两段。
+  const infos = blocks.map(function (b) {
+    const raw = b.textContent || '';
+    const lead = (/^\s*/.exec(raw) || [''])[0];
+    const rest = raw.slice(lead.length);
+    const trail = (/\s*$/.exec(rest) || [''])[0];
+    const body = rest.slice(0, rest.length - trail.length);
+    const sep = /\s+/.exec(body);
+    return {
+      el: b,
+      lead: lead.length,
+      body: body,
+      trail: trail.length,
+      sepStart: sep ? sep.index : -1,
+      sepEnd: sep ? sep.index + sep[0].length : -1,
+      cols: _textCols(body)
+    };
+  });
+  const baseCols = Math.max.apply(null, infos.map(function (x) { return x.cols; }));
+  histRun('多行对齐', [i], function () {
+    infos.forEach(function (x) {
+      const b = x.el;
+      if (!x.body) return;   // 空行不参与（原样保留）
+      const need = baseCols - x.cols;   // 该行比基准短多少列
+      if (x.sepStart >= 0) {
+        // 有空格：左段靠左、右段靠右，中间（分隔空白 + 填充）统一为 &nbsp;
+        // 分隔空白本身的列数原样保留，只把字符换成 &nbsp;（避免 HTML 折叠后错位）
+        const sepCols = _textCols(x.body.slice(x.sepStart, x.sepEnd));
+        const mid = NBSP.repeat(sepCols) + NBSP.repeat(Math.max(0, need));
+        _replaceBlockRange(b, x.lead + x.sepStart, x.lead + x.sepEnd, mid);
+      } else if (need > 0) {
+        // 无空格：整段靠左，右侧补齐到基准宽度。
+        // 连同尾部空白一起替换——否则重复对齐会一次次往后追加（不幂等）
+        const from = x.lead + x.body.length;
+        _replaceBlockRange(b, from, from + x.trail, NBSP.repeat(need));
+      }
+      // 标记类：导出时该段豁免空白符清理（对齐用的空白是版式的一部分）。
+      // 单元格裸文本先包 <p>：ptoe-align-lines 不在单元格类白名单内，落 td 上会丢。
+      _paragraphCarrier(b).classList.add(ALIGN_LINES_CLASS);
+    });
+    syncContent(ed);
+    if (row) { markDirty(i); scheduleRemeasure(i); }
+  });
+}
+// 文本显示列宽：CJK/全角字符占 2 列，其余占 1 列。
+// 多行对齐按列宽（不是字符数）算基准宽度——中文行按字符数补齐会左右错位。
+function _textCols(str) {
+  let w = 0;
+  for (const ch of String(str == null ? '' : str)) {
+    const c = ch.codePointAt(0);
+    const wide = (c >= 0x1100 && c <= 0x115f) || (c >= 0x2e80 && c <= 0x303e) ||
+      (c >= 0x3041 && c <= 0x33ff) || (c >= 0x3400 && c <= 0x4dbf) ||
+      (c >= 0x4e00 && c <= 0x9fff) || (c >= 0xa000 && c <= 0xa4cf) ||
+      (c >= 0xac00 && c <= 0xd7a3) || (c >= 0xf900 && c <= 0xfaff) ||
+      (c >= 0xfe10 && c <= 0xfe19) || (c >= 0xfe30 && c <= 0xfe6f) ||
+      (c >= 0xff00 && c <= 0xff60) || (c >= 0xffe0 && c <= 0xffe6) ||
+      (c >= 0x20000 && c <= 0x2fffd) || (c >= 0x30000 && c <= 0x3fffd);
+    w += wide ? 2 : 1;
+  }
+  return w;
+}
+// 块内文本节点（按文档序）：行内格式（strong/em/span）里的文字也要参与拼接
+function _blockTextNodes(block) {
+  const out = [];
+  (function walk(node) {
+    const kids = node.childNodes;
+    for (let k = 0; k < kids.length; k++) {
+      const c = kids[k];
+      if (c.nodeType === 3) out.push(c);
+      else if (c.nodeType === 1 && c.tagName !== 'BR') walk(c);
+    }
+  })(block);
+  return out;
+}
+// 用 newText 替换块内文本的 [start, end) 区间（start === end 即纯插入）。
+// 只动空白区、不整体覆写 innerHTML——行内加粗/斜体/标记 span 原样保留。
+function _replaceBlockRange(block, start, end, newText) {
+  const nodes = _blockTextNodes(block);
+  if (!nodes.length) return false;
+  if (start === end) {
+    let pos = 0;
+    for (const n of nodes) {
+      const len = n.data.length;
+      if (start <= pos + len) {
+        const at = start - pos;
+        n.data = n.data.slice(0, at) + newText + n.data.slice(at);
+        return true;
+      }
+      pos += len;
+    }
+    return false;
+  }
+  let pos = 0, done = false;
+  for (const n of nodes) {
+    const len = n.data.length;
+    const s = Math.max(0, start - pos);
+    const e = Math.min(len, end - pos);
+    if (e > s) {
+      if (!done) {
+        n.data = n.data.slice(0, s) + newText + n.data.slice(e);
+        done = true;
+      } else {
+        n.data = n.data.slice(e);   // 区间跨节点：后续节点被覆盖的前段清空
+      }
+    }
+    pos += len;
+  }
+  return done;
+}
+
 function applyAlign(ed, pos) {
   const row = ed.closest('.page-row');
   const i = row ? Number(row.dataset.i) : -1;
@@ -4981,10 +5577,7 @@ function applyAlign(ed, pos) {
       const whole = document.createRange();
       whole.selectNodeContents(block);
       const r = (range && !range.collapsed) ? range : whole;
-      const blockLevel = multi || r.collapsed || (
-        r.compareBoundaryPoints(Range.START_TO_START, whole) === 0 &&
-        r.compareBoundaryPoints(Range.END_TO_END, whole) === 0
-      );
+      const blockLevel = multi || _isWholeBlockRange(block, r);
       if (blockLevel) {
         block.classList.remove('ptoe-align-left', 'ptoe-align-center', 'ptoe-align-right');
         block.classList.add(cls);
@@ -5014,8 +5607,11 @@ function applyFormatBrushToSelection(format) {
   // block classes
   applyToSelectedBlocks(ed, function(block, r) {
     if (format.blockClasses && format.blockClasses.length) {
-      for (const c of ['ptoe-note','ptoe-align-left','ptoe-align-center','ptoe-align-right']) block.classList.remove(c);
-      for (const c of format.blockClasses) block.classList.add(c);
+      // 注释是段落级类，单元格裸文本需先包 <p>（单元格上的类保存时会被清洗掉）；
+      // 对齐类可直接落在 td 上（后端白名单保留 td/th 的 align 类）。
+      const target = format.blockClasses.indexOf('ptoe-note') >= 0 ? _paragraphCarrier(block) : block;
+      for (const c of ['ptoe-note','ptoe-align-left','ptoe-align-center','ptoe-align-right']) target.classList.remove(c);
+      for (const c of format.blockClasses) target.classList.add(c);
     }
     // inline: bold/italic/color
     if (format.bold) withScrollStable(() => document.execCommand('bold'));
@@ -5065,10 +5661,12 @@ function applyIndentMode(ed, mode) {
     const cls = mode === 'flush' ? 'ptoe-flush' : 'ptoe-indent';
     histRun(mode === 'flush' ? '顶格' : '缩进', [i], function () {
         applyToSelectedBlocks(ed, function(block) {
+            // 缩进/顶格是段落级格式；单元格裸文本先包 <p>，否则保存清洗会丢类。
+            const target = _paragraphCarrier(block);
             // 互斥：先清两个类；再次点击已生效的类则取消（回到默认）
-            const had = block.classList.contains(cls);
-            block.classList.remove('ptoe-flush', 'ptoe-indent');
-            if (!had) block.classList.add(cls);
+            const had = target.classList.contains(cls);
+            target.classList.remove('ptoe-flush', 'ptoe-indent');
+            if (!had) target.classList.add(cls);
         });
         syncContent(ed);
         if (row) { markDirty(i); scheduleRemeasure(i); }
@@ -5083,7 +5681,8 @@ function captureFormatFromSelection() {
   const range = sel.getRangeAt(0);
   let node = range.commonAncestorContainer;
   if (node.nodeType === 3) node = node.parentElement;
-  const block = (node && node.closest ? node.closest('p,div,h1,h2,h3,h4,h5,h6') : null) || ed;
+  // 表格单元格内裸文本没有 p/div：块候选需包含 td/th，否则刷子抓不到单元格对齐类。
+  const block = (node && node.closest ? node.closest(BLOCK_SEL) : null) || ed;
   const fmt = { blockClasses: [], bold: false, italic: false, color: null, inlineClasses: [] };
   if (block && block.classList) {
     for (const c of ['ptoe-note','ptoe-align-left','ptoe-align-center','ptoe-align-right']) {
@@ -5133,6 +5732,8 @@ function applyOp(op) {
    // 弹窗内部自行判定目标编辑区，故候选池按钮与快捷键都走这一入口。
    if (op === 'charformat') { openCharFormatDialog(); return; }
    const ed = currentEditable(); if (!ed) return;
+   // LaTeX 公式（2026-10-21）：弹窗输入 LaTeX 源码 → KaTeX 渲染成 MathML 插入正文
+   if (op === 'latex') { openLatexModal(ed); return; }
    // 「转成表格」（2026-10）：把选中文字交给服务端 /api/table_convert 转成原生 <table>，
    // 成功后就地替换选区。手动档：显式选中即认定是表格（无分隔行/空格对齐列也认）。
    if (op === 'table') { convertSelectionToTable(); return; }
@@ -5141,14 +5742,19 @@ function applyOp(op) {
    // 「分栏」（2026-10）：选中段落两两转无边框两列表 / 光标处插入空白分栏行。
    if (op === 'columns') { convertSelectionToColumns(); return; }
    // 新增内联格式（2026-09）：下划线、删除线、字符边框、底纹、突显、上标、下标
-   if (INLINE_CLASSES.includes('ptoe-' + op)) {
-     applyInlineClass(ed, 'ptoe-' + op, {toggle:true});
+   // 文字包围格式（2026-10-21）：波浪线/双下划线/上划线/着重号/多色突显 → 行内 class；
+   // 拼音注音需输入注音内容 → 走注音弹窗（openRubyModal）
+   const wrapCls = _opInlineClass(op);
+   if (wrapCls) {
+     if (wrapCls === 'ptoe-ruby') { openRubyModal(ed); return; }
+     applyInlineClass(ed, wrapCls, {toggle:true});
      return;
    }
    if (op.indexOf('marker_') === 0) { insertMarker(op); return; }
    if (op === 'note') { toggleNote(ed); return; }
    if (op === 'citation') { toggleCitation(ed); return; }
    if (op === 'heading') { cycleHeading(ed); return; }
+   if (op === 'align_lines') { alignLines(ed); return; }
    if (op.indexOf('align_') === 0) { applyAlign(ed, op.slice(6)); return; }
    if (op === 'flush' || op === 'indent') { applyIndentMode(ed, op); return; }
    if (op === 'strip_ws') {
@@ -5205,6 +5811,22 @@ function applyOp(op) {
     }
     // 逐字符格式载体：span 上的 style 全部剥除（与「清除字符格式」同效）
     unwrapStyledSpans(block, range);
+    if (_isCellEl(block)) {
+      // 单元格裸文本（2026-10-21）：只清文本格式，绝不能走下面的 td→p 转换，
+      // 也不能删 style/全部 class —— 否则列宽、垂直对齐、合并单元格全部丢失。
+      for (const c of Array.from(block.classList)) {
+        if (c === 'ptoe-vtop' || c === 'ptoe-vmid' || c === 'ptoe-vbot') continue;
+        if (c.indexOf('ptoe-') === 0 || c === CAPTION_CLASS) block.classList.remove(c);
+      }
+      for (const a of _IND_ATTRS) block.removeAttribute(a);
+      // style 只保留表格布局属性（字体/颜色/对齐/缩进等文本格式清掉）
+      const keepStyle = ['width', 'height', 'min-width', 'max-width', 'vertical-align'];
+      for (const prop of Array.from(block.style)) {
+        if (keepStyle.indexOf(prop) < 0) block.style.removeProperty(prop);
+      }
+      if (!block.getAttribute('style')) block.removeAttribute('style');
+      return;
+    }
     // 块级标签：H1-H6 / DIV → 归一 <p>（_convertBlockTag 保留 class/data-*，
     // 图片段落若在 DIV 内其 ptoe-img-* 类随之保留）
     if (/^H[1-6]$/.test(block.tagName) || block.tagName === 'DIV') {
@@ -5212,26 +5834,18 @@ function applyOp(op) {
     }
     // 文本格式块类清除（ptoe-img-* 图片段落布局类 + ptoe-caption 题注类例外保留：
     // 题注类不是「文本格式」，清掉它会让图注失去居中小字外观）
-    const keepClasses = [];
-    for (const c of block.classList) {
-      if (c.indexOf('ptoe-img-') === 0 || c === CAPTION_CLASS) keepClasses.push(c);
-    }
-    for (const c of ['ptoe-note', 'ptoe-citation', 'ptoe-align-left', 'ptoe-align-center', 'ptoe-align-right', 'ptoe-flush', 'ptoe-indent']) {
-      block.classList.remove(c);
-    }
-    for (const c of keepClasses) block.classList.add(c);
-    // 缩进 data 属性与内联 style（缩进样式）一并移除
-    for (const a of _IND_ATTRS) block.removeAttribute(a);
-    if (block.hasAttribute('style')) block.removeAttribute('style');
+    _stripBlockTextFormat(block);
   });
 });
-      else if (op === 'p') applyToSelectedBlocks(ed, function(block) { _toBodyParagraph(block); }); // 与 heading 一致逐块转换（execCommand formatBlock 对跨块选区只转起始块）；并清注释/引用样式与行内注释 span
+      else if (op === 'p') applyToSelectedBlocks(ed, function(block) { _toBodyParagraph(_paragraphCarrier(block)); }); // 与 heading 一致逐块转换（execCommand formatBlock 对跨块选区只转起始块）；并清注释/引用样式与行内注释 span；单元格先包 <p>
       else if (op === 'centerbold') applyToSelectedBlocks(ed, function(block) {
         // 顺序：先设对齐（_convertBlockTag 会保留 class）→ 再加粗（selection 仍指向原 block）→ 最后转 <p>
-        block.classList.remove('ptoe-align-left', 'ptoe-align-right');
-        block.classList.add('ptoe-align-center');
+        // 单元格裸文本：包成 <p> 后再设类，避免 td 被转成 p 毁掉表格。
+        const target = _paragraphCarrier(block);
+        target.classList.remove('ptoe-align-left', 'ptoe-align-right');
+        target.classList.add('ptoe-align-center');
         withScrollStable(() => document.execCommand('bold'));
-        _convertBlockTag(block, 'p');
+        if (target === block) _convertBlockTag(block, 'p');
       });
       else if (op === 'merge') _mergeSelectedBlocks(ed);
      syncContent(ed);
@@ -5484,6 +6098,8 @@ const CLEAN_RULE_CHECKS = [
   ['cleanHtmlTagsChk', 'clean_html_tags'],
   ['cleanParagraphsChk', 'clean_paragraphs'],
   ['cleanDigitPunctChk', 'clean_digit_punct'],
+  ['cleanSpacesChk', 'clean_spaces'],
+  ['cleanSpacesGapChk', 'clean_spaces_keep_word_gap'],
 ];
 let _settingsPanelOpened = false; // 本会话是否打开过设置面板（openSettings 置位）
 
@@ -5588,6 +6204,25 @@ function _searchTokens(i) {
   const src = pageSource(i) || '';
   if (mdMode) return [src];
   return src.split(/(<[^>]+>)/);
+}
+// MathML 标签（2026-10-21）：公式内部结构（mrow/mi/mo/…）
+const _MATH_TAG_RE = /^<\/?(?:math|semantics|annotation|annotation-xml|mrow|mi|mn|mo|mtext|mspace|mstyle|msup|msub|msubsup|mfrac|msqrt|mroot|munder|mover|munderover|mmultiscripts|mprescripts|none|mtable|mtr|mtd|mlabeledtr|mpadded|mphantom|menclose|maction|merror)\b/i;
+// 公式内部（MathML）不参与文本搜索/替换：<mi>E</mi> 里的 "E" 不是正文里的 E ——
+// 搜到它会「搜得到、替换不掉」（改坏公式结构），故整段公式跳过。
+// 返回与 token 数组平行的布尔数组：true = 该 token 位于公式内部。
+function _tokenMathFlags(toks) {
+  const flags = [];
+  let depth = 0;
+  for (let k = 0; k < toks.length; k++) {
+    const t = toks[k];
+    if (!t || t.charAt(0) !== '<') { flags.push(depth > 0); continue; }
+    if (_MATH_TAG_RE.test(t)) {
+      if (t.charAt(1) === '/') depth = Math.max(0, depth - 1);
+      else if (!/\/>\s*$/.test(t)) depth += 1;
+    }
+    flags.push(false);
+  }
+  return flags;
 }
 function pageText(i) {
   // 搜索用的纯文本：与 replaceAll/replaceCurrent 完全相同的 token 切分
@@ -5777,8 +6412,11 @@ function _partialApply(text, re, kg, replacement, target, startOrd) {
 // count=处理到的匹配总数；seen=正则实际命中的匹配总数（含零宽，永不小于 count 的已处理部分）。
 function _partialReplaceTokens(toks, re, kg, replacement, target) {
   let out = '', replaced = 0, ord = 0, seen = 0;
-  for (const tok of toks) {
+  const mflags = _tokenMathFlags(toks);
+  for (let ti = 0; ti < toks.length; ti++) {
+    const tok = toks[ti];
     if (!mdMode && tok.charAt(0) === '<') { out += tok; continue; } // mdMode：整页当一个文本 token（源码可能以 < 开头）
+    if (mflags[ti]) { out += tok; continue; }  // 公式内部（MathML）不替换
     const r = _partialApply(tok, re, kg, replacement, target, ord);
     out += r.out;
     replaced += r.replaced;
@@ -5975,9 +6613,12 @@ function searchPages() {
     // 命中绝不跨标签边界——旧实现把所有文本拼成一个串再 exec，跨 </b><b> 的命中
     // 搜索能列出、替换却做不到，报「该处匹配已变化」或只替换一部分（看起来就是失效）
     const toks = _searchTokens(i);
+    const mflags = _tokenMathFlags(toks);
     let text = '';
-    for (const tok of toks) {
+    for (let ti = 0; ti < toks.length; ti++) {
+      const tok = toks[ti];
       if (!mdMode && tok.charAt(0) === '<') continue; // 标签 token：替换侧同样跳过
+      if (mflags[ti]) continue;                       // 公式内部（MathML）：不参与文本搜索
       const base = text.length;
       text += tok;
       const spans = _entitySpans(tok);
@@ -6362,8 +7003,11 @@ function replaceCurrent() {
     });
   } else {
     // 与搜索同一份 token 切分（_searchTokens），序号才与结果列表一一对应
-    out = _searchTokens(i).map(function (tok) {
+    const _toks = _searchTokens(i);
+    const _mflags = _tokenMathFlags(_toks);
+    out = _toks.map(function (tok, ti) {
       if (tok.charAt(0) === '<') return tok;
+      if (_mflags[ti]) return tok;   // 公式内部（MathML）不替换
       const spans = _entitySpans(tok);
       return tok.replace(re, function () {
         const m = arguments[0], s0 = _replaceOffset(arguments);
@@ -6449,8 +7093,11 @@ function replaceAll() {
       } else {
         // 富文本：只替换标签之间的文本 token，不触碰标签/属性，避免破坏 HTML 结构；
         // 与搜索同一份 token 切分（_searchTokens），序号才与结果列表一一对应
-        out = _searchTokens(i).map(function (tok) {
+        const _toks = _searchTokens(i);
+        const _mflags = _tokenMathFlags(_toks);
+        out = _toks.map(function (tok, ti) {
           if (tok.charAt(0) === '<') return tok;
+          if (_mflags[ti]) return tok;   // 公式内部（MathML）不替换
           const spans = _entitySpans(tok);
           return tok.replace(re, function () {
             const m = arguments[0], s0 = _replaceOffset(arguments);
@@ -6489,6 +7136,351 @@ function replaceAll() {
   histEnd(before, '全部替换');
   showToast('已替换 ' + count + ' 处' + (searchScope === 'page' ? '（当前页）' : ''), 'ok');
   searchPages(); // 替换后刷新结果列表（匹配数可能变化）
+}
+
+// ============================================================================
+// 按格式查找 / 把一种格式替换成另一种格式（2026-10-21）
+//
+// 与「按文字搜索/替换」互补：文字搜索看字面内容，这里看**格式**——
+// 「找出全书所有下划线」「把红色文字全改成蓝色」「把上标全换成下标」。
+//
+// 实现要点：
+// 1) 扫**页面源码**（contentMap）而不是 DOM：页面是虚拟滚动的，未挂载的页
+//    也在 contentMap 里；只扫 DOM 会漏掉屏幕外的页（表现为「只找到当前屏」）。
+// 2) 逐 token（按标签切分）扫描并维护元素栈：命中开标签就改写它，同时记住
+//    闭标签要一并改写（<strong> → <span class="ptoe-underline"> 时 </strong>
+//    必须变 </span>，否则产出非法 HTML）。
+// 3) 字符样式（颜色/字号/字体）走 normalizeCharStyle / charStyleString ——
+//    与后端 rulemanage.normalize_char_style 同一契约，保证落盘后不 churn。
+// ============================================================================
+// 目标格式表（查找与替换共用）：
+//   kind='class' → span 的行内格式类（ptoe-*）
+//   kind='tag'   → 元素级格式（strong=粗体 / em=斜体）
+//   kind='style' → span 的字符样式单条声明（color / font-size / font-family）
+const FORMAT_SPECS = [
+  {id:'ptoe-underline', kind:'class', label:'下划线'},
+  {id:'ptoe-underdot', kind:'class', label:'下加点'},
+  {id:'ptoe-strike', kind:'class', label:'删除线'},
+  {id:'ptoe-charbox', kind:'class', label:'字符边框'},
+  {id:'ptoe-shade', kind:'class', label:'底纹'},
+  {id:'ptoe-highlight', kind:'class', label:'突显'},
+  {id:'ptoe-highlight-green', kind:'class', label:'突显·绿'},
+  {id:'ptoe-highlight-blue', kind:'class', label:'突显·蓝'},
+  {id:'ptoe-highlight-pink', kind:'class', label:'突显·粉'},
+  {id:'ptoe-highlight-orange', kind:'class', label:'突显·橙'},
+  {id:'ptoe-highlight-purple', kind:'class', label:'突显·紫'},
+  {id:'ptoe-wavy', kind:'class', label:'波浪线'},
+  {id:'ptoe-double', kind:'class', label:'双下划线'},
+  {id:'ptoe-overline', kind:'class', label:'上划线'},
+  {id:'ptoe-emphasis', kind:'class', label:'着重号'},
+  {id:'ptoe-sup', kind:'class', label:'上标'},
+  {id:'ptoe-sub', kind:'class', label:'下标'},
+  {id:'ptoe-ruby', kind:'class', label:'拼音注音'},
+  {id:'bold', kind:'tag', tags:['strong','b'], label:'粗体'},
+  {id:'italic', kind:'tag', tags:['em','i'], label:'斜体'},
+  {id:'color', kind:'style', prop:'color', label:'文字颜色', input:'color'},
+  {id:'font-size', kind:'style', prop:'font-size', label:'字号', input:'size'},
+  {id:'font-family', kind:'style', prop:'font-family', label:'字体', input:'font'},
+];
+function _fmtSpecById(id) {
+  for (let k = 0; k < FORMAT_SPECS.length; k++) if (FORMAT_SPECS[k].id === id) return FORMAT_SPECS[k];
+  return null;
+}
+// 属性串读写（只处理双引号属性——本项目产出的 HTML 一律双引号）
+function _fmtAttrGet(attrs, name) {
+  const re = new RegExp('(?:^|\\s)' + name + '\\s*=\\s*"([^"]*)"', 'i');
+  const m = re.exec(attrs || '');
+  return m ? m[1] : null;
+}
+function _fmtAttrSet(attrs, name, value) {
+  const re = new RegExp('(^|\\s)(' + name + ')\\s*=\\s*"([^"]*)"', 'i');
+  const cur = String(attrs || '');
+  if (value === null || value === undefined) {
+    return cur.replace(re, '').replace(/[ \t]{2,}/g, ' ').trim();
+  }
+  if (re.test(cur)) {
+    // 保留原有的前导空白（避免拼出双空格）
+    return cur.replace(re, function (m, sp, nm) { return sp + nm + '="' + value + '"'; });
+  }
+  return (cur.trim() ? cur.trim() + ' ' : '') + name + '="' + value + '"';
+}
+function _fmtClassList(attrs) {
+  const c = _fmtAttrGet(attrs, 'class');
+  return c ? c.split(/\s+/).filter(function (x) { return !!x; }) : [];
+}
+// 该元素是否带有目标格式
+function _fmtMatch(spec, name, attrs) {
+  if (!spec) return false;
+  if (spec.kind === 'class') {
+    if (name !== 'span') return false;
+    return _fmtClassList(attrs).indexOf(spec.id) >= 0;
+  }
+  if (spec.kind === 'tag') return spec.tags.indexOf(name) >= 0;
+  if (spec.kind === 'style') {
+    if (name !== 'span') return false;
+    return !!charStyleGet(_fmtAttrGet(attrs, 'style') || '', spec.prop);
+  }
+  return false;
+}
+// 逐 token 扫描并改写命中元素（闭标签按栈一并改写）
+// onOpen(name, attrs, selfClose) → null（不改）| {tag, attrs}（改写）
+function _fmtTransform(src, onOpen) {
+  const toks = String(src == null ? '' : src).split(/(<[^>]+>)/);
+  const stack = [];
+  let count = 0;
+  for (let k = 0; k < toks.length; k++) {
+    const tok = toks[k];
+    if (!tok || tok.charAt(0) !== '<') continue;
+    if (tok.charAt(1) === '/') {
+      const closeName = tok.slice(2).replace(/>.*$/, '').trim().toLowerCase();
+      for (let i = stack.length - 1; i >= 0; i--) {
+        if (stack[i].name === closeName) {
+          // 关闭其上未闭合的元素（脏数据容错）
+          for (let j = stack.length - 1; j > i; j--) {
+            if (stack[j].newName) toks[stack[j].tokIdx] = '</' + stack[j].newName + '>';
+          }
+          const matched = stack[i];
+          stack.length = i;  // 丢弃 i 及其以上的栈项
+          if (matched.newName && matched.newName !== closeName) toks[k] = '</' + matched.newName + '>';
+          break;
+        }
+      }
+      continue;
+    }
+    const nm = /^<([a-zA-Z][a-zA-Z0-9]*)/.exec(tok);
+    const name = nm ? nm[1].toLowerCase() : '';
+    const selfClose = /\/>$/.test(tok);
+    const attrs = tok.replace(/^<[a-zA-Z][a-zA-Z0-9]*/, '').replace(/\/?>$/, '');
+    const res = onOpen(name, attrs, selfClose);
+    if (res) {
+      count++;
+      const at = res.attrs ? String(res.attrs).trim() : '';
+      toks[k] = '<' + res.tag + (at ? ' ' + at : '') + (selfClose ? '/>' : '>');
+      if (!selfClose) stack.push({name: name, newName: res.tag, tokIdx: k});
+    } else if (!selfClose) {
+      stack.push({name: name, newName: null, tokIdx: k});
+    }
+  }
+  // 源码本身缺闭标签时：补上改写后的闭标签（保证输出可解析）
+  let tail = '';
+  for (let i = stack.length - 1; i >= 0; i--) {
+    if (stack[i].newName) tail += '</' + stack[i].newName + '>';
+  }
+  return {text: toks.join('') + tail, count: count};
+}
+// 把「查找格式」替换成「替换格式」
+function _fmtApplySpec(src, fromSpec, toSpec, value) {
+  return _fmtTransform(src, function (name, attrs) {
+    if (!_fmtMatch(fromSpec, name, attrs)) return null;
+    let tag = name;
+    let at = attrs;
+    // 1) 摘掉「查找格式」本身
+    if (fromSpec.kind === 'class') {
+      const cl = _fmtClassList(at).filter(function (c) { return c !== fromSpec.id; });
+      at = _fmtAttrSet(at, 'class', cl.length ? cl.join(' ') : null);
+    } else if (fromSpec.kind === 'style') {
+      const map = charStyleDeclMap(_fmtAttrGet(at, 'style') || '');
+      delete map[fromSpec.prop];
+      const st = charStyleString(map);
+      at = _fmtAttrSet(at, 'style', st ? st : null);
+    } else if (fromSpec.kind === 'tag' && toSpec.kind !== 'tag') {
+      tag = 'span';  // 元素级 → 行内类：整体降级为 span
+    }
+    // 2) 套上「替换格式」
+    if (toSpec.kind === 'class') {
+      tag = 'span';
+      const cl = _fmtClassList(at).filter(function (c) { return !!c; });
+      if (cl.indexOf(toSpec.id) < 0) cl.push(toSpec.id);
+      at = _fmtAttrSet(at, 'class', cl.join(' '));
+    } else if (toSpec.kind === 'tag') {
+      tag = toSpec.tags[0];
+    } else if (toSpec.kind === 'style') {
+      const map = charStyleDeclMap(_fmtAttrGet(at, 'style') || '');
+      map[toSpec.prop] = value;
+      const st = charStyleString(map);
+      at = _fmtAttrSet(at, 'style', st ? st : null);
+    }
+    return {tag: tag, attrs: at};
+  });
+}
+// 找出页面源码里所有带目标格式的元素（返回各自的文本片段）
+function _fmtFindIn(src, spec) {
+  const toks = String(src == null ? '' : src).split(/(<[^>]+>)/);
+  const hits = [];
+  const stack = [];
+  for (let k = 0; k < toks.length; k++) {
+    const tok = toks[k];
+    if (!tok || tok.charAt(0) !== '<') continue;
+    if (tok.charAt(1) === '/') {
+      const closeName = tok.slice(2).replace(/>.*$/, '').trim().toLowerCase();
+      for (let i = stack.length - 1; i >= 0; i--) {
+        if (stack[i].name === closeName) {
+          if (stack[i].matched) {
+            let inner = '';
+            for (let j = stack[i].tokIdx + 1; j < k; j++) {
+              const t = toks[j];
+              if (t && t.charAt(0) !== '<') inner += t;
+            }
+            hits.push({text: decodeEntities(inner).replace(/\s+/g, ' ').trim()});
+          }
+          stack.length = i;
+          break;
+        }
+      }
+      continue;
+    }
+    const nm = /^<([a-zA-Z][a-zA-Z0-9]*)/.exec(tok);
+    const name = nm ? nm[1].toLowerCase() : '';
+    const selfClose = /\/>$/.test(tok);
+    const attrs = tok.replace(/^<[a-zA-Z][a-zA-Z0-9]*/, '').replace(/\/?>$/, '');
+    const matched = _fmtMatch(spec, name, attrs);
+    if (selfClose) { if (matched) hits.push({text: ''}); continue; }
+    stack.push({name: name, matched: matched, tokIdx: k});
+  }
+  return hits;
+}
+// 「按格式查找」：结果进搜索结果列表（可 ↑↓ 导航、点击跳页）
+function findByFormat() {
+  const sel = document.getElementById('fmtFindSel');
+  const spec = _fmtSpecById(sel ? sel.value : '');
+  if (!spec) { showToast('请先选择要查找的格式', 'warn'); return; }
+  if (mdMode) { showToast('按格式查找仅适用于富文本模式（Markdown 模式无格式概念）', 'warn'); return; }
+  const scopeIdx = _searchScopeIndexes();
+  const MAX = searchMaxResults();
+  const results = [];
+  let total = 0;
+  for (const i of scopeIdx) {
+    const src = pageSource(i);
+    if (!src) continue;
+    const hits = _fmtFindIn(src, spec);
+    for (const h of hits) {
+      const within = total;
+      total++;
+      if (results.length >= MAX) continue;
+      results.push({
+        i: i, page: (pages[i] && pages[i].page) ? pages[i].page : (i + 1),
+        pageOrd: total - 1, withinPage: within, scopePage: searchScope === 'page',
+        ctx: '<b>' + esc(spec.label) + '</b> · ' + esc(h.text || '（空）').slice(0, 120)
+      });
+    }
+  }
+  searchResults = results;
+  searchCurrent = results.length ? 0 : -1;
+  renderSearchResults(results, total, MAX);
+  updateSearchNav();
+  const sbg = document.getElementById('searchModalBg');
+  if (!sbg || sbg.style.display !== 'flex') openSearchModal();
+  if (total === 0) showToast('未找到「' + spec.label + '」格式', 'warn');
+  else showToast('按格式找到 ' + total + ' 处「' + spec.label + '」', 'ok');
+}
+// 目标格式（style 类）需要的取值
+function _fmtTargetValue(spec) {
+  if (!spec || spec.kind !== 'style') return '';
+  const inp = document.getElementById('fmtValueInput');
+  const fontSel = document.getElementById('fmtFontSel');
+  if (spec.prop === 'font-family') {
+    const v = fontSel ? String(fontSel.value || '') : '';
+    return v || null;
+  }
+  const raw = String((inp && inp.value) || '').trim();
+  if (!raw) return null;
+  if (spec.prop === 'color') {
+    const v = normalizeColorValue(raw);
+    return v || null;
+  }
+  if (spec.prop === 'font-size') {
+    const n = parseFloat(raw);
+    if (!isFinite(n)) return null;
+    return Math.max(CHAR_SIZE_MIN, Math.min(CHAR_SIZE_MAX, Math.round(n))) + 'px';
+  }
+  return null;
+}
+// 「替换格式」：把范围内所有「查找格式」命中的文字换成「替换格式」
+function replaceFormat() {
+  const fromSel = document.getElementById('fmtFindSel');
+  const toSel = document.getElementById('fmtReplaceSel');
+  const fromSpec = _fmtSpecById(fromSel ? fromSel.value : '');
+  const toSpec = _fmtSpecById(toSel ? toSel.value : '');
+  if (!fromSpec) { showToast('请先选择要查找的格式', 'warn'); return; }
+  if (!toSpec) { showToast('请先选择要替换成的格式', 'warn'); return; }
+  if (mdMode) { showToast('替换格式仅适用于富文本模式（Markdown 模式无格式概念）', 'warn'); return; }
+  const value = _fmtTargetValue(toSpec);
+  if (value === null) { showToast('请先填写目标格式的取值', 'warn'); return; }
+  const scopeIdx = _replaceScopeIndexes();
+  const before = histBegin('替换格式', scopeIdx);
+  const changed = [];
+  let count = 0;
+  for (const i of scopeIdx) {
+    const src = pageSource(i);
+    if (!src) continue;
+    const rr = _fmtApplySpec(src, fromSpec, toSpec, value);
+    if (rr.count > 0 && rr.text !== src) {
+      contentMap.set(i, rr.text);
+      changed.push(i);
+      count += rr.count;
+    }
+  }
+  if (!changed.length) {
+    histEnd(before, '替换格式'); // 无实际变化不推入撤销栈
+    showToast('未找到「' + fromSpec.label + '」格式，未替换', 'warn');
+    return;
+  }
+  for (const row of [...host.children]) {
+    const idx = Number(row.dataset.i);
+    const ed = row.querySelector('.editable');
+    if (ed) { ed.innerHTML = displayHtml(idx); _reapplyProofread(idx); scheduleRemeasure(idx); }
+  }
+  for (const i of changed) editedSet.add(i);
+  dirty = true;
+  updateStatus();
+  histEnd(before, '替换格式');
+  showToast('已把 ' + count + ' 处「' + fromSpec.label + '」换成「' + toSpec.label + '」' +
+            (searchScope === 'page' ? '（当前页）' : ''), 'ok');
+}
+// 「按格式」下拉框初始化 + 取值控件联动
+function _fmtFillSelect(sel) {
+  if (!sel) return;
+  sel.innerHTML = '';
+  for (const spec of FORMAT_SPECS) {
+    const o = document.createElement('option');
+    o.value = spec.id;
+    o.textContent = spec.label;
+    sel.appendChild(o);
+  }
+}
+function _fmtSyncValueUi() {
+  const toSel = document.getElementById('fmtReplaceSel');
+  const wrap = document.getElementById('fmtValueWrap');
+  const inp = document.getElementById('fmtValueInput');
+  const fontSel = document.getElementById('fmtFontSel');
+  const spec = _fmtSpecById(toSel ? toSel.value : '');
+  const need = spec && spec.kind === 'style';
+  if (wrap) wrap.style.display = need ? 'inline-flex' : 'none';
+  if (!need) return;
+  const isFont = spec.prop === 'font-family';
+  if (inp) { inp.style.display = isFont ? 'none' : ''; inp.placeholder = spec.prop === 'color' ? '#ff0000 或 red' : '字号（像素，8-72）'; }
+  if (fontSel) {
+    fontSel.style.display = isFont ? '' : 'none';
+    if (isFont && !fontSel.options.length) {
+      for (const f of CHAR_FONT_STACKS) {
+        const o = document.createElement('option');
+        o.value = f; o.textContent = f;
+        fontSel.appendChild(o);
+      }
+    }
+  }
+}
+function _fmtBindUi() {
+  const findSel = document.getElementById('fmtFindSel');
+  const toSel = document.getElementById('fmtReplaceSel');
+  _fmtFillSelect(findSel);
+  _fmtFillSelect(toSel);
+  const findBtn = document.getElementById('fmtFindBtn');
+  if (findBtn) findBtn.addEventListener('click', findByFormat);
+  const replBtn = document.getElementById('fmtReplaceBtn');
+  if (replBtn) replBtn.addEventListener('click', replaceFormat);
+  if (toSel) toSel.addEventListener('change', _fmtSyncValueUi);
+  _fmtSyncValueUi();
 }
 
 // ---------- 保存 / 完成 ----------
@@ -6567,7 +7559,7 @@ let _autoSaveTimer = null;
 let _autoSaveInFlight = false;
 
 function _autoSaveModalOpen() {
-  const ids = ['modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','charFormatModalBg','finishModalBg','finishConfirmBg','formatRulesModalBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg','replaceRulesModalBg','rrEditModalBg','cmdBar'];
+  const ids = ['modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','charFormatModalBg','rubyModalBg','latexModalBg','finishModalBg','finishConfirmBg','formatRulesModalBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg','replaceRulesModalBg','rrEditModalBg','cmdBar'];
   for (let k = 0; k < ids.length; k++) {
     const el = document.getElementById(ids[k]);
     if (el && (el.style.display === 'flex' || el.classList.contains('cmd-open'))) return true;
@@ -7001,22 +7993,42 @@ function cancelRename(id) {
     }
   }
 }
+let historySearchKeyword = "";
 async function loadHistory() {
   const tbody = document.querySelector('#historyTable tbody');
   tbody.innerHTML = '<tr><td colspan="7" style="padding:12px;color:#9aa7b4;">加载中 ...</td></tr>';
   document.getElementById('historyCheckAll').checked = false;
   try {
     const res = await fetchJSON('/api/history');
-    const items = res.items || [];
+    let items = res.items || [];
+    const kw = (historySearchKeyword || "").trim();
+    if (kw) {
+      const kl = kw.toLowerCase();
+      items = items.filter(it => {
+        const name = (it.display_name || it.name || "").toLowerCase();
+        const path = (it.path || "").toLowerCase();
+        const id = (it.id || "").toLowerCase();
+        return name.indexOf(kl) >= 0 || path.indexOf(kl) >= 0 || id.indexOf(kl) >= 0;
+      });
+    }
+    const clearBtn = document.getElementById('historySearchClear');
+    if (clearBtn) clearBtn.style.display = kw ? "" : "none";
     tbody.innerHTML = '';
     if (!items.length) {
-      tbody.innerHTML = '<tr><td colspan="7" style="padding:12px;color:#9aa7b4;">暂无历史记录</td></tr>';
+      tbody.innerHTML = kw ? '<tr><td colspan="7" style="padding:12px;color:#9aa7b4;">无匹配结果</td></tr>' : '<tr><td colspan="7" style="padding:12px;color:#9aa7b4;">暂无历史记录</td></tr>';
       return;
     }
     for (const it of items) tbody.appendChild(historyRow(it));
   } catch (e) {
     tbody.innerHTML = '<tr><td colspan="7" style="padding:12px;color:#b3543a;">加载失败: ' + e + '</td></tr>';
   }
+}
+function clearHistorySearch() {
+  const inp = document.getElementById('historySearchInput');
+  if (inp) { inp.value = ""; historySearchKeyword = ""; }
+  const btn = document.getElementById('historySearchClear');
+  if (btn) btn.style.display = "none";
+  loadHistory();
 }
 function openHistory() { loadHistory(); document.getElementById('historyModalBg').style.display = 'flex'; }
 function closeHistory() { document.getElementById('historyModalBg').style.display = 'none'; }
@@ -7279,17 +8291,228 @@ function applyIndentSettings(mode, clearOnly) {
   }
   histRun(clearOnly ? '清除段落设置' : '段落设置', [i], function () {
     const blocks = applyToSelectedBlocks(ed, function(block) {
-      for (const a of _IND_ATTRS) block.removeAttribute(a);
+      // 段落设置（缩进值等）是段落级 data/style；单元格裸文本先包 <p>，
+      // 否则 data-* 落在 td 上会被保存清洗丢弃，style 也只保留表格布局属性。
+      const target = _paragraphCarrier(block);
+      for (const a of _IND_ATTRS) target.removeAttribute(a);
       for (const a in vals) {
-        if (vals[a] !== '' && !(a === 'data-indv' && vals['data-ind'] === '') && !(a === 'data-ind' && vals[a] === '')) block.setAttribute(a, vals[a]);
+        if (vals[a] !== '' && !(a === 'data-indv' && vals['data-ind'] === '') && !(a === 'data-ind' && vals[a] === '')) target.setAttribute(a, vals[a]);
       }
-      block.style.cssText = _indStyleFromData(_blockAttrsString(block));
+      target.style.cssText = _indStyleFromData(_blockAttrsString(target));
     });
     if (!blocks.length) { showToast('未选中可设置的段落（光标/选区需在正文内）', 'warn'); return; }
     syncContent(ed);
     if (row) { markDirty(i); scheduleRemeasure(i); }
   });
   _close();
+}
+
+// ============================================================================
+// 颜色选择器（2026-10-21）—— 常用色 + 色板 + #HEX / rgb() 输入
+// ============================================================================
+// 常用色：中文排版最常用的一组（黑白灰 + 12 色），色值写死保证跨版本一致。
+const COLOR_COMMON = [
+  ['#000000', '纯黑'], ['#404040', '深灰'], ['#808080', '中灰'], ['#c0c0c0', '浅灰'], ['#ffffff', '纯白'],
+  ['#c00000', '暗红'], ['#ff0000', '红'],   ['#ff7f50', '橙红'], ['#ffa500', '橙'],   ['#ffff00', '黄'],
+  ['#00b050', '绿'],   ['#00ced1', '青'],   ['#0070c0', '蓝'],   ['#800080', '紫'],   ['#ff00ff', '品红'],
+  ['#ffc0cb', '粉']
+];
+// HSL → #RRGGBB（色板用；色相 0..360，饱和/明度 0..100）
+function _hslToHex(h, s, l) {
+  s = s / 100; l = l / 100;
+  const k = function (n) { return (n + h / 30) % 12; };
+  const a = s * Math.min(l, 1 - l);
+  const f = function (n) {
+    const v = l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+    return ('0' + Math.round(255 * v).toString(16)).slice(-2);
+  };
+  return ('#' + f(0) + f(8) + f(4));
+}
+// 色板：6 级灰阶 + 12 色相 × 5 明度档（浅→深）
+const COLOR_PALETTE_GRAY = (function () {
+  const out = [];
+  for (let i = 0; i < 6; i++) {
+    const v = Math.round(255 * (1 - i / 6));
+    const hx = ('0' + v.toString(16)).slice(-2);
+    out.push(['#' + hx + hx + hx, '灰 ' + v]);
+  }
+  return out;
+})();
+const COLOR_PALETTE_HUES = (function () {
+  const out = [];
+  const shades = [85, 65, 50, 35, 20];
+  for (let hi = 0; hi < 12; hi++) {
+    const h = hi * 30;
+    for (let si = 0; si < shades.length; si++) {
+      out.push([_hslToHex(h, 75, shades[si]), _hslToHex(h, 75, shades[si])]);
+    }
+  }
+  return out;
+})();
+// 颜色输入归一：#RGB / #RGBA / #RRGGBB / #RRGGBBAA / rgb(...) / rgba(...) / 颜色名
+// → 统一为 '#rrggbb'（带半透明时为 '#rrggbbaa'，后端白名单允许 3..8 位十六进制）
+// 非法输入返回 ''（调用方据此提示「颜色格式不正确」）。
+function normalizeColorValue(raw) {
+  const v = String(raw == null ? '' : raw).trim();
+  if (!v) return '';
+  if (v.charAt(0) === '#') {
+    let h = v.slice(1).toLowerCase();
+    if (!/^[0-9a-f]+$/.test(h)) return '';
+    if (h.length === 3 || h.length === 4) {
+      let e = '';
+      for (let i = 0; i < h.length; i++) e += h.charAt(i) + h.charAt(i);
+      h = e;
+    }
+    if (h.length !== 6 && h.length !== 8) return '';
+    return '#' + h;
+  }
+  const m = v.match(/^rgba?\s*\(([^)]*)\)$/i);
+  if (m) {
+    const parts = m[1].split(/[,\s\/]+/).filter(function (x) { return x !== ''; });
+    if (parts.length < 3) return '';
+    const nums = [];
+    for (let i = 0; i < 3; i++) {
+      const n = parseInt(parts[i], 10);
+      if (!isFinite(n) || n < 0 || n > 255) return '';
+      nums.push(n);
+    }
+    let out = '#' + nums.map(function (n) { return ('0' + n.toString(16)).slice(-2); }).join('');
+    if (parts.length >= 4) {
+      let a = parts[3];
+      let alpha = String(a).indexOf('%') >= 0 ? parseFloat(a) / 100 : parseFloat(a);
+      if (!isFinite(alpha)) alpha = 1;
+      alpha = Math.max(0, Math.min(1, alpha));
+      if (alpha < 1) out += ('0' + Math.round(alpha * 255).toString(16)).slice(-2);
+    }
+    return out;
+  }
+  // 颜色名（black / red / …）：后端白名单允许 3..20 位字母名，原样透传
+  if (/^[a-zA-Z]{3,20}$/.test(v)) return v;
+  return '';
+}
+// 渲染一个色块按钮
+function _colorSwatchBtn(hex, title, onPick) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'cf-swatch';
+  b.style.background = hex;
+  b.title = (title ? title + ' ' : '') + hex;
+  b.setAttribute('aria-label', b.title);
+  b.addEventListener('click', function (e) { e.preventDefault(); onPick(hex); });
+  return b;
+}
+// 构造颜色面板（常用色 / 色板 / 颜色值输入 + 系统选色）
+// opts: {get: ()=>当前颜色, set: (hex)=>void}
+function buildColorPanel(root, opts) {
+  const o = opts || {};
+  const get = o.get || function () { return ''; };
+  const set = o.set || function () {};
+  root.innerHTML = '';
+  const mkGroup = function (label) {
+    const g = document.createElement('div');
+    g.className = 'cf-color-group';
+    const l = document.createElement('span');
+    l.className = 'cf-color-label';
+    l.textContent = label;
+    g.appendChild(l);
+    return g;
+  };
+  // 常用色
+  const g1 = mkGroup('常用色');
+  const c1 = document.createElement('div');
+  c1.className = 'cf-swatches';
+  COLOR_COMMON.forEach(function (c) { c1.appendChild(_colorSwatchBtn(c[0], c[1], set)); });
+  g1.appendChild(c1);
+  root.appendChild(g1);
+  // 色板
+  const g2 = mkGroup('色板');
+  const gray = document.createElement('div');
+  gray.className = 'cf-swatches';
+  COLOR_PALETTE_GRAY.forEach(function (c) { gray.appendChild(_colorSwatchBtn(c[0], c[1], set)); });
+  g2.appendChild(gray);
+  const hues = document.createElement('div');
+  hues.className = 'cf-palette';
+  COLOR_PALETTE_HUES.forEach(function (c) { hues.appendChild(_colorSwatchBtn(c[0], '', set)); });
+  g2.appendChild(hues);
+  root.appendChild(g2);
+  // 颜色值输入（#HEX / rgb()）
+  const g3 = mkGroup('颜色值（#1c2733 / rgb(28,39,51)）');
+  const row = document.createElement('div');
+  row.className = 'cf-color-row';
+  const inp = document.createElement('input');
+  inp.type = 'text';
+  inp.className = 'cf-color-input';
+  inp.placeholder = '#1c2733 或 rgb(28,39,51)';
+  inp.setAttribute('aria-label', '颜色值（支持 #HEX 与 rgb()）');
+  const okBtn = document.createElement('button');
+  okBtn.type = 'button';
+  okBtn.className = 'tb-btn';
+  okBtn.textContent = '应用';
+  okBtn.title = '按输入的颜色值设置颜色';
+  const native = document.createElement('input');
+  native.type = 'color';
+  native.className = 'cf-color-native';
+  native.style.display = 'none';
+  const nativeBtn = document.createElement('button');
+  nativeBtn.type = 'button';
+  nativeBtn.className = 'tb-btn';
+  nativeBtn.textContent = '系统选色';
+  nativeBtn.title = '打开系统取色器';
+  const applyText = function () {
+    const v = normalizeColorValue(inp.value);
+    if (!v) { showToast('颜色格式不正确（示例：#1c2733 或 rgb(28,39,51)）', 'warn'); return; }
+    set(v);
+    inp.value = v;
+  };
+  okBtn.addEventListener('click', function (e) { e.preventDefault(); applyText(); });
+  inp.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); applyText(); }
+  });
+  nativeBtn.addEventListener('click', function (e) {
+    e.preventDefault();
+    const cur = normalizeColorValue(get()) || '';
+    // input[type=color] 只接受 #rrggbb：颜色名/8 位带 alpha 的值先取前 6 位十六进制
+    native.value = (cur.charAt(0) === '#' && cur.length >= 7) ? cur.slice(0, 7) : '#000000';
+    native.click();
+  });
+  native.addEventListener('input', function () { set(native.value); inp.value = native.value; });
+  row.appendChild(inp);
+  row.appendChild(okBtn);
+  row.appendChild(nativeBtn);
+  row.appendChild(native);
+  g3.appendChild(row);
+  root.appendChild(g3);
+  // 初始值回填
+  inp.value = get() || '';
+  return { input: inp, sync: function () { inp.value = get() || ''; } };
+}
+// 浮动颜色面板（工具栏「颜色」按钮用）：锚定在按钮下方，点击外部关闭
+let _colorPop = null;
+function openColorPanel(anchor, opts) {
+  closeColorPanel();
+  const pop = document.createElement('div');
+  pop.className = 'color-pop';
+  document.body.appendChild(pop);
+  buildColorPanel(pop, opts || {});
+  const r = anchor.getBoundingClientRect();
+  pop.style.left = Math.max(6, Math.min(r.left, window.innerWidth - pop.offsetWidth - 6)) + 'px';
+  pop.style.top = Math.max(6, Math.min(r.bottom + 4, window.innerHeight - pop.offsetHeight - 6)) + 'px';
+  _colorPop = pop;
+  const onDocDown = function (e) {
+    if (pop.contains(e.target)) return;
+    if (anchor && anchor.contains(e.target)) return;
+    closeColorPanel();
+  };
+  setTimeout(function () { document.addEventListener('mousedown', onDocDown, true); }, 0);
+  pop._onDocDown = onDocDown;
+  return pop;
+}
+function closeColorPanel() {
+  if (!_colorPop) return;
+  const pop = _colorPop;
+  _colorPop = null;
+  if (pop._onDocDown) document.removeEventListener('mousedown', pop._onDocDown, true);
+  if (pop.parentNode) pop.parentNode.removeChild(pop);
 }
 
 // ============================================================================
@@ -7302,6 +8525,8 @@ function applyIndentSettings(mode, clearOnly) {
 let _cfSelRange = null;
 let _cfCaretRange = null;
 let _cfColor = '';
+// 颜色面板句柄（2026-10-21）：常用色/色板/#HEX·rgb() 输入，与 _cfColor 双向同步
+let _cfColorPanelApi = null;
 function _paintColorSwatch() {
   const sw = document.getElementById('cfColorSwatch');
   if (sw) sw.style.background = _cfColor || '';
@@ -7376,6 +8601,7 @@ function openCharFormatDialog() {
   if (fontSel) fontSel.value = fam || '';
   _cfColor = charStyleGet(cur, 'color') || '';
   _paintColorSwatch();
+  if (_cfColorPanelApi) _cfColorPanelApi.sync();
   updateCharFormatPreview();
   bg.style.display = 'flex';
 }
@@ -7791,6 +9017,13 @@ async function deleteHistory(ids, all) {
 }
 document.getElementById('historyBtn').addEventListener('click', openHistory);
 document.getElementById('historyCloseBtn').addEventListener('click', closeHistory);
+document.getElementById('historySearchClear').addEventListener('click', clearHistorySearch);
+document.getElementById('historySearchInput').addEventListener('input', (e) => {
+  historySearchKeyword = e.target.value;
+  const btn = document.getElementById('historySearchClear');
+  if (btn) btn.style.display = historySearchKeyword.trim() ? "" : "none";
+  loadHistory();
+});
 document.getElementById('historyCheckAll').addEventListener('change', (e) => {
   document.querySelectorAll('.hist-check').forEach(c => { c.checked = e.target.checked; });
 });
@@ -7818,6 +9051,9 @@ function _makePopBtn(op) {
   b.addEventListener('mouseenter', scheduleTip);
   b.addEventListener('mouseleave', hideTip);
   b.addEventListener('mousedown', (e) => {
+    // 仅左键/右键触发菜单操作；中键（滑动手势）与侧键一律忽略 —— 否则中键在菜单上
+    // 滑动做「上/下/左/右」调整时会误触发这里的格式操作。
+    if (!_popupActAllowed(e)) { e.preventDefault(); return; }
     e.preventDefault();
     hideTip();
     suppressPopupUntil = performance.now() + 250;
@@ -7851,6 +9087,7 @@ function popupOpIcon(op) {
 }
 // 格式刷按钮（id=popPaint，单次模式，Word 风格）：从 buildPopup 抽出以支持两行可配置复用。
 // 语义与旧版一致：点击 → paintActive ? applyPaint() : activatePaint()，mouseenter/leave 走提示。
+// 动作挂在 mousedown（与其余菜单按钮一致，且能同时支持左键与右键）；中键/侧键忽略。
 function _makePaintBtn() {
   const paintBtn = document.createElement('button');
   paintBtn.type = 'button'; paintBtn.className = 'pop-btn'; paintBtn.id = 'popPaint';
@@ -7860,8 +9097,10 @@ function _makePaintBtn() {
   if (paintActive) paintBtn.classList.add('active');
   paintBtn.addEventListener('mouseenter', scheduleTip);
   paintBtn.addEventListener('mouseleave', hideTip);
-  paintBtn.addEventListener('mousedown', (e) => { e.preventDefault(); hideTip(); });
-  paintBtn.addEventListener('click', () => {
+  paintBtn.addEventListener('mousedown', (e) => {
+    if (!_popupActAllowed(e)) { e.preventDefault(); return; }  // 中键/侧键不触发
+    e.preventDefault();
+    hideTip();
     suppressPopupUntil = performance.now() + 250;
     if (paintActive) applyPaint(); else activatePaint();
   });
@@ -7922,6 +9161,7 @@ function buildPopup() {
       btn.addEventListener('mouseenter', scheduleTip);
       btn.addEventListener('mouseleave', hideTip);
       btn.addEventListener('mousedown', (e) => {
+        if (!_popupActAllowed(e)) { e.preventDefault(); return; }  // 中键/侧键不触发规则
         e.preventDefault();
         e.stopPropagation();
         suppressPopupUntil = performance.now() + 250;
@@ -7933,13 +9173,12 @@ function buildPopup() {
     });
   }).catch(function () {});
 
-  // Rule button click: open the rules modal
+  // Rule button: open the rules modal（同样仅左键/右键；中键留给滑动手势）
   ruleBtn.addEventListener('mousedown', (e) => {
+    if (!_popupActAllowed(e)) { e.preventDefault(); return; }
     e.preventDefault();
     suppressPopupUntil = performance.now() + 250;
     hideTip();
-  });
-  ruleBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     openFormatRulesModal();
     hidePopup();
@@ -8001,6 +9240,7 @@ function _editableFromSelection(range, sel) {
   return null;
 }
 function maybeShowPopup() {
+  if (_dragUiActive) { hidePopup(); return; } // 拖拽中/拖拽未清理完：不弹选中菜单
   if (performance.now() < suppressPopupUntil) return;
   const sel = window.getSelection();
   if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { hidePopup(); return; }
@@ -8565,7 +9805,7 @@ ctxMenu.addEventListener('click', (e) => {
     const mk = subBtn.dataset.ctxMarker;
     if (mk) { ctxMarkerInsert(mk); return; }
     const wr = subBtn.dataset.ctxWrap;
-    if (wr) { ctxRun(() => applyInlineClass(ctxTargetEditable(), 'ptoe-' + wr, {toggle: true})); return; }
+    if (wr) { ctxRun(() => applyWrapFormat(ctxTargetEditable(), wr)); return; }
     const ex = subBtn.dataset.ctxExport;
     if (ex) { ctxExportRun(ex); return; }
     const ifv = subBtn.dataset.ctxImgfloatVal;
@@ -8603,6 +9843,12 @@ ctxMenu.addEventListener('click', (e) => {
       sel.addRange(range);
     }
     applyOp('remove'); // applyOp 内部自带 histRun 与整块/选区语义
+  });
+  else if (kind === 'align_lines') ctxRun(function () {
+    // 右键「多行对齐」：以选中行中最长行为基准，空格左右内容分别靠两端对齐，中间用 &nbsp; 填充
+    const ed2 = ctxTargetEditable();
+    if (!ed2) { showToast('请先点击某一页的文字', 'warn'); return; }
+    alignLines(ed2);
   });
   else if (kind === 'clearpage') ctxRun(function () {
     // 清空当前页内容（2026-08-23：替代原 Markdown 占位项）
@@ -8810,7 +10056,14 @@ document.addEventListener('mousedown', (e) => {
     e.preventDefault();
     return;
   }
-  const ed = e.target && e.target.closest ? e.target.closest('.editable') : null;
+  let ed = e.target && e.target.closest ? e.target.closest('.editable') : null;
+  if (!ed) {
+    // 手势起点落在悬浮菜单（#popup）上：菜单浮在选中文字正上方，中键滑动做
+    // 「上/下/左/右」时很容易从菜单上起手。此时改用当前选区所属的编辑区，
+    // 让手势照常生效（菜单本身已忽略中键，不会误触发菜单操作）。
+    const inPopup = e.target && e.target.closest ? e.target.closest('#popup') : null;
+    if (inPopup) ed = currentEditable();
+  }
   if (!ed) return;                  // 编辑区外不干预
   e.preventDefault();               // 阻止 Windows 中键自动滚动
   suppressPopupUntil = performance.now() + 300; // 中键不产生选区，抑制 mouseup 选中菜单
@@ -8968,7 +10221,8 @@ function applyFormat(fmt, range) {
     if (fmt.sub) applyInlineClass(ed, 'ptoe-sub', { toggle: false });
   }
   if (fmt.note && ed) {
-    applyToSelectedBlocks(ed, function(block) { block.classList.add('ptoe-note'); });
+    // 单元格裸文本先包 <p>，保证注释类保存/导出后仍在。
+    applyToSelectedBlocks(ed, function(block) { _paragraphCarrier(block).classList.add('ptoe-note'); });
   }
 }
 
@@ -9135,9 +10389,7 @@ function _selectBlockRange(ed, blocks) {
 function _brushMergeBlocks(ed, block) {
   const next = _nextBlockAfter(ed, block);
   if (!next) return false;
-  const needSpace = block.textContent.length > 0 && next.textContent.length > 0;
-  block.innerHTML += (needSpace ? ' ' : '') + next.innerHTML;
-  next.parentNode.removeChild(next);
+  _mergeBlockList(block, [block, next]);
   // 合并动画：结果块背景脉冲一下
   _ptoeAnimPulse(block, 'ptoe-anim-merge');
   return true;
@@ -9203,13 +10455,7 @@ function _brushWatchSelection() {
     const i = row ? Number(row.dataset.i) : -1;
     _brushLastMergeSel = null; // 清除，避免重复触发
     histRun('功能刷合并', [i], function () {
-      for (let k = 1; k < mergeBlocks.length; k++) {
-        const b = mergeBlocks[k];
-        if (!b || !b.parentNode) continue;
-        const needSpace = mergeBlocks[0].textContent.length > 0 && b.textContent.length > 0;
-        mergeBlocks[0].innerHTML += (needSpace ? ' ' : '') + b.innerHTML;
-        b.parentNode.removeChild(b);
-      }
+      _mergeBlockList(mergeBlocks[0], mergeBlocks);
       syncContent(mergeEd);
       if (row) { markDirty(i); scheduleRemeasure(i); }
       _ptoeAnimPulse(mergeBlocks[0], 'ptoe-anim-merge');
@@ -9236,13 +10482,7 @@ function _brushWatchSelection() {
     const row = ed2.closest('.page-row');
     const i = row ? Number(row.dataset.i) : -1;
     histRun('功能刷合并', [i], function () {
-      for (let k = 1; k < blocks.length; k++) {
-        const b = blocks[k];
-        if (!b || !b.parentNode) continue;
-        const needSpace = blocks[0].textContent.length > 0 && b.textContent.length > 0;
-        blocks[0].innerHTML += (needSpace ? ' ' : '') + b.innerHTML;
-        b.parentNode.removeChild(b);
-      }
+      _mergeBlockList(blocks[0], blocks);
       syncContent(ed2);
       if (row) { markDirty(i); scheduleRemeasure(i); }
       // 合并动画：结果块背景脉冲一下
@@ -9266,11 +10506,8 @@ function _applyOpToRange(op, range) {
     // 还原为行内正文（解包选区内的注释/引用/对齐 span），不整段改写。
     const block = _boundaryBlockInRange(currentEditable(), range.startContainer, false);
     if (!block) return;
-    const whole = document.createRange();
-    whole.selectNodeContents(block);
-    if (range.compareBoundaryPoints(Range.START_TO_START, whole) === 0 &&
-        range.compareBoundaryPoints(Range.END_TO_END, whole) === 0) {
-      _toBodyParagraph(block);
+    if (_isWholeBlockRange(block, range)) {
+      _toBodyParagraph(_paragraphCarrier(block));
     } else {
       const snap = _snapOffsets(block, range);
       // 每类解包前用快照重建 range（解包会移动文本节点，range 可能被折叠损坏）
@@ -9286,13 +10523,12 @@ function _applyOpToRange(op, range) {
     if (!ed) return;
     const block = _boundaryBlockInRange(ed, range.startContainer, false);
     if (!block) return;
-    const whole = document.createRange();
-    whole.selectNodeContents(block);
-    const isWhole = range.compareBoundaryPoints(Range.START_TO_START, whole) === 0 &&
-                    range.compareBoundaryPoints(Range.END_TO_END, whole) === 0;
+    const isWhole = _isWholeBlockRange(block, range);
     if (isWhole) {
-      if (op === 'note') { block.classList.toggle('ptoe-note'); }
-      else { block.classList.toggle('ptoe-citation'); }
+      // 单元格裸文本 → 先包 <p>，否则单元格上的块级类保存时被清洗丢弃。
+      const target = _paragraphCarrier(block);
+      if (op === 'note') { target.classList.toggle('ptoe-note'); }
+      else { target.classList.toggle('ptoe-citation'); }
     } else {
       // 部分选区 → 行内包裹
       const cls = op === 'note' ? 'ptoe-note' : 'ptoe-citation';
@@ -9398,10 +10634,12 @@ document.addEventListener('click', function (e) {
   if (!t || !t.closest) return;
   if (t.closest('#toolbar') || t.closest('.tb-more-panel') || t.closest('.modal') ||
       t.closest('#popup') || t.closest('#contextMenu') || t.closest('#toast')) return;
-  let block = t.closest('p,div,h1,h2,h3,h4,h5,h6');
-  const ed = block ? block.parentNode : null;
-  if (!ed || !ed.classList || !ed.classList.contains('editable')) return;
-  if (block === ed) { block = _nearestBlockAtY(ed, e.clientY); if (!block) return; }
+  // 表格单元格内裸文本：块候选含 td/th，且容器判断不能再用 parentNode===editable
+  // （单元格的父节点是 tr/table），改为向上找 .editable。
+  const ed = t.closest('.editable');
+  if (!ed) return;
+  let block = _closestEditableBlock(ed, t);
+  if (!block) { block = _nearestBlockAtY(ed, e.clientY); if (!block) return; }
   e.preventDefault();
   _brushApplyToBlock(ed, block);
 });
@@ -10072,6 +11310,54 @@ function advanceToNextError(i, k) {
   errKey = { i: i, k: nextK };
   _errHideBlockUntil = performance.now() + 600; // 屏蔽紧随其后的 selectionchange 隐藏
   showErrPopup(rect);
+}
+
+// 跨页错误导航（2026-10）：Ctrl+PageDown / Ctrl+PageUp 从当前位置向后/向前查找
+// 第一处仍有待处理错误的页面，跳转并定位该页第一个错误（弹出采纳/忽略窗）。
+// 不再只停留在当前页；到文档首/尾时只提示，不循环，避免误以为还有错误。
+function _firstLiveErrorIndex(i) {
+  const errors = proofreadErrors[i];
+  if (!errors || !errors.length) return -1;
+  for (let k = 0; k < errors.length; k++) {
+    if (errors[k] && !errors[k]._gone) return k;
+  }
+  return -1;
+}
+function jumpToErrorPage(dir) {
+  // 以当前视口页为准：即使采纳窗还停留在旧页，用户滚动后快捷键也应从眼前这一页继续。
+  let cur = viewportPage();
+  if (cur == null || cur < 0 || cur >= pages.length) {
+    cur = (errKey && typeof errKey.i === 'number') ? errKey.i : -1;
+  }
+  if (cur == null || cur < 0 || cur >= pages.length) return false;
+  let target = -1;
+  if (dir > 0) {
+    for (let i = cur + 1; i < pages.length; i++) {
+      if (_firstLiveErrorIndex(i) >= 0) { target = i; break; }
+    }
+  } else {
+    for (let i = cur - 1; i >= 0; i--) {
+      if (_firstLiveErrorIndex(i) >= 0) { target = i; break; }
+    }
+  }
+  if (target < 0) {
+    setStatus(dir > 0 ? '当前页之后没有待处理错误' : '当前页之前没有待处理错误');
+    return true;
+  }
+  hideErrPopup();
+  jumpToPageIndex(target);
+  const row = host.querySelector('.page-row[data-i="' + target + '"]');
+  const ed = row ? row.querySelector('.editable') : null;
+  const k = _firstLiveErrorIndex(target);
+  const el = ed && k >= 0 ? ed.querySelector('.ptoe-err[data-err-i="' + k + '"]') : null;
+  if (!el) { setStatus('已跳转到第 ' + pages[target].page + ' 页'); return true; }
+  el.scrollIntoView({ block: 'center', behavior: 'auto' });
+  const rect = _errAnchorRect(target, k) || el.getBoundingClientRect();
+  errKey = { i: target, k: k };
+  _errHideBlockUntil = performance.now() + 600; // 屏蔽紧随其后的 selectionchange 隐藏
+  showErrPopup(rect);
+  setStatus('第 ' + pages[target].page + ' 页：第 ' + (k + 1) + ' 处待处理错误');
+  return true;
 }
 
 // ---------- 文字纠错下拉菜单 ----------
@@ -11048,6 +12334,10 @@ const FORMAT_RULE_OPTS = [
   // 新增内联格式（2026-09）
   ['underline','下划线'], ['strike','删除线'], ['charbox','字符边框'],
   ['shade','底纹'], ['highlight','突显'], ['sup','上标'], ['sub','下标'],
+  // 2026-10-21 新增行内格式
+  ['wavy','波浪线'], ['double','双下划线'], ['overline','上划线'], ['emphasis','着重号'],
+  ['highlight_green','突显·绿'], ['highlight_blue','突显·蓝'], ['highlight_pink','突显·粉'],
+  ['highlight_orange','突显·橙'], ['highlight_purple','突显·紫'],
 ];
 let formatRules = [];
 let formatRuleEditingId = null;
@@ -12158,6 +13448,71 @@ function applyAllFormatRules() {
     showToast('应用全部格式规则失败: ' + e, 'fail');
   });
 }
+// 合并段落时自动清理段内空白（2026-10-22）：
+// 换行/制表符/全角空格/不换行空格/零宽字符等一律删除；英文/数字单词之间的
+// 空白折叠为一个空格（与智能清理的 keep_word_gap=True 保持一致）。
+// 只处理文本节点，保留 strong/em/span 等行内格式与图片/分隔线结构。
+const _MERGE_WS_RE = /[\s\u00a0\u3000\u2000-\u200a\u202f\u205f\ufeff\u00ad\u180e\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060]+/g;
+
+function _isAsciiWordChar(ch) {
+  return !!ch && /[A-Za-z0-9]/.test(ch);
+}
+
+function _mergeEdgeChar(block, dir) {
+  if (!block) return '';
+  const text = String(block.textContent || '').trim();
+  if (!text) return '';
+  return dir < 0 ? text.charAt(text.length - 1) : text.charAt(0);
+}
+
+function _cleanMergedBlockWhitespace(block) {
+  if (!block) return;
+  // 逐行对齐段依赖行尾 &nbsp; 撑开版式，合并后不得清掉这些空格
+  if (block.classList && block.classList.contains(ALIGN_LINES_CLASS)) return;
+  const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, {
+    acceptNode: function (node) {
+      // 嵌套表格是独立数据区，不随外层段落合并清理
+      let el = node.parentElement;
+      while (el && el !== block) {
+        if (el.tagName === 'TABLE') return NodeFilter.FILTER_REJECT;
+        el = el.parentElement;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  }, false);
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  for (let idx = 0; idx < nodes.length; idx++) {
+    const node = nodes[idx];
+    const text = String(node.data || '');
+    if (!text) continue;
+    const cleaned = text.replace(_MERGE_WS_RE, function (match, offset) {
+      const before = offset > 0 ? text.charAt(offset - 1)
+        : (idx > 0 ? String(nodes[idx - 1].data || '').slice(-1) : '');
+      const afterPos = offset + match.length;
+      const after = afterPos < text.length ? text.charAt(afterPos)
+        : (idx + 1 < nodes.length ? String(nodes[idx + 1].data || '').charAt(0) : '');
+      return (_isAsciiWordChar(before) && _isAsciiWordChar(after)) ? ' ' : '';
+    });
+    if (cleaned !== text) node.data = cleaned;
+  }
+}
+
+function _mergeBlockInto(target, source) {
+  if (!target || !source || !source.parentNode) return;
+  // 只有英文/数字直接相接时才补空格；中文之间不补，避免合并后留下空隙。
+  const needSpace = _isAsciiWordChar(_mergeEdgeChar(target, -1))
+    && _isAsciiWordChar(_mergeEdgeChar(source, 1));
+  target.innerHTML += (needSpace ? ' ' : '') + source.innerHTML;
+  source.parentNode.removeChild(source);
+}
+
+function _mergeBlockList(target, blocks) {
+  for (let k = 1; k < blocks.length; k++) _mergeBlockInto(target, blocks[k]);
+  // 自动清理合并后的段内空白（软换行、行首行尾空格、中文间空格等）
+  _cleanMergedBlockWhitespace(target);
+}
+
 function _mergeSelectedBlocks(ed) {
   // 合并选区内所有块到第一个块（段落合并）
   if (typeof isComposing !== 'undefined' && isComposing) {
@@ -12170,25 +13525,28 @@ function _mergeSelectedBlocks(ed) {
   const range = sel.getRangeAt(0);
   const startNode = range.startContainer.nodeType === 3 ? range.startContainer.parentElement : range.startContainer;
   const endNode = range.endContainer.nodeType === 3 ? range.endContainer.parentElement : range.endContainer;
-  let startBlock = (startNode && startNode.closest) ? (startNode.closest('p,div,h1,h2,h3,h4,h5,h6') || null) : null;
-  let endBlock = (endNode && endNode.closest) ? (endNode.closest('p,div,h1,h2,h3,h4,h5,h6') || null) : null;
+  let startBlock = (startNode && startNode.closest) ? (startNode.closest(BLOCK_SEL) || null) : null;
+  let endBlock = (endNode && endNode.closest) ? (endNode.closest(BLOCK_SEL) || null) : null;
   if (startBlock === ed) startBlock = null;
   if (endBlock === ed) endBlock = null;
   const blocks = _blocksBetween(ed, startBlock, endBlock);
   if (blocks.length < 2) return;
+  // 保护表格结构：合并会删除后续块，跨单元格/跨表格合并会把表压成一段。
+  // 同一单元格内的多个 <p> 合并是安全的。
+  const cellScope = blocks[0].closest ? blocks[0].closest('td,th') : null;
+  for (let k = 1; k < blocks.length; k++) {
+    const cs = blocks[k].closest ? blocks[k].closest('td,th') : null;
+    if (cs !== cellScope) {
+      showToast('选区跨越表格单元格：请在同一个单元格内（或表格外）选择段落后再合并', 'warn');
+      return;
+    }
+  }
   const row = ed.closest('.page-row');
   const i = row ? Number(row.dataset.i) : -1;
   histRun('合并段落', [i], function () {
-    // 把后续块的内容追加到第一个块，再逐个移除
+    // 把后续块的内容追加到第一个块，再逐个移除；合并后自动清理段内空白
     const first = blocks[0];
-    for (let k = 1; k < blocks.length; k++) {
-      const b = blocks[k];
-      if (!b || !b.parentNode) continue;
-      // 在两段之间加一个空格避免中英混排粘连
-      const needSpace = first.innerHTML.length > 0 && b.innerHTML.length > 0;
-      first.innerHTML += (needSpace ? ' ' : '') + b.innerHTML;
-      b.parentNode.removeChild(b);
-    }
+    _mergeBlockList(first, blocks);
     syncContent(ed);
     if (row) { markDirty(i); scheduleRemeasure(i); }
     // 将光标置于合并后块的末尾
@@ -12215,7 +13573,7 @@ function applySingleFormat(op, ed) {
   if (op === 'no_bold') { applyToSelectedBlocks(ed, function (block) { block.style.fontWeight = 'normal'; }); return; }
   if (op === 'italic') { applyInlineFormat(ed, 'italic'); return; }
   if (op === 'remove') { applyToSelectedBlocks(ed, function () { document.execCommand('removeFormat'); }); return; }
-  if (op === 'p') { applyToSelectedBlocks(ed, function (block) { _toBodyParagraph(block); }); return; }
+  if (op === 'p') { applyToSelectedBlocks(ed, function (block) { _toBodyParagraph(_paragraphCarrier(block)); }); return; }
   if (op === 'merge') { _mergeSelectedBlocks(ed); return; }
   if (op === 'note') { toggleNote(ed); return; }
   if (op === 'citation') { toggleCitation(ed); return; }
@@ -12223,7 +13581,8 @@ function applySingleFormat(op, ed) {
   if (op.indexOf('align_') === 0) { applyAlign(ed, op.slice(6)); return; }
   if (op.indexOf('heading') === 0) {
     const tag = 'h' + op.slice(7);
-    applyToSelectedBlocks(ed, function (block) { _convertBlockTag(block, tag); });
+    // 单元格裸文本：先包 <p> 再转标题，避免把 td 转成 hN 毁表。
+    applyToSelectedBlocks(ed, function (block) { _convertBlockTag(_paragraphCarrier(block), tag); });
   }
   // 新增内联格式（2026-09）：规则应用路径（toggle=false，强制应用不解包）
   if (op === 'underline') { applyInlineClass(ed, 'ptoe-underline', {toggle:false}); return; }
@@ -12311,6 +13670,13 @@ function comboOf(e) {
   if (mods.length === 0 && !/^F\d{1,2}$/.test(key) && key !== 'Enter' && key !== 'Escape') return null; // 必须带修饰键或功能键（Enter/Escape 裸键放行）
   return [...mods, key].join('+');
 }
+// 组合键显示名：鼠标侧键绑定（Mouse4/Mouse5）显示为「侧键1（后退）」等中文名，
+// 键盘组合键原样显示。
+function comboLabel(c) {
+  if (!c) return '';
+  for (const [name, label] of MOUSE_SIDE_BUTTONS) if (name === c) return label;
+  return c;
+}
 function renderShortcutTable() {
   const tbody = document.getElementById('shortcutTable');
   tbody.innerHTML = '';
@@ -12322,13 +13688,13 @@ function renderShortcutTable() {
     // 每行都显示，未绑定的操作也可点标签后按住中键滑动完成绑定。
     const gest = mouseBindings[op];
     const gestLine = '<div class="mouse-badge' + (gest ? '' : ' unbound') + '" data-op="' + op + '" title="点击后按住中键滑动，把该操作绑定到该方向的手势">中键：' + (gest ? gestureLabel(gest) : '未绑定') + '</div>';
-    tr.innerHTML = '<td>' + label + gestLine + '</td><td>' + (combo ? '<kbd>' + combo.replace(/\+/g, '</kbd>+<kbd>') + '</kbd>' : '<span style="color:#9aa7b4">未绑定</span>') + '</td>';
+    tr.innerHTML = '<td>' + label + gestLine + '</td><td>' + (combo ? '<kbd>' + comboLabel(combo).replace(/\+/g, '</kbd>+<kbd>') + '</kbd>' : '<span style="color:#9aa7b4">未绑定</span>') + '</td>';
     tr.addEventListener('click', () => {
       capturingOp = op;
       mouseCapturingOp = null;   // 键盘捕获与鼠标捕获互斥
       renderShortcutTable();
       const row = tbody.querySelector('tr[data-op="' + op + '"]');
-      if (row) row.querySelector('td:nth-child(2)').textContent = '按下新组合键…（Esc 取消，Del 清除）';
+      if (row) row.querySelector('td:nth-child(2)').textContent = '按下新组合键或鼠标侧键…（Esc 取消，Del 清除）';
     });
     tbody.appendChild(tr);
   };
@@ -12340,6 +13706,56 @@ function renderShortcutTable() {
     grp.innerHTML = '<td colspan="2">增强格式刷（功能刷，武装后点击段落应用）</td>';
     tbody.appendChild(grp);
     for (const [op, label] of BRUSH_SHORTCUT_OPS) _appendRow(op, label);
+  }
+  renderSideButtonTable();
+}
+// 鼠标侧键表（2026-10-21）：侧键「单独」绑定到某个操作，不需要与键盘按键组合。
+// 绑定值仍是 bindings[op] = 'Mouse4' / 'Mouse5'（与快捷键捕获同一份数据），
+// 因此派发逻辑（reverseBindings）完全复用，无需另开一套配置。
+function renderSideButtonTable() {
+  const tbody = document.getElementById('sideButtonTable');
+  if (!tbody) return;
+  tbody.innerHTML = '';
+  const rev = reverseBindings();
+  for (const [name, label] of MOUSE_SIDE_BUTTONS) {
+    const tr = document.createElement('tr');
+    tr.dataset.side = name;
+    const td1 = document.createElement('td');
+    td1.textContent = label;
+    const td2 = document.createElement('td');
+    const sel = document.createElement('select');
+    sel.style.cssText = 'padding:4px 6px;border:1px solid var(--border);border-radius:4px;font:inherit;max-width:260px;';
+    const optNone = document.createElement('option');
+    optNone.value = '';
+    optNone.textContent = '不绑定';
+    sel.appendChild(optNone);
+    for (const [op, lbl] of OPS.concat(BRUSH_SHORTCUT_OPS)) {
+      const o = document.createElement('option');
+      o.value = op;
+      o.textContent = lbl;
+      sel.appendChild(o);
+    }
+    const cur = rev[name] || '';
+    sel.value = cur;
+    if (cur && !sel.value) {   // 绑定的操作已从 OPS 列表移除 → 补一个临时项，避免显示成「不绑定」
+      const o = document.createElement('option');
+      o.value = cur;
+      o.textContent = opLabel(cur) + '（已失效）';
+      sel.appendChild(o);
+      sel.value = cur;
+    }
+    sel.addEventListener('change', () => {
+      const old = reverseBindings()[name];
+      if (old && bindings[old] === name) bindings[old] = '';
+      if (sel.value) bindings[sel.value] = name;
+      saveBindings();
+      renderShortcutTable();
+      showToast(sel.value ? '已把「' + label + '」单独绑定到「' + opLabel(sel.value) + '」' : '已解除「' + label + '」绑定', 'ok');
+    });
+    td2.appendChild(sel);
+    tr.appendChild(td1);
+    tr.appendChild(td2);
+    tbody.appendChild(tr);
   }
 }
 // 手势键 → 中文标签（未知手势原样显示）
@@ -12452,6 +13868,10 @@ function openSettings() {
   if (cdpIn) cdpIn.checked = !!uiBool('clean_digit_punct', true);
   const cblIn = document.getElementById('cleanBlankLinesChk');
   if (cblIn) cblIn.checked = !!uiBool('clean_blank_lines', false);
+  const cspIn = document.getElementById('cleanSpacesChk');
+  if (cspIn) cspIn.checked = !!uiBool('clean_spaces', false);
+  const cspgIn = document.getElementById('cleanSpacesGapChk');
+  if (cspgIn) cspgIn.checked = !!uiBool('clean_spaces_keep_word_gap', true);
   // 同步符号映射表到编辑器（2026-10-16）
   const smeIn = document.getElementById('cleanSymbolMapEditor');
   if (smeIn) {
@@ -14669,6 +16089,7 @@ function _cmdRenderSuggest(value) {
       const sug = document.getElementById('cmdSuggest');
       if (!sug) return;
       e.preventDefault();
+      _beginDragUi(); // 候选列表高度拖拽期间不弹选中文字菜单
       const startY = e.clientY, startH = sug.getBoundingClientRect().height;
       const mv = function (ev) {
         const h = Math.max(44, Math.min(Math.round(window.innerHeight * 0.7), startH - (ev.clientY - startY)));
@@ -14678,6 +16099,7 @@ function _cmdRenderSuggest(value) {
         document.removeEventListener('mousemove', mv);
         document.removeEventListener('mouseup', up);
         try { localStorage.setItem('ptoe_cmd_suggest_h', String(Math.round(sug.getBoundingClientRect().height))); } catch (er) {}
+        _endDragUi();
       };
       document.addEventListener('mousemove', mv);
       document.addEventListener('mouseup', up);
@@ -14730,6 +16152,8 @@ const SHORTCUT_ACTIONS = {
   proofread_apply: proofreadApplyCurrent,
   proofread_clear: proofreadClearCurrent,
   proofread_revert: proofreadRevertCurrent,
+  proofread_next_page_error: () => jumpToErrorPage(1),
+  proofread_prev_page_error: () => jumpToErrorPage(-1),
   proofread_accept: acceptErrShortcut,
   proofread_ignore: ignoreErrShortcut,
   insert_table: openTableDialog,
@@ -14774,6 +16198,52 @@ function runOp(op) {
 }
 
 // ---------- 全局事件（统一快捷键分发） ----------
+// 鼠标侧键（X1/X2）快捷键：既可在「快捷键」设置里绑定，也可在正文里直接触发。
+// capture 阶段监听：设置弹窗打开时（页面被遮罩）也要能捕获侧键；
+// 同时 preventDefault 掉 Chrome 把 X1/X2 映射成的「后退/前进」导航。
+// 侧键可以「单独」绑定（bindings[op] = 'Mouse4'），不需要和任何键盘按键组合。
+function _handleSideButton(e, sb) {
+  if (capturingOp) {                       // 设置弹窗内：绑定到当前操作
+    bindings[capturingOp] = sb.name;
+    saveBindings();
+    capturingOp = null;
+    renderShortcutTable();
+    showToast('已把「' + sb.label + '」绑定到该操作', 'ok');
+    return;
+  }
+  if (mouseCapturingOp) return;            // 中键手势捕获中：侧键不参与
+  if (_multiSelAnyModalOpen()) return;     // 弹窗打开时不派发操作
+  const op = reverseBindings()[sb.name];
+  if (!op) return;
+  // 输入框聚焦时不派发（与键盘的 undo/redo 守卫同理）
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
+  runOp(op);
+}
+// 记录最近一次已处理的侧键：auxclick 兜底时避免与 mousedown 重复触发
+let _lastSideBtnName = '';
+let _lastSideBtnAt = 0;
+document.addEventListener('mousedown', (e) => {
+  const sb = _sideButtonOf(e);
+  if (!sb) return;
+  e.preventDefault();
+  _lastSideBtnName = sb.name;
+  _lastSideBtnAt = Date.now();
+  _handleSideButton(e, sb);
+}, true);
+// 兜底：部分内嵌浏览器（WebView2 / 某些鼠标驱动）只在 mouseup/auxclick 阶段上报侧键，
+// 这里补一个 auxclick 监听；若 mousedown 已处理过同一个侧键则跳过，避免重复触发。
+document.addEventListener('auxclick', (e) => {
+  const sb = _sideButtonOf(e);
+  if (!sb) return;
+  e.preventDefault();
+  const now = Date.now();
+  if (sb.name === _lastSideBtnName && now - _lastSideBtnAt < 500) return;
+  _lastSideBtnName = sb.name;
+  _lastSideBtnAt = now;
+  _handleSideButton(e, sb);
+}, true);
+
 document.addEventListener('keydown', (e) => {
   if (capturingOp) {
     e.preventDefault(); e.stopPropagation();
@@ -14814,20 +16284,25 @@ document.addEventListener('keydown', (e) => {
   return;
 });
   document.getElementById('searchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') searchPages(); });
-  // Color picker input (hidden). Append to body to avoid messing toolbar layout.
-  const colorInput = document.createElement('input'); colorInput.type = 'color'; colorInput.id = 'colorInput'; colorInput.style.display = 'none'; document.body.appendChild(colorInput);
+  // 工具栏「颜色」：浮动颜色面板（常用色 + 色板 + #HEX/rgb() 输入，2026-10-21）
   const colorBtn = document.getElementById('colorBtn');
   if (colorBtn) {
-    colorBtn.addEventListener('click', (e) => { e.preventDefault(); colorInput.click(); });
-    colorInput.addEventListener('input', (e) => {
-      const color = e.target.value;
-      const ed = currentEditable(); if (!ed) return;
+    const applyToolbarColor = function (raw) {
+      const v = normalizeColorValue(raw);
+      if (!v) { showToast('颜色格式不正确（示例：#1c2733 或 rgb(28,39,51)）', 'warn'); return; }
+      const ed = currentEditable(); if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
       const row = ed.closest('.page-row'); const i = row ? Number(row.dataset.i) : -1;
+      // execCommand('foreColor') 不接受 8 位带透明度的十六进制 → 取前 6 位
+      const cmd = v.length === 9 ? v.slice(0, 7) : v;
       histRun('颜色', [i], function() {
-        applyToSelectedBlocks(ed, function() { withScrollStable(() => document.execCommand('foreColor', false, color)); });
+        applyToSelectedBlocks(ed, function() { withScrollStable(() => document.execCommand('foreColor', false, cmd)); });
         syncContent(ed);
         if (row) { markDirty(Number(row.dataset.i)); scheduleRemeasure(Number(row.dataset.i)); }
       });
+    };
+    colorBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      openColorPanel(colorBtn, { get: function () { return ''; }, set: applyToolbarColor });
     });
   }
   const brushBtn = document.getElementById('formatBrushBtn');
@@ -15076,6 +16551,8 @@ document.getElementById('replaceInput').addEventListener('keydown', (e) => { if 
 document.getElementById('searchPrevBtn').addEventListener('click', () => gotoMatch(-1));
 document.getElementById('searchNextBtn').addEventListener('click', () => gotoMatch(1));
 document.getElementById('searchCloseBtn').addEventListener('click', closeSearchModal);
+// 按格式查找/替换（2026-10-21）：下拉框填充 + 按钮绑定
+_fmtBindUi();
 // 2026-09：遮罩点击关闭守卫。拖选弹窗内输入框文字时，若 mouseup 落在遮罩上
 // （弹窗卡片外），click 事件以 mousedown/mouseup 的公共祖先为 target，即遮罩本身
 // → 弹窗被误关（用户报告：搜索框内鼠标选词时搜索窗口随机消失）。修复=仅当
@@ -15195,26 +16672,86 @@ if (document.getElementById('tableModalBg')) _backdropClickClose('tableModalBg',
   });
   const fontSel = document.getElementById('cfFontSel');
   if (fontSel) fontSel.addEventListener('change', updateCharFormatPreview);
-  // 颜色：隐藏 input[type=color] + 色块预览（与工具栏 colorBtn 同一模式，独立一个以免串扰）
+  // 颜色：面板（常用色 + 色板 + #HEX/rgb() 输入，2026-10-21）替代单一系统取色器
   const colorBtn = document.getElementById('cfColorBtn');
   const colorClear = document.getElementById('cfColorClearBtn');
+  const colorPanel = document.getElementById('cfColorPanel');
+  if (colorPanel) {
+    _cfColorPanelApi = buildColorPanel(colorPanel, {
+      get: function () { return _cfColor; },
+      set: function (v) { _cfColor = v; _paintColorSwatch(); updateCharFormatPreview(); }
+    });
+  }
   if (colorBtn) {
-    const inp = document.createElement('input');
-    inp.type = 'color'; inp.id = 'cfColorInput'; inp.style.display = 'none';
-    document.body.appendChild(inp);
     colorBtn.addEventListener('click', (e) => {
       e.preventDefault();
-      inp.value = _cfColor || '#000000';   // 空值时给个可用的默认起点
-      inp.click();
+      if (_cfColorPanelApi) {
+        try { _cfColorPanelApi.input.focus(); _cfColorPanelApi.input.select(); } catch (err) { /* 忽略 */ }
+      } else {
+        showToast('颜色面板不可用', 'warn');
+      }
     });
-    inp.addEventListener('input', () => { _cfColor = inp.value; _paintColorSwatch(); updateCharFormatPreview(); });
   }
-  if (colorClear) colorClear.addEventListener('click', () => { _cfColor = ''; _paintColorSwatch(); updateCharFormatPreview(); });
+  if (colorClear) colorClear.addEventListener('click', () => {
+    _cfColor = ''; _paintColorSwatch(); updateCharFormatPreview();
+    if (_cfColorPanelApi) _cfColorPanelApi.sync();
+  });
   // 弹窗内 Esc 关闭（与遮罩点击/关闭按钮一致）
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
     const bg = document.getElementById('charFormatModalBg');
     if (bg && bg.style.display === 'flex' && !e.defaultPrevented) { closeCharFormatDialog(); e.preventDefault(); }
+  });
+})();
+// 拼音注音弹窗事件绑定（2026-10-21）：应用 / 取消 / 关闭 / 遮罩点击 / Esc / 回车
+(function bindRubyModal() {
+  const ok = document.getElementById('rubyOkBtn');
+  if (ok) ok.addEventListener('click', applyRubyModal);
+  const cancel = document.getElementById('rubyCancelBtn');
+  if (cancel) cancel.addEventListener('click', closeRubyModal);
+  const x = document.getElementById('rubyCloseBtn');
+  if (x) x.addEventListener('click', closeRubyModal);
+  if (document.getElementById('rubyModalBg')) _backdropClickClose('rubyModalBg', closeRubyModal);
+  const inp = document.getElementById('rubyInput');
+  if (inp) inp.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); applyRubyModal(); }
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    const bg = document.getElementById('rubyModalBg');
+    if (bg && bg.style.display === 'flex' && !e.defaultPrevented) { closeRubyModal(); e.preventDefault(); }
+  });
+})();
+// LaTeX 公式弹窗事件绑定（2026-10-21）：插入 / 取消 / 关闭 / 遮罩点击 / Esc /
+// Ctrl+Enter 插入 / 输入实时预览 / 工具栏「公式」按钮
+(function bindLatexModal() {
+  const ok = document.getElementById('latexOkBtn');
+  if (ok) ok.addEventListener('click', applyLatexModal);
+  const cancel = document.getElementById('latexCancelBtn');
+  if (cancel) cancel.addEventListener('click', closeLatexModal);
+  const x = document.getElementById('latexCloseBtn');
+  if (x) x.addEventListener('click', closeLatexModal);
+  if (document.getElementById('latexModalBg')) _backdropClickClose('latexModalBg', closeLatexModal);
+  const inp = document.getElementById('latexInput');
+  if (inp) {
+    inp.addEventListener('input', renderLatexPreview);
+    inp.addEventListener('keydown', function (e) {
+      // Ctrl+Enter 插入（Enter 保留换行——LaTeX 源码常需换行书写）
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); applyLatexModal(); }
+    });
+  }
+  const disp = document.getElementById('latexDisplay');
+  if (disp) disp.addEventListener('change', renderLatexPreview);
+  // 工具栏「公式」按钮（在「更多」下拉里）
+  const btn = document.getElementById('latexBtn');
+  if (btn) btn.addEventListener('click', function (e) {
+    e.preventDefault();
+    openLatexModal(currentEditable());
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    const bg = document.getElementById('latexModalBg');
+    if (bg && bg.style.display === 'flex' && !e.defaultPrevented) { closeLatexModal(); e.preventDefault(); }
   });
 })();
 // 分隔线下拉菜单（2026-09-27）：dividerBtn -> dividerMenu（data-div: solid/dashed/dotted/double）
@@ -15559,6 +17096,10 @@ document.getElementById('resetUiSettingsBtn').addEventListener('click', () => {
   if (cdpr) cdpr.checked = !!UI_SETTINGS_DEFAULTS.clean_digit_punct;
   const cblr = document.getElementById('cleanBlankLinesChk');
   if (cblr) cblr.checked = !!UI_SETTINGS_DEFAULTS.clean_blank_lines;
+  const cspr = document.getElementById('cleanSpacesChk');
+  if (cspr) cspr.checked = !!UI_SETTINGS_DEFAULTS.clean_spaces;
+  const cspgr = document.getElementById('cleanSpacesGapChk');
+  if (cspgr) cspgr.checked = !!UI_SETTINGS_DEFAULTS.clean_spaces_keep_word_gap;
   // 符号映射表恢复默认（2026-10-16）
   const smeR = document.getElementById('cleanSymbolMapEditor');
   if (smeR) smeR.value = formatSymbolMap(UI_SETTINGS_DEFAULTS.clean_symbol_map);
@@ -15709,6 +17250,8 @@ if (_textJustifyToggle) _textJustifyToggle.addEventListener('change', (e) => {
   ['cleanHtmlTagsChk', 'clean_html_tags'],
   ['cleanParagraphsChk', 'clean_paragraphs'],
   ['cleanDigitPunctChk', 'clean_digit_punct'],
+  ['cleanSpacesChk', 'clean_spaces'],
+  ['cleanSpacesGapChk', 'clean_spaces_keep_word_gap'],
 ].forEach(([id, key]) => {
   const el = document.getElementById(id);
   if (el) el.addEventListener('change', (e) => {
@@ -15820,12 +17363,12 @@ document.querySelectorAll('#toolbar button[data-op]').forEach((b) => {
     const idx = Math.min(pages.length - 1, Math.max(0, Math.round(ratio * (pages.length - 1))));
     if (pages[idx]) jumpToPageIndex(idx);
   }
-  wrap.addEventListener('mousedown', (e) => { dragging = true; scrub(e); });
+  wrap.addEventListener('mousedown', (e) => { _beginDragUi(); dragging = true; scrub(e); });
   window.addEventListener('mousemove', (e) => { if (dragging) scrub(e); });
-  window.addEventListener('mouseup', () => { dragging = false; });
-  wrap.addEventListener('touchstart', (e) => { dragging = true; scrub(e); }, { passive: true });
+  window.addEventListener('mouseup', () => { dragging = false; _endDragUi(); });
+  wrap.addEventListener('touchstart', (e) => { _beginDragUi(); dragging = true; scrub(e); }, { passive: true });
   window.addEventListener('touchmove', (e) => { if (dragging) scrub(e.touches[0]); }, { passive: true });
-  window.addEventListener('touchend', () => { dragging = false; });
+  window.addEventListener('touchend', () => { dragging = false; _endDragUi(); });
 })();
 
 // 上一页 / 下一页
@@ -15878,9 +17421,7 @@ _backdropClickClose('finishConfirmBg', () => {
       const item = e.target.closest('[data-wrap]');
       if (!item) return;
       closeDropMenu('charWrapBtn', 'charWrapMenu');
-      const ed = currentEditable();
-      if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
-      applyInlineClass(ed, 'ptoe-' + item.dataset.wrap, {toggle:true});
+      applyWrapFormat(currentEditable(), item.dataset.wrap);
     });
   }
   // 突显按钮：highlightBtn (data-op="highlight") 已由 toolbar 统一绑定走 applyOp，无需额外绑定
@@ -16012,7 +17553,7 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
     // Defensive: hide known modal/backdrop elements at startup to avoid accidental blocking overlays
     (function(){
       const _modalIds = [
-        'modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','charFormatModalBg','finishModalBg','finishConfirmBg',
+        'modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','charFormatModalBg','rubyModalBg','latexModalBg','finishModalBg','finishConfirmBg',
         'historyModalBg','helpModalBg','formatRulesModalBg','frRuleModalBg','frFmtPopupBg',
         'replaceRulesModalBg','rrEditModalBg',
         'imgPopup','errPopup','popup','proofreadMenu',
@@ -16034,6 +17575,9 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
 
     const pagesRes = await fetchJSON('/api/pages');
     pages = pagesRes.pages || [];
+    // 实时跟随 OCR 进度（2026-10-21）：转换进行中启动矫正时，识别完成的页面
+    // 由服务端推来，这里开启增量轮询并追加到编辑器。
+    if (pagesRes.live) startLiveOcrPolling(pagesRes.live_version || 0, pagesRes.live_total || 0);
     // 启动即恢复上次未落地的纠错状态（已识别错误/建议 + 已忽略集合 + 上次纠错页），
     // 修「模型纠错后保存、重新打开 → 未应用的错误丢失、须重新识别」（2026-10-17）。
     // 此时首屏行尚未挂载（updateViewport 之后才建行），页挂载会按 proofreadErrors 重绘。
@@ -16064,7 +17608,7 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
   // 防御性：确保没有 modal 遮罩在初始化时意外显示（会导致工具栏/按钮无法响应）
   // 注意：contextMenu 不在此列——它靠 hidden 属性 + CSS [hidden] 显隐，inline display:none
   // 会永久压过 #contextMenu{display:flex}，导致右键菜单永不显示（2026-08 修复）。
-  ['modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','charFormatModalBg','formatRulesModalBg','finishModalBg','finishConfirmBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg','replaceRulesModalBg','rrEditModalBg','imgPopup','errPopup','popup','proofreadMenu','charWrapMenu','supSubMenu','dividerMenu'].forEach(function(id) {
+  ['modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','charFormatModalBg','rubyModalBg','latexModalBg','formatRulesModalBg','finishModalBg','finishConfirmBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg','replaceRulesModalBg','rrEditModalBg','imgPopup','errPopup','popup','proofreadMenu','charWrapMenu','supSubMenu','dividerMenu'].forEach(function(id) {
     const el = document.getElementById(id);
     if (el) el.style.display = 'none';
   });

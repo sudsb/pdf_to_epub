@@ -58,11 +58,29 @@ VALID_FORMAT_OPS = {
     "highlight",
     "sup",
     "sub",
+    # 2026-10-21 新增行内格式（9 项）：波浪线/双下划线/上划线/着重号/多色突显
+    "wavy",
+    "double",
+    "overline",
+    "emphasis",
+    "highlight_green",
+    "highlight_blue",
+    "highlight_pink",
+    "highlight_orange",
+    "highlight_purple",
 }
 
-# 8 种行内包装格式类（2026-09-19）：单一事实来源。
+# 行内包装格式类（2026-09-19 首批 8 种，2026-10-21 扩充）：单一事实来源。
 # 前端（ui/app.js INLINE_CLASSES、ui/epubedit.js INLINE_CLASSES）、
 # correctmanage (sanitize/导出 DOCX/MD)、rulemanage remove op、htmlmanage CSS 均与此保持一致。
+#
+# 2026-10-21 新增：
+#   ptoe-wavy              波浪下划线（text-decoration: underline wavy）
+#   ptoe-double            双下划线（text-decoration: underline double）
+#   ptoe-overline          上划线（text-decoration: overline）
+#   ptoe-emphasis          着重号（text-emphasis: dot；与 ptoe-underdot 的整条虚线不同）
+#   ptoe-highlight-<色>    多色突显（yellow 沿用 ptoe-highlight，其余为独立类）
+#   ptoe-ruby              拼音注音（注音内容放 data-rt 属性，见 rulemanage.normalize_ruby_rt）
 INLINE_FORMAT_CLASSES = (
     "ptoe-underline",
     "ptoe-underdot",
@@ -72,7 +90,28 @@ INLINE_FORMAT_CLASSES = (
     "ptoe-highlight",
     "ptoe-sup",
     "ptoe-sub",
+    # —— 2026-10-21 新增行内格式 ——
+    "ptoe-wavy",
+    "ptoe-double",
+    "ptoe-overline",
+    "ptoe-emphasis",
+    "ptoe-highlight-green",
+    "ptoe-highlight-blue",
+    "ptoe-highlight-pink",
+    "ptoe-highlight-orange",
+    "ptoe-highlight-purple",
+    "ptoe-ruby",
 )
+
+# 多色突显类 → 背景色（EPUB CSS / 界面预览 / DOCX 底纹共用同一张表）
+HIGHLIGHT_COLORS = {
+    "ptoe-highlight": "#e0e0e0",
+    "ptoe-highlight-green": "#c8e6c9",
+    "ptoe-highlight-blue": "#bbdefb",
+    "ptoe-highlight-pink": "#f8bbd0",
+    "ptoe-highlight-orange": "#ffe0b2",
+    "ptoe-highlight-purple": "#e1bee7",
+}
 
 # span 上允许保留的 class 全集（MiniDOMParser 白名单的单一事实来源）。
 # = 8 个行内包装格式类（INLINE_FORMAT_CLASSES，构造时求值，永不漂移）
@@ -90,6 +129,47 @@ ALLOWED_SPAN_CLASSES = frozenset(INLINE_FORMAT_CLASSES) | {
 # 空元素（void elements）——无闭合标签、无子节点
 VOID_TAGS = {"br", "img", "hr", "input", "meta", "link", "base", "area", "col", "embed", "param", "source", "track", "wbr"}
 
+# ---------------------------------------------------------------------------
+# MathML —— LaTeX 公式的载体（2026-10-21）
+#
+# 矫正界面用 KaTeX（ui/vendor/katex.min.js，随包离线）把 LaTeX 源码渲染成
+# MathML（<math …><semantics><mrow>…</mrow><annotation>…</annotation></semantics></math>）
+# 存进正文，导出 EPUB 时原样保留 —— EPUB 3 阅读器原生支持 MathML，公式照常显示。
+# DOCX/MD/TXT 无 MathML 概念 → 走 <math alttext="…"> 里的 LaTeX 源码做纯文本兜底。
+#
+# 标签与属性都走白名单（与 sanitize_html 同策略）：
+#   - 不在白名单的 MathML 标签整体丢弃（只留文本）；
+#   - 属性只放行 MathML 表现层属性 + xmlns/alttext/display，**不**放行
+#     href / xlink:href / style / on* （防注入）。
+# KaTeX 实际产出的标签与属性（实测，见 ui/vendor/katex.min.js）：
+#   标签 math semantics annotation mrow mi mn mo mtext mstyle msup msub msubsup
+#        mfrac msqrt mroot mtable mtr mtd
+#   属性 xmlns displaystyle scriptlevel fence stretchy columnalign rowspacing
+#        columnspacing encoding
+# ---------------------------------------------------------------------------
+MATHML_TAGS = frozenset({
+    "math", "semantics", "annotation", "annotation-xml",
+    "mrow", "mi", "mn", "mo", "mtext", "mspace", "mstyle",
+    "msup", "msub", "msubsup", "mfrac", "msqrt", "mroot",
+    "munder", "mover", "munderover", "mmultiscripts", "mprescripts", "none",
+    "mtable", "mtr", "mtd", "mlabeledtr",
+    "mpadded", "mphantom", "menclose", "maction", "mfenced", "merror",
+})
+
+MATHML_ATTRS = frozenset({
+    # 命名空间与语义
+    "xmlns", "alttext", "display", "encoding", "mathvariant", "mathsize",
+    "mathcolor", "mathbackground",
+    # 表现层通用
+    "displaystyle", "scriptlevel", "accent", "accentunder", "align",
+    "alignmentscope", "bevelled", "charalign", "close", "columnalign",
+    "columnlines", "columnspacing", "depth", "edge", "fence", "frame",
+    "framespacing", "groupalign", "height", "largeop", "length", "lspace",
+    "lquote", "maxsize", "minsize", "movablelimits", "notation", "open",
+    "rowalign", "rowlines", "rowspacing", "rspace", "rquote", "scriptlevel",
+    "separator", "separators", "stretchy", "symmetric", "voffset", "width",
+})
+
 # 序列化时允许的标签（与 sanitize_html 白名单兼容）
 # 2026-09-15：补充 div —— 矫正界面未应用规则前的页面 HTML 就是 <div> 行块，
 # 若排除 div 则 MiniDOMParser 把 div 当 __skip_ 透明容器、其内文本全部丢弃，
@@ -102,7 +182,7 @@ VOID_TAGS = {"br", "img", "hr", "input", "meta", "link", "base", "area", "col", 
 ALLOWED_TAGS = {
     "p", "h1", "h2", "h3", "h4", "h5", "h6", "div", "strong", "em", "br", "span", "img",
     "table", "thead", "tbody", "tfoot", "tr", "th", "td",
-}
+} | set(MATHML_TAGS)
 
 # 块级标签
 BLOCK_TAGS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "div"}
@@ -198,6 +278,22 @@ def _canon_char_decl(prop: str, val: str) -> str:
         # 十六进制统一小写（颜色名原样）
         return v.lower() if v.startswith("#") else v
     return ""
+
+
+# 拼音注音（2026-10-21）：注音内容存放在 span 的 data-rt 属性里。
+# 窄口径白名单：最多 32 个字符，去掉首尾空白与控制字符/换行（属性值不能含换行），
+# 其余字符（含中文、字母、数字、括号）原样保留 —— 注音本身就是用户手输的自由文本。
+RUBY_RT_MAX_LEN = 32
+_RUBY_RT_BAD_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def normalize_ruby_rt(raw: str) -> str:
+    """拼音注音原文 → 规范化后的注音文本（非法/空 → ""）。"""
+    s = str(raw or "")
+    s = _RUBY_RT_BAD_RE.sub("", s).strip()
+    if len(s) > RUBY_RT_MAX_LEN:
+        s = s[:RUBY_RT_MAX_LEN].strip()
+    return s
 
 
 def normalize_char_style(raw: str) -> str:
@@ -673,6 +769,22 @@ class MiniDOMParser(HTMLParser):
                         new_attrs[k] = norm
             attr_dict = new_attrs
 
+        # MathML 公式（2026-10-21）：只保留白名单属性（xmlns/alttext/display +
+        # MathML 表现层属性）。**不放行** href / xlink:href / style / on* ——
+        # 公式内容来自用户输入，但 sanitize_html 同样是安全边界，口径必须一致。
+        # 不加这段时，每次应用格式规则都会把 <math> 的属性剥光（xmlns 一丢，
+        # 导出的 XHTML 里 <math> 就不在 MathML 命名空间，阅读器不渲染公式）。
+        if tag in MATHML_TAGS:
+            new_attrs = {}
+            for k, v in attr_dict.items():
+                if k not in MATHML_ATTRS:
+                    continue
+                val = " ".join(str(x) for x in v) if isinstance(v, list) else str(v)
+                if k == "xmlns" and val != "http://www.w3.org/1998/Math/MathML":
+                    continue
+                new_attrs[k] = val
+            attr_dict = new_attrs
+
         # p/h1-h6 保留 class（ptoe-note/ptoe-citation/ptoe-align-*/ptoe-flush/
         # ptoe-indent/ptoe-divider*/ptoe-caption）与段落设置 data-* 属性（缩进/间距/行距）
         if tag in BLOCK_TAGS:
@@ -1109,6 +1221,24 @@ def apply_inline_format(nodes_info: list[TextNodeInfo], start_off: int, end_off:
     elif op == "highlight":
         # 突显
         return _wrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "span", {"class": "ptoe-highlight"})
+    elif op == "wavy":
+        # 波浪下划线（2026-10-21）
+        return _wrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "span", {"class": "ptoe-wavy"})
+    elif op == "double":
+        # 双下划线（2026-10-21）
+        return _wrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "span", {"class": "ptoe-double"})
+    elif op == "overline":
+        # 上划线（2026-10-21）
+        return _wrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "span", {"class": "ptoe-overline"})
+    elif op == "emphasis":
+        # 着重号（2026-10-21）
+        return _wrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "span", {"class": "ptoe-emphasis"})
+    elif op.startswith("highlight_"):
+        # 多色突显（2026-10-21）：highlight_green / highlight_blue / …
+        cls = "ptoe-highlight-" + op[len("highlight_"):]
+        if cls not in HIGHLIGHT_COLORS:
+            return False
+        return _wrap_inline(nodes_info, start_node, start_idx, end_node, end_idx, "span", {"class": cls})
     elif op == "sup":
         # 上标：先移除可能存在的下标，再包裹上标（互斥）
         _unwrap_inline_class(nodes_info, start_node, start_idx, end_node, end_idx, "ptoe-sub")
@@ -1688,7 +1818,22 @@ def apply_rules(
 # 新增 7 项行内格式（2026-09）：underline/strike/charbox/shade/highlight/sup/sub
 _INLINE_LEAF_OPS = {"bold", "italic", "no_bold", "remove", "underline", "strike", "charbox", "shade", "highlight", "sup", "sub"}
 
-_INLINE_LEAF_OPS_M = {"bold", "italic", "no_bold", "remove", "note", "underline", "strike", "charbox", "shade", "highlight", "sup", "sub"}
+# 2026-10-21 新增行内格式操作（波浪线/双下划线/上划线/着重号/多色突显）
+_NEW_INLINE_OPS = {
+    "wavy",
+    "double",
+    "overline",
+    "emphasis",
+    "highlight_green",
+    "highlight_blue",
+    "highlight_pink",
+    "highlight_orange",
+    "highlight_purple",
+}
+
+_INLINE_LEAF_OPS = _INLINE_LEAF_OPS | _NEW_INLINE_OPS
+
+_INLINE_LEAF_OPS_M = _INLINE_LEAF_OPS | {"note"}
 
 
 def _selection_bounds(
@@ -1974,7 +2119,7 @@ def _apply_pattern_conds(
 
     # 行内格式（对齐已移至块级：ptoe-align-* 类，text-align 对 inline span 无效）
     # 新增 7 项行内格式（2026-09）：underline/strike/charbox/shade/highlight/sup/sub
-    inline_ops = {"bold", "italic", "no_bold", "remove", "underline", "strike", "charbox", "shade", "highlight", "sup", "sub"}
+    inline_ops = _INLINE_LEAF_OPS
     inline_fmts = [op for op in fmts if op in inline_ops]
     block_fmts = [op for op in fmts if op not in inline_ops]
 

@@ -342,6 +342,63 @@ class TestHTMLConverterIntegration(unittest.TestCase):
         self.assertIn('text-indent: 2em', css)
 
 
+class TestAlignLinesExport(unittest.TestCase):
+    """多行对齐（ptoe-align-lines）导出保真：空白填充不被清理掉
+
+    2026-10-20：前端「多行对齐」把对齐填充写成 &nbsp;（HTML 会把连续半角空格
+    折叠成一个），并给对齐段落打 ptoe-align-lines 标记类。导出时该段豁免
+    空白符清理——否则左右两侧又对不齐了。
+    """
+
+    NB = '\u00a0'
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.converter = htmlmanage.HTMLConverter(output_dir=self.tmpdir)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _render(self, page_html):
+        structured = {
+            'meta': {'title': '测试书', 'author': '作者', 'language': 'zh-CN'},
+            'pages': [{'page': 1, 'text': page_html}],
+        }
+        result = self.converter.convert_document(structured, merge_pages=True)
+        content_file = os.path.join(self.tmpdir, result['content_files'][0])
+        with open(content_file, 'r', encoding='utf-8') as f:
+            return f.read()
+
+    def test_align_lines_keeps_nbsp_fill(self):
+        """多行对齐段的 &nbsp; 填充在 XHTML 里原样保留"""
+        content = self._render(
+            '<p class="ptoe-align-lines">第一章' + self.NB * 3 + '总则</p>'
+            '<p class="ptoe-align-lines">第一节' + self.NB + '总则的适用范围</p>'
+        )
+        self.assertIn('第一章' + self.NB * 3 + '总则', content)
+        self.assertIn('第一节' + self.NB + '总则的适用范围', content)
+        self.assertIn('ptoe-align-lines', content)
+
+    def test_align_lines_keeps_inner_spaces(self):
+        """多行对齐段里的半角空格不被空白符清理吃掉（版式的一部分）"""
+        content = self._render(
+            '<p class="ptoe-align-lines">甲  乙</p>'
+        )
+        self.assertIn('甲  乙', content)
+
+    def test_normal_block_still_collapses_spaces(self):
+        """普通段落的空白清理口径不变（回归）"""
+        # CJK 之间的空白照旧清掉
+        content = self._render('<p>甲  乙</p>')
+        self.assertIn('甲乙', content)
+        self.assertNotIn('甲  乙', content)
+        # 英文/数字之间保留单个空格
+        content = self._render('<p>a  b</p>')
+        self.assertIn('a b', content)
+        self.assertNotIn('a  b', content)
+
+
 class TestTableCellParagraphFormat(unittest.TestCase):
     """表格单元格内段落的格式导出（2026-10-19）。
 

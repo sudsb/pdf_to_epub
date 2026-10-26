@@ -11,6 +11,7 @@ A Windows-oriented CLI tool that converts PDFs to EPUB via local OCR and local m
 - **Text Processing**: Clean, structure, and normalize OCR text (bbox conversion, page-number stripping, heading detection, zh-CN/zh-TW conversion)
 - **EPUB Generation**: Convert structured text to XHTML and package as standard EPUB3
 - **Optional Manual Correction**: Browser-based UI for page-by-page correction with formatting, markers, search/replace, proofreading, and history
+- **Batch Conversion**: Queue multiple PDFs in the GUI (or pass several PDFs to `mian.py epub`) and convert them sequentially, continuing after individual failures
 - **Resume Support**: Resume interrupted OCR jobs from checkpoint
 - **Packaging**: Single-file Windows executable via PyInstaller
 
@@ -147,8 +148,8 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
-  --dpi {0,1,2,3,4}     DPI level 0-4: 0=100, 1=150, 2=200, 3=300, 4=600
-                        (default: 0=100)
+  --dpi {0,1,2,3,4}     DPI level 0-4: 0=100, 1=150, 2=200, 3=300, 4=600, or a raw
+                        value 36-1200 (default: config.json dpi, 200)
   --model MODEL         Model key in config.json model_choices (default: from
                         config.json)
   --engine {llama,vllm,paddle}
@@ -193,8 +194,8 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
-  --dpi {0,1,2,3,4}     DPI level 0-4: 0=100, 1=150, 2=200, 3=300, 4=600
-                        (default: 0=100)
+  --dpi {0,1,2,3,4}     DPI level 0-4: 0=100, 1=150, 2=200, 3=300, 4=600, or a raw
+                        value 36-1200 (default: config.json dpi, 200)
   --model MODEL         Model key in config.json model_choices (default: from
                         config.json)
   --engine {llama,vllm,paddle}
@@ -224,7 +225,7 @@ options:
 usage: ptoe correct [-h] [--engine {llama,vllm,paddle}] [--title TITLE]
                     [--author AUTHOR] [--lang LANG] [--out-dir OUT_DIR]
                     [--epub-path EPUB_PATH]
-                    [--correct-timeout CORRECT_TIMEOUT]
+                    [--correct-timeout CORRECT_TIMEOUT] [--live-ocr]
                     [pdf]
 
 直接打开手动矫正界面：不运行 OCR；页面文本优先取本地历史缓存最新版本（同一 PDF 上次矫正/暂存的内容），无历史则为空白页。点「完成并转换」时生成
@@ -247,6 +248,7 @@ options:
                         Explicit output path for the .epub file
   --correct-timeout CORRECT_TIMEOUT
                         浏览器被关闭后自动继续后续流程的等待秒数（默认 600=10 分钟）
+  --live-ocr            实时跟随 OCR 进度：转换进行中启动矫正时，识别完成的页面实时进入矫正界面
 ```
 
 ### model
@@ -399,6 +401,12 @@ pywebview-window interface by default (config `gui_display=browser` switches to 
 - Start/stop inference server
 - Launch conversion with progress monitoring
 - File/directory pickers via tkinter (main thread)
+
+Conversion page & correction page are separate now:
+
+- **转换页**：只显示**一条进度条 + 一条转换消息**；子进程的完整输出写入本地任务日志 `logs/convert-<时间戳>.log`，点「打开日志」可直接查看。
+- **矫正页**（独立页面）：自带 PDF 选择与矫正实例管理，可与转换并行；转换进行中可在转换页点「启动矫正（跟随当前转换）」，识别完成的页面会**实时出现**在矫正界面里。
+- **分隔线菜单**：除直线/线段/点线/双线外，支持 8 种花样分割符号（★ ◆ ● ❀ ❄ ≈ ※ ❦）。
 
 ## Packaging (Windows Executable)
 

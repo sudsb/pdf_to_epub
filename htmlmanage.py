@@ -25,7 +25,21 @@ from typing import Dict, List, Any, Optional, Tuple
 # 表格标签于 2026-09-20 加入：只含 <table> 的片段（无 p/strong/em/br/span）也须
 # 走标记渲染路径，否则落入纯文本转义分支导致 EPUB 表格被打成字面量。
 _MARKUP_RE = re.compile(
-    r"</?(?:p|h[1-6]|strong|em|br|span|table|thead|tbody|tfoot|tr|th|td)([^>]*)>",
+    r"</?(?:p|h[1-6]|strong|em|br|span|table|thead|tbody|tfoot|tr|th|td"
+    # LaTeX 公式（2026-10-21）：MathML 承载的公式也须走标记渲染路径，
+    # 否则整段公式会被当纯文本转义成字面量（<mi>x</mi> 之类）。
+    r"|math|semantics|annotation|mrow|mi|mn|mo|mtext|mstyle|mspace"
+    r"|msup|msub|msubsup|mfrac|msqrt|mroot|mtable|mtr|mtd)([^>]*)>",
+    flags=re.I,
+)
+
+# MathML 标签（2026-10-21）：用于「公式内部不做空白符清理」——<mtext> 里的空格
+# 是公式的一部分（"if x > 0" 少了空格就变成 "ifx > 0"）。
+_MATHML_TAG_RE = re.compile(
+    r"^</?(?:math|semantics|annotation|annotation-xml|mrow|mi|mn|mo|mtext|mspace"
+    r"|mstyle|msup|msub|msubsup|mfrac|msqrt|mroot|munder|mover|munderover"
+    r"|mmultiscripts|mprescripts|none|mtable|mtr|mtd|mlabeledtr|mpadded|mphantom"
+    r"|menclose|maction|merror)\b",
     flags=re.I,
 )
 
@@ -43,6 +57,11 @@ _CELL_PARA_OPEN_RE = re.compile(r"<p\b([^>]*)>", flags=re.I)
 # 块级保留 class：注释（ptoe-note）+ 对齐类（ptoe-align-*）+ 换页（ptoe-page-break）
 _NOTE_CLASS = "ptoe-note"
 _ALIGN_CLASSES = ("ptoe-align-left", "ptoe-align-center", "ptoe-align-right")
+# 多行对齐标记类（2026-10-20）：矫正界面「多行对齐」给对齐段落打的块级标记。
+# 导出时该段豁免空白符清理——对齐用的空白是版式的一部分（与居右段 ptoe-align-right、
+# 注释标签段 ptoe-note-label 同策略）。不进 _ALIGN_CLASSES：那是水平对齐语义
+# （左/中/右互斥），多行对齐与左/中/右并存，塞进去会挤掉真正的水平对齐类。
+_ALIGN_LINES_CLASS = "ptoe-align-lines"
 _PAGE_BREAK_CLASS = "ptoe-page-break"
 # 注释标签 class：加粗注释标签转换后的块级标记（取消首行缩进）
 _NOTE_LABEL_CLASS = "ptoe-note-label"
@@ -75,7 +94,7 @@ _DIVIDER_CLASS_PREFIX = "ptoe-divider"
 #   data-spb/data-spa = 段前/段后(行) → margin-top/bottom（1 行 ≈ 1.5em）
 #   data-lh = 行距倍数              → line-height
 _INDENT_DATA_NUM_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
-_WS_RUN_RE = re.compile(r"[\s\u3000\u200b\u200c\ufeff]+")
+_WS_RUN_RE = re.compile(r"[ \t\n\r\f\v\u3000\u200b\u200c\ufeff]+")
 
 
 def _indent_style_attrs(attrs: str) -> str:
@@ -137,6 +156,36 @@ def _strip_ws_text(s: str) -> str:
         return ""
 
     return _WS_RUN_RE.sub(_sub, s)
+
+
+# 块首尾/段内空白清理时保留 &nbsp; 的口径：只剥这些字符，&nbsp;（U+00A0）不动。
+# 多行对齐段（ptoe-align-lines）的对齐填充是版式的一部分，Python 的 str.strip()
+# 会把 &nbsp; 一起剥掉——对齐就废了。
+_WS_KEEP_NBSP = " \t\n\r\f\v\u3000\u200b\u200c\ufeff"
+
+
+def strip_block_ws(text: str, keep_nbsp: bool = False) -> str:
+    """块首尾空白清理；keep_nbsp=True 时保留 &nbsp;（U+00A0）不剥。
+
+    多行对齐段（ptoe-align-lines）的段尾 &nbsp; 填充是版式的一部分，
+    默认口径的 str.strip() 会连它一起剥掉——导出后左右两侧就对不齐了。
+    """
+    return text.strip(_WS_KEEP_NBSP) if keep_nbsp else text.strip()
+
+
+def blank_block_ws(text: str, keep_nbsp: bool = False) -> bool:
+    """文本是否只有空白；keep_nbsp=True 时 &nbsp; 算内容（不算空白）。"""
+    return not strip_block_ws(text, keep_nbsp)
+
+
+def _keep_ws_text(s: str) -> str:
+    """保留段内空白（多行对齐段用），只去掉首尾的空白。
+
+    与 _strip_ws_text 的差别：段内空白串（对齐的间隔/填充）原样保留；
+    首尾只剥空白（块开标签后补的换行在阅读器里会显示成一个前导空格），
+    &nbsp; 一律不动。
+    """
+    return s.strip(_WS_KEEP_NBSP)
 
 
 _TABLE_SPAN_RE = re.compile(r"<table\b[^>]*>.*?</table\s*>", flags=re.I | re.S)
@@ -497,7 +546,7 @@ def _block_class_html(attrs: str) -> str:
     keep = [
         c
         for c in m.group(1).split()
-        if c == _NOTE_CLASS or c == _NOTE_LABEL_CLASS or c in _ALIGN_CLASSES or c == _PAGE_BREAK_CLASS or c in _IMG_CLASSES or c in _FORMAT_CLASSES
+        if c == _NOTE_CLASS or c == _NOTE_LABEL_CLASS or c in _ALIGN_CLASSES or c == _ALIGN_LINES_CLASS or c == _PAGE_BREAK_CLASS or c in _IMG_CLASSES or c in _FORMAT_CLASSES
         # 题注（2026-10 图文混合）：白名单未同步会剥掉类 → EPUB 里题注样式全丢
         # （与分隔线同型的「样式丢失」缺陷）
         or c == _CAPTION_CLASS
@@ -781,10 +830,67 @@ class CSSManager:
         .ptoe-highlight {
           background: #e0e0e0;
         }
+        /* 多色突显（2026-10-21）：与 ptoe-highlight 同机制，仅底色不同 */
+        .ptoe-highlight-green {
+          background: #c8e6c9;
+        }
+        .ptoe-highlight-blue {
+          background: #bbdefb;
+        }
+        .ptoe-highlight-pink {
+          background: #f8bbd0;
+        }
+        .ptoe-highlight-orange {
+          background: #ffe0b2;
+        }
+        .ptoe-highlight-purple {
+          background: #e1bee7;
+        }
+        /* 波浪下划线（2026-10-21）：text-decoration: underline wavy 属 CSS3，
+           部分阅读器整条丢弃 → 同时给 border-bottom 兜底（与 ptoe-underdot
+           同样的取舍：视觉优先于语义精确） */
+        .ptoe-wavy {
+          text-decoration: underline wavy;
+          text-decoration-style: wavy;
+          border-bottom: 1px solid #333;
+        }
+        /* 双下划线（2026-10-21） */
+        .ptoe-double {
+          text-decoration: underline double;
+        }
+        /* 上划线（2026-10-21） */
+        .ptoe-overline {
+          text-decoration: overline;
+        }
+        /* 着重号（2026-10-21）：字下小圆点，区别于 ptoe-underdot 的整条虚线 */
+        .ptoe-emphasis {
+          text-emphasis: dot;
+          -webkit-text-emphasis: dot;
+          text-emphasis-position: under right;
+          -webkit-text-emphasis-position: under right;
+        }
+        /* 拼音注音（2026-10-21）：注音内容放 data-rt 属性，CSS 用 attr() 取值
+           渲染为括号注音；不支持 attr() 的阅读器退化为纯正文（内容不丢） */
+        .ptoe-ruby {
+          ruby-position: over;
+        }
+        .ptoe-ruby::after {
+          content: "(" attr(data-rt) ")";
+          font-size: .6em;
+          vertical-align: super;
+        }
         .ptoe-sup {
           vertical-align: super;
           font-size: .7em;
           line-height: 1;
+        }
+        /* LaTeX 公式（2026-10-21）：正文里以 MathML（<math>）承载，EPUB 3
+           阅读器原生支持 MathML → 公式照常渲染。这里只做保守的版式微调：
+           跟随正文字号、与基线对齐；不写 display（部分阅读器对 math 的
+           display 覆盖敏感，写死 inline 会让 display="block" 的公式塌成一行）。 */
+        math {
+          font-size: 1em;
+          vertical-align: middle;
         }
         .ptoe-sub {
           vertical-align: sub;
@@ -825,6 +931,15 @@ class CSSManager:
           letter-spacing: 0.05em;
           font-weight: bold;
         }
+        /* 花样分割符号（2026-10-21）：装饰字形排布，字距放宽 */
+        .ptoe-divider-stars { letter-spacing: 0.35em; }
+        .ptoe-divider-diamonds { letter-spacing: 0.35em; }
+        .ptoe-divider-circles { letter-spacing: 0.35em; }
+        .ptoe-divider-flowers { letter-spacing: 0.35em; }
+        .ptoe-divider-snow { letter-spacing: 0.35em; }
+        .ptoe-divider-wave { letter-spacing: 0.25em; }
+        .ptoe-divider-note { letter-spacing: 0.35em; }
+        .ptoe-divider-leaf { letter-spacing: 0.35em; }
         img {
           display: block;
           max-width: 100%;
@@ -1232,6 +1347,7 @@ class HTMLConverter:
         hcount = 0  # 标题锚点计数（每片段内 h1..hN）
         heading: Optional[Tuple[int, List[str]]] = None  # 当前标题 (级别, 文本缓冲)
         strip_ws = True  # 当前块是否清理文本空白符（居右段落与注释标签段豁免）
+        keep_ws = False  # 当前块是否保留段内空白（多行对齐段：空白是版式的一部分）
         # 表格原子缓冲（2026-09-27）：in_table 为真时 token 原样累加进 table_buf，
         # 期间不合成包裹、不做空白符清理、不动 hcount/toc_out/open_tag/strip_ws。
         # 与 correctmanage.apply_markers 同源缺陷：<table> 不在本循环的块标签集合里
@@ -1241,6 +1357,7 @@ class HTMLConverter:
         in_table = False
         in_cell = False  # 是否处于单元格内（表内 <p> 开标签按单元格段落重建）
         table_buf: List[str] = []
+        math_depth = 0  # MathML 公式嵌套深度（2026-10-21）：>0 时不做空白符清理
 
         def _flush_block() -> None:
             nonlocal cur, kind, open_tag, heading
@@ -1325,6 +1442,9 @@ class HTMLConverter:
                 # 空白符清理豁免：居右段落（用户显式要求保留）与注释标签段（注　　释：
                 # 的全角空格是版式的一部分）；标题/正文/注释一律清理
                 strip_ws = not ('ptoe-align-right' in raw_attrs or _NOTE_LABEL_CLASS in raw_attrs)
+                # 多行对齐段（2026-10-20）：段内空白是对齐的间隔/填充，属版式的一部分，
+                # 清理掉左右两侧就对不齐了——只去掉首尾空白，段内原样保留
+                keep_ws = _ALIGN_LINES_CLASS in raw_attrs
                 if tag.startswith('h'):
                     hcount += 1
                     kind = tag
@@ -1345,8 +1465,21 @@ class HTMLConverter:
                 continue
             # 空白符清理只作用于文本 token——标签 token（如 <img src="..." alt="..."/>）
             # 内部的属性间空格是语法的一部分，清掉会产出非法 XHTML（src="..."alt=...）
-            if strip_ws and not tok.startswith("<"):
-                tok = _strip_ws_text(tok)
+            if not tok.startswith("<"):
+                # 公式内部（MathML，2026-10-21）不做空白符清理：<mtext> 里的空格
+                # 是公式的一部分（"if x > 0" 少了空格就变成 "ifx > 0"）。
+                if math_depth <= 0:
+                    if keep_ws:
+                        tok = _keep_ws_text(tok)
+                    elif strip_ws:
+                        tok = _strip_ws_text(tok)
+            else:
+                # 公式标签深度跟踪（用于上面的空白符豁免）
+                if _MATHML_TAG_RE.match(tok):
+                    if tok.startswith("</"):
+                        math_depth = max(0, math_depth - 1)
+                    elif not tok.rstrip().endswith("/>"):
+                        math_depth += 1
             cur.append(tok)
             if heading is not None:
                 heading[1].append(tok)

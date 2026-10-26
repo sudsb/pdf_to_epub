@@ -9,12 +9,14 @@ Covers:
 """
 
 import inspect
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -56,6 +58,7 @@ from correctmanage import (
     DIVIDER_CLASS,
     DIVIDER_STYLES,
     DIVIDER_GLYPHS,
+    DIVIDER_DECORATIVE,
     export_content_to_file,
 )
 
@@ -766,6 +769,55 @@ class TestSanitize(unittest.TestCase):
         self.assertEqual(out, "<p>xyz</p>")
 
 
+class TestAlignLinesBlocks(unittest.TestCase):
+    """多行对齐（ptoe-align-lines）块：标记类保真 + 导出时 &nbsp; 填充不被剥掉
+
+    2026-10-20：前端「多行对齐」把对齐填充写成 &nbsp;（HTML 会把连续半角空格折叠成
+    一个，导出的空白清理也会吃掉半角空格），并给对齐段落打 ptoe-align-lines 标记类。
+    导出链路（sanitize → apply_markers → 渲染）必须把这个填充原样带出去，
+    否则左右两侧又对不齐了。
+    """
+
+    NB = "\u00a0"
+
+    def test_sanitize_keeps_align_lines_class(self):
+        out = sanitize_html('<p class="ptoe-align-lines">x</p>')
+        self.assertIn('ptoe-align-lines', out)
+
+    def test_sanitize_keeps_align_lines_with_other_classes(self):
+        # 多行对齐与水平对齐并存：两个类都要留（不能互相挤掉）
+        out = sanitize_html('<p class="ptoe-align-lines ptoe-align-center">x</p>')
+        self.assertIn('ptoe-align-lines', out)
+        self.assertIn('ptoe-align-center', out)
+
+    def test_apply_markers_keeps_nbsp_fill(self):
+        html = ('<p class="ptoe-align-lines">\n第一章' + self.NB * 3 + '总则</p>\n'
+                '<p class="ptoe-align-lines">\n第一节' + self.NB + '总则的适用范围</p>')
+        arts = apply_markers([{"page": 1, "text": html}])
+        text = arts[0]["text"]
+        self.assertIn('第一章' + self.NB * 3 + '总则', text)
+        self.assertIn('第一节' + self.NB + '总则的适用范围', text)
+
+    def test_apply_markers_keeps_trailing_fill_for_line_without_space(self):
+        # 无空格的行：右侧补齐的 &nbsp; 落在段尾，.strip() 默认口径会把它剥掉
+        html = '<p class="ptoe-align-lines">\n无空格行' + self.NB * 3 + '</p>'
+        arts = apply_markers([{"page": 1, "text": html}])
+        self.assertIn('无空格行' + self.NB * 3, arts[0]["text"])
+
+    def test_rich_blocks_keep_trailing_fill(self):
+        # TXT/MD/DOCX 导出链路（_html_to_rich_blocks）：段尾 &nbsp; 填充不剥
+        html = '<p class="ptoe-align-lines">\n无空格行' + self.NB * 3 + '</p>'
+        blocks = _html_to_rich_blocks(html)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["text"], '无空格行' + self.NB * 3)
+
+    def test_normal_block_still_strips_nbsp(self):
+        # 普通段落口径不变（回归）：段尾 &nbsp; 照旧剥掉
+        html = '<p>普通行' + self.NB * 3 + '</p>'
+        blocks = _html_to_rich_blocks(html)
+        self.assertEqual(blocks[0]["text"], '普通行')
+
+
 class TestEnsureMarkerClasses(unittest.TestCase):
     """_ensure_marker_classes：serve 时只为「真正带 data-ptoe-marker 的标记 span」
     补回 ptoe-marker 显示类。
@@ -1034,6 +1086,45 @@ class TestCleanPageHtmlExtended(unittest.TestCase):
             '<p>第一段</p>\n<p>续文</p>',
         )
 
+    def test_merge_auto_cleans_whitespace(self):
+        # 合并段落自动清理段内空白：软换行 / 行首行尾空格 / 中文之间空格。
+        # 即使 clean_spaces=False（默认），合并后的自然段也不应残留可见空隙。
+        self.assertEqual(
+            clean_page_html(
+                '<p>关于同意发表《克服教条主义，</p>'
+                '<p> 投入反右派斗争》一文的批语〔1〕</p>',
+                clean_paragraphs=True,
+            ),
+            '<p>关于同意发表《克服教条主义，投入反右派斗争》一文的批语〔1〕</p>',
+        )
+        self.assertEqual(
+            clean_page_html('<p>第一段 </p><p>\n续文</p>', clean_paragraphs=True),
+            '<p>第一段续文</p>',
+        )
+        # 旧参数 merge_paragraphs 同样自动清理
+        self.assertEqual(
+            clean_page_html('<p>第一段 </p><p> 续文</p>', merge_paragraphs=True),
+            '<p>第一段续文</p>',
+        )
+        # 英文/数字单词之间保留一个空格，不粘成 helloworld
+        self.assertEqual(
+            clean_page_html('<p>Hello  </p><p> \n world</p>', clean_paragraphs=True),
+            '<p>Hello world</p>',
+        )
+        # 未参与合并的段落保持原样（不因开启合并而顺手清空）
+        self.assertEqual(
+            clean_page_html('<p>甲 乙。</p><p>丙</p>', clean_paragraphs=True),
+            '<p>甲 乙。</p>\n<p>丙</p>',
+        )
+
+    def test_merge_auto_clean_counts_spaces(self):
+        out, stats = clean_page_html(
+            '<p>第一段 </p><p> 续文</p>', clean_paragraphs=True, with_stats=True
+        )
+        self.assertEqual(out, '<p>第一段续文</p>')
+        self.assertGreaterEqual(stats["spaces"], 2)
+        self.assertEqual(stats["merged"], 1)
+
     def test_idempotent_with_all_options(self):
         src = '<p>你好,世界**重点**他沉默...良久...开口</p>'
         once = clean_page_html(src)
@@ -1178,7 +1269,10 @@ class TestCleanStats(unittest.TestCase):
         self.assertIsInstance(res, tuple)
         html, st = res
         self.assertIsInstance(html, str)
-        self.assertEqual(set(st), {"punct", "symbols", "md", "merged", "tags", "chars"})
+        self.assertEqual(
+            set(st),
+            {"punct", "symbols", "md", "merged", "tags", "chars", "spaces"},
+        )
         for k in st:
             self.assertIsInstance(st[k], int, f"{k}")
         self.assertEqual(st["punct"], 1)  # 半角逗号 → 全角
@@ -6258,7 +6352,7 @@ class TestInlineFormatSingleSource(unittest.TestCase):
         new_html, err = rulemanage.apply_rules(html, rules, all_rules=True)
         self.assertIsNone(err)
         # 文本内容全部保留、无任何 ptoe- 包装 span 残留
-        self.assertEqual(new_html.count("中"), 8)
+        self.assertEqual(new_html.count("中"), len(rulemanage.INLINE_FORMAT_CLASSES))
         self.assertIn("前", new_html)
         self.assertIn("后", new_html)
         for cls in rulemanage.INLINE_FORMAT_CLASSES:
@@ -9811,6 +9905,9 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "clean_digit_punct_map": [["。", "."], ["，", ","], ["、", ","], ["：", ":"], ["；", ";"], ["．", "."]],
                     # 导出时清理空白行（2026-10）：默认关，只在导出流程生效
                     "clean_blank_lines": False,
+                    # 清理段落内空白（2026-10-21）：默认关；保留英文单词间空格默认开
+                    "clean_spaces": False,
+                    "clean_spaces_keep_word_gap": True,
                     # 表格内浮层菜单开关（2026-10）：默认全关，只影响表格范围
                     "tbl_popup_menu": False,
                     "tbl_ctx_menu": False,
@@ -9839,8 +9936,8 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "editor_font_size": 14,
                     "img_mode": "",
                     "rule_all_pages_confirm": True,
-                    "popup_row1": ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"],
-                    "popup_row2": ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub", "table", "table2text"],
+                    "popup_row1": ["bold", "italic", "underline", "underdot", "wavy", "double", "overline", "emphasis", "strike", "charbox", "shade", "highlight_green", "highlight_blue", "highlight_pink", "highlight_orange", "highlight_purple", "ruby", "paint", "remove"],
+                    "popup_row2": ["heading", "p", "note", "citation", "align_left", "align_center", "align_right", "align_lines", "centerbold", "merge", "sup", "sub", "table", "table2text"],
                     "popup_rule_count": 5,
                     "proofread_batch_pages": 0,
                     "proofread_auto_jump": True,
@@ -9859,6 +9956,9 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "clean_digit_punct_map": [["。", "."], ["，", ","], ["、", ","], ["：", ":"], ["；", ";"], ["．", "."]],
                     # 导出时清理空白行（2026-10）：默认关，只在导出流程生效
                     "clean_blank_lines": False,
+                    # 清理段落内空白（2026-10-21）：默认关；保留英文单词间空格默认开
+                    "clean_spaces": False,
+                    "clean_spaces_keep_word_gap": True,
                     # 表格内浮层菜单开关（2026-10）：默认全关，只影响表格范围
                     "tbl_popup_menu": False,
                     "tbl_ctx_menu": False,
@@ -10496,11 +10596,11 @@ class TestUiSettingsEndpoint(unittest.TestCase):
             self.assertTrue(res["ok"])
             self.assertEqual(
                 res["ui_settings"]["popup_row1"],
-                ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"],
+                ["bold", "italic", "underline", "underdot", "wavy", "double", "overline", "emphasis", "strike", "charbox", "shade", "highlight_green", "highlight_blue", "highlight_pink", "highlight_orange", "highlight_purple", "ruby", "paint", "remove"],
             )
             self.assertEqual(
                 res["ui_settings"]["popup_row2"],
-                ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub", "table", "table2text"],
+                ["heading", "p", "note", "citation", "align_left", "align_center", "align_right", "align_lines", "centerbold", "merge", "sup", "sub", "table", "table2text"],
             )
             self.assertEqual(res["ui_settings"]["popup_rule_count"], 5)
         finally:
@@ -11432,8 +11532,8 @@ class TestSetUiSettingsConfig(unittest.TestCase):
                 "editor_font_size": 14,
                 "img_mode": "",
                 "rule_all_pages_confirm": True,
-                "popup_row1": ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"],
-                "popup_row2": ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub", "table", "table2text"],
+                "popup_row1": ["bold", "italic", "underline", "underdot", "wavy", "double", "overline", "emphasis", "strike", "charbox", "shade", "highlight_green", "highlight_blue", "highlight_pink", "highlight_orange", "highlight_purple", "ruby", "paint", "remove"],
+                "popup_row2": ["heading", "p", "note", "citation", "align_left", "align_center", "align_right", "align_lines", "centerbold", "merge", "sup", "sub", "table", "table2text"],
                 "popup_rule_count": 5,
                 "proofread_batch_pages": 0,
                 "proofread_auto_jump": True,
@@ -11452,6 +11552,9 @@ class TestSetUiSettingsConfig(unittest.TestCase):
                 "clean_digit_punct_map": [["。", "."], ["，", ","], ["、", ","], ["：", ":"], ["；", ";"], ["．", "."]],
                 # 导出时清理空白行（2026-10）：默认关，只在导出流程生效
                 "clean_blank_lines": False,
+                # 清理段落内空白（2026-10-21）：默认关；保留英文单词间空格默认开
+                "clean_spaces": False,
+                "clean_spaces_keep_word_gap": True,
                 # 表格内浮层菜单开关（2026-10）：默认全关，只影响表格范围
                 "tbl_popup_menu": False,
                 "tbl_ctx_menu": False,
@@ -11503,20 +11606,22 @@ class TestSetUiSettingsConfig(unittest.TestCase):
 
     def test_popup_defensive_fallback(self):
         # 结构性非法（非列表 / 含非法项 / 越界数值 / 布尔）→ 回退默认
+        from configmanage import POPUP_ROW1_DEFAULT, POPUP_ROW2_DEFAULT
+
         cfg = self.cm.set_ui_settings({"popup_row1": "bold"})
         self.assertEqual(
             cfg["ui_settings"]["popup_row1"],
-            ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"],
+            list(POPUP_ROW1_DEFAULT),
         )
         cfg = self.cm.set_ui_settings({"popup_row2": ["bogus", "note"]})
         self.assertEqual(
             cfg["ui_settings"]["popup_row2"],
-            ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub", "table", "table2text"],
+            list(POPUP_ROW2_DEFAULT),
         )
         cfg = self.cm.set_ui_settings({"popup_row1": ["bold", "bold"]})  # 重复
         self.assertEqual(
             cfg["ui_settings"]["popup_row1"],
-            ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"],
+            list(POPUP_ROW1_DEFAULT),
         )
         for bad in (99, -1, True, "5", None):
             cfg = self.cm.set_ui_settings({"popup_rule_count": bad})
@@ -11545,6 +11650,9 @@ class TestSetUiSettingsConfig(unittest.TestCase):
                 "clean_paragraphs": False,
                 "clean_digit_punct": True,
                 "clean_blank_lines": False,
+                # 2026-10-21 新增：清理段落内空白（默认关）+ 保留英文单词间空格（默认开）
+                "clean_spaces": False,
+                "clean_spaces_keep_word_gap": True,
             },
         )
         cfg = self.cm.set_ui_settings(
@@ -11586,9 +11694,25 @@ class TestSetUiSettingsConfig(unittest.TestCase):
             POPUP_RULE_COUNT_DEFAULT,
         )
 
-        self.assertEqual(POPUP_ROW1_DEFAULT, ["bold", "italic", "heading", "p", "note", "citation", "paint", "remove"])
-        self.assertEqual(POPUP_ROW2_DEFAULT, ["align_left", "align_center", "align_right", "centerbold", "merge", "sup", "sub", "table", "table2text"])
+        self.assertEqual(POPUP_ROW1_DEFAULT, ["bold", "italic", "underline", "underdot", "wavy", "double", "overline", "emphasis", "strike", "charbox", "shade", "highlight_green", "highlight_blue", "highlight_pink", "highlight_orange", "highlight_purple", "ruby", "paint", "remove"])
+        self.assertEqual(POPUP_ROW2_DEFAULT, ["heading", "p", "note", "citation", "align_left", "align_center", "align_right", "align_lines", "centerbold", "merge", "sup", "sub", "table", "table2text"])
         self.assertEqual(POPUP_RULE_COUNT_DEFAULT, 5)
+        # 前端 ui/app.js 的 UI_SETTINGS_DEFAULTS 必须与后端一致（两侧漂移会让
+        # 「设置里改的行布局」与实际弹窗对不上）
+        import os
+        import re as _re
+
+        app_js = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "app.js")
+        with open(app_js, "r", encoding="utf-8") as f:
+            src = f.read()
+        m1 = _re.search(r"popup_row1:\s*\[([^\]]*)\]", src)
+        m2 = _re.search(r"popup_row2:\s*\[([^\]]*)\]", src)
+        self.assertIsNotNone(m1, "ui/app.js 缺少 popup_row1 默认值")
+        self.assertIsNotNone(m2, "ui/app.js 缺少 popup_row2 默认值")
+        js1 = _re.findall(r"'([^']*)'", m1.group(1))
+        js2 = _re.findall(r"'([^']*)'", m2.group(1))
+        self.assertEqual(js1, list(POPUP_ROW1_DEFAULT), "前后端 popup_row1 默认值不一致")
+        self.assertEqual(js2, list(POPUP_ROW2_DEFAULT), "前后端 popup_row2 默认值不一致")
 
 
 class TestConfigEndpoint(unittest.TestCase):
@@ -15871,11 +15995,12 @@ class TestCharStyleAndDivider(unittest.TestCase):
         self.assertIn("ptoe-divider-wavy", out)
 
     def test_divider_glyph_mapping(self):
-        """四种样式名 → 8 字形（宽高一致），未知名回退默认。"""
+        """样式名 → 规范字形（线条型 8 字形、花样型 5 字形），未知名回退默认。"""
         self.assertEqual(_divider_glyph("solid"), DIVIDER_GLYPHS["solid"])
         self.assertEqual(_divider_glyph("double"), DIVIDER_GLYPHS["double"])
-        for glyph in DIVIDER_GLYPHS.values():
-            self.assertEqual(len(glyph), 8)
+        for style, glyph in DIVIDER_GLYPHS.items():
+            want = 5 if style in DIVIDER_DECORATIVE else 8
+            self.assertEqual(len(glyph), want, style)
         self.assertEqual(_divider_glyph("nope"), DIVIDER_GLYPHS["solid"])
 
     def test_rich_blocks_yield_divider_block(self):
@@ -15942,10 +16067,13 @@ class TestCharStyleAndDivider(unittest.TestCase):
         self.assertIn("红", md)
 
     def test_md_divider_becomes_hr(self):
-        """MD：分隔线 → --- 分隔线。"""
+        """MD：线条型分隔线 → --- 分隔线；花样型保留装饰字形（无横线记号）。"""
         for style, cls in DIVIDER_STYLES.items():
             md = self._export_text(f'<p class="{DIVIDER_CLASS} {cls}">X</p>', "md")
-            self.assertIn("---", md, style)
+            if style in DIVIDER_DECORATIVE:
+                self.assertIn(DIVIDER_GLYPHS[style], md, style)
+            else:
+                self.assertIn("---", md, style)
 
     def test_txt_keeps_glyph_and_drops_char_style(self):
         """TXT：保留规范字形（字符样式在纯文本中天然丢弃）。"""
@@ -15956,7 +16084,7 @@ class TestCharStyleAndDivider(unittest.TestCase):
     # ---------- 导出：分隔线 ----------
 
     def test_docx_divider_uses_real_borders(self):
-        """DOCX：分隔线走真实段落边框（single/dashed/dotted/double）。"""
+        """DOCX：线条型走真实段落边框；花样型输出居中字形（无边框可画）。"""
         want = {
             "solid": "single",
             "dashed": "dashed",
@@ -15965,7 +16093,11 @@ class TestCharStyleAndDivider(unittest.TestCase):
         }
         for style, cls in DIVIDER_STYLES.items():
             doc = self._docx_xml(f'<p class="{DIVIDER_CLASS} {cls}">X</p>')
-            self.assertIn(f'<w:bottom w:val="{want[style]}"', doc, style)
+            if style in DIVIDER_DECORATIVE:
+                self.assertNotIn("<w:pBdr>", doc, style)
+                self.assertIn(DIVIDER_GLYPHS[style], doc, style)
+            else:
+                self.assertIn(f'<w:bottom w:val="{want[style]}"', doc, style)
 
     def test_docx_divider_has_no_glyph_text(self):
         """DOCX：分隔线为空段 + 边框，不残留字形文本。"""
@@ -16106,12 +16238,74 @@ class TestCharStyleAndDivider(unittest.TestCase):
         self.assertLess(rpr.index("rFonts"), rpr.index("<w:sz"))
         self.assertLess(rpr.index("<w:color"), rpr.index("<w:sz"))
         self.assertEqual(rpr.count("<w:color"), 1)
+    # ---------- 花样分割符号（2026-10-21） ----------
+
+    def test_decorative_divider_styles_registered(self):
+        """花样分割符号：样式名/类名/字形齐全（8 种）。"""
+        for style in (
+            "stars",
+            "diamonds",
+            "circles",
+            "flowers",
+            "snow",
+            "wave",
+            "note",
+            "leaf",
+        ):
+            self.assertIn(style, DIVIDER_STYLES, style)
+            self.assertIn(style, DIVIDER_GLYPHS, style)
+            self.assertTrue(
+                DIVIDER_STYLES[style].startswith(DIVIDER_CLASS + "-"), style
+            )
+            self.assertIn(style, DIVIDER_DECORATIVE, style)
+
+    def test_decorative_divider_survives_sanitize_and_blocks(self):
+        """花样分隔线：清洗保留类名；富文本块还原为规范字形。"""
+        style = "stars"
+        cls = DIVIDER_STYLES[style]
+        out = sanitize_html(f'<p class="{DIVIDER_CLASS} {cls}">X</p>')
+        self.assertIn(f'class="{DIVIDER_CLASS} {cls}"', out)
+        blocks = _html_to_rich_blocks(out)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["kind"], "divider")
+        self.assertEqual(blocks[0]["style"], style)
+        self.assertEqual(blocks[0]["text"], DIVIDER_GLYPHS[style])
+
+    def test_decorative_divider_txt_keeps_glyph(self):
+        """花样分隔线：TXT 导出保留装饰字形。"""
+        for style, cls in DIVIDER_STYLES.items():
+            if style not in DIVIDER_DECORATIVE:
+                continue
+            txt = self._export_text(f'<p class="{DIVIDER_CLASS} {cls}">X</p>', "txt")
+            self.assertIn(DIVIDER_GLYPHS[style], txt, style)
+
+    def test_frontend_divider_contract_matches_backend(self):
+        """前端 ui/app.js 的分隔线样式表/字形个数与后端一致（契约测试）。"""
+        app_js = (Path(__file__).parent / "ui" / "app.js").read_text(encoding="utf-8")
+        for style, cls in DIVIDER_STYLES.items():
+            self.assertIn(cls, app_js, style)
+        m = re.search(r"const DIVIDER_GLYPHS = \{(.*?)\};", app_js, re.S)
+        self.assertIsNotNone(m, "app.js 缺少 DIVIDER_GLYPHS")
+        c = re.search(r"const DIVIDER_COUNTS = \{(.*?)\};", app_js, re.S)
+        self.assertIsNotNone(c, "app.js 缺少 DIVIDER_COUNTS")
+        for style, glyph in DIVIDER_GLYPHS.items():
+            self.assertRegex(m.group(1), rf"\b{style}\s*:", style)
+            mm = re.search(rf"\b{style}\s*:\s*(\d+)", c.group(1))
+            self.assertIsNotNone(mm, style)
+            self.assertEqual(int(mm.group(1)), len(glyph), style)
+
+    def test_divider_menu_has_decorative_entries(self):
+        """矫正界面分隔线菜单提供花样分割符号入口。"""
+        html = correctmanage._UI_HTML
+        for style in ("stars", "diamonds", "circles", "flowers"):
+            self.assertIn(f'data-div="{style}"', html, style)
+
+
 
 
 # 题注段落的固定写法（与 test_imgtxt.CAPTION_TEXT 同源：真实链路上的图注形态）
 CAP_TEXT = "图1示例插图"
 CAP_HTML = '<p class="ptoe-caption">图1示例插图</p>'
-
 
 class TestExportCaption(unittest.TestCase):
     """题注（ptoe-caption）在四种导出格式下的降级与保真（2026-10 图文混合）。
@@ -16799,6 +16993,106 @@ class TestCleanHistoryPages(unittest.TestCase):
         self.assertTrue(res["ok"])
         self.assertEqual(res["cleaned"], 1)
         self.assertEqual(res["changed"], 0)
+
+
+class TestLiveOcrProgress(unittest.TestCase):
+    """实时跟随 OCR 进度（2026-10-21）：转换进行中启动矫正，识别完成的页实时进页。"""
+
+    def _make_state(self):
+        return {
+            # 初始已有一页（用户已载入/编辑过）：不应被实时灌入覆盖
+            "pages": {99: "<p>已有</p>"},
+            "pages_lock": threading.Lock(),
+            "live_ocr_path": None,
+            "live_ocr_pdf": "",
+            "live_version": 0,
+            "live_added": {},
+            "live_done": 0,
+            "live_total": 0,
+            "live_status": "",
+        }
+
+    def _write_progress(self, base: Path, name: str, pages: dict, total: int = 2,
+                        status: str = "running") -> Path:
+        d = base / "data" / name
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / ".ocr_progress.json"
+        f.write_text(
+            json.dumps({"pdf": "x.pdf", "total": total, "status": status, "pages": pages}),
+            encoding="utf-8",
+        )
+        return f
+
+    def test_ocr_progress_files_matches_pdf_stem(self):
+        """按 PDF 名找到 OCR 进度文件。"""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            self._write_progress(base, "book", {"1": {"status": "done", "result": "A"}})
+            with mock.patch("pdfmanage.app_base_dir", return_value=base):
+                files = correctmanage._ocr_progress_files(str(base / "book.pdf"))
+            self.assertEqual(len(files), 1)
+            self.assertEqual(files[0].name, ".ocr_progress.json")
+
+    def test_seed_live_pages_adds_only_done_pages(self):
+        """灌入初始内容：只收 done 页，不覆盖已有页。"""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            f = self._write_progress(
+                base,
+                "book",
+                {
+                    "1": {"status": "done", "result": "第一页"},
+                    "2": {"status": "error", "result": ""},
+                },
+            )
+            state = self._make_state()
+            added = correctmanage._seed_live_pages(state, f)
+            self.assertEqual(added, [1])
+            self.assertIn("第一页", state["pages"][1])
+            self.assertNotIn(2, state["pages"])
+            self.assertEqual(state["live_total"], 2)
+
+    def test_watch_ocr_progress_picks_new_pages(self):
+        """后台轮询：新识别的页进入 state['pages'] 并带版本号。"""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            f = self._write_progress(
+                base,
+                "book",
+                {"1": {"status": "done", "result": "第一页"}},
+                total=2,
+            )
+            state = self._make_state()
+            state["live_ocr_path"] = str(f)
+            state["live_ocr_pdf"] = str(base / "book.pdf")
+            stop = threading.Event()
+            t = threading.Thread(
+                target=correctmanage._watch_ocr_progress,
+                args=(state, stop),
+                daemon=True,
+            )
+            t.start()
+            try:
+                deadline = time.time() + 15
+                while time.time() < deadline and 2 not in state["pages"]:
+                    # 模拟识别推进：写入第 2 页
+                    self._write_progress(
+                        base,
+                        "book",
+                        {
+                            "1": {"status": "done", "result": "第一页"},
+                            "2": {"status": "done", "result": "第二页"},
+                        },
+                        total=2,
+                    )
+                    time.sleep(0.2)
+            finally:
+                stop.set()
+                t.join(timeout=5)
+            self.assertIn(2, state["pages"])
+            self.assertIn("第二页", state["pages"][2])
+            self.assertGreaterEqual(state["live_version"], 1)
+            self.assertIn(2, state["live_added"])
 
 
 if __name__ == "__main__":

@@ -678,3 +678,78 @@ def clean_alnum_spaces(text: str) -> str:
                     text_list[start:end] = list(merged)
         text = "".join(text_list)
     return text
+# 水平空白（不含换行）：半角空格、制表符、全角空格(U+3000)、不换行空格(U+00A0)、
+# Unicode 各类水平空白(U+2000..U+200A)、窄空格(U+202F)、中英文间隔(U+205F)、BOM(U+FEFF)；
+# 另含 OCR/PDF 常见但不可见的字符：软连字符(U+00AD)、蒙古文元音分隔符(U+180E)、
+# 零宽字符/双向控制符(U+200B..U+200F)、词连接符(U+2060)、行/段分隔符(U+2028/U+2029)、
+# NEL(U+0085)。这些字符肉眼不可见却会撑出词间距，一并按空白处理。
+_HSPACE_RE = re.compile(
+    r"[ \t\u00a0\u3000\u2000-\u200a\u202f\u205f\ufeff"
+    r"\u00ad\u180e\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060\u0085]+"
+)
+# 全部空白（含 \r\n 与上述不可见字符）：keep_newlines=False 时使用，
+# 用于把 OCR 段内软换行合并回一个自然段。
+_ALL_WS_RE = re.compile(
+    r"[\s\u00a0\u3000\u2000-\u200a\u202f\u205f\ufeff"
+    r"\u00ad\u180e\u200b-\u200f\u202a-\u202e\u2060]+"
+)
+
+
+def _is_ascii_word_char(ch: str) -> bool:
+    """是否 ASCII 字母/数字（英文单词判定；CJK 字符不算，避免中文被粘连判断影响）。"""
+    return bool(ch) and ch.isascii() and ch.isalnum()
+
+
+def strip_inline_spaces(text: str, keep_word_gap: bool = True,
+                        keep_newlines: bool = True) -> str:
+    """去除段落内的空白字符。
+
+    - ``keep_newlines=True``（默认，兼容旧行为）：**换行符一律保留**，只处理
+      水平空白；用于需要保持逐行排版的段落（如 ``ptoe-align-lines``）。
+    - ``keep_newlines=False``：把段内换行也当作空白一起处理——OCR 的软换行
+      （``《…，\\n投入…》``）会合并回同一行，浏览器不再把换行渲染成词间空隙。
+      这是「智能清理 → 段落中的空白符」的预期语义。
+    - 删除：半角空格、制表符、全角空格(U+3000)、不换行空格(U+00A0)、Unicode
+      水平空白，以及零宽/软连字符等不可见字符（见 ``_HSPACE_RE``）；
+    - ``keep_word_gap=True``：ASCII 字母/数字之间的空白（含换行）折叠为
+      **一个**空格（"hello  \\n world" → "hello world"），其余位置的空白直接删除
+      （中文之间的空格、行首行尾空格、标点前的空格都被删掉）；
+    - ``keep_word_gap=False``：所有空白一律删除（与界面「去空」操作一致）。
+
+    幂等：对同一文本重复处理结果不变。
+    """
+    if not text:
+        return ""
+    if not keep_newlines:
+        if not keep_word_gap:
+            return _ALL_WS_RE.sub("", text)
+
+        def _repl_all(m, _text=text):
+            before = _text[m.start() - 1] if m.start() > 0 else ""
+            after = _text[m.end()] if m.end() < len(_text) else ""
+            if _is_ascii_word_char(before) and _is_ascii_word_char(after):
+                return " "
+            return ""
+
+        return _ALL_WS_RE.sub(_repl_all, text)
+    parts = re.split(r"(\r\n|\r|\n)", text)
+    out = []
+    for idx, part in enumerate(parts):
+        if idx % 2 == 1:  # 捕获组：换行分隔符，原样保留
+            out.append(part)
+            continue
+        if not part:
+            continue
+        if not keep_word_gap:
+            out.append(_HSPACE_RE.sub("", part))
+            continue
+
+        def _repl(m, _part=part):
+            before = _part[m.start() - 1] if m.start() > 0 else ""
+            after = _part[m.end()] if m.end() < len(_part) else ""
+            if _is_ascii_word_char(before) and _is_ascii_word_char(after):
+                return " "
+            return ""
+
+        out.append(_HSPACE_RE.sub(_repl, part))
+    return "".join(out)

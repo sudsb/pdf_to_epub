@@ -21,6 +21,10 @@
 - batch_infer 返回形状与 llamamanage.batch_infer 完全一致：
   [{page, result, error}, ...]（按页码排序），失败不抛异常、逐页捕获，
   使 mian 的结构化/断点续传/进度文件逻辑零改动复用。
+- 检测分辨率解耦（2026-10，配置键 config.json 的 paddle_det_limit，默认 960）：
+  检测耗时与输入像素数成正比，识别则把每条裁切线统一缩到 48px 高，所以检测
+  降分辨率几乎不影响总耗时结构。默认按最长边 960 缩放检测输入（0=关闭），
+  200dpi 密排书实测 det 143ms→41ms、整页 656ms→522ms，相对 CER 0.85%。
 """
 
 from __future__ import annotations
@@ -144,6 +148,11 @@ _FALLBACK_LINE_HEIGHT = 20.0
 # 保持三个消费方对 paddle_merge_lines 的解释完全一致。
 _BOOL_TRUE_WORDS = ("true", "1", "on", "yes")
 _BOOL_FALSE_WORDS = ("false", "0", "off", "no")
+
+# 检测阶段最长边上限（paddle_det_limit）：默认 960，0=关闭，上限防御性截断。
+# 960 在 200dpi 密排书实测 det 143ms→41ms，整页 656ms→522ms，相对 CER 0.85%。
+_DEFAULT_DET_LIMIT = 960
+_DET_LIMIT_MAX = 4000
 
 # 句末标点：当前行 strip 后的末字符命中 → 判定为句子/段落结束，不与下一行合并
 _SENTENCE_END = frozenset("。！？；：.!?;:)）】」』》〉\"'”")
@@ -471,6 +480,43 @@ def _read_merge_lines_setting() -> bool:
     return True
 
 
+def _read_det_limit_setting() -> int:
+    """读取 config.json 的 paddle_det_limit（每批只读一次）。
+
+    返回检测阶段最长边上限；0 = 关闭（按原图分辨率检测）。键缺失/非法值/
+    读取异常一律回退默认 960（headless、损坏配置都不能让 OCR 挂掉）。
+    惰性导入 configmanage，避免模块顶层循环依赖；show_dialogs=False 免弹窗。
+    """
+    try:
+        from configmanage import get_config
+
+        cfg = get_config(show_dialogs=False)
+    except Exception:
+        return _DEFAULT_DET_LIMIT
+    if not isinstance(cfg, dict):
+        return _DEFAULT_DET_LIMIT
+    raw = cfg.get("paddle_det_limit", _DEFAULT_DET_LIMIT)
+    try:
+        limit = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return _DEFAULT_DET_LIMIT
+    if limit < 0:
+        return _DEFAULT_DET_LIMIT
+    return min(limit, _DET_LIMIT_MAX)
+
+
+def det_kwargs_for(limit: int) -> dict[str, Any]:
+    """把 paddle_det_limit 转成 PaddleOCR 3.x 的 predict() 关键字参数。
+
+    limit<=0 时返回空 dict（不干预，检测按原图分辨率）。PaddleX 的
+    limit_side_len 默认是 64/min，对整页扫描件等于「不缩放」，所以必须显式
+    传 max + 目标边长才能让检测真正降分辨率。
+    """
+    if limit is None or limit <= 0:
+        return {}
+    return {"text_det_limit_side_len": int(limit), "text_det_limit_type": "max"}
+
+
 def _page_text(outs, merge_lines: bool) -> str:
     """一页 predict() 输出 → 最终文本（merge_lines 开时走「文本行合并成段落」）。"""
     fallback = "\n".join(_plain_texts(outs))  # 旧的逐行行为，作为兜底基准
@@ -520,6 +566,7 @@ def batch_infer(
     results: list[dict[str, Any]] = []
     # 配置每批只读一次：避免逐页 get_config() 锁竞争 + tkinter 弹窗（仓库约定）
     merge_lines = _read_merge_lines_setting()
+    det_kwargs = det_kwargs_for(_read_det_limit_setting())
 
     def _item_page(item: Any, idx: int) -> int:
         if isinstance(item, dict):
@@ -567,7 +614,7 @@ def batch_infer(
         try:
             if not path or not os.path.isfile(path):
                 raise FileNotFoundError(f"页面图片不存在：{path}")
-            outs = predictor.predict(path)
+            outs = predictor.predict(path, **det_kwargs)
             entry["result"] = _page_text(outs, merge_lines)
         except Exception as exc:  # 逐页捕获：单页失败不中断整批
             entry["error"] = str(exc)
