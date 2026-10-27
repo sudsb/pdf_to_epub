@@ -27,9 +27,6 @@
     （RNN/注意力等），本程序的检测+识别流程实测不会触发。若你后续要跑更强模型
     （如文档方向分类/版面分析）并遇到 CUDNN 报错，加此开关重打包即可。
 
-.PARAMETER SkipSmokeTest
-    跳过打包后的 `ptoe.exe --version` 启动冒烟测试。
-
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\0pack.ps1
 .EXAMPLE
@@ -45,7 +42,6 @@ param(
     [switch]$OneFile,
     [switch]$NoPaddle,
     [switch]$KeepCudnnAdv,
-    [switch]$SkipSmokeTest,
     [string]$Name = 'ptoe'
 )
 
@@ -162,20 +158,6 @@ else {
                 exit 1
             }
         }
-    }
-}
-
-# ---------------------------------------------------------------
-# 启动冒烟测试：确认 exe 能起来（版本号同时验证 pyproject.toml 已打入）
-# ---------------------------------------------------------------
-if (-not $SkipSmokeTest) {
-    Write-Host "==> 冒烟测试：$Name.exe --version" -ForegroundColor Cyan
-    $verOut = & $exePath --version 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host ("    OK：{0}" -f ($verOut | Out-String).Trim()) -ForegroundColor Green
-    }
-    else {
-        Write-Host "    [警告] 冒烟测试失败（退出码 $LASTEXITCODE）：$verOut" -ForegroundColor Yellow
     }
 }
 

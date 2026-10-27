@@ -8805,6 +8805,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 LINE_NUM_SIZE_CHOICES,
                 CLEAN_SYMBOL_MAP_DEFAULT,
                 CLEAN_DIGIT_PUNCT_MAP_DEFAULT,
+                _CLEAN_DIGIT_PUNCT_MAP_MAX_ITEMS,
             )
 
             if self.command == "GET":
@@ -9048,6 +9049,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                 "clean_md_tags",
                 "clean_html_tags",
                 "clean_paragraphs",
+                "clean_digit_punct",
                 "brush_merge_on_leave",
                 "clean_blank_lines",
                 "clean_spaces",
@@ -9074,6 +9076,27 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     self._send(400, self._json({"ok": False, "error": "clean_symbol_map 最多 32 项"}), "application/json; charset=utf-8")
                     return
                 clean["clean_symbol_map"] = [list(p) for p in v]
+            if "clean_digit_punct_map" in ui:
+                v = ui["clean_digit_punct_map"]
+                if not isinstance(v, list) or not v:
+                    self._send(400, self._json({"ok": False, "error": "clean_digit_punct_map 必须是数组"}), "application/json; charset=utf-8")
+                    return
+                _seen = set()
+                for item in v:
+                    if (
+                        not isinstance(item, list)
+                        or len(item) != 2
+                        or not all(isinstance(x, str) and x for x in item)
+                        or len(item[0]) != 1
+                        or item[0] in _seen
+                    ):
+                        self._send(400, self._json({"ok": False, "error": "clean_digit_punct_map 格式无效（每项为 [单字符源, 目标] 非空字符串，源不可重复）"}), "application/json; charset=utf-8")
+                        return
+                    _seen.add(item[0])
+                if len(v) > _CLEAN_DIGIT_PUNCT_MAP_MAX_ITEMS:
+                    self._send(400, self._json({"ok": False, "error": "clean_digit_punct_map 最多 %d 项" % _CLEAN_DIGIT_PUNCT_MAP_MAX_ITEMS}), "application/json; charset=utf-8")
+                    return
+                clean["clean_digit_punct_map"] = [list(p) for p in v]
             set_ui_settings(clean)
             self._send(200, self._json({"ok": True}), "application/json; charset=utf-8")
         except Exception as e:  # noqa: BLE001

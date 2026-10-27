@@ -104,6 +104,18 @@ assert.strictEqual(api._parseCmdLine('s2 简体').verb, 's2', 's2 应为普通�
 assert.strictEqual(api._parseCmdLine('s/旧/新/').verb, 's', 's/旧/新/ 特判不变');
 assert.strictEqual(api._parseCmdLine('/关键词').kind, 'search', '/搜索 不变');
 
+// 清空页范围：动词后的 N-M/+X 作为 args，不能误判成行范围前缀
+const clearRange = api._parseCmdLine('清空 2-8');
+assert.strictEqual(clearRange.verb, '清空');
+assert.strictEqual(clearRange.args, '2-8');
+assert.strictEqual(clearRange.loc, null, '清空 2-8 的 2-8 是页范围参数，不是行定位');
+const clearPlus = api._parseCmdLine('清空 +3');
+assert.strictEqual(clearPlus.args, '+3');
+assert.strictEqual(clearPlus.loc, null, '清空 +3 的 +3 是页范围参数');
+const clearLines = api._parseCmdLine('7,10清空');
+assert.strictEqual(clearLines.verb, '清空');
+assert.ok(clearLines.loc && clearLines.loc.line === 7, '旧语法 7,10清空 仍解析为行范围');
+
 // 简写候选进 suggest（简写项指向目标 desc）
 const suggestSrc = cut('function _cmdSuggestItems()', '\n}');
 assert.ok(/_CMD_SHORT_ALIASES/.test(suggestSrc), '候选表应包含简写追加逻辑');

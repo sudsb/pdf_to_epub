@@ -169,6 +169,18 @@ class TestPopupHiddenWhileDragging(unittest.TestCase):
             r"document\.addEventListener\('drop', function \(\) \{\s*_endDragUi\(\);\s*\}, true\);",
         )
 
+    def test_drag_gesture_requires_point_inside_selection(self):
+        # 旧选区仍在、用户在新位置重新拖选时，不能误判为“拖动已选文字”
+        self.assertIn("function _pointInRange(x, y, range)", self.js)
+        self.assertIn("range.getClientRects()", self.js)
+        self.assertIn("ed.contains(range.commonAncestorContainer)", self.js)
+        self.assertIn("_pointInRange(e.clientX, e.clientY, range)", self.js)
+        # 正文左键按下先收起菜单，拖动/重新选择文字时菜单不挡落点
+        m = self.js.find("_dragGesture = _dragGestureTarget(e)")
+        self.assertGreaterEqual(m, 0)
+        block = self.js[max(0, m - 400):m]
+        self.assertIn("if (ed) hidePopup();", block)
+
     def test_custom_drag_handles_enter_drag_state(self):
         for snippet in (
             "_beginDragUi(); // 尺寸拖拽期间不弹选中文字菜单",

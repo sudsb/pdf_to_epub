@@ -61,6 +61,36 @@ class CleanRangeStaticTest(unittest.TestCase):
         self.assertIn('_cmdCleanSpec(ctx.ed, ctx.args)', entry)
         self.assertIn('无参数=当前页', entry, '用法说明应写明无参数=当前页')
 
+    # ---------- C1b：命令行「清空」页范围 ----------
+    def test_cmd_clear_spec_uses_page_range(self):
+        src = self.src
+        self.assertIn('function _cmdClearSpec(', src)
+        body = function_body(src, '_cmdClearSpec')
+        self.assertIn('_cmdPageSpecIndices(args, currentPageIndex(ed))', body,
+                      '清空应复用页范围解析，基准页取当前页（光标页优先）')
+        self.assertIn('_cmdClearPages(ps.indices);', body)
+        self.assertIn('页范围无效', body, '非法范围要有提示')
+        self.assertIn('未找到匹配的页', body, '空范围要有提示')
+
+    def test_clear_builtin_registered(self):
+        src = self.src
+        self.assertIn("keys: ['clear', '清空', '清除', 'empty']", src)
+        i = src.index("keys: ['clear', '清空', '清除', 'empty']")
+        entry = src[i:i + 900]
+        self.assertIn('global: true', entry, '清空无需正文焦点（默认当前选中页）')
+        self.assertIn('_cmdClearSpec(ctx.ed, ctx.args)', entry)
+        self.assertIn('ctx.spec.loc', entry, '行范围前缀语法应继续按行清空')
+        self.assertIn('_cmdClearRange(ctx.ed, blocks, idxs)', entry)
+        self.assertIn('无参数=当前页', entry, '用法说明应写明无参数=当前页')
+
+    def test_clear_pages_updates_offscreen_sources(self):
+        body = function_body(self.src, '_cmdClearPages')
+        self.assertIn("histRun('清空页面', uniq", body, '多页清空应合并为一次撤销')
+        self.assertIn("contentMap.set(i, '')", body, '离屏页也必须从 contentMap 清空')
+        self.assertIn("mdSourceMap.set(i, '')", body, 'Markdown 模式源串也要清空')
+        self.assertIn('syncContent(ed)', body, '已挂载页清空后同步回源串')
+        self.assertIn('scheduleRemeasure(i)', body, '清空后重测行高')
+
     # ---------- C2：工具栏按钮仍清全部页 ----------
     def test_toolbar_clean_all_pages(self):
         src = self.src
@@ -149,8 +179,10 @@ eq(F._cmdPageSpecIndices('当前', 0), { indices: [0] }, '当前 = 基准页（0
 eq(F._cmdPageSpecIndices('.', 5), { indices: [5] }, '. = 当前页');
 eq(F._cmdPageSpecIndices('全部', 5).indices.length, 20, '全部 = 整本');
 eq(F._cmdPageSpecIndices('+10', 5), { indices: [5,6,7,8,9,10,11,12,13,14] }, '+X = 当前页起 X 页');
+eq(F._cmdPageSpecIndices('+3', 5), { indices: [5,6,7] }, '清空 +3 = 当前页起共 3 页');
 eq(F._cmdPageSpecIndices('+10', 17).indices, [17,18,19], '+X 触底截断');
 eq(F._cmdPageSpecIndices('17', 0), { indices: [16] }, 'N = 原书页号优先匹配');
+eq(F._cmdPageSpecIndices('2-8', 0).indices, [1,2,3,4,5,6,7], '清空 2-8 = 原书第 2~8 页');
 eq(F._cmdPageSpecIndices('17-100', 0).indices, [16,17,18,19], 'N-M = 页号区间（触底截断）');
 eq(F._cmdPageSpecIndices('3~5', 0).indices, [2,3,4], 'N~M 区间');
 eq(F._cmdPageSpecIndices('5-3', 0).indices, [2,3,4], '反序区间自动交换');

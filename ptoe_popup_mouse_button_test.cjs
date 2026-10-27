@@ -101,6 +101,18 @@ function mdown(el, button, opts) {
   el.dispatchEvent(ev);
   return ev;
 }
+function mup(el, button, opts) {
+  const init = Object.assign({ bubbles: true, cancelable: true, button: button }, opts || {});
+  const ev = new w.MouseEvent('mouseup', init);
+  el.dispatchEvent(ev);
+  return ev;
+}
+function aux(el, button, opts) {
+  const init = Object.assign({ bubbles: true, cancelable: true, button: button }, opts || {});
+  const ev = new w.MouseEvent('auxclick', init);
+  el.dispatchEvent(ev);
+  return ev;
+}
 
 setTimeout(run, 60);
 
@@ -191,11 +203,57 @@ function run() {
   console.log('\n== 5. 快捷键：侧键派发 ==');
   const rev = S.reverseBindings();
   A(rev['Mouse4'] === 'italic', '反向表可由侧键1查到操作 (' + rev['Mouse4'] + ')');
-  mdown(doc.body, 3);
+  const evDown = mdown(doc.body, 3);
   A(runLog().indexOf('italic') !== -1, '按侧键1 派发绑定的操作 (' + JSON.stringify(runLog()) + ')');
+  A(evDown.defaultPrevented, '已绑定侧键按下时拦截浏览器后退/前进');
+  clearLogs();
+  mup(doc.body, 3);
+  A(runLog().length === 0, '同一按压的 mouseup 不重复派发 (' + JSON.stringify(runLog()) + ')');
   clearLogs();
   mdown(doc.body, 4);
   A(runLog().indexOf('underline') !== -1, '按侧键2 派发绑定的操作 (' + JSON.stringify(runLog()) + ')');
+  clearLogs();
+
+  console.log('\n== 5b. 侧键兜底：只上报 mouseup + 未绑定不拦截 ==');
+  mup(doc.body, 4); // 结束上一段 mousedown 按压
+  aux(doc.body, 4);
+  clearLogs();
+  // 某些内嵌浏览器只在 mouseup 阶段上报侧键：此时也必须派发一次
+  mup(doc.body, 4);
+  A(runLog().length === 1 && runLog()[0] === 'underline', 'mouseup-only 侧键派发一次 (' + JSON.stringify(runLog()) + ')');
+  aux(doc.body, 4);
+  A(runLog().length === 1, '紧随其后的 auxclick 不重复派发 (' + JSON.stringify(runLog()) + ')');
+  clearLogs();
+  // auxclick 已结束本次按压，下一次 mouseup-only 仍应生效（不能被 500ms 去重吃掉）
+  mup(doc.body, 4);
+  A(runLog().length === 1, '下一次 mouseup-only 点击仍生效 (' + JSON.stringify(runLog()) + ')');
+  clearLogs();
+
+  // 未绑定侧键：保留系统默认后退/前进，不 preventDefault
+  S.setBinding('italic', '');
+  const evUnbound = mdown(doc.body, 3);
+  A(runLog().length === 0, '未绑定侧键不派发操作');
+  A(!evUnbound.defaultPrevented, '未绑定侧键不拦截浏览器默认行为');
+  const evUnboundUp = mup(doc.body, 3);
+  A(!evUnboundUp.defaultPrevented, '未绑定侧键 mouseup 不拦截默认行为');
+  S.setBinding('italic', 'Mouse4');
+  clearLogs();
+
+  // 长按侧键：mousedown 已派发后，超过 500ms 的 mouseup 也不能再次触发
+  const realNow = Date.now;
+  let fakeNow = realNow();
+  Date.now = function () { return fakeNow; };
+  try {
+    mdown(doc.body, 3);
+    A(runLog().length === 1, '长按侧键：mousedown 派发一次');
+    fakeNow += 5000;
+    mup(doc.body, 3);
+    A(runLog().length === 1, '长按侧键：超时 mouseup 不重复派发 (' + JSON.stringify(runLog()) + ')');
+    aux(doc.body, 3);
+    A(runLog().length === 1, '长按侧键：超时 auxclick 不重复派发');
+  } finally {
+    Date.now = realNow;
+  }
   clearLogs();
 
   console.log('\n== 6. 快捷键表渲染：侧键显示为中文名 ==');

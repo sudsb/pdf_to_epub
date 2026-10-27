@@ -3922,6 +3922,63 @@ document.addEventListener('dragend', function () {
   _dragBlkEd = null;
   _endDragUi();
 });
+
+// ---------- 拖拽手势兜底：文字拖拽时原生 dragstart 可能不触发 ----------
+// 原生 dragstart 对“拖动选中文字”的触发不可靠，若不触发则 _dragUiActive 从未置位，
+// mouseup 的 maybeShowPopup 就会在拖拽结束后误弹选中菜单，遮住落点并干扰拖拽。
+// 这里以 mousedown 时存在非折叠选区 + mousemove 超过阈值作为拖拽判定，
+// 确保拖拽期间选中悬浮菜单始终隐藏；松手后短暂抑制，避免补发的 mouseup 误弹。
+let _dragGesture = null; // {x, y}：左键按下在选区内的起点，用于判定是否进入拖拽
+const DRAG_GESTURE_THRESHOLD = 3;
+function _pointInRange(x, y, range) {
+  let rects = null;
+  try { rects = range.getClientRects(); } catch (err) { return false; }
+  if (!rects || !rects.length) return false;
+  // 2px 容差：点在选择区边缘/行间时仍按“拖动已选文字”处理
+  for (let i = 0; i < rects.length; i++) {
+    const r = rects[i];
+    if (x >= r.left - 2 && x <= r.right + 2 && y >= r.top - 2 && y <= r.bottom + 2) return true;
+  }
+  return false;
+}
+function _dragGestureTarget(e) {
+  const t = e.target;
+  if (!t || !t.closest) return false;
+  const ed = t.closest('.editable');
+  if (!ed) return false;
+  if (e.button !== 0) return false;
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount || sel.isCollapsed) return false;
+  const range = sel.getRangeAt(0);
+  // 选区必须属于当前编辑区，且按下点落在选区的实际矩形内——否则用户只是在新位置
+  // 重新拖选文字（旧选区还在），不能误判成“拖动已选文字”，否则 mouseup 会抑制菜单。
+  if (!ed.contains(range.commonAncestorContainer)) return false;
+  return _pointInRange(e.clientX, e.clientY, range);
+}
+document.addEventListener('mousedown', function (e) {
+  // 左键在正文按下时先收起选中菜单：开始拖动/重新选择文字时菜单不应挡住落点。
+  if (e.button === 0) {
+    const t = e.target;
+    const ed = (t && t.closest) ? t.closest('.editable') : null;
+    if (ed) hidePopup();
+  }
+  _dragGesture = _dragGestureTarget(e) ? { x: e.clientX, y: e.clientY } : null;
+}, true);
+document.addEventListener('mousemove', function (e) {
+  if (!_dragGesture) return;
+  const dx = Math.abs(e.clientX - _dragGesture.x);
+  const dy = Math.abs(e.clientY - _dragGesture.y);
+  if (dx > DRAG_GESTURE_THRESHOLD || dy > DRAG_GESTURE_THRESHOLD) {
+    _beginDragUi(); // 确认进入拖拽：收起选中菜单，拖拽期间不再弹出
+    _dragGesture = null;
+  }
+}, true);
+document.addEventListener('mouseup', function () {
+  _dragGesture = null;
+  if (_dragUiActive) _endDragUi(); // 拖拽结束：退出拖拽态并短暂抑制选中菜单
+}, true);
+document.addEventListener('dragend', function () { _dragGesture = null; });
+document.addEventListener('drop', function () { _dragGesture = null; });
 // 文字拖放落点脉冲（2026-10）：原生文字拖放行为不变，仅在落点块上播一次背景脉冲。
 // 图片拖放走上方专用路径（clone 已单独脉冲），这里跳过；OS 文件拖放不落在块内也不闪。
 document.addEventListener('drop', function (e) {
@@ -4263,9 +4320,11 @@ function _boundaryBlockInRange(ed, node, isEnd) {
 
 function applyToSelectedBlocks(ed, fn) {
   // If IME composition in progress, queue operation to run after compositionend
-  if (typeof isComposing !== 'undefined' && isComposing) {
+  if ((typeof isComposing !== 'undefined' && isComposing) || (window.isComposing)) {
     _pendingOps.push(() => applyToSelectedBlocks(ed, fn));
     showToast('输入法中，已将操作排队，输入结束后自动应用', 'warn');
+    // Failsafe: auto-flush after 3 seconds if stuck
+    setTimeout(() => { if (window._pendingOps && window._pendingOps.length > 0 && window.isComposing) { window.isComposing = false; _flushPendingOps(); } }, 3000);
     return [];
   }
   // 多段选择（Ctrl+点击）模式：集合非空 → 跳过选区解析，对集合内所有块逐一应用。
@@ -10125,7 +10184,7 @@ document.addEventListener('mouseup', (e) => {
 document.addEventListener('mousedown', function (e) {
   if (e.button === 0 && (e.ctrlKey || e.metaKey)) {
     // 中键手势捕获/格式刷/输入法期间不介入
-    if (_midCapture || mouseCapturingOp || paintActive || (typeof isComposing !== 'undefined' && isComposing)) return;
+    if (_midCapture || mouseCapturingOp || paintActive || (typeof isComposing !== 'undefined' && isComposing) || window.isComposing) return;
     const block = _multiSelBlockFromEvent(e);
     if (!block) return;
     e.preventDefault();             // 阻止默认选中文本/拖拽
@@ -13515,9 +13574,10 @@ function _mergeBlockList(target, blocks) {
 
 function _mergeSelectedBlocks(ed) {
   // 合并选区内所有块到第一个块（段落合并）
-  if (typeof isComposing !== 'undefined' && isComposing) {
+  if ((typeof isComposing !== 'undefined' && isComposing) || (window.isComposing)) {
     _pendingOps.push(() => _mergeSelectedBlocks(ed));
     showToast('输入法中，已将操作排队，输入结束后自动应用', 'warn');
+    setTimeout(() => { if (window._pendingOps && window._pendingOps.length > 0 && window.isComposing) { window.isComposing = false; _flushPendingOps(); } }, 3000);
     return;
   }
   const sel = window.getSelection();
@@ -14323,7 +14383,18 @@ const _CMD_FORMAT_OPS = new Set([
 const _CMD_BUILTINS = [
   { keys: ['merge', '合并', '合'], desc: '合并行范围（至少两行）', example: '7,10merge', usage: '[范围]merge' },
   { keys: ['delete', '删除', '删', 'd', 'x'], desc: '删除行范围', example: '7,10删除', usage: '[范围]删除' },
-  { keys: ['clear', '清空', '清除', 'empty'], desc: '清空行范围（保留空行）', example: '7,10清空', usage: '[范围]清空' },
+  { keys: ['clear', '清空', '清除', 'empty'], desc: '清空页内容（无参数=当前页；N / N-M / +X / 全部）', example: '清空 2-8', usage: '清空 [N ｜ N-M ｜ +X ｜ 当前 ｜ 全部]（无参数=当前页）；7,10清空 = 清空行', global: true, run: function (ctx) {
+    // 保留旧语法：行范围前缀（如 7,10清空 / %清空）仍按行清空
+    if (ctx.spec && ctx.spec.loc) {
+      if (!ctx.ed) { showToast('没有聚焦的页面，命令未执行', 'warn'); return; }
+      const blocks = ctx.blocks || _cmdLineBlocks(ctx.ed);
+      const idxs = _cmdResolveRange(ctx.ed, ctx.spec.loc, blocks);
+      if (!idxs || !idxs.length) { showToast('行范围无有效行（本页共 ' + blocks.length + ' 行）', 'warn'); return; }
+      _cmdClearRange(ctx.ed, blocks, idxs);
+      return;
+    }
+    _cmdClearSpec(ctx.ed, ctx.args);
+  } },
   { keys: ['replace', '替换', '改', 'r'], desc: '替换行内容 / s旧新 正则替换', example: '7替换 新文本', usage: '[范围]替换 新文本 ｜ [范围]s/旧/新/g' },
   { keys: ['format', '格式', '套用'], desc: '对范围套用格式名', example: '7,10format 加粗', usage: '[范围]format 格式名' },
   { keys: ['页', '页面', 'page'], desc: '全局跳转到原书页号（无需聚焦正文）', example: '页 12', usage: '页 N', global: true, run: function (ctx) {
@@ -15284,6 +15355,38 @@ async function _cmdCleanSpec(ed, args) {
   if (!ps.indices.length) { showToast('未找到匹配的页', 'warn'); return; }
   await cleanPages(ps.indices);
 }
+// 命令行「清空」：无参数 = 当前页；N / N-M / +X / 当前 / 全部（与清理同款页范围）。
+function _cmdClearSpec(ed, args) {
+  const ps = _cmdPageSpecIndices(args, currentPageIndex(ed));
+  if (ps === null) { showToast('页范围无效（如 清空 12 / 12-15 / +3 / 当前 / 全部）', 'warn'); return; }
+  if (!ps.indices.length) { showToast('未找到匹配的页', 'warn'); return; }
+  _cmdClearPages(ps.indices);
+}
+function _cmdClearPages(indices) {
+  const uniq = [];
+  const seen = new Set();
+  for (const i of (indices || [])) {
+    if (i >= 0 && i < pages.length && !seen.has(i)) { seen.add(i); uniq.push(i); }
+  }
+  if (!uniq.length) { showToast('未找到匹配的页', 'warn'); return; }
+  histRun('清空页面', uniq, function () {
+    for (const i of uniq) {
+      // 直接写页面源串：离屏页没有挂载 DOM，也必须清空，否则滚动回来仍是旧内容
+      contentMap.set(i, '');
+      mdSourceMap.set(i, '');
+      markDirty(i);
+      const row = host.querySelector('.page-row[data-i="' + i + '"]');
+      if (!row) continue;
+      const ed = row.querySelector('.editable');
+      if (!ed) continue;
+      ed.innerHTML = '';
+      syncContent(ed);
+      scheduleRemeasure(i);
+    }
+  });
+  hidePopup();
+  showToast(uniq.length === 1 ? '已清空第 ' + pages[uniq[0]].page + ' 页内容' : '已清空 ' + uniq.length + ' 页内容', 'ok');
+}
 async function _cmdReocrSpec(ed, args) {
   const ps = _cmdPageSpecIndices(args, _cmdPageIndex(ed));
   if (ps === null) { showToast('页范围无效（如 重识别 12 / 12-15 / +3 / 全部）', 'warn'); return; }
@@ -16220,28 +16323,60 @@ function _handleSideButton(e, sb) {
   if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
   runOp(op);
 }
-// 记录最近一次已处理的侧键：auxclick 兜底时避免与 mousedown 重复触发
+// 记录最近一次已处理的侧键：mouseup/auxclick 兜底时避免与 mousedown 重复触发
 let _lastSideBtnName = '';
 let _lastSideBtnAt = 0;
-document.addEventListener('mousedown', (e) => {
-  const sb = _sideButtonOf(e);
-  if (!sb) return;
-  e.preventDefault();
-  _lastSideBtnName = sb.name;
-  _lastSideBtnAt = Date.now();
-  _handleSideButton(e, sb);
-}, true);
-// 兜底：部分内嵌浏览器（WebView2 / 某些鼠标驱动）只在 mouseup/auxclick 阶段上报侧键，
-// 这里补一个 auxclick 监听；若 mousedown 已处理过同一个侧键则跳过，避免重复触发。
-document.addEventListener('auxclick', (e) => {
-  const sb = _sideButtonOf(e);
-  if (!sb) return;
-  e.preventDefault();
+const _sideBtnDown = Object.create(null); // 记录本次按压是否已由 mousedown 派发
+function _sideButtonBound(sb) {
+  return !!(sb && reverseBindings()[sb.name]);
+}
+// 只有「已绑定 / 正在捕获」时才拦截浏览器默认的后退/前进；未绑定侧键保留系统行为。
+function _sideButtonPrevent(sb) {
+  return !!(capturingOp || mouseCapturingOp || _sideButtonBound(sb));
+}
+function _sideButtonDispatch(e, sb, isDown) {
+  if (_sideButtonPrevent(sb)) e.preventDefault();
+  if (isDown) {
+    // 每一次真实按下都视为新的一次点击（即使紧接着上一次，也不能被去重吃掉）
+    _sideBtnDown[sb.name] = true;
+    _lastSideBtnName = sb.name;
+    _lastSideBtnAt = Date.now();
+    _handleSideButton(e, sb);
+    return;
+  }
   const now = Date.now();
-  if (sb.name === _lastSideBtnName && now - _lastSideBtnAt < 500) return;
+  if (_sideBtnDown[sb.name]) {
+    // 同一物理按压：mousedown 已派发，后续 mouseup/auxclick 无论按住多久都不再触发
+    _sideBtnDown[sb.name] = false;
+    _lastSideBtnName = sb.name;
+    _lastSideBtnAt = now;
+    return;
+  }
+  if (sb.name === _lastSideBtnName && now - _lastSideBtnAt < 500) {
+    // 同一物理按键的后续阶段：跳过重复派发。部分浏览器只在 mouseup 上报侧键，
+    // 此时 auxclick 是本次按压的最后一个阶段，清掉时间戳让下一次 mouseup 能正常触发。
+    if (e.type === 'auxclick') _lastSideBtnAt = 0;
+    return;
+  }
   _lastSideBtnName = sb.name;
   _lastSideBtnAt = now;
   _handleSideButton(e, sb);
+}
+// 三个阶段都监听：不同浏览器/鼠标驱动上报侧键的阶段不一致（mousedown / mouseup / auxclick）。
+document.addEventListener('mousedown', (e) => {
+  const sb = _sideButtonOf(e);
+  if (!sb) return;
+  _sideButtonDispatch(e, sb, true);
+}, true);
+document.addEventListener('mouseup', (e) => {
+  const sb = _sideButtonOf(e);
+  if (!sb) return;
+  _sideButtonDispatch(e, sb, false);
+}, true);
+document.addEventListener('auxclick', (e) => {
+  const sb = _sideButtonOf(e);
+  if (!sb) return;
+  _sideButtonDispatch(e, sb, false);
 }, true);
 
 document.addEventListener('keydown', (e) => {
@@ -17502,9 +17637,21 @@ window.addEventListener('pagehide', () => { navigator.sendBeacon('/api/gone'); }
 // IME composition guard and pending ops queue（顶层注册，避免依赖 setMdMode 调用）
 window.isComposing = false;
 window._pendingOps = [];
-function _flushPendingOps() { while (window._pendingOps.length) { const f = window._pendingOps.shift(); try { f(); } catch (e) { console.error('pending op failed', e); } } }
-document.addEventListener('compositionstart', () => { window.isComposing = true; });
-document.addEventListener('compositionend', () => { window.isComposing = false; _flushPrPending(); setTimeout(_flushPendingOps, 0); });
+window._lastCompositionStart = 0;
+function _flushPendingOps() { 
+  // Failsafe: if composition state stuck for too long, clear it
+  if (window.isComposing && window._lastCompositionStart && (Date.now() - window._lastCompositionStart > 30000)) {
+    window.isComposing = false;
+  }
+  while (window._pendingOps.length) { const f = window._pendingOps.shift(); try { f(); } catch (e) { console.error('pending op failed', e); } } 
+}
+document.addEventListener('compositionstart', () => { window.isComposing = true; window._lastCompositionStart = Date.now(); });
+document.addEventListener('compositionend', () => { window.isComposing = false; window._lastCompositionStart = 0; _flushPrPending(); setTimeout(_flushPendingOps, 0); });
+// Also flush on blur and visibility change as failsafes
+window.addEventListener('blur', () => { if (window.isComposing) { window.isComposing = false; window._lastCompositionStart = 0; setTimeout(_flushPendingOps, 0); } });
+document.addEventListener('visibilitychange', () => { if (document.hidden && window.isComposing) { window.isComposing = false; window._lastCompositionStart = 0; setTimeout(_flushPendingOps, 0); } });
+// Periodic failsafe check
+setInterval(() => { if (window._pendingOps.length > 0) { _flushPendingOps(); } }, 2000);
 
 // ---------- 宽度基准动态行高 ----------
 // 行高由左侧图片按栏宽等比撑出（服务端 /api/pages 下发各页原始宽高 w/h）。

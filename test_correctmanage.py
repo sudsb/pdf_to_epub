@@ -10003,6 +10003,53 @@ class TestUiSettingsEndpoint(unittest.TestCase):
         finally:
             self._stop(server)
 
+    def test_post_persists_clean_digit_punct_settings(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            payload = {
+                "ui_settings": {
+                    "clean_digit_punct": False,
+                    "clean_digit_punct_map": [["。", "-"], ["，", ","]],
+                }
+            }
+            res = requests.post(base + "/api/ui_settings", data=_json.dumps(payload)).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(
+                calls,
+                [{
+                    "clean_digit_punct": False,
+                    "clean_digit_punct_map": [["。", "-"], ["，", ","]],
+                }],
+                "数字标点开关与映射表都必须落盘（此前被 POST 校验丢弃）",
+            )
+        finally:
+            self._stop(server)
+
+    def test_post_bad_clean_digit_punct_map_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"clean_digit_punct_map": [["--", "-"]]}}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("格式无效", res["error"])
+            self.assertEqual(calls, [], "非法映射表不应落盘")
+        finally:
+            self._stop(server)
+
     def test_post_non_dict_400(self):
         import json as _json
 
