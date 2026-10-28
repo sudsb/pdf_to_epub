@@ -968,38 +968,96 @@ function _injectFloatLayoutUI() {
 // 命令行（2026-10）样式：底栏 + 输入框 + 候选提示。与 correctmanage 的界面同源视觉
 // （玻璃拟态/圆角/accent 色），样式从 app.js 注入（与 multiSel/mouseShortcut 同模式），
 // 避免为一个小组件回改 _UI_HTML 的巨型 <style>。
+// 2026-10-28 美化：顶部 accent 细线标识、输入胶囊前缀、ghost 补全预览、候选面板改为
+// 贴在底栏上方的浮层（圆角/分组标题/类型徽标/命中高亮/头部信息条 + 高度自适应按钮）。
 (function injectCmdLineStyles() {
   if (document.getElementById('cmdLineStyles')) return;
   const st = document.createElement('style');
   st.id = 'cmdLineStyles';
+  const mono = 'ui-monospace,SFMono-Regular,Menlo,Consolas,monospace';
   st.textContent = [
-    '#cmdBar{position:fixed;left:0;right:0;bottom:0;z-index:95;display:none;align-items:center;gap:8px;',
-    '  padding:8px 14px;background:rgba(255,255,255,.94);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);',
-    '  border-top:1px solid var(--border,#d6dde5);box-shadow:0 -4px 12px rgba(0,0,0,.08);}',
+    // ---- 底栏 ----
+    '#cmdBar{position:fixed;left:0;right:0;bottom:0;z-index:95;display:none;align-items:center;gap:10px;',
+    '  padding:7px 12px;background:rgba(255,255,255,.96);backdrop-filter:blur(18px) saturate(140%);',
+    '  -webkit-backdrop-filter:blur(18px) saturate(140%);border-top:1px solid var(--border,#d6dde5);',
+    '  box-shadow:0 -8px 24px rgba(20,40,80,.10);}',
     '#cmdBar.cmd-open{display:flex;}',
-    '#cmdPrefix{flex:none;color:var(--accent,#316dca);font-weight:700;font-size:15px;',
-    '  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}',
-    '#cmdInput{flex:1;min-width:0;border:none;outline:none;background:transparent;font:inherit;font-size:14px;',
-    '  color:var(--text,#1c2733);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}',
-    '#cmdHint{flex:none;font-size:11px;color:#9aa7b4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:46%;}',
-    '#cmdSuggest{position:fixed;left:0;right:0;bottom:37px;z-index:95;display:none;flex-direction:column;',
-    '  margin:0 14px;background:rgba(255,255,255,.94);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);',
-    '  border:1px solid var(--border,#d6dde5);border-radius:8px 8px 0 0;',
-    '  box-shadow:0 -4px 12px rgba(0,0,0,.08);overflow:hidden;height:220px;min-height:44px;max-height:70vh;}',
+    '#cmdBar.cmd-focus{box-shadow:0 -10px 28px rgba(49,109,202,.16);}',
+    // 顶部强调色细线：一眼看出「命令模式已激活」
+    '#cmdBar::before{content:"";position:absolute;left:0;right:0;top:0;height:2px;',
+    '  background:linear-gradient(90deg,rgba(49,109,202,0),var(--accent,#316dca) 30%,var(--accent,#316dca) 70%,rgba(49,109,202,0));opacity:.75;}',
+    '#cmdPrefix{flex:none;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;',
+    '  border-radius:7px;background:var(--accent-soft,#e8eeff);color:var(--accent,#316dca);',
+    '  font:700 14px/1 ' + mono + ';user-select:none;}',
+    '#cmdField{position:relative;flex:1;min-width:0;display:flex;align-items:center;}',
+    '#cmdInput{flex:1;min-width:0;border:none;outline:none;background:transparent;padding:2px 0;',
+    '  font:14px/1.45 ' + mono + ';color:var(--text,#1c2733);caret-color:var(--accent,#316dca);}',
+    '#cmdInput::placeholder{color:#9aa7b4;font-family:inherit;}',
+    // ghost 补全预览：灰色后缀，Tab 可接受
+    '#cmdGhost{position:absolute;top:50%;transform:translateY(-50%);color:#b8c4d2;pointer-events:none;',
+    '  font:14px/1.45 ' + mono + ';white-space:pre;overflow:hidden;max-width:100%;}',
+    // 右侧提示胶囊：有用法/候选说明时高亮
+    '#cmdHint{flex:none;display:inline-flex;align-items:center;gap:6px;max-width:44%;padding:3px 10px;',
+    '  border-radius:999px;background:#f2f5f9;color:#5a6b7c;font-size:11.5px;line-height:1.5;',
+    '  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:background .15s,color .15s;}',
+    '#cmdHint.cs-live{background:var(--accent-soft,#e8eeff);color:#2c5db3;}',
+    // ---- 候选浮层（initCmdLine 会把它移进 #cmdBar，贴在底栏上方） ----
+    '#cmdSuggest{position:absolute;left:8px;right:8px;bottom:calc(100% + 6px);z-index:95;display:none;',
+    '  flex-direction:column;background:rgba(255,255,255,.97);backdrop-filter:blur(18px);',
+    '  -webkit-backdrop-filter:blur(18px);border:1px solid var(--border,#d6dde5);border-radius:10px;',
+    '  box-shadow:0 -10px 30px rgba(20,40,80,.16);overflow:hidden;max-height:70vh;}',
     '#cmdSuggest.cmd-open{display:flex;}',
-    // 顶部拖拽条：上下拖动改高度（double-click 折叠/展开）；高度持久化在 localStorage
-    '#cmdSuggestGrip{flex:none;height:8px;cursor:ns-resize;background:linear-gradient(#f4f7fb,#e9eef5);border-bottom:1px solid var(--border,#d6dde5);}',
-    '#cmdSuggestGrip:hover{background:linear-gradient(#eef3fb,#dfe7f3);}',
-    '#cmdSuggestList{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;}',
-    '#cmdSuggestList .cs-item{padding:6px 12px;font-size:13px;color:var(--text,#1c2733);cursor:pointer;',
-    '  display:flex;gap:8px;align-items:baseline;}',
-    '#cmdSuggestList .cs-item .cs-k{flex:none;color:#8b98a6;font-size:11px;',
-    '  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}',
-    '#cmdSuggestList .cs-item:hover,#cmdSuggestList .cs-item.cs-on{background:var(--accent-soft,#e8eeff);}',
-    '#cmdSuggestList .cs-item.cs-on{box-shadow:inset 3px 0 0 var(--accent,#316dca);}',
-    '#cmdSuggestList .cs-empty{padding:6px 12px;font-size:12px;color:#8b98a6;}',
+    // 头部信息条：候选数量 + 快捷键说明 + 工具按钮
+    '#cmdSuggestHead{flex:none;display:flex;align-items:center;gap:10px;padding:5px 10px;',
+    '  background:#f7f9fc;border-bottom:1px solid var(--border,#d6dde5);font-size:11.5px;color:#5a6b7c;}',
+    '#cmdSuggestHead .cs-count{font-weight:600;color:#33414f;}',
+    '#cmdSuggestHead .cs-legend{color:#8794a5;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+    '#cmdSuggestHead .cs-tools{margin-left:auto;flex:none;display:inline-flex;gap:4px;}',
+    '#cmdSuggestHead button{border:1px solid var(--border,#d6dde5);background:#fff;border-radius:5px;',
+    '  padding:1px 7px;font:inherit;font-size:11px;line-height:16px;color:#5a6b7c;cursor:pointer;}',
+    '#cmdSuggestHead button:hover{background:#eef4ff;border-color:#bcd0e6;color:var(--accent,#316dca);}',
+    // 拖拽条：中间一道短横，暗示可拖动
+    '#cmdSuggestGrip{flex:none;height:10px;cursor:ns-resize;display:flex;align-items:center;justify-content:center;',
+    '  background:#f2f5f9;border-bottom:1px solid var(--border,#d6dde5);}',
+    '#cmdSuggestGrip::after{content:"";width:26px;height:2px;border-radius:2px;background:#cbd5e1;transition:background .15s;}',
+    '#cmdSuggestGrip:hover{background:#e9eef7;}',
+    '#cmdSuggestGrip:hover::after{background:#9fb0c6;}',
+    '#cmdSuggestList{flex:1 1 auto;min-height:0;overflow:auto;display:block;padding:4px 0;overscroll-behavior:contain;}',
+    '#cmdSuggestList::-webkit-scrollbar{width:8px;}',
+    '#cmdSuggestList::-webkit-scrollbar-thumb{background:#d4dce7;border-radius:8px;}',
+    '#cmdSuggestList::-webkit-scrollbar-thumb:hover{background:#c0cbdb;}',
+    // 分组标题（空输入时按类型分组；sticky 便于长列表滚动时保持上下文）
+    '#cmdSuggestList .cs-sec{position:sticky;top:0;z-index:1;padding:4px 12px 2px;font-size:10.5px;',
+    '  letter-spacing:.06em;color:#93a1b1;background:rgba(255,255,255,.97);}',
+    // 候选行：类型徽标 | 命令名 | 说明 | Tab 提示
+    '#cmdSuggestList .cs-item{display:grid;grid-template-columns:auto minmax(64px,auto) 1fr auto;gap:8px;',
+    '  align-items:center;padding:5px 12px;font-size:13px;color:var(--text,#1c2733);cursor:pointer;',
+    '  border-left:3px solid transparent;}',
+    '#cmdSuggestList .cs-item:hover{background:#f4f7fc;}',
+    '#cmdSuggestList .cs-item.cs-on{background:var(--accent-soft,#e8eeff);border-left-color:var(--accent,#316dca);}',
+    '#cmdSuggestList .cs-kind{font-size:10px;line-height:16px;padding:0 5px;border-radius:4px;',
+    '  background:#eef2f7;color:#6b7c90;white-space:nowrap;}',
+    '#cmdSuggestList .cs-item .cs-k{font-family:' + mono + ';font-weight:600;color:#2f4a6b;',
+    '  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+    '#cmdSuggestList .cs-item .cs-d{font-size:12px;color:#5a6b7c;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+    '#cmdSuggestList .cs-item .cs-tab{font-size:10px;color:#a9b7c7;visibility:hidden;}',
+    '#cmdSuggestList .cs-item.cs-on .cs-tab{visibility:visible;}',
+    '#cmdSuggestList mark{background:#fff0a8;color:inherit;border-radius:2px;padding:0 1px;}',
+    // 空结果：示例 chips（点一下填进输入框，不直接执行）
+    '#cmdSuggestList .cs-empty{padding:8px 12px 4px;font-size:12px;color:#8b98a6;}',
+    '#cmdSuggestList .cs-chips{display:flex;flex-wrap:wrap;gap:6px;padding:0 12px 10px;}',
+    '#cmdSuggestList .cs-chip{border:1px solid var(--border,#d6dde5);background:#fff;border-radius:999px;',
+    '  padding:2px 10px;font-size:12px;color:#3b5266;cursor:pointer;font-family:inherit;}',
+    '#cmdSuggestList .cs-chip:hover{background:#eef4ff;border-color:#bcd0e6;color:var(--accent,#316dca);}',
     // 命令行打开期间禁用页面选中高亮干扰：候选行 hover 要有指针反馈
     'body.cmd-active .page-row{cursor:default;}',
+    // 动效：尊重「减少动态效果」
+    '@media (prefers-reduced-motion:no-preference){',
+    '  #cmdBar.cmd-open{animation:cmdBarIn .16s ease-out;}',
+    '  #cmdSuggest.cmd-open{animation:cmdSuggestIn .16s ease-out;}',
+    '  @keyframes cmdBarIn{from{transform:translateY(10px);opacity:0;}to{transform:none;opacity:1;}}',
+    '  @keyframes cmdSuggestIn{from{transform:translateY(6px);opacity:0;}to{transform:none;opacity:1;}}',
+    '}',
   ].join('');
   document.head.appendChild(st);
 })();
@@ -14591,19 +14649,98 @@ let _cmdHistory = [];
 let _cmdHistIdx = -1;
 let _cmdSavedInput = '';
 let _cmdAliasCache = null;
-let _cmdItems = [];             // 当前候选（{key,desc,cmd}）
+let _cmdItems = [];             // 当前候选（{key,desc,cmd,kind}）
 let _cmdSel = -1;               // 候选高亮索引（-1 = 无）
+let _cmdQuery = '';             // 最近一次渲染候选时的输入（分组/命中高亮用）
 let _cmdSuggestHidden = false;  // 是否隐藏候选列表（命令行打开期间）
 let _cmdTargetEd = null;        // 打开命令行时的目标页编辑区（文档光标/选区作用对象）
 let _cmdCaret = null;           // {line,ch} 文档光标（行 1 基 / 字符 0 基）
 let _cmdAnchor = null;          // Shift 扩展选区时的锚点 {line,ch}
 let _cmdCaretMoved = false;     // 命令行内是否用键盘移动过正文光标（关闭时把真实光标落回）
 let _cmdSavedRange = null;      // 打开命令行前的真实选区快照（关闭时恢复，供格式化插入/包围复用）
-const _CMD_HINT_TEXT = '多命令用 ; 分隔、（…）分组作用目标 · ↑↓ 候选/历史 · Tab 补全（无高亮插首推） · Ctrl+↑↓ 正文行';
+let _cmdGhostEl = null;         // ghost 补全预览（灰色后缀）
+let _cmdUserHeight = 0;         // 用户拖拽设定的候选高度（0 = 自适应）
+const _CMD_HINT_TEXT = '↑↓ 候选/历史 · Tab 补全 · Enter 执行 · Ctrl+U 清空 · ; 分隔多命令';
+const _CMD_HISTORY_KEY = 'ptoe_cmd_history';
+const _CMD_SUGGEST_H_KEY = 'ptoe_cmd_suggest_h';
+const _CMD_HISTORY_MAX = 100;
 
 function _cmdInputValue() {
   const i = document.getElementById('cmdInput');
   return i ? i.value : '';
+}
+
+// ---- 命令历史持久化（2026-10-28）：跨会话可用，重复命令上移而不是重复堆叠 ----
+function _cmdHistoryLoad() {
+  try {
+    const raw = localStorage.getItem(_CMD_HISTORY_KEY);
+    const arr = raw ? JSON.parse(raw) : null;
+    if (Array.isArray(arr)) {
+      _cmdHistory = arr.filter(function (x) { return typeof x === 'string' && x.trim(); })
+        .slice(0, _CMD_HISTORY_MAX);
+    }
+  } catch (e) { /* 坏数据/无 localStorage：当作空历史 */ }
+}
+function _cmdHistorySave() {
+  try { localStorage.setItem(_CMD_HISTORY_KEY, JSON.stringify(_cmdHistory.slice(0, _CMD_HISTORY_MAX))); }
+  catch (e) { /* 隐私模式写不进去：只在本次会话内有效 */ }
+}
+function _cmdHistoryAdd(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return;
+  const at = _cmdHistory.indexOf(s);
+  if (at >= 0) _cmdHistory.splice(at, 1);
+  _cmdHistory.unshift(s);
+  if (_cmdHistory.length > _CMD_HISTORY_MAX) _cmdHistory.length = _CMD_HISTORY_MAX;
+  _cmdHistorySave();
+}
+
+// ---- 候选类型徽标 / 分组标题 ----
+function _cmdKindLabel(kind) {
+  if (kind === 'recent') return '最近';
+  if (kind === 'format') return '格式';
+  if (kind === 'tool') return '工具';
+  if (kind === 'short') return '简写';
+  if (kind === 'arg') return '参数';
+  return '命令';
+}
+function _cmdKindBadge(kind) {
+  if (kind === 'recent') return '近';
+  if (kind === 'format') return '式';
+  if (kind === 'tool') return '工';
+  if (kind === 'short') return '简';
+  if (kind === 'arg') return '参';
+  return '令';
+}
+
+// 命中高亮：把输入里出现的片段包进 <mark>（先转义，避免把用户输入当 HTML）
+function _cmdHi(text, q) {
+  const s = String(text == null ? '' : text);
+  const e = esc(s);
+  const needle = String(q == null ? '' : q).trim();
+  if (!needle) return e;
+  const at = s.toLowerCase().indexOf(needle.toLowerCase());
+  if (at < 0) return e;
+  return esc(s.slice(0, at)) + '<mark>' + esc(s.slice(at, at + needle.length)) + '</mark>' +
+    esc(s.slice(at + needle.length));
+}
+
+// 空输入的候选：最近执行 + 全部内置命令（格式/工具/简写靠输入筛选，避免一屏几百项）
+function _cmdQuickItems() {
+  const out = [], seen = new Set();
+  const push = function (it) {
+    const k = String(it.key || '').trim().toLowerCase();
+    if (!k || seen.has(k)) return;
+    seen.add(k);
+    out.push(it);
+  };
+  for (const h of _cmdHistory.slice(0, 6)) {
+    push({ key: h, desc: '最近执行（Tab 整条填入）', cmd: h, kind: 'recent', full: true });
+  }
+  for (const b of _CMD_BUILTINS) {
+    push({ key: b.keys[0], desc: b.desc, cmd: b.example, kind: 'builtin' });
+  }
+  return out;
 }
 
 // 命令行可作用于行范围的「块级/行内格式」操作白名单（工具类/跳转类操作不走范围）
@@ -15451,6 +15588,14 @@ async function _cmdRunScript(raw) {
   if (nodes.length === 1 && nodes[0].kind === 'unit' && _cmdUnitKeepOpen(nodes[0].spec)) {
     const ed0 = (_cmdTargetEd && _cmdTargetEd.isConnected) ? _cmdTargetEd : currentEditable();
     await _cmdExecSpec(nodes[0].spec, ed0, ed0 ? _cmdLineBlocks(ed0) : []);
+    // keepOpen 命令（help/隐藏/显示）执行完把输入框清空，避免把"伪命令"留在框里
+    if (_cmdLineActive) {
+      const input = document.getElementById('cmdInput');
+      if (input) { input.value = ''; try { input.focus(); } catch (e) {} }
+      _cmdHistIdx = -1;
+      _cmdSel = -1;
+      _cmdRenderSuggest('');
+    }
     return;
   }
   closeCmdLine();
@@ -16094,17 +16239,17 @@ function openCmdLine() {
     _cmdCaret = null;
   }
   const sug = document.getElementById('cmdSuggest');
+  // 候选面板高度：用户拖过 → 用持久化高度；没拖过 → 自适应内容（CSS max-height 兜底）
+  _cmdUserHeight = 0;
+  try { _cmdUserHeight = parseInt(localStorage.getItem(_CMD_SUGGEST_H_KEY) || '', 10) || 0; } catch (e) { _cmdUserHeight = 0; }
   if (sug) {
-    let h = 0;
-    try { h = parseInt(localStorage.getItem('ptoe_cmd_suggest_h') || '', 10); } catch (e) {}
-    if (h >= 44) sug.style.height = Math.min(h, Math.round(window.innerHeight * 0.7)) + 'px';
+    if (_cmdUserHeight >= 44) sug.style.height = Math.min(_cmdUserHeight, Math.round(window.innerHeight * 0.7)) + 'px';
+    else sug.style.height = '';
   }
   bar.classList.add('cmd-open');
   document.body.classList.add('cmd-active');
   input.value = '';
   _cmdRenderSuggest('');
-  const hint = document.getElementById('cmdHint');
-  if (hint) hint.textContent = _CMD_HINT_TEXT;
   input.focus();
   _updateCurLine();
   return true;
@@ -16122,10 +16267,12 @@ function closeCmdLine() {
   if (sug) sug.classList.remove('cmd-open');
   if (list) list.innerHTML = '';
   _cmdItems = [];
+  _cmdQuery = '';
   document.body.classList.remove('cmd-active');
   if (input) input.value = '';
+  if (_cmdGhostEl) _cmdGhostEl.textContent = '';
   const hint = document.getElementById('cmdHint');
-  if (hint) hint.textContent = _CMD_HINT_TEXT;
+  if (hint) { hint.textContent = _CMD_HINT_TEXT; hint.classList.remove('cs-live'); }
   const ed = (_cmdTargetEd && _cmdTargetEd.isConnected) ? _cmdTargetEd : currentEditable();
   if (ed) {
     try { ed.focus(); } catch (e) {}
@@ -16151,10 +16298,10 @@ function _cmdSubmit() {
   const input = document.getElementById('cmdInput');
   if (!input) return;
   let raw = input.value;
+  // 空输入直接回车：有高亮候选时执行它（不用先 Tab），否则关掉命令行
   if (_cmdSel >= 0 && _cmdItems[_cmdSel]) { raw = _cmdComplete(raw, _cmdItems[_cmdSel]); input.value = raw; }
   if (!raw || !raw.trim()) { closeCmdLine(); return; }
-  _cmdHistory.unshift(raw);
-  if (_cmdHistory.length > 100) _cmdHistory.pop();
+  _cmdHistoryAdd(raw);
   _cmdHistIdx = -1;
   _cmdSel = -1;
   try { Promise.resolve(_cmdRunScript(raw)).catch(function (e) { closeCmdLine(); showToast('命令执行失败：' + e, 'fail'); }); }
@@ -16164,16 +16311,54 @@ function _cmdSubmit() {
 function _cmdHistoryMove(dir) {
   const input = document.getElementById('cmdInput');
   if (!input || !_cmdHistory.length) return;
+  // 索引：-1 = 当前输入；0 = 最近一条；越大越旧。
+  // dir < 0 = 更旧（↑ / Ctrl+P），dir > 0 = 更新（↓ / Ctrl+N）。
+  // 2026-10-28 修复：此前从「当前输入」按 ↑ 会越界夹回 -1，等于翻不动历史。
   if (_cmdHistIdx === -1) _cmdSavedInput = input.value;
-  _cmdHistIdx += (dir > 0 ? 1 : -1);
-  if (_cmdHistIdx < -1) _cmdHistIdx = -1;
-  if (_cmdHistIdx >= _cmdHistory.length) _cmdHistIdx = _cmdHistory.length - 1;
-  input.value = _cmdHistIdx === -1 ? _cmdSavedInput : _cmdHistory[_cmdHistIdx];
+  const last = _cmdHistory.length - 1;
+  let idx;
+  if (dir < 0) idx = (_cmdHistIdx === -1) ? 0 : Math.min(last, _cmdHistIdx + 1);
+  else idx = (_cmdHistIdx <= 0) ? -1 : _cmdHistIdx - 1;
+  _cmdHistIdx = idx;
+  input.value = idx === -1 ? _cmdSavedInput : _cmdHistory[idx];
   try { input.setSelectionRange(input.value.length, input.value.length); } catch (e) {}
   _cmdSel = -1;
   // 翻历史时收起候选列表：↑↓ 继续翻历史；一旦输入（input 事件）即恢复候选提示
   _cmdSuggestSetOpen(false);
+  _cmdUpdateGhost(input.value);
   _cmdUpdateHint(input.value);
+}
+
+// 直接改输入框内容（保持焦点/光标在末尾，并同步候选与 ghost）
+function _cmdSetInput(value) {
+  const input = document.getElementById('cmdInput');
+  if (!input) return;
+  input.value = String(value == null ? '' : value);
+  _cmdHistIdx = -1;
+  _cmdSel = -1;
+  try { input.setSelectionRange(input.value.length, input.value.length); } catch (e) {}
+  _cmdRenderSuggest(input.value);
+  try { input.focus(); } catch (e) {}
+}
+
+// Ctrl+U：清空整行（nvim 习惯）；Ctrl+W：删除光标前的一个词
+function _cmdClearInput() { _cmdSetInput(''); }
+function _cmdDeleteWord() {
+  const input = document.getElementById('cmdInput');
+  if (!input) return;
+  const v = input.value;
+  let caret = v.length;
+  try { caret = input.selectionStart != null ? input.selectionStart : v.length; } catch (e) { caret = v.length; }
+  if (!v) return;
+  const left = v.slice(0, caret);
+  const at = left.search(/\S+\s*$/);
+  const from = at >= 0 ? at : Math.max(0, caret - 1);
+  const next = v.slice(0, from) + v.slice(caret);
+  input.value = next;
+  try { input.setSelectionRange(from, from); } catch (e) {}
+  _cmdHistIdx = -1;
+  _cmdSel = -1;
+  _cmdRenderSuggest(next);
 }
 
 // 候选高亮导航（↑↓）：-1 起手进入首/末项
@@ -16183,6 +16368,7 @@ function _cmdSelectIndex(dir) {
   else _cmdSel = Math.max(0, Math.min(_cmdItems.length - 1, _cmdSel + dir));
   _cmdRenderList();
   _cmdUpdateHint(_cmdInputValue());
+  _cmdUpdateGhost(_cmdInputValue());
 }
 
 // 当前输入所在的「子命令段」：以顶层 ; / ； / 换行 / 段首 ( 为分界。
@@ -16210,6 +16396,8 @@ function _cmdVerbToken(value) {
 // 对「已有参数」的段不动（避免覆盖用户已敲的参数）。参数候选（item.arg）只替换参数 token。
 function _cmdComplete(cur, item) {
   const s = String(cur == null ? '' : cur);
+  // 「最近执行」候选：整条填入（key 本身可能带范围/参数，不能再按段替换）
+  if (item && item.full) return String(item.key == null ? '' : item.key);
   // 参数位候选：替换当前段末尾的参数 token（保留前面的多命令与前导范围）
   if (item && item.arg) {
     const seg = _cmdCurrentSegment(s);
@@ -16239,10 +16427,7 @@ function _cmdAcceptSelected() {
   // Tab（2026-10）：无高亮时默认插入第一个推荐候选；↑↓ 高亮后插入高亮项
   const idx = _cmdSel >= 0 ? _cmdSel
     : ((_cmdItems.length && !_cmdSuggestHidden && _cmdSuggestVisible()) ? 0 : -1);
-  if (idx >= 0 && _cmdItems[idx]) {
-    input.value = _cmdComplete(input.value, _cmdItems[idx]);
-    try { input.setSelectionRange(input.value.length, input.value.length); } catch (e) {}
-  }
+  if (idx >= 0 && _cmdItems[idx]) { _cmdSetInput(_cmdComplete(input.value, _cmdItems[idx])); return; }
   _cmdSel = -1;
   _cmdRenderSuggest(input.value);
 }
@@ -16251,16 +16436,31 @@ function _cmdAcceptSelected() {
 function _cmdUpdateHint(value) {
   const hint = document.getElementById('cmdHint');
   if (!hint) return;
-  if (_cmdSel >= 0 && _cmdItems[_cmdSel]) { hint.textContent = _cmdItems[_cmdSel].desc; return; }
+  const set = function (text, live) {
+    hint.textContent = text;
+    hint.classList.toggle('cs-live', !!live);
+  };
+  if (_cmdSel >= 0 && _cmdItems[_cmdSel]) { set(_cmdItems[_cmdSel].desc + ' · Tab 补全', true); return; }
   const vt = _cmdVerbToken(_cmdCurrentSegment(value));
   const head0 = vt.head;
   const head = _CMD_SHORT_ALIASES[head0.toLowerCase()] || head0; // 字母简写 → 规范名
   const b = _cmdBuiltinByVerb(head.toLowerCase());
-  if (b) { hint.textContent = b.usage; return; }
+  if (b) { set(b.usage, true); return; }
   const op = _cmdOpAliasMap()[head] || _cmdOpAliasMap()[head.toLowerCase()];
-  if (op && _CMD_FORMAT_OPS.has(op)) { hint.textContent = '[范围]' + head + ' → ' + (OP_TIP[op] || op); return; }
-  if (_CMD_TOOL_ALIAS[head] || _CMD_TOOL_ALIAS[head.toLowerCase()]) { hint.textContent = '工具操作：' + head; return; }
-  hint.textContent = _CMD_HINT_TEXT;
+  if (op && _CMD_FORMAT_OPS.has(op)) { set('[范围]' + head + ' → ' + (OP_TIP[op] || op), true); return; }
+  if (_CMD_TOOL_ALIAS[head] || _CMD_TOOL_ALIAS[head.toLowerCase()]) { set('工具操作：' + head, true); return; }
+  // 输入还没成形（如前缀 me）：直接给出首个候选，Tab 即可补全
+  if (String(value == null ? '' : value).trim() && _cmdSuggestVisible() && _cmdItems.length) {
+    const it0 = _cmdItems[0];
+    set('Tab 补全：' + it0.key + ' — ' + it0.desc, true);
+    return;
+  }
+  // 空输入且用过命令行：把上次命令亮出来（回车即重跑，↑ 可翻更早的历史）
+  if (!String(value == null ? '' : value).trim() && _cmdHistory.length) {
+    set('上次：' + _cmdHistory[0] + ' · ↑↓ 历史 · Tab 补全', false);
+    return;
+  }
+  set(_CMD_HINT_TEXT, false);
 }
 
 function _cmdSuggestSetOpen(open) {
@@ -16312,21 +16512,89 @@ document.addEventListener('selectionchange', function () {
   _cmdCaptureEditorSelection();
 });
 
+// 空结果时的示例（点一下填进输入框，不直接执行）
+const _CMD_EMPTY_CHIPS = ['help', '页 12', '7,10merge', '插入 注释', '搜索 关键词', '清理 当前'];
+
 function _cmdRenderList() {
   const list = document.getElementById('cmdSuggestList');
   if (!list) return;
-  if (!_cmdItems.length) { list.innerHTML = '<div class="cs-empty">无匹配命令，输入 help 查看用法</div>'; return; }
-  list.innerHTML = _cmdItems.map(function (it, i) {
-    const k = esc(String(it.key));
-    return '<div class="cs-item' + (i === _cmdSel ? ' cs-on' : '') + '" data-idx="' + i + '" data-cmd="' + k + '">' +
-      '<span class="cs-k">' + k + '</span><span>' + esc(String(it.desc)) + '</span></div>';
-  }).join('');
+  const q = String(_cmdQuery || '');
+  if (!_cmdItems.length) {
+    list.innerHTML = '<div class="cs-empty">没有匹配「' + esc(q.trim()) + '」的命令。可试：</div>' +
+      '<div class="cs-chips">' + _CMD_EMPTY_CHIPS.map(function (c) {
+        return '<button type="button" class="cs-chip" data-cmd="' + esc(c) + '">' + esc(c) + '</button>';
+      }).join('') + '</div>';
+    const cnt = document.getElementById('cmdSuggestCount');
+    if (cnt) cnt.textContent = '候选 0 项';
+    return;
+  }
+  // 空输入按类型分组（命令 / 格式 / 工具 / 简写 / 参数），有输入时保持相关度排序
+  const grouped = !q.trim();
+  let html = '', lastKind = '';
+  _cmdItems.forEach(function (it, i) {
+    const kind = it.kind || 'builtin';
+    if (grouped && kind !== lastKind) {
+      html += '<div class="cs-sec">' + esc(_cmdKindLabel(kind)) + '</div>';
+      lastKind = kind;
+    }
+    html += '<div class="cs-item' + (i === _cmdSel ? ' cs-on' : '') + '" id="cs-item-' + i + '" role="option"' +
+      ' aria-selected="' + (i === _cmdSel ? 'true' : 'false') + '"' +
+      ' data-idx="' + i + '" data-cmd="' + esc(String(it.cmd || it.key)) + '">' +
+      '<span class="cs-kind">' + esc(_cmdKindBadge(kind)) + '</span>' +
+      '<span class="cs-k">' + _cmdHi(it.key, q) + '</span>' +
+      '<span class="cs-d">' + _cmdHi(it.desc, q) + '</span>' +
+      '<span class="cs-tab">Tab</span></div>';
+  });
+  list.innerHTML = html;
+  const cnt = document.getElementById('cmdSuggestCount');
+  if (cnt) cnt.textContent = '候选 ' + _cmdItems.length + ' 项';
+  if (_cmdSel >= 0) list.setAttribute('aria-activedescendant', 'cs-item-' + _cmdSel);
+  else list.removeAttribute('aria-activedescendant');
   const on = list.querySelector('.cs-item.cs-on');
   if (on && on.scrollIntoView) { try { on.scrollIntoView({ block: 'nearest' }); } catch (e) {} }
 }
 
+// ghost 补全预览（灰色后缀）：显示 Tab 会补上的部分，纯视觉、不写入内容
+let _cmdMirrorEl = null;
+function _cmdTextWidthPx(text) {
+  const input = document.getElementById('cmdInput');
+  if (!input) return 0;
+  try {
+    if (!_cmdMirrorEl) {
+      _cmdMirrorEl = document.createElement('span');
+      _cmdMirrorEl.setAttribute('aria-hidden', 'true');
+      _cmdMirrorEl.style.cssText = 'position:absolute;left:-9999px;top:-9999px;visibility:hidden;white-space:pre;';
+      document.body.appendChild(_cmdMirrorEl);
+    }
+    const cs = window.getComputedStyle(input);
+    _cmdMirrorEl.style.font = cs.font || ((cs.fontSize || '14px') + ' ' + (cs.fontFamily || 'sans-serif'));
+    _cmdMirrorEl.textContent = String(text == null ? '' : text);
+    const r = _cmdMirrorEl.getBoundingClientRect();
+    return (r && r.width) ? r.width : 0;
+  } catch (e) { return 0; }
+}
+function _cmdUpdateGhost(value) {
+  const g = _cmdGhostEl;
+  if (!g) return;
+  const input = document.getElementById('cmdInput');
+  if (!input || !_cmdLineActive || _cmdSuggestHidden || !_cmdSuggestVisible()) { g.textContent = ''; return; }
+  const cur = String(value == null ? input.value : value);
+  if (!cur) { g.textContent = ''; return; }   // 空输入不预览（候选面板已列出来）
+  const it = _cmdSel >= 0 ? _cmdItems[_cmdSel] : _cmdItems[0];
+  if (!it) { g.textContent = ''; return; }
+  let full = '';
+  try { full = String(_cmdComplete(cur, it) || ''); } catch (e) { full = ''; }
+  // 只有「在当前输入后面追加」才算 ghost（Tab 会整体替换时不给预览，避免误导）
+  if (!full || full.length <= cur.length || full.slice(0, cur.length) !== cur) { g.textContent = ''; return; }
+  g.textContent = full.slice(cur.length);
+  let scroll = 0;
+  try { scroll = input.scrollLeft || 0; } catch (e) { scroll = 0; }
+  g.style.left = Math.max(0, Math.round(_cmdTextWidthPx(cur) - scroll)) + 'px';
+}
+
 function _cmdRenderSuggest(value) {
-  const seg = _cmdCurrentSegment(value);
+  const raw = String(value == null ? '' : value);
+  const seg = _cmdCurrentSegment(raw);
   const vt = _cmdVerbToken(seg);
   // 参数位候选（2026-10）：动词已输完、进入其第一个参数 token 时改为提示参数词表
   // （如「插入 」→ 注释/引用/…；「页尾; 标记 」→ 全文/注释/段落/换页），
@@ -16345,53 +16613,138 @@ function _cmdRenderSuggest(value) {
         const hit = argList.filter(function (x) { return x.key.toLowerCase().indexOf(a) >= 0; });
         if (hit.length) args = hit;
       }
+      _cmdQuery = argTok || '';
       _cmdItems = args.map(function (x) { return { key: x.key, desc: x.desc, cmd: x.key, kind: 'arg', arg: true }; });
       if (_cmdSel >= _cmdItems.length) _cmdSel = _cmdItems.length - 1;
       _cmdRenderList();
-      _cmdUpdateHint(value);
+      _cmdUpdateHint(raw);
       _cmdSuggestSetOpen(true);
+      _cmdUpdateGhost(raw);
       return;
     }
   }
-  const all = _cmdSuggestItems();
   let items;
-  if (!vt.head) items = all;
-  else {
+  if (!vt.head) {
+    // 空输入：最近命令 + 内置命令（不再一次铺开上百项格式/工具/简写）
+    _cmdQuery = '';
+    items = _cmdQuickItems();
+  } else {
+    _cmdQuery = vt.head;
     const h = vt.head.toLowerCase();
+    const all = _cmdSuggestItems();
     items = all.filter(function (it) { return it.key.toLowerCase().indexOf(h) >= 0; });
     items.sort(function (a, b) {
       const ap = a.key.toLowerCase().indexOf(h) === 0 ? 0 : 1;
       const bp = b.key.toLowerCase().indexOf(h) === 0 ? 0 : 1;
       return ap - bp;
     });
-    if (!items.length) items = all.filter(function (it) { return it.desc.toLowerCase().indexOf(h) >= 0; });
+    if (!items.length) {
+      items = all.filter(function (it) { return it.desc.toLowerCase().indexOf(h) >= 0; });
+      _cmdQuery = '';
+    }
   }
   _cmdItems = items;
   if (_cmdSel >= items.length) _cmdSel = items.length - 1;
   _cmdRenderList();
-  _cmdUpdateHint(value);
+  _cmdUpdateHint(raw);
   _cmdSuggestSetOpen(true);
+  _cmdUpdateGhost(raw);
 }
 
 (function initCmdLine() {
+  const bar = document.getElementById('cmdBar');
   const input = document.getElementById('cmdInput');
-  if (!input) return;
+  if (!bar || !input) return;
+
+  // ---- DOM 增强（2026-10-28）：输入字段容器 + ghost 补全层；候选浮层挂到底栏上方 ----
+  if (!document.getElementById('cmdField')) {
+    const field = document.createElement('div');
+    field.id = 'cmdField';
+    input.parentNode.insertBefore(field, input);
+    field.appendChild(input);
+    const ghost = document.createElement('span');
+    ghost.id = 'cmdGhost';
+    ghost.setAttribute('aria-hidden', 'true');
+    field.appendChild(ghost);
+    _cmdGhostEl = ghost;
+  } else {
+    _cmdGhostEl = document.getElementById('cmdGhost');
+  }
+  const sug = document.getElementById('cmdSuggest');
+  if (sug && sug.parentNode !== bar) bar.appendChild(sug);
+  if (sug && !document.getElementById('cmdSuggestHead')) {
+    const head = document.createElement('div');
+    head.id = 'cmdSuggestHead';
+    head.innerHTML = '<span class="cs-count" id="cmdSuggestCount">候选</span>' +
+      '<span class="cs-legend">↑↓ 选择 · Tab 补全 · Enter 执行 · F2 隐藏</span>' +
+      '<span class="cs-tools"><button type="button" data-cs="auto" title="候选面板高度恢复自适应">自适应</button>' +
+      '<button type="button" data-cs="hide" title="隐藏候选面板（F2 恢复）">收起</button></span>';
+    // 顺序：拖拽条（面板顶边）→ 信息条 → 候选列表
+    const gripEl = document.getElementById('cmdSuggestGrip');
+    if (gripEl) sug.insertBefore(head, gripEl.nextSibling);
+    else sug.insertBefore(head, sug.firstChild);
+    // 头部按钮：mousedown preventDefault 保住输入焦点
+    head.addEventListener('mousedown', function (e) {
+      const btn = e.target && e.target.closest ? e.target.closest('button[data-cs]') : null;
+      if (!btn) return;
+      e.preventDefault();
+      const act = btn.getAttribute('data-cs');
+      if (act === 'auto') {
+        _cmdUserHeight = 0;
+        try { localStorage.removeItem(_CMD_SUGGEST_H_KEY); } catch (er) {}
+        if (sug) sug.style.height = '';
+      } else if (act === 'hide') {
+        _cmdSuggestHidden = true;
+        _cmdSuggestSetOpen(true);
+        if (_cmdGhostEl) _cmdGhostEl.textContent = '';
+      }
+      try { input.focus(); } catch (er) {}
+    });
+  }
+  _cmdHistoryLoad();
+
   input.addEventListener('keydown', function (e) {
     e.stopPropagation(); // 命令行打开时不触达全局快捷键分发
     const k = e.key;
-    // Ctrl(+Shift)+方向/Home/End：移动正文光标
+    // Ctrl(+Shift)+方向/Home/End：移动正文光标（与 nvim 命令行一致）
     if (e.ctrlKey && !e.altKey && !e.metaKey) {
       if (k === 'ArrowUp' || k === 'ArrowDown') { e.preventDefault(); _cmdDocMove(k === 'ArrowUp' ? 'up' : 'down', e.shiftKey); return; }
       if (k === 'ArrowLeft' || k === 'ArrowRight') { e.preventDefault(); _cmdDocMove(k === 'ArrowLeft' ? 'left' : 'right', e.shiftKey); return; }
       if (k === 'Home') { e.preventDefault(); _cmdDocMove('home', e.shiftKey); return; }
       if (k === 'End') { e.preventDefault(); _cmdDocMove('end', e.shiftKey); return; }
+      // Ctrl+P/N：历史（nvim 命令行习惯）；Ctrl+U 清空；Ctrl+W 删词
+      if (k === 'p' || k === 'P') { e.preventDefault(); _cmdHistoryMove(-1); return; }
+      if (k === 'n' || k === 'N') { e.preventDefault(); _cmdHistoryMove(1); return; }
+      if (k === 'u' || k === 'U') { e.preventDefault(); _cmdClearInput(); return; }
+      if (k === 'w' || k === 'W') { e.preventDefault(); _cmdDeleteWord(); return; }
     }
-    if (k === 'Escape') { e.preventDefault(); closeCmdLine(); return; }
+    // Esc：先取消候选高亮，再关闭命令行（避免误关）
+    if (k === 'Escape') {
+      e.preventDefault();
+      if (_cmdSel >= 0) {
+        _cmdSel = -1;
+        _cmdRenderList();
+        _cmdUpdateHint(_cmdInputValue());
+        _cmdUpdateGhost(_cmdInputValue());
+        return;
+      }
+      closeCmdLine();
+      return;
+    }
     if (k === 'Enter') { e.preventDefault(); _cmdSubmit(); return; }
     // Shift+Tab：焦点切到正文编辑区（命令行保持打开），可在正文里选词/定位后再切回
     if (k === 'Tab' && e.shiftKey) { e.preventDefault(); _cmdFocusEditor(); return; }
     if (k === 'Tab') { e.preventDefault(); _cmdAcceptSelected(); return; }
-    if (k === 'F2') { e.preventDefault(); _cmdSuggestHidden = !_cmdSuggestHidden; _cmdSuggestSetOpen(true); return; }
+    if (k === 'F2') { e.preventDefault(); _cmdSuggestHidden = !_cmdSuggestHidden; _cmdSuggestSetOpen(true); _cmdUpdateGhost(_cmdInputValue()); return; }
+    // PageUp/PageDown：翻候选列表
+    if (k === 'PageDown' || k === 'PageUp') {
+      const listEl = document.getElementById('cmdSuggestList');
+      if (listEl && _cmdSuggestVisible()) {
+        e.preventDefault();
+        listEl.scrollTop += (k === 'PageDown' ? 1 : -1) * Math.max(40, listEl.clientHeight - 40);
+        return;
+      }
+    }
     // ↑↓ 候选高亮（列表可见且有候选）；否则切换历史命令；Alt+↑↓ 始终切历史
     if ((k === 'ArrowUp' || k === 'ArrowDown') && e.altKey) { e.preventDefault(); _cmdHistoryMove(k === 'ArrowUp' ? -1 : 1); return; }
     if (k === 'ArrowUp') {
@@ -16405,29 +16758,50 @@ function _cmdRenderSuggest(value) {
       return;
     }
   });
-  input.addEventListener('input', function () { _cmdHistIdx = -1; _cmdSel = -1; _cmdRenderSuggest(input.value); });
+  input.addEventListener('input', function () {
+    _cmdHistIdx = -1;
+    _cmdSel = -1;
+    _cmdRenderSuggest(input.value);
+  });
+  // 输入很长时 ghost 要跟随横向滚动
+  input.addEventListener('scroll', function () { _cmdUpdateGhost(input.value); });
+  input.addEventListener('focus', function () { bar.classList.add('cmd-focus'); });
+  input.addEventListener('blur', function () { bar.classList.remove('cmd-focus'); });
+
   const list = document.getElementById('cmdSuggestList');
   if (list) {
-    // mousedown 补全（preventDefault 保持输入焦点）；Enter 执行
+    // mousedown 补全（preventDefault 保持输入焦点）；示例 chip 只填入不执行
     list.addEventListener('mousedown', function (e) {
+      const chip = e.target && e.target.closest ? e.target.closest('.cs-chip') : null;
+      if (chip) {
+        e.preventDefault();
+        _cmdSetInput(chip.getAttribute('data-cmd') || '');
+        return;
+      }
       const it = e.target && e.target.closest ? e.target.closest('.cs-item') : null;
       if (!it) return;
       e.preventDefault();
       const i = parseInt(it.getAttribute('data-idx'), 10);
       const item = (i >= 0 && _cmdItems[i]) ? _cmdItems[i] : null;
       if (!item) return;
-      input.value = _cmdComplete(input.value, item);
-      input.focus();
-      try { input.setSelectionRange(input.value.length, input.value.length); } catch (er) {}
-      _cmdSel = -1;
-      _cmdRenderSuggest(input.value);
+      _cmdSetInput(_cmdComplete(input.value, item));
+    });
+    // 双击候选：直接填入并执行（少按一次回车）
+    list.addEventListener('dblclick', function (e) {
+      const it = e.target && e.target.closest ? e.target.closest('.cs-item') : null;
+      if (!it) return;
+      const i = parseInt(it.getAttribute('data-idx'), 10);
+      const item = (i >= 0 && _cmdItems[i]) ? _cmdItems[i] : null;
+      if (!item) return;
+      e.preventDefault();
+      _cmdSetInput(_cmdComplete(input.value, item));
+      _cmdSubmit();
     });
   }
   const grip = document.getElementById('cmdSuggestGrip');
   if (grip) {
     // 拖拽调整候选列表高度（持久化到 localStorage）；双击折叠/展开
     grip.addEventListener('mousedown', function (e) {
-      const sug = document.getElementById('cmdSuggest');
       if (!sug) return;
       e.preventDefault();
       _beginDragUi(); // 候选列表高度拖拽期间不弹选中文字菜单
@@ -16439,13 +16813,18 @@ function _cmdRenderSuggest(value) {
       const up = function () {
         document.removeEventListener('mousemove', mv);
         document.removeEventListener('mouseup', up);
-        try { localStorage.setItem('ptoe_cmd_suggest_h', String(Math.round(sug.getBoundingClientRect().height))); } catch (er) {}
+        _cmdUserHeight = Math.round(sug.getBoundingClientRect().height);
+        try { localStorage.setItem(_CMD_SUGGEST_H_KEY, String(_cmdUserHeight)); } catch (er) {}
         _endDragUi();
       };
       document.addEventListener('mousemove', mv);
       document.addEventListener('mouseup', up);
     });
-    grip.addEventListener('dblclick', function () { _cmdSuggestHidden = !_cmdSuggestHidden; _cmdSuggestSetOpen(true); });
+    grip.addEventListener('dblclick', function () {
+      _cmdSuggestHidden = !_cmdSuggestHidden;
+      _cmdSuggestSetOpen(true);
+      _cmdUpdateGhost(_cmdInputValue());
+    });
   }
 })();
 
