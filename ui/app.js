@@ -4,11 +4,18 @@ const BUFFER = 15, GAP = 12;
 // 滚到那里时高度已测量，滚动中几乎不再触发补偿（减少跳变诱因）。代价：常驻 DOM/预览图内存略增（可接受）。
 const PRELOAD = 15;
 // 吸顶工具栏（#toolbar sticky top:0）在视口顶部的遮挡高度。jumpToPage /
-// jumpToPageIndex / scrollToIndex 统一按 hostTop + prefixTop(idx) - VIEW_TOP_OFFSET
+// jumpToPageIndex / scrollToIndex 统一按 hostTop + prefixTop(idx) - toolbarOffset()
 // 落点，即「跳过去的那一页顶边正好停在工具栏下沿」；viewportPage 判定「当前页」
 // 必须用同一条线（2026-10 修复：判定用窗口顶 y=0，跳转后目标页 rect.top=60，
 // 取到的是被工具栏盖住的上一页 → 搜索范围「当前页」替换打错页 = 替换失效）。
-const VIEW_TOP_OFFSET = 60;
+// 2026-10 修复：Ribbon 工具栏 = 选项卡行(28) + 面板行(自适应/会换行) + 状态行(28)，
+// 高度**不是定值**，写死 60px 会让跳页落点被工具栏遮住或落偏 → 统一实测 #toolbar 高度。
+const VIEW_TOP_OFFSET_FALLBACK = 60;
+function toolbarOffset() {
+  const tb = document.getElementById('toolbar');
+  const h = tb ? tb.getBoundingClientRect().height : 0;
+  return h > 0 ? h : VIEW_TOP_OFFSET_FALLBACK;
+}
 let _scrollDir = 1, _viewportY = 0, _lastLo = 0; // 最近一次滚动方向（1 向下 / -1 向上）、视口位置与上次窗口下界，供 updateViewport 动态预挂载/空白兜底
 const OPS = [
   ['bold','粗体'], ['italic','斜体'], ['heading','标题'], ['p','正文'],
@@ -26,6 +33,9 @@ const OPS = [
   ['highlight_green','突显·绿'], ['highlight_blue','突显·蓝'], ['highlight_pink','突显·粉'],
   ['highlight_orange','突显·橙'], ['highlight_purple','突显·紫'], ['ruby','拼音注音'],
   ['charformat','字符格式'],
+  // 格式规则（2026-10）：此前是硬编码 keydown 监听（不在绑定表里，用户改不了、
+  // 录制快捷键时还会和捕获同时触发）→ 纳入 OPS/绑定体系，默认 Ctrl+Shift+Q。
+  ['format_rules','格式规则'],
   ['strip_ws','去空'],
   // 工具操作（无需 currentEditable，直接调用）
   ['search','搜索'], ['clean','智能清理'], ['convert_t2s','繁→简'], ['convert_s2t','简→繁'],
@@ -136,7 +146,7 @@ const DEFAULTS = {
   // 文字包围格式（2026-10-21）：同样默认不绑定
   wavy:'', double:'', overline:'', emphasis:'',
   highlight_green:'', highlight_blue:'', highlight_pink:'', highlight_orange:'', highlight_purple:'', ruby:'',
-  charformat:'', strip_ws:'',
+  charformat:'', format_rules:'Ctrl+Shift+Q', strip_ws:'',
   // 工具操作默认快捷键
   search:'Ctrl+F', clean:'Ctrl+Shift+C', convert_t2s:'Ctrl+Shift+T', convert_s2t:'Ctrl+Shift+Y',
   toggle_md:'Ctrl+Shift+D', undo:'Ctrl+Z', redo:'Ctrl+Y', history:'Ctrl+H',
@@ -159,6 +169,9 @@ const BRUSH_MIX_DEFAULT = ['merge', 'heading'];
 // 键名以 brush_<op> 存放，派发走 SHORTCUT_ACTIONS（见文件后段）。
 for (const d of BRUSH_OPS) DEFAULTS['brush_' + d.op] = 'Ctrl+Shift+' + d.key;
 DEFAULTS['brush_mix'] = 'Ctrl+Shift+G'; // 混合刷：直接武装默认混合组合（不打开选择菜单）
+// 弹窗（设置/搜索/导出/帮助/格式规则…）打开时仍然放行的全局快捷键：存盘类 + 搜索。
+// 其余操作一律不派发，避免在弹窗里按 Ctrl+Z / Ctrl+B 静默改到背后的正文（2026-10 修复）。
+const MODAL_SAFE_OPS = ['save', 'stage', 'finish', 'search'];
 // 鼠标中键手势（与键盘快捷键同一套操作体系）：手势是稀缺资源，默认只绑定对齐三件套。
 const MOUSE_GESTURES = [
   ['Middle+Click','中键单击'], ['Middle+Up','中键上滑'], ['Middle+Down','中键下滑'],
@@ -417,14 +430,42 @@ function saveUIMirror() {
     localStorage.setItem('ptoe_tbl_tbl_menu', uiSettings.tbl_tbl_menu ? '1' : '0');
   } catch (e) {}
 }
+// 保存失败必须可见（2026-10 修复）：此前三条 save* 全是 fire-and-forget，服务端 400/500
+// 完全静默——localStorage 镜像已写入，界面看着「保存成功」，重启后却回退旧值。
+// 典型触发：/api/ui_settings 的逐键校验里任何一项不合法（如 img_mode 绕排值、映射表重复源）
+// 都会让**整批**设置被拒绝，所以这里统一把失败原因冒到界面上。
+let _persistFailAt = 0;
+function _reportPersistFailure(what, err) {
+  const now = Date.now();
+  if (now - _persistFailAt < 3000) return; // 连续保存（映射表逐字输入）只提示一次
+  _persistFailAt = now;
+  const msg = (err && err.message) ? err.message : String(err || '网络错误');
+  if (typeof showToast === 'function') showToast(what + '未保存：' + msg, 'fail');
+  try { console.warn('[persist] ' + what + ' 保存失败: ' + msg); } catch (e) {}
+}
+// 统一 POST 助手：HTTP 非 2xx → 取服务端 error 文案并提示（返回的 Promise 永不 reject）
+function _postJson(url, payload, what) {
+  return fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }).then(function (res) {
+    if (res && res.ok) return;
+    return res.text().then(function (txt) {
+      let detail = '';
+      try { const j = JSON.parse(txt || '{}'); detail = (j && j.error) || ''; } catch (e) {}
+      throw new Error(detail || ('HTTP ' + (res && res.status)));
+    }, function () {
+      throw new Error('HTTP ' + (res && res.status));
+    });
+  }).catch(function (err) {
+    _reportPersistFailure(what, err);
+  });
+}
 function saveUiSettings() {
   if (!uiSettings) return;
   saveUIMirror();
-  fetch('/api/ui_settings', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ui_settings: uiSettings }),
-  }).catch(function () {});
+  _postJson('/api/ui_settings', { ui_settings: uiSettings }, '界面设置');
 }
 function applyUiPrefs() {
   const fs = (uiSettings && uiSettings.editor_font_size) || UI_SETTINGS_DEFAULTS.editor_font_size;
@@ -492,7 +533,10 @@ function hideTip() {
 function loadBindings() {
   let saved = {};
   try { saved = JSON.parse(localStorage.getItem('ptoe_shortcuts') || '{}'); } catch (e) {}
-  return Object.assign({}, DEFAULTS, saved);
+  const merged = Object.assign({}, DEFAULTS, saved);
+  // 旧值迁移（Ctrl+Shift+ArrowUp → Ctrl+Shift+Up 等），见 normalizeCombo
+  for (const k in merged) merged[k] = normalizeCombo(merged[k]);
+  return merged;
 }
 // 服务端持久化（config.json shortcuts）：随机端口下 localStorage 每次运行失效，
 // 故 init 时异步拉取服务端设置覆盖内存 bindings（服务端为准）；localStorage 仅作同步兜底。
@@ -503,6 +547,7 @@ async function loadBindingsFromServer() {
     const sc = res.shortcuts;
     if (!sc || typeof sc !== 'object' || !Object.keys(sc).length) return;
     bindings = Object.assign({}, DEFAULTS, sc);
+    for (const k in bindings) bindings[k] = normalizeCombo(bindings[k]);
     try { localStorage.setItem('ptoe_shortcuts', JSON.stringify(bindings)); } catch (e) {}
     // 设置弹窗已打开时刷新表格（keydown 分发在派发时读 bindings 变量，无需额外处理）
     const bg = document.getElementById('modalBg');
@@ -511,14 +556,24 @@ async function loadBindingsFromServer() {
 }
 function saveBindings() {
   try { localStorage.setItem('ptoe_shortcuts', JSON.stringify(bindings)); } catch (e) {}
-  // fire-and-forget 持久化到 config.json（失败静默，localStorage 仍生效）
-  fetch('/api/shortcuts', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ shortcuts: bindings }),
-  }).catch(function () {});
+  // 持久化到 config.json（失败会提示，见 _postJson）
+  _postJson('/api/shortcuts', { shortcuts: bindings }, '快捷键设置');
 }
 function reverseBindings() { const m = {}; for (const op in bindings) if (bindings[op]) m[bindings[op]] = op; return m; }
+// 绑定写入的唯一入口（2026-10 修复）：同一个组合键/侧键只能属于一个操作。
+// 冲突时先解除其它操作上的同键绑定，返回被解除的操作名（供调用方提示）。
+// 此前捕获直接写 bindings[op] = combo，reverseBindings() 里「后写者胜」→ 旧操作静默失效，
+// 而设置表两行仍显示同一个组合键（用户以为两个都能用）。
+function assignBinding(op, combo) {
+  let displaced = '';
+  if (!op) return displaced;
+  if (!combo) { bindings[op] = ''; return displaced; }
+  for (const k in bindings) {
+    if (k !== op && bindings[k] === combo) { bindings[k] = ''; displaced = k; }
+  }
+  bindings[op] = combo;
+  return displaced;
+}
 // ---------- 鼠标手势绑定（中键滑动；与键盘快捷键同构，服务端持久化 config.json mouse_shortcuts） ----------
 function loadMouseBindings() {
   let saved = {};
@@ -540,14 +595,20 @@ async function loadMouseBindingsFromServer() {
 }
 function saveMouseBindings() {
   try { localStorage.setItem('ptoe_mouse_shortcuts', JSON.stringify(mouseBindings)); } catch (e) {}
-  // fire-and-forget 持久化到 config.json（失败静默，localStorage 仍生效）
-  fetch('/api/mouse_shortcuts', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ mouse_shortcuts: mouseBindings }),
-  }).catch(function () {});
+  // 持久化到 config.json（失败会提示，见 _postJson）
+  _postJson('/api/mouse_shortcuts', { mouse_shortcuts: mouseBindings }, '鼠标手势设置');
 }
 function mouseReverseBindings() { const m = {}; for (const op in mouseBindings) if (mouseBindings[op]) m[mouseBindings[op]] = op; return m; }
+// 手势写入的唯一入口（与 assignBinding 同构）：同一手势只能属于一个操作，冲突时解除旧操作。
+function assignGesture(op, gesture) {
+  let displaced = '';
+  if (!op) return displaced;
+  for (const k in mouseBindings) {
+    if (k !== op && mouseBindings[k] === gesture) { mouseBindings[k] = ''; displaced = k; }
+  }
+  mouseBindings[op] = gesture;
+  return displaced;
+}
 
 // ---------- Ctrl+点击 多段选择（非连续多选；2026-09-19） ----------
 // 按住 Ctrl/Meta 点击任意段落 → 加入/移出选择集合（可跨页、中间可隔其他段落）；
@@ -1479,7 +1540,7 @@ function jumpToPageIndex(idx) {
   if (idx < 0 || idx >= pages.length) return;
   const hostTop = host.getBoundingClientRect().top + window.scrollY;
   _progJumpTs = Date.now();
-  window.scrollTo({ top: Math.max(0, hostTop + prefixTop(idx) - VIEW_TOP_OFFSET), behavior: 'auto' });
+  window.scrollTo({ top: Math.max(0, hostTop + prefixTop(idx) - toolbarOffset()), behavior: 'auto' });
   updateViewport();
   const row = host.querySelector('.page-row[data-i="' + idx + '"]');
   if (row) { const ed = row.querySelector('.editable'); if (ed) ed.scrollTop = 0; }
@@ -1680,11 +1741,12 @@ function viewportPage() {
   //    影响——虚拟列表只有可见行挂载，挂载行的实际位置即当前视图的真实布局。
   //    取「顶边在工具栏下沿（含）之上、且最贴近该线」的那一页 = 视口内容第一页。
   const rows = host.querySelectorAll('.page-row');
+  const topOff = toolbarOffset(); // 工具栏下沿（实测高度，Ribbon 换行时随之变化）
   if (rows.length > 0) {
     let bestIdx = -1, bestTop = -Infinity;
     for (const row of rows) {
       const rect = row.getBoundingClientRect();
-      if (rect.top <= VIEW_TOP_OFFSET && rect.top > bestTop) {
+      if (rect.top <= topOff && rect.top > bestTop) {
         bestTop = rect.top;
         bestIdx = Number(row.dataset.i);
       }
@@ -1693,7 +1755,7 @@ function viewportPage() {
   }
   // 2) 兜底：无挂载行时用二分，取「包含工具栏下沿那条线」的那一页（与 1) 同一语义）
   const hostTop = host.getBoundingClientRect().top + window.scrollY;
-  const y = Math.max(0, window.scrollY - hostTop + VIEW_TOP_OFFSET);
+  const y = Math.max(0, window.scrollY - hostTop + topOff);
   let lo = 0, hi = pages.length;
   while (lo < hi) { const mid = (lo + hi) >> 1; if (prefixTop(mid) < y) lo = mid + 1; else hi = mid; }
   return lo > 0 ? lo - 1 : 0;
@@ -4161,7 +4223,7 @@ function updateViewport() {
   if (sy !== _viewportY) { _scrollDir = sy > _viewportY ? 1 : -1; } // 动态方向感知
   if (sy !== _viewportY) { _viewportY = sy; }
   const hostTop = host.getBoundingClientRect().top + window.scrollY;
-  const y = Math.max(0, window.scrollY - hostTop - VIEW_TOP_OFFSET);
+  const y = Math.max(0, window.scrollY - hostTop - toolbarOffset());
   let lo = 0, hi = pages.length;
   while (lo < hi) { const mid = (lo + hi) >> 1; if (prefixTop(mid) < y) lo = mid + 1; else hi = mid; }
   const viewRows = Math.ceil((window.innerHeight - 140) / (est || 420)) + 1;
@@ -5800,6 +5862,8 @@ function applyOp(op) {
    if (op === 'table2text') { convertTablesToText(); return; }
    // 「分栏」（2026-10）：选中段落两两转无边框两列表 / 光标处插入空白分栏行。
    if (op === 'columns') { convertSelectionToColumns(); return; }
+   // 「格式规则」（2026-10）：纳入 OPS 后，命令行与快捷键共用这一入口。
+   if (op === 'format_rules') { openFormatRulesModal(); return; }
    // 新增内联格式（2026-09）：下划线、删除线、字符边框、底纹、突显、上标、下标
    // 文字包围格式（2026-10-21）：波浪线/双下划线/上划线/着重号/多色突显 → 行内 class；
    // 拼音注音需输入注音内容 → 走注音弹窗（openRubyModal）
@@ -6036,7 +6100,7 @@ function jumpToPage() {
   // updateViewport 挂载行并发出 /preview 图片请求，且行卸载不取消已发出的
   // 请求——跨几百页跳转时会积压成百上千个串行渲染请求，加载近分钟级。
   _progJumpTs = Date.now(); // 程序性跳页：参考行锚定让路（防「跳不过去」）
-  window.scrollTo({ top: Math.max(0, hostTop + prefixTop(idx) - VIEW_TOP_OFFSET), behavior: 'auto' });
+  window.scrollTo({ top: Math.max(0, hostTop + prefixTop(idx) - toolbarOffset()), behavior: 'auto' });
   // 固定行高下同步挂载目标行（scroll 事件异步触发，这里显式调用保证行已存在），
   // 并把页内文字滚动复位到顶部，避免沿用上一页的内部滚动位置
   updateViewport();
@@ -6199,17 +6263,21 @@ function currentCleanOpts() {
 // ---------- 符号映射表编辑 + 实时预览（2026-10-16） ----------
 function parseSymbolMap(text) {
   // 解析符号映射表编辑器内容：每行 "src → dst" 或 "src->dst" 或 "src dst"
+  // 2026-10 修复：同源必须合并（后者覆盖前者）——后端 /api/ui_settings 拒绝重复源，
+  // 只要有一条重复，**整批**界面设置都会被 400 拒绝（表现为「设置改了却存不下来」）。
   const lines = text.split('\n');
   const result = [];
+  const at = new Map(); // src → 在 result 里的下标
   for (const line of lines) {
     const t = line.trim();
     if (!t) continue;
     const m = t.match(/^(.+?)\s*(?:→|->|→)\s*(.+)$/);
-    if (m) {
-      const src = m[1].trim();
-      const dst = m[2].trim();
-      if (src && dst) result.push([src, dst]);
-    }
+    if (!m) continue;
+    const src = m[1].trim();
+    const dst = m[2].trim();
+    if (!src || !dst) continue;
+    if (at.has(src)) result[at.get(src)] = [src, dst];
+    else { at.set(src, result.length); result.push([src, dst]); }
   }
   return result;
 }
@@ -7093,7 +7161,7 @@ function scrollToIndex(idx) {
   const hostTop = host.getBoundingClientRect().top + window.scrollY;
   // 瞬时跳转（同 jumpToPage）：smooth 滚动会逐页挂载中间行、积压图片请求
   _progJumpTs = Date.now(); // 程序性跳页：参考行锚定让路
-  window.scrollTo({ top: Math.max(0, hostTop + prefixTop(idx) - VIEW_TOP_OFFSET), behavior: 'auto' });
+  window.scrollTo({ top: Math.max(0, hostTop + prefixTop(idx) - toolbarOffset()), behavior: 'auto' });
   // 固定行高下同步挂载目标行，并把页内文字滚动复位到顶部
   updateViewport();
   const row = host.querySelector('.page-row[data-i="' + idx + '"]');
@@ -10145,11 +10213,15 @@ document.addEventListener('mouseup', (e) => {
     const g = _midGestureDir(e.clientX - c.x, e.clientY - c.y);
     if (mouseCapturingOp) {
       // 无滑动方向 = 中键单击 → 绑定 'Middle+Click'（此前 g 为空导致中键单击永远无法绑定）
-      mouseBindings[mouseCapturingOp] = g || 'Middle+Click';
-      saveMouseBindings();
+      const op = mouseCapturingOp;
+      const gest = g || 'Middle+Click';
       mouseCapturingOp = null;
+      const displaced = assignGesture(op, gest);   // 同一手势只能属于一个操作
+      saveMouseBindings();
       renderMouseShortcutTable();
       renderShortcutTable();
+      showToast('已把「' + opLabel(op) + '」绑定到「' + gestureLabel(gest) + '」'
+        + (displaced ? '；「' + opLabel(displaced) + '」的同一手势已解除' : ''), 'ok');
     }
     return;
   }
@@ -11420,29 +11492,30 @@ function jumpToErrorPage(dir) {
 }
 
 // ---------- 文字纠错下拉菜单 ----------
-function positionProofreadMenu() {
-  const btn = document.getElementById('proofreadBtn');
-  const menu = document.getElementById('proofreadMenu');
-  if (!btn || !menu) return;
-  const r = btn.getBoundingClientRect();
-  let left = r.left;
-  left = Math.max(8, Math.min(left, window.innerWidth - menu.offsetWidth - 8));
-  menu.style.left = left + 'px';
-  menu.style.top = (r.bottom + 2) + 'px';
-}
+// 2026-10：菜单已迁入「校对」工具栏面板，改由 .tb-more/.tb-more-panel 的 .open 类控制
+// （与 包围/上下标/导出 等下拉一致）；不再按视口坐标写 position:fixed，也不再自管 inline display。
 function openProofreadMenu() {
-  positionProofreadMenu();
-  document.getElementById('proofreadMenu').style.display = 'block';
+  const menu = document.getElementById('proofreadMenu');
+  const more = menu && menu.closest('.tb-more');
+  if (more) more.classList.add('open');
+  if (menu) menu.style.display = ''; // 清掉可能残留的内联值（内联优先级高于 .open 规则）
   proofreadMenuOpen = true;
-  document.getElementById('proofreadBtn').classList.add('active');
+  const btn = document.getElementById('proofreadBtn');
+  if (btn) { btn.classList.add('active'); btn.setAttribute('aria-expanded', 'true'); }
 }
 function closeProofreadMenu() {
-  document.getElementById('proofreadMenu').style.display = 'none';
+  const menu = document.getElementById('proofreadMenu');
+  const more = menu && menu.closest('.tb-more');
+  if (more) more.classList.remove('open');
+  if (menu) menu.style.display = '';
   proofreadMenuOpen = false;
-  document.getElementById('proofreadBtn').classList.remove('active');
+  const btn = document.getElementById('proofreadBtn');
+  if (btn) { btn.classList.remove('active'); btn.setAttribute('aria-expanded', 'false'); }
 }
 function toggleProofreadMenu() {
-  if (proofreadMenuOpen) closeProofreadMenu();
+  const menu = document.getElementById('proofreadMenu');
+  const more = menu && menu.closest('.tb-more');
+  if (more && more.classList.contains('open')) closeProofreadMenu();
   else openProofreadMenu();
 }
 
@@ -11484,6 +11557,17 @@ function toggleDropMenu(btnId, menuId) {
   const menu = document.getElementById(menuId);
   if (isDropMenuOpen(menu)) closeDropMenu(btnId, menuId);
   else openDropMenu(btnId, menuId);
+}
+// 关闭某个 .tb-more 下拉（Ribbon 工具栏下拉：.open 类 + CSS 显隐）。
+// 同时清掉内联 display——历史上 openDropMenu/初始化写过内联值，而内联优先级高于
+// .tb-more.open 的 CSS 规则，不清掉会出现「点按钮打不开 / 关不上」（2026-10 修复）。
+function closeToolbarMore(el) {
+  const more = el && el.closest ? el.closest('.tb-more') : null;
+  if (!more) return;
+  more.classList.remove('open');
+  const btn = more.querySelector('.tb-more-btn');
+  if (btn) btn.setAttribute('aria-expanded', 'false');
+  more.querySelectorAll('.tb-more-panel').forEach(function (p) { p.style.display = ''; });
 }
 
 // 子项1 校正：对当前页执行纠错
@@ -12066,21 +12150,11 @@ document.getElementById('errNo').addEventListener('click', function () {
 // 点击编辑区外 / 滚动 / 选区折叠 → 关闭悬浮窗
 document.addEventListener('mousedown', function (e) {
   if (errKey && !e.target.closest('#errPopup')) hideErrPopup();
-  // 点击菜单外（且不在按钮上）→ 关闭下拉菜单
-  if (proofreadMenuOpen && !e.target.closest('#proofreadMenu') && !e.target.closest('#proofreadBtn')) {
-    closeProofreadMenu();
-  }
-  // 新增下拉菜单（2026-09）：charWrapMenu / supSubMenu
-  const cwMenu = document.getElementById('charWrapMenu');
-  const cwBtn = document.getElementById('charWrapBtn');
-  if (cwMenu && cwMenu.style.display === 'block' && !e.target.closest('#charWrapMenu') && !e.target.closest('#charWrapBtn')) {
-    closeDropMenu('charWrapBtn', 'charWrapMenu');
-  }
-  const ssMenu = document.getElementById('supSubMenu');
-  const ssBtn = document.getElementById('supSubBtn');
-  if (ssMenu && ssMenu.style.display === 'block' && !e.target.closest('#supSubMenu') && !e.target.closest('#supSubBtn')) {
-    closeDropMenu('supSubBtn', 'supSubMenu');
-  }
+  // 点击菜单外关闭：校正下拉已是工具栏 .tb-more 面板，由 bindMoreDropdowns 的外部点击监听统一收起
+  // 新增下拉菜单（2026-09）：charWrapMenu / supSubMenu —— 已在 2026-10 改为 Ribbon 工具栏内的
+  // .tb-more 下拉，开/合由 bindMoreDropdowns 的通用逻辑（.open 类）统一处理，此处不再重复接管。
+  // 此前这里按 style.display === 'block' 判断，而 .tb-more-panel 用 flex 展开 → 永远判不成立，
+  // 菜单一旦打开点哪里都关不掉。
   // 分隔线下拉（2026-09-27）
   const dvMenu = document.getElementById('dividerMenu');
   const dvBtn = document.getElementById('dividerBtn');
@@ -12327,24 +12401,23 @@ function _insertCaptionMd(ed, i, block) {
   return capRow;
 }
 // 题注工具按钮（前端注入，correctmanage 侧无需改 HTML）：
-// ①工具栏「更多格式工具」面板（紧跟「插入表格」）②图片设置弹窗（紧邻「删除」）。
-// 两处都幂等 + 空守卫；按钮缺 CSS 类时静默跳过（不影响快捷键）。
+// ①工具栏「插入」面板（紧跟「插入表格」，平铺可见；2026-10 从「更多格式」下拉移出）
+//   ②图片设置弹窗（紧邻「删除」）。两处都幂等 + 空守卫。
 function _injectCaptionButtons() {
-  const panel = document.getElementById('morePanelFormat');
-  if (panel && !document.getElementById('captionBtn')) {
+  const tableBtn = document.getElementById('tableBtn');
+  const host = (tableBtn && tableBtn.parentNode) || document.getElementById('morePanelFormat');
+  if (host && !document.getElementById('captionBtn')) {
     const b = document.createElement('button');
     b.type = 'button';
     b.className = 'tb-btn';
     b.id = 'captionBtn';
-    b.setAttribute('role', 'menuitem');
     b.title = '为图片添加题注：在图片所在段落之后插入可编辑的题注段落（Ctrl+Alt+G）';
     b.setAttribute('aria-label', '插入题注');
     b.textContent = '插入题注';
     b.addEventListener('mousedown', (e) => e.preventDefault()); // 同 tableBtn：不夺焦
     b.addEventListener('click', () => { insertCaption(); });
-    const ref = document.getElementById('tableBtn');
-    if (ref && ref.parentNode === panel) ref.parentNode.insertBefore(b, ref.nextSibling);
-    else panel.appendChild(b);
+    if (tableBtn && tableBtn.parentNode === host) host.insertBefore(b, tableBtn.nextSibling);
+    else host.appendChild(b);
   }
   const pop = document.getElementById('imgPopup');
   if (pop && !pop.querySelector('.img-pop-btn[data-img-op="caption"]')) {
@@ -12374,12 +12447,18 @@ document.addEventListener('keydown', function (e) {
 // 字号下拉：仅调整编辑区显示字号（CSS 变量 --editor-font-size）；
 // 显示偏好，刻意不写入保存内容/导出 EPUB（阅读器自控字号，2026-09-19）
 function applyFontSize(v) {
-  const fv = v || 14;
+  // 值域必须与 /api/ui_settings 的 editor_font_size（10-28）一致：后端逐键校验，
+  // 越界会让**整批**界面设置 400 不落盘（此前输入框可手打 30，全部设置就都存不下来）。
+  let fv = parseInt(v, 10);
+  if (!isFinite(fv)) fv = 14;
+  fv = Math.max(10, Math.min(28, fv));
   document.documentElement.style.setProperty('--editor-font-size', fv + 'px');
   setStatus('编辑字号：' + fv + 'px');
   if (uiSettings) { uiSettings.editor_font_size = fv; saveUiSettings(); }
   const s = document.getElementById('fontSizeSel');
-  if (s) s.value = fv;
+  if (s && s.querySelector('option[value="' + fv + '"]')) s.value = fv;
+  const inp = document.getElementById('editorFontSizeInput');
+  if (inp && document.activeElement !== inp) inp.value = fv;
 }
 
 // ---------- 格式规则（弹窗管理 + 条件列表/求值模式应用） ----------
@@ -13711,6 +13790,10 @@ function applyInlineFormat(ed, format) {
 // ---------- 快捷键绑定 ----------
 // 数字行上档符号 → 数字（US 布局）。仅在 e.code 不可用时兜底，保证 Shift+数字 归一为数字。
 const SHIFT_DIGIT_SYMBOL = { '!':'1', '@':'2', '#':'3', '$':'4', '%':'5', '^':'6', '&':'7', '*':'8', '(':'9', ')':'0' };
+// 方向键：KeyboardEvent.key 是 ArrowUp/ArrowDown/ArrowLeft/ArrowRight，而 DEFAULTS 与
+// tooltip 都写 Up/Down/Left/Right → 统一归一成短名。2026-10 修复：此前不归一，
+// 「Ctrl+Shift+Up/Left/Right」三个默认对齐快捷键永远匹配不上（死键）。
+const KEY_ALIAS = { ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right' };
 function comboOf(e) {
   const mods = [];
   if (e.ctrlKey) mods.push('Ctrl');
@@ -13726,9 +13809,16 @@ function comboOf(e) {
   else if (/^Numpad[0-9]$/.test(e.code || '')) key = e.code.slice(6);
   else if (/^[a-zA-Z]$/.test(key)) key = key.toUpperCase();
   else if (SHIFT_DIGIT_SYMBOL[key]) key = SHIFT_DIGIT_SYMBOL[key];
+  else if (KEY_ALIAS[key]) key = KEY_ALIAS[key];
   if (key === ' ') key = 'Space';
   if (mods.length === 0 && !/^F\d{1,2}$/.test(key) && key !== 'Enter' && key !== 'Escape') return null; // 必须带修饰键或功能键（Enter/Escape 裸键放行）
   return [...mods, key].join('+');
+}
+// 历史绑定值迁移：早期版本把方向键录制/存成 'Ctrl+Shift+ArrowUp'（当时能用，因为两边都带 Arrow），
+// 归一改短名后必须把这类旧值一并迁成 'Ctrl+Shift+Up'，否则用户原有的绑定会失效。
+function normalizeCombo(c) {
+  if (!c) return c || '';
+  return String(c).replace(/Arrow(Up|Down|Left|Right)$/, '$1');
 }
 // 组合键显示名：鼠标侧键绑定（Mouse4/Mouse5）显示为「侧键1（后退）」等中文名，
 // 键盘组合键原样显示。
@@ -13749,6 +13839,9 @@ function renderShortcutTable() {
     const gest = mouseBindings[op];
     const gestLine = '<div class="mouse-badge' + (gest ? '' : ' unbound') + '" data-op="' + op + '" title="点击后按住中键滑动，把该操作绑定到该方向的手势">中键：' + (gest ? gestureLabel(gest) : '未绑定') + '</div>';
     tr.innerHTML = '<td>' + label + gestLine + '</td><td>' + (combo ? '<kbd>' + comboLabel(combo).replace(/\+/g, '</kbd>+<kbd>') + '</kbd>' : '<span style="color:#9aa7b4">未绑定</span>') + '</td>';
+    // 重绘时保住「正在录制」提示：否则任何一次 renderShortcutTable（如异步加载完绑定、
+    // 侧键改绑后刷新）都会把提示冲掉，但捕获状态还开着，用户不知道接下来按的键会被录走。
+    if (capturingOp === op) tr.querySelector('td:nth-child(2)').textContent = '按下新组合键或鼠标侧键…（Esc 取消，Del 清除）';
     tr.addEventListener('click', () => {
       capturingOp = op;
       mouseCapturingOp = null;   // 键盘捕获与鼠标捕获互斥
@@ -13840,6 +13933,7 @@ function renderMouseShortcutTable() {
     tr.dataset.gesture = g;
     const op = rev[g];
     tr.innerHTML = '<td>' + glabel + '</td><td>' + (op ? opLabel(op) : '<span style="color:#9aa7b4">未绑定</span>') + '</td>';
+    if (mouseCapturingOp && mouseCapturingOp === op) tr.querySelector('td:nth-child(2)').textContent = '按住中键滑动…（Esc 取消，Del 清除）';
     tr.addEventListener('click', () => {
       if (!op) { showToast('该手势未绑定操作；可在上方「快捷键」表点击操作右侧的中键标签进行绑定', 'warn'); return; }
       mouseCapturingOp = op;
@@ -13878,6 +13972,15 @@ document.addEventListener('click', function (e) {
     const cell = row.querySelector('td:nth-child(2)');
     if (cell) cell.textContent = '按住中键滑动…（Esc 取消，Del 清除）';
   }
+}, true);
+// 键盘捕获期间点快捷键表以外的地方 → 退出捕获（2026-10 修复）。
+// 此前捕获状态只由 Esc/Del/新按键清除：用户点了一行快捷键、之后又去点设置里的输入框，
+// 接下来按的每一个键都会被 keydown 捕获分支 preventDefault + 绑到那一行（输入被吞、绑定被误改）。
+document.addEventListener('click', function (e) {
+  if (!capturingOp) return;
+  if (e.target && e.target.closest && e.target.closest('#shortcutTable')) return;
+  capturingOp = null;
+  renderShortcutTable();
 }, true);
 function openSettings() {
   _settingsPanelOpened = true; // 面板已打开：此后清理口径以界面现值为准（currentCleanOpts）
@@ -16250,6 +16353,7 @@ const SHORTCUT_ACTIONS = {
   jump: jumpToPage,
   help: () => { document.getElementById('helpModalBg').style.display = 'flex'; },
   settings: openSettings,
+  format_rules: openFormatRulesModal,
   proofread_correct: proofreadCorrect,
   proofread_reocr: runReocr,
   proofread_apply: proofreadApplyCurrent,
@@ -16307,11 +16411,13 @@ function runOp(op) {
 // 侧键可以「单独」绑定（bindings[op] = 'Mouse4'），不需要和任何键盘按键组合。
 function _handleSideButton(e, sb) {
   if (capturingOp) {                       // 设置弹窗内：绑定到当前操作
-    bindings[capturingOp] = sb.name;
-    saveBindings();
+    const op = capturingOp;
+    const displaced = assignBinding(op, sb.name);   // 同键冲突先解除旧操作
     capturingOp = null;
+    saveBindings();
     renderShortcutTable();
-    showToast('已把「' + sb.label + '」绑定到该操作', 'ok');
+    showToast('已把「' + sb.label + '」绑定到「' + opLabel(op) + '」'
+      + (displaced ? '；「' + opLabel(displaced) + '」的同一绑定已解除' : ''), 'ok');
     return;
   }
   if (mouseCapturingOp) return;            // 中键手势捕获中：侧键不参与
@@ -16383,9 +16489,17 @@ document.addEventListener('keydown', (e) => {
   if (capturingOp) {
     e.preventDefault(); e.stopPropagation();
     if (e.key === 'Escape') { capturingOp = null; renderShortcutTable(); return; }
-    if (e.key === 'Delete' || e.key === 'Backspace') { bindings[capturingOp] = ''; saveBindings(); capturingOp = null; renderShortcutTable(); return; }
+    if (e.key === 'Delete' || e.key === 'Backspace') { assignBinding(capturingOp, ''); saveBindings(); capturingOp = null; renderShortcutTable(); return; }
     const combo = comboOf(e);
-    if (combo) { bindings[capturingOp] = combo; saveBindings(); capturingOp = null; renderShortcutTable(); }
+    if (combo) {
+      const op = capturingOp;
+      const displaced = assignBinding(op, combo);   // 同键冲突先解除旧操作（否则旧操作静默失效）
+      capturingOp = null;
+      saveBindings();
+      renderShortcutTable();
+      showToast('已把「' + opLabel(op) + '」绑定到 ' + comboLabel(combo)
+        + (displaced ? '；「' + opLabel(displaced) + '」的同一组合键已解除' : ''), 'ok');
+    }
     return;
   }
   // 鼠标手势绑定捕获中：键盘只处理 Esc 取消 / Del 清除（滑动本身走 mousedown/mouseup）
@@ -16415,6 +16529,10 @@ document.addEventListener('keydown', (e) => {
     const t = e.target;
     if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
   }
+  // 弹窗打开时只放行少量全局操作（与侧键分支的守卫同口径，2026-10 修复）：
+  // 否则在设置/搜索/导出弹窗里按 Ctrl+Z、Ctrl+B 会静默改到弹窗背后的正文——
+  // 撤销尤其危险：改了正文却没有保存，用户完全看不到。
+  if (_multiSelAnyModalOpen() && MODAL_SAFE_OPS.indexOf(op) === -1) return;
   if (runOp(op)) e.preventDefault();
   return;
 });
@@ -16669,7 +16787,8 @@ document.addEventListener('keydown', (e) => {
   document.getElementById('prLlmSwitch').addEventListener('click', switchLlm);
 
 document.getElementById('cleanBtn').addEventListener('click', cleanAll);
-document.getElementById('proofreadBtn').addEventListener('click', toggleProofreadMenu);
+// 2026-10：校正下拉开合改由 bindMoreDropdowns 的 .tb-more 通用逻辑负责（CSS .open 驱动），
+// 这里不再重复绑 click——两处都切状态会互相收回（同 包围/上下标 修过的问题）。
 document.getElementById('prMenuCorrect').addEventListener('click', proofreadCorrect);
 document.getElementById('prMenuReocr').addEventListener('click', runReocr);
 document.getElementById('prMenuApply').addEventListener('click', proofreadApplyCurrent);
@@ -16924,13 +17043,9 @@ document.getElementById('frFmtPopupCloseBtn').addEventListener('click', closeFmt
 document.getElementById('frFmtCancelBtn').addEventListener('click', closeFmtPopup);
 document.getElementById('frFmtOkBtn').addEventListener('click', confirmFmtPopup);
 _backdropClickClose('frFmtPopupBg', closeFmtPopup);
-// 格式规则快捷键 Ctrl+Shift+Q（独立注册，不依赖 bindings 体系）
-document.addEventListener('keydown', (e) => {
-  if (e.ctrlKey && e.shiftKey && (e.key === 'Q' || e.key === 'q')) {
-    e.preventDefault();
-    openFormatRulesModal();
-  }
-});
+// 格式规则快捷键（2026-10）：已并入 bindings（DEFAULTS.format_rules = Ctrl+Shift+Q，
+// 派发走 SHORTCUT_ACTIONS），此处不再单独注册 keydown——否则录制快捷键时两个监听会同时触发，
+// 且用户无法在设置里改绑/清除。
 document.getElementById('closeSettings').addEventListener('click', closeSettings);
 _backdropClickClose('modalBg', closeSettings);
 // 设置面板标签切换
@@ -17475,6 +17590,16 @@ document.getElementById('jumpBtn').addEventListener('click', jumpToPage);
 document.getElementById('pageJump').addEventListener('keydown', (e) => { if (e.key === 'Enter') jumpToPage(); });
 document.getElementById('toTraditionBtn').addEventListener('click', () => convertAll('s2t'));
 document.getElementById('toSimplifiedBtn').addEventListener('click', () => convertAll('t2s'));
+// 提示条折叠（#hintbar 右侧 ✕）：CSS 早已写好 #hintbar.hidden，但一直没有点击绑定 →
+// 按钮点了没反应（2026-10 修复）。只做会话内隐藏（刷新即恢复）：页面内没有「重新显示」
+// 入口，若持久化到 localStorage 会让用户误点一次就再也看不到提示条。
+(function bindHintBar() {
+  const bar = document.getElementById('hintbar');
+  if (!bar) return;
+  const btn = document.getElementById('hintClose');
+  if (!btn) return;
+  btn.addEventListener('click', function () { bar.classList.add('hidden'); });
+})();
 document.querySelectorAll('#toolbar button[data-op]').forEach((b) => {
   // mousedown 阻止默认夺焦（2026-08-23 修复：点击工具栏按钮会抢走编辑区焦点，
   // 导致 currentEditable() 返回 null、格式类操作静默失效）
@@ -17483,6 +17608,40 @@ document.querySelectorAll('#toolbar button[data-op]').forEach((b) => {
   b.addEventListener('mouseleave', hideTip);
   b.addEventListener('click', () => { hideTip(); suppressPopupUntil = performance.now() + 250; applyOp(b.dataset.op); });
 });
+
+// Ribbon 选项卡切换
+(function bindRibbonTabs() {
+  const tabs = document.querySelectorAll('.ribbon-tab');
+  const panels = document.querySelectorAll('.ribbon-panel');
+  function showTab(tabId) {
+    tabs.forEach(t => {
+      t.classList.remove('active');
+      t.setAttribute('aria-selected', 'false');
+    });
+    panels.forEach(p => p.classList.remove('active'));
+    const tab = document.getElementById(tabId);
+    const panel = document.getElementById(tabId.replace('tab', 'panel'));
+    if (tab) { tab.classList.add('active'); tab.setAttribute('aria-selected', 'true'); }
+    if (panel) panel.classList.add('active');
+  }
+  tabs.forEach(t => {
+    t.addEventListener('click', (e) => { e.preventDefault(); showTab(t.id); });
+    t.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); showTab(t.id); }
+    });
+  });
+  // 快捷键：Alt+1/2/3/4 切换选项卡。
+  // 2026-10 修复：原用 Ctrl+1..4，但 Ctrl+1 是「标题」的默认快捷键（见 DEFAULTS.heading），
+  // 全局快捷键分发并不检查 defaultPrevented → 按一次 Ctrl+1 既切到「开始」页签又改了标题格式；
+  // 而 Shift+Ctrl+1..0 已被增强格式刷占用。故页签改用 Alt+数字（与标题/格式刷互不冲突）。
+  window.addEventListener('keydown', (e) => {
+    if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    const map = { '1': 'tabHome', '2': 'tabInsert', '3': 'tabProof', '4': 'tabPage' };
+    const key = /^Digit[0-9]$/.test(e.code || '') ? e.code.slice(5) : e.key;
+    const id = map[key];
+    if (id) { e.preventDefault(); showTab(id); }
+  });
+})();
 
 // 进度条拖拽跳转 + 点击跳转
 (function bindProgressBar() {
@@ -17545,36 +17704,37 @@ _backdropClickClose('finishConfirmBg', () => {
   document.getElementById('finishConfirmBg').style.display = 'none';
 });
 
-// 新增下拉菜单绑定（2026-09）：文/背/X 三个菜单 —— 空守卫，另一车道在 correctmanage.py 注入 DOM
+// 新增下拉菜单绑定（2026-09）：包围 / 上下标 —— 空守卫，DOM 在 correctmanage.py 的 Ribbon 工具栏内
+// 2026-10 修复：按钮的展开/收起统一交给下面 bindMoreDropdowns 的 .tb-more 通用逻辑（.open + CSS），
+// 这里只负责菜单项动作与收起。此前两处都绑了 click：通用逻辑切 .open、这里切内联 display，
+// 互相打架（一次点击可能被另一处立刻收回、aria-expanded 与实际状态相反）。
 (function bindDropMenus() {
-  // 文字包围：charWrapBtn -> charWrapMenu（data-wrap: underline/underdot/strike/charbox/shade）
-  const cwBtn = document.getElementById('charWrapBtn');
+  // 文字包围：charWrapMenu（data-wrap: underline/strike/charbox/shade）
   const cwMenu = document.getElementById('charWrapMenu');
-  if (cwBtn && cwMenu) {
-    cwBtn.addEventListener('click', (e) => { e.preventDefault(); toggleDropMenu('charWrapBtn', 'charWrapMenu'); });
+  if (cwMenu) {
+    // 菜单项 mousedown 阻止夺焦，保住正文选区（与工具栏格式按钮同一约定）
+    cwMenu.addEventListener('mousedown', (e) => { if (e.target.closest('[data-wrap]')) e.preventDefault(); });
     cwMenu.addEventListener('click', (e) => {
       const item = e.target.closest('[data-wrap]');
       if (!item) return;
-      closeDropMenu('charWrapBtn', 'charWrapMenu');
+      closeToolbarMore(cwMenu);
       applyWrapFormat(currentEditable(), item.dataset.wrap);
     });
   }
   // 突显按钮：highlightBtn (data-op="highlight") 已由 toolbar 统一绑定走 applyOp，无需额外绑定
-  // 上标下标：supSubBtn -> supSubMenu（data-sup: sup/sub）
-  const ssBtn = document.getElementById('supSubBtn');
+  // 上标下标：supSubMenu（data-sup: sup/sub）
   const ssMenu = document.getElementById('supSubMenu');
-  if (ssBtn && ssMenu) {
-    ssBtn.addEventListener('click', (e) => { e.preventDefault(); toggleDropMenu('supSubBtn', 'supSubMenu'); });
+  if (ssMenu) {
+    ssMenu.addEventListener('mousedown', (e) => { if (e.target.closest('[data-sup]')) e.preventDefault(); });
     ssMenu.addEventListener('click', (e) => {
       const item = e.target.closest('[data-sup]');
       if (!item) return;
-      closeDropMenu('supSubBtn', 'supSubMenu');
+      closeToolbarMore(ssMenu);
       const ed = currentEditable();
       if (!ed) { showToast('请先点击某一页的文字', 'warn'); return; }
       applyInlineClass(ed, 'ptoe-' + item.dataset.sup, {toggle:true});
     });
   }
-  // 点击菜单外关闭：复用现有 mousedown 监听器（约 5976 行），在此追加两菜单
 })();
 
 // 更多下拉菜单切换（工具栏 .tb-more）
@@ -17591,27 +17751,29 @@ _backdropClickClose('finishConfirmBg', () => {
       e.preventDefault();
       e.stopPropagation();
       const isOpen = more.classList.toggle('open');
+      // 清掉可能残留的内联 display：内联值优先级高于 .tb-more.open 的 CSS 展开规则，
+      // 残留会让「再点一次打开」失效（2026-10 修复）。
+      if (panel.style.display) panel.style.display = '';
       btn.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
     });
   });
   // 点击外部关闭所有 .tb-more
   document.addEventListener('click', function (e) {
     if (!e.target.closest('.tb-more')) {
-      document.querySelectorAll('.tb-more.open').forEach(function (more) {
-        more.classList.remove('open');
-        const btn = more.querySelector('.tb-more-btn');
-        if (btn) btn.setAttribute('aria-expanded', 'false');
-      });
+      document.querySelectorAll('.tb-more.open').forEach(closeToolbarMore);
     }
+  });
+  // 点中下拉里的动作按钮 → 收起该下拉（动作本身由各自的监听器先执行）。
+  // 只处理 CSS 驱动的 .open 下拉：格式刷那组用内联 display 由 openDropMenu 控制，
+  // 若在这里一并收起，点「混合…」会被立刻关掉。
+  document.addEventListener('click', function (e) {
+    const hit = e.target && e.target.closest ? e.target.closest('.tb-more.open .tb-more-panel button') : null;
+    if (hit) closeToolbarMore(hit);
   });
   // ESC 关闭
   document.addEventListener('keydown', function (e) {
     if (e.key === 'Escape') {
-      document.querySelectorAll('.tb-more.open').forEach(function (more) {
-        more.classList.remove('open');
-        const btn = more.querySelector('.tb-more-btn');
-        if (btn) btn.setAttribute('aria-expanded', 'false');
-      });
+      document.querySelectorAll('.tb-more.open').forEach(closeToolbarMore);
     }
   });
 })();
@@ -17703,8 +17865,10 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
         'modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','charFormatModalBg','rubyModalBg','latexModalBg','finishModalBg','finishConfirmBg',
         'historyModalBg','helpModalBg','formatRulesModalBg','frRuleModalBg','frFmtPopupBg',
         'replaceRulesModalBg','rrEditModalBg',
-        'imgPopup','errPopup','popup','proofreadMenu',
-        'charWrapMenu','supSubMenu'
+        'imgPopup','errPopup','popup'
+        // 注意：charWrapMenu / supSubMenu / proofreadMenu 都是 Ribbon 工具栏内的 .tb-more-panel 下拉，
+        // 显隐由 .tb-more.open 的 CSS 规则驱动；此处若写内联 display:none 会永久压过该规则
+        // （内联样式优先级高于选择器）→ 菜单永远打不开（2026-10 修复）。
       ];
       for (const id of _modalIds) {
         try {
@@ -17755,7 +17919,9 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
   // 防御性：确保没有 modal 遮罩在初始化时意外显示（会导致工具栏/按钮无法响应）
   // 注意：contextMenu 不在此列——它靠 hidden 属性 + CSS [hidden] 显隐，inline display:none
   // 会永久压过 #contextMenu{display:flex}，导致右键菜单永不显示（2026-08 修复）。
-  ['modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','charFormatModalBg','rubyModalBg','latexModalBg','formatRulesModalBg','finishModalBg','finishConfirmBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg','replaceRulesModalBg','rrEditModalBg','imgPopup','errPopup','popup','proofreadMenu','charWrapMenu','supSubMenu','dividerMenu'].forEach(function(id) {
+  // 同样不能把 charWrapMenu / supSubMenu / proofreadMenu 加进来：它们是工具栏 .tb-more-panel
+  // 下拉，内联 display:none 会盖过 .tb-more.open 的展开规则（2026-10 修复）。
+  ['modalBg','searchModalBg','exportModalBg','indentModalBg','tableModalBg','charFormatModalBg','rubyModalBg','latexModalBg','formatRulesModalBg','finishModalBg','finishConfirmBg','historyModalBg','helpModalBg','frRuleModalBg','frFmtPopupBg','replaceRulesModalBg','rrEditModalBg','imgPopup','errPopup','popup','dividerMenu'].forEach(function(id) {
     const el = document.getElementById(id);
     if (el) el.style.display = 'none';
   });

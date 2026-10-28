@@ -157,6 +157,12 @@ SEARCH_MAX_RESULTS_MAX = 1000000
 # 控制行号字号与左侧留白/数字-正文间距。默认大（large）。
 LINE_NUM_SIZE_DEFAULT = "large"
 LINE_NUM_SIZE_CHOICES = ("small", "medium", "large")
+# 插入图片的布局模式（ui_settings.img_mode；2026-10 扩到 5 种）：
+# full/fit/inline 是块级三态，float-left/float-right 是 2026-10 新增的绕排。
+# **前后端共用的唯一值域**——前端 ui/app.js 的 IMG_MODES 与这里必须一致：
+# 后端曾只认 3 种，选「绕排」时整批 ui_settings 被 400 拒绝（设置看似保存却全部丢失）。
+IMG_MODE_DEFAULT = ""
+IMG_MODE_CHOICES = ("", "full", "fit", "inline", "float-left", "float-right")
 # 智能清理规则默认开关（ui_settings 同名键；2026-10）：
 # /api/clean 与设置界面共用同一份默认值。clean_symbols 含「省略号长度归一」。
 CLEAN_SETTINGS_DEFAULTS = {
@@ -1062,7 +1068,7 @@ def set_ui_settings(ui: dict) -> dict:
         clean["editor_font_size"] = max(10, min(28, v))
     if "img_mode" in ui:
         v = str(ui["img_mode"])
-        clean["img_mode"] = v if v in ("", "full", "fit", "inline") else ""
+        clean["img_mode"] = v if v in IMG_MODE_CHOICES else IMG_MODE_DEFAULT
     if "rule_all_pages_confirm" in ui:
         # 类型归一：非 bool 输入统一回退 true（与既有数值/枚举键 clamp 写法一致）
         v = ui["rule_all_pages_confirm"]

@@ -74,6 +74,15 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+# 插入图片布局模式值域：**与 configmanage.IMG_MODE_CHOICES 同源**（前端 ui/app.js 的
+# IMG_MODES 必须与之一致）。configmanage 平时只在函数内惰性导入，这里单独取一次常量，
+# 供 /api/ui_settings 的 POST 校验使用（2026-10：此前这里写死 3 种，选「绕排」时整批
+# ui_settings 被 400 拒绝 → 所有界面设置都存不下来）。
+try:  # pragma: no cover - 极端打包场景下回退到同值字面量
+    from configmanage import IMG_MODE_CHOICES
+except Exception:  # noqa: BLE001
+    IMG_MODE_CHOICES = ("", "full", "fit", "inline", "float-left", "float-right")
+
 # 可选 msgpack 支持：用于内嵌预览图 sidecar 存储（比 gzip+JSON 更快、更小）
 try:
     import msgpack
@@ -8943,8 +8952,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     return
                 clean["editor_font_size"] = v
             if "img_mode" in ui:
+                # 值域与前端 IMG_MODES / configmanage.IMG_MODE_CHOICES 保持一致（含 2 种绕排）
                 v = str(ui["img_mode"])
-                if v not in ("", "full", "fit", "inline"):
+                if v not in IMG_MODE_CHOICES:
                     self._send(400, self._json({"ok": False, "error": "img_mode 取值无效"}), "application/json; charset=utf-8")
                     return
                 clean["img_mode"] = v
@@ -12422,18 +12432,97 @@ body{margin:0;font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sys
 #toolbar select:focus{outline:none;border-color:var(--accent);box-shadow:var(--focus-ring);}
 .dark #toolbar select{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239AA4B8' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");}
 
-/* 3-section layout */
-#toolbar .tb-section{display:flex;align-items:center;gap:3px;flex-wrap:wrap;}
-#toolbar .tb-left{flex:0 0 auto;min-width:0;}
-#toolbar .tb-center{flex:1 1 auto;min-width:0;justify-content:center;}
-#toolbar .tb-right{flex:0 0 auto;margin-left:auto;justify-content:flex-end;}
-/* Status bar: leftmost, single-line horizontal layout */
-#toolbar .tb-statusbar{display:flex;align-items:center;gap:8px;flex:0 0 auto;flex-wrap:nowrap;white-space:nowrap;}
+/* ---------- Ribbon 选项卡工具栏 ---------- */
+/* 三段**纵向**堆叠：选项卡行 28px / 面板行（min-height 32px，窄窗口按组换行）/ 状态行 28px。
+   2026-10 修复：此前 #toolbar 仍是旧的单行 flex 容器（display:flex 默认 row + flex-wrap），
+   选项卡、面板、状态栏被当成同一行的 flex item 争宽、各自换行 → 工具栏内部错位、
+   状态栏跑到面板右侧或挤成第二行、面板右侧按钮被挤出可视区。
+   总高度随窗口宽度变化，故跳转落点不再写死 60px，改由 ui/app.js 的 toolbarOffset() 实测。 */
+#toolbar{position:sticky;top:0;z-index:40;display:flex;flex-direction:column;align-items:stretch;flex-wrap:nowrap;gap:0;min-height:0;padding:0;}
+
+/* 选项卡行：固定 28px，单行，不换行 */
+.ribbon-tabs{display:flex;align-items:center;gap:0;height:28px;padding:0 6px;flex:0 0 auto;width:100%;box-sizing:border-box;border-bottom:1px solid var(--border);background:var(--bg-elev);}
+.ribbon-tab{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 12px;border:none;background:transparent;color:var(--text-muted);font:inherit;font-size:12px;cursor:pointer;border-bottom:2px solid transparent;transition:color var(--transition),border-color var(--transition),background var(--transition);white-space:nowrap;}
+.ribbon-tab:hover{color:var(--accent);background:var(--bg-hover);}
+.ribbon-tab.active{color:var(--accent);border-bottom-color:var(--accent);background:var(--bg-elev);font-weight:600;}
+
+/* 内容面板：min-height 32px 自适应高度；**不能** overflow:hidden——
+   下拉菜单（包围/上下标/格式刷/导出/更多）是面板内 .tb-more 的绝对定位子元素，
+   裁剪后整个菜单被裁掉，表现为「点了按钮没反应」；窄窗口按组换行，按钮不会被挤出可视区。 */
+.ribbon-panel{display:none;align-items:center;gap:6px;min-height:32px;padding:3px 6px;flex:0 0 auto;width:100%;box-sizing:border-box;flex-wrap:wrap;white-space:nowrap;overflow:visible;}
+.ribbon-panel.active{display:flex;}
+.ribbon-panel .tb-group{display:inline-flex;align-items:center;gap:2px;padding:0 3px;height:28px;background:var(--bg-elev);border:1px solid var(--border);border-radius:var(--radius);white-space:nowrap;transition:background var(--transition),border-color var(--transition),box-shadow var(--transition);}
+.ribbon-panel .tb-group:hover{background:var(--bg-hover);border-color:var(--border-strong);}
+.ribbon-panel .tb-group:focus-within{border-color:var(--accent);box-shadow:var(--focus-ring);}
+
+/* 面板内的分隔线 */
+.ribbon-sep{width:1px;height:20px;background:var(--border);margin:0 4px;display:inline-block;vertical-align:middle;}
+
+/* Icon / text buttons（沿用原变量，仅缩小适配 Ribbon 行高） */
+#toolbar .ic-btn{width:var(--btn-size);height:var(--btn-size);padding:0;display:inline-flex;align-items:center;justify-content:center;border:none;background:transparent;color:var(--text);border-radius:var(--radius-sm);cursor:pointer;transition:background var(--transition),color var(--transition),transform .05s ease;}
+#toolbar .ic-btn:hover{background:var(--bg-hover);color:var(--accent);}
+#toolbar .ic-btn:active{background:var(--bg-active);transform:scale(.96);}
+#toolbar .ic-btn:focus-visible{outline:none;box-shadow:var(--focus-ring);}
+#toolbar .ic-btn:disabled{opacity:.4;cursor:default;pointer-events:none;}
+#toolbar .ic-btn svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;}
+#toolbar .ic-btn.active{background:var(--accent-soft);color:var(--accent);}
+
+#toolbar .tb-btn{display:inline-flex;align-items:center;justify-content:center;height:26px;padding:0 7px;border:1px solid var(--border);background:var(--bg-elev);color:var(--text);border-radius:var(--radius-sm);font:inherit;font-size:12px;cursor:pointer;transition:background var(--transition),border-color var(--transition),color var(--transition),transform .05s ease;white-space:nowrap;}
+/* 2026-10 修复：带图标的文字按钮（插入面板的 图片/表格/公式/分隔线/分栏/颜色）此前没有
+   svg 尺寸约束 → 无 width/height 的 <svg> 默认 300×150、fill 默认黑，把按钮撑成黑块并
+   把文字挤没（截图里的黑方块/竖条）。统一 14px 线性图标，与 .ic-btn/.tb-more-btn 一致。 */
+#toolbar .tb-btn svg{width:14px;height:14px;flex:0 0 auto;margin-right:4px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;}
+#toolbar .tb-btn:hover{background:var(--bg-hover);border-color:var(--border-strong);color:var(--accent);}
+#toolbar .tb-btn:active{background:var(--bg-active);transform:scale(.98);}
+#toolbar .tb-btn:focus-visible{outline:none;box-shadow:var(--focus-ring);}
+#toolbar .tb-btn:disabled{opacity:.5;cursor:not-allowed;}
+
+/* 主操作按钮（保留原有视觉区分） */
+#toolbar #saveBtn{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600;padding:0 14px;}
+#toolbar #saveBtn:hover{background:var(--accent-hover);border-color:var(--accent-hover);color:#fff;}
+#toolbar #finishBtn{background:#1a7f37;border-color:#1a7f37;color:#fff;font-weight:600;padding:0 12px;box-shadow:var(--shadow-sm);}
+#toolbar #finishBtn:hover{background:#15692e;border-color:#15692e;box-shadow:var(--shadow-md);transform:translateY(-1px);}
+
+/* 下拉菜单 */
+#toolbar .tb-more{position:relative;}
+/* 高度 26px：与 .ic-btn/.tb-btn 对齐，且能放进 28px 高的 .tb-group（1px 上下边框内剩 26px） */
+#toolbar .tb-more-btn{display:inline-flex;align-items:center;gap:4px;height:26px;padding:0 10px;border:1px solid var(--border);background:var(--bg-elev);color:var(--text);border-radius:var(--radius-sm);font:inherit;font-size:12px;cursor:pointer;transition:background var(--transition),border-color var(--transition);}
+#toolbar .tb-more-btn:hover{background:var(--bg-hover);border-color:var(--border-strong);}
+/* 下拉展开态：按钮保持高亮，用户能看出当前是哪个下拉打开着 */
+#toolbar .tb-more.open > .tb-more-btn,#toolbar .tb-more-btn.active{background:var(--accent-soft);border-color:var(--accent);color:var(--accent);}
+#toolbar .tb-more-btn svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;}
+/* max-height + 滚动：包围菜单条目较多，小窗口下不至于溢出视口底部点不到 */
+#toolbar .tb-more-panel{position:absolute;top:calc(100% + 4px);right:0;z-index:30;min-width:160px;max-height:70vh;overflow-y:auto;padding:6px;background:var(--bg-elev);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow-md);display:none;flex-direction:column;gap:2px;}
+#toolbar .tb-more.open .tb-more-panel{display:flex;}
+#toolbar .tb-more-panel .tb-btn{width:100%;text-align:left;justify-content:flex-start;}
+#toolbar .tb-more-panel .tb-btn:active{background:var(--bg-active);}
+
+/* 按压反馈水波 */
+#toolbar .ic-btn,#toolbar .tb-btn{position:relative;overflow:hidden;}
+#toolbar .ic-btn::after,#toolbar .tb-btn:not(.loading)::after{content:'';position:absolute;left:50%;top:50%;width:10px;height:10px;margin:-5px 0 0 -5px;border-radius:50%;background:currentColor;opacity:0;pointer-events:none;transform:scale(0);}
+@keyframes ptoeRipple{from{opacity:.25;transform:scale(0);}to{opacity:0;transform:scale(7);}}
+#toolbar .ic-btn:active::after,#toolbar .tb-btn:not(.loading):active::after{animation:ptoeRipple .25s ease-out;}
+
+/* 进度条与状态（底部常驻，不随 Ribbon 选项卡切换） */
+#toolbar .tb-statusbar{display:flex;align-items:center;gap:8px;height:28px;width:100%;box-sizing:border-box;flex:0 0 auto;flex-wrap:nowrap;white-space:nowrap;background:var(--bg-elev);border-top:1px solid var(--border);padding:0 10px;}
+#toolbar .tb-status{display:inline-flex;align-items:center;font-size:11px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:0 4px;}
+
+/* 窄窗口：按钮文字隐藏，仅保留图标/缩写 */
+@media (max-width:1200px){
+  #toolbar .tb-btn{padding:0 6px;font-size:11px;}
+  #toolbar .tb-more-btn{padding:0 8px;}
+  #toolbar .tb-btn span{display:none;}
+}
+@media (max-width:900px){
+  .ribbon-panel{flex-wrap:wrap;height:auto;min-height:32px;overflow:visible;white-space:normal;}
+  .ribbon-panel .tb-group{margin-bottom:2px;}
+  .ribbon-tabs{flex-wrap:wrap;height:auto;}
+}
 
 /* Groups as pills */
 #toolbar .tb-group{
   display:inline-flex;align-items:center;gap:1px;
-  padding:0 3px;height:32px;
+  padding:0 3px;height:28px; /* 与 .ribbon-panel 行高一致（此处 ID 选择器会覆盖上面的 28px 声明） */
   background:var(--bg-elev);border:1px solid var(--border);
   border-radius:var(--radius);
   white-space:nowrap;
@@ -12497,7 +12586,7 @@ body{margin:0;font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sys
 #toolbar .tb-more{position:relative;}
 #toolbar .tb-more-btn{
   display:inline-flex;align-items:center;gap:4px;
-  height:28px;padding:0 10px;
+  height:26px;padding:0 10px;
   border:1px solid var(--border);background:var(--bg-elev);color:var(--text);
   border-radius:var(--radius-sm);font:inherit;font-size:12px;cursor:pointer;
   transition:background var(--transition),border-color var(--transition);
@@ -12549,9 +12638,10 @@ body{margin:0;font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sys
 
 /* Status (truncate long text, never force toolbar reflow) */
 #status{font-size:12px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px;}
-#pos{font-size:12px;color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:80px;height:32px;flex-shrink:0;}
-#pagePos{font-size:12px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100px;height:32px;flex-shrink:0;}
-#prLastPage{font-size:12px;color:var(--accent);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100px;height:32px;flex-shrink:0;}
+/* 2026-10 修复：状态行高 28px，这几项曾写死 height:32px（旧单行工具栏遗留）→ 在状态行内上下溢出 2px、与相邻元素错位 */
+#pos{font-size:12px;color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:80px;flex-shrink:0;}
+#pagePos{font-size:12px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100px;flex-shrink:0;}
+#prLastPage{font-size:12px;color:var(--accent);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100px;flex-shrink:0;}
 /* Status spans as standalone flex items in .tb-right (wrap independently of action buttons) */
 #toolbar .tb-status{
   display:inline-flex;align-items:center;
@@ -12600,7 +12690,7 @@ button.loading::after{content:'';display:inline-block;width:11px;height:11px;mar
   button,#errBadge,.page-row,.toast{transition:none !important;transform:none !important;}
   #toolbar .ic-btn::after,#toolbar .tb-btn:not(.loading)::after{animation:none !important;content:none !important;}
 }
-/* U3：hintbar 可折叠（✕ 关闭，localStorage 记忆） */
+/* U3：hintbar 可折叠（✕ 关闭，仅本次会话生效；刷新后恢复） */
 #hintbar{padding:6px 14px;font-size:12px;color:#5a6b7c;background:#eef3fb;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;}
 #hintbar .hint-text{flex:1;}
 #hintClose{flex:none;width:22px;height:22px;padding:0;line-height:1;border:none;background:transparent;color:#8a97a6;font-size:14px;border-radius:4px;}
@@ -12821,9 +12911,13 @@ body.paint-mode{cursor:copy;}
 /* 文字纠错下拉菜单 / 文字包围 / 上标下标 / 分隔线 */
 /* 分隔线菜单 #dividerMenu 必须与前三个同构：openDropMenu 写 left/top 并 display:block，
    缺 position:fixed 时坐标被忽略、static 块又被 sticky 的 #toolbar 盖住 → 点击像没反应。 */
-#proofreadMenu, #charWrapMenu, #supSubMenu, #dividerMenu{position:fixed;z-index:70;background:#fff;border:1px solid #ddd;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.15);min-width:120px;padding:4px;display:none;}
-#proofreadMenu button, #charWrapMenu button, #supSubMenu button, #dividerMenu button{display:block;width:100%;text-align:left;padding:6px 10px;border:none;background:none;cursor:pointer;border-radius:4px;font-size:13px;}
-#proofreadMenu button:hover, #charWrapMenu button:hover, #supSubMenu button:hover, #dividerMenu button:hover{background:#f0f0f0;}
+/* 2026-10 修复：原选择器里含 #charWrapMenu / #supSubMenu / #proofreadMenu——这些 id 现在都属于
+   Ribbon 工具栏内的 .tb-more-panel 下拉（见 #toolbar），ID 选择器特异性更高，会把工具栏下拉
+   改成 position:fixed（脱离 .tb-more 定位、悬浮到错误位置）、display:none 盖过 .open 展开规则。
+   故此处只保留仍为独立浮层的分隔线菜单。 */
+#dividerMenu{position:fixed;z-index:70;background:#fff;border:1px solid #ddd;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.15);min-width:120px;padding:4px;display:none;}
+#dividerMenu button{display:block;width:100%;text-align:left;padding:6px 10px;border:none;background:none;cursor:pointer;border-radius:4px;font-size:13px;}
+#dividerMenu button:hover{background:#f0f0f0;}
 /* 下拉指示符：小号低对比三角，提示「校」为下拉菜单；菜单展开时按钮高亮 */
 #proofreadBtn .ptoe-caret{font-size:9px;color:#8a97a6;margin-left:3px;vertical-align:1px;}
 #popup .sep{width:100%;height:0;border-top:1px solid var(--border);margin:2px 0;}
@@ -13223,37 +13317,35 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
 </head>
 <body>
 <div id="toolbar">
-  <!-- LEFT: 导航与编辑区 -->
-  <div class="tb-section tb-left" role="region" aria-label="导航与编辑">
-    <!-- Zone 1: 导航 -->
-    <div class="tb-group" role="group" aria-label="导航">
-      <button type="button" class="ic-btn" id="searchOpenBtn" onmousedown="event.preventDefault()" title="搜索/替换全部页面 (Ctrl+F)" aria-label="搜索 (Ctrl+F)">
-        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-      </button>
-      <label style="display:inline-flex;align-items:center;gap:2px;">
-        <input type="number" id="pageJump" min="1" placeholder="页码" aria-label="跳转页码" title="跳转页码 (Ctrl+G)" style="width:64px;height:28px;padding:0 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text);font:inherit;">
-      </label>
-      <button type="button" class="tb-btn" id="jumpBtn" onmousedown="event.preventDefault()" title="跳转到指定页码 (Ctrl+G)">跳转</button>
-    </div>
-    <!-- Zone 1b: 编辑 -->
+  <!-- Ribbon 选项卡行 -->
+  <div class="ribbon-tabs" role="tablist" aria-label="功能选项卡">
+    <button type="button" class="ribbon-tab active" id="tabHome" role="tab" aria-selected="true" aria-controls="panelHome" title="开始 (Alt+1)">开始</button>
+    <button type="button" class="ribbon-tab" id="tabInsert" role="tab" aria-selected="false" aria-controls="panelInsert" title="插入 (Alt+2)">插入</button>
+    <button type="button" class="ribbon-tab" id="tabProof" role="tab" aria-selected="false" aria-controls="panelProof" title="校对 (Alt+3)">校对</button>
+    <button type="button" class="ribbon-tab" id="tabPage" role="tab" aria-selected="false" aria-controls="panelPage" title="页面 (Alt+4)">页面</button>
+  </div>
+
+  <!-- 面板：开始（默认可见） -->
+  <div class="ribbon-panel active" id="panelHome" role="tabpanel" aria-labelledby="tabHome">
     <div class="tb-group" role="group" aria-label="编辑">
       <button type="button" class="ic-btn" id="undoBtn" onmousedown="event.preventDefault()" disabled title="撤回上一步 (Ctrl+Z)" aria-label="撤回 (Ctrl+Z)">
         <svg viewBox="0 0 24 24"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg>
       </button>
-      <button type="button" class="ic-btn" id="redoBtn" onmousedown="event.preventDefault()" disabled title="前进下一步 (Ctrl+Y / Ctrl+Shift+Z)" aria-label="前进 (Ctrl+Y)">
+      <!-- 2026-10 修复：Ctrl+Shift+Z 实际绑给「回退原文」（proofread_revert），此处不得再宣传为重做 -->
+      <button type="button" class="ic-btn" id="redoBtn" onmousedown="event.preventDefault()" disabled title="前进下一步 (Ctrl+Y)" aria-label="前进 (Ctrl+Y)">
         <svg viewBox="0 0 24 24"><path d="M21 7v6h-6"/><path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3L21 13"/></svg>
       </button>
-      <!-- 编辑器显示字号（仅视图，不写入内容；与「字符格式」弹窗的逐字符字号区分） -->
+      <!-- 编辑器显示字号（仅视图，不写入内容） -->
       <label style="display:inline-flex;align-items:center;gap:2px;" title="编辑器显示字号：只改变编辑区文字的显示大小，不修改正文、不写入内容（真正改文字字号请用「字符格式」）">
         <span aria-hidden="true" style="font-size:12px;line-height:1;color:var(--text-muted);letter-spacing:.5px;user-select:none;">Aa</span>
-        <select id="fontSizeSel" aria-label="编辑器显示字号（仅影响视图，不写入内容）" title="编辑器显示字号（仅影响视图，不写入内容）" style="height:28px;padding:0 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text);font:inherit;">
+        <select id="fontSizeSel" aria-label="编辑器显示字号（仅影响视图，不写入内容）" title="编辑器显示字号（仅影响视图，不写入内容）" style="height:26px;padding:0 6px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text);font:inherit;">
           <option value="12">12</option><option value="13">13</option><option value="14" selected>14</option>
           <option value="15">15</option><option value="16">16</option><option value="17">17</option>
           <option value="18">18</option><option value="20">20</option>
         </select></label>
     </div>
-    <!-- Zone 2: 格式/插入 -->
-    <div class="tb-group" role="group" aria-label="格式/插入">
+    <span class="ribbon-sep"></span>
+    <div class="tb-group" role="group" aria-label="段落格式">
       <button type="button" class="ic-btn" data-op="bold" onmousedown="event.preventDefault()" title="粗体 (Ctrl+B)" aria-label="粗体 (Ctrl+B)">
         <svg viewBox="0 0 24 24"><path d="M6 4h8a4 4 0 0 1 4 4v6a4 4 0 0 1-4 4H6z"/><path d="M6 12h9a4 4 0 0 0 0-8H6v16"/></svg>
       </button>
@@ -13275,76 +13367,58 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <button type="button" class="ic-btn" data-op="citation" onmousedown="event.preventDefault()" title="引用：把选中内容设为引用（斜体 + 独立字体，默认宋体；整块/光标处则切换整段）" aria-label="引用">
         <svg viewBox="0 0 24 24"><text x="12" y="16" text-anchor="middle" font-size="14" fill="currentColor" stroke="none">引</text></svg>
       </button>
-      <button type="button" class="ic-btn" data-op="strip_ws" onmousedown="event.preventDefault()" title="去空（去除段落内全部空白，保留换行）" aria-label="去空">
-        <svg viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
-      </button>
-      <button type="button" class="ic-btn" data-op="highlight" onmousedown="event.preventDefault()" title="突显文字：对选中文字设置背景色高亮" aria-label="突显文字">
-        <svg viewBox="0 0 24 24"><path d="M12 3v18M19 12H5"/></svg>
-      </button>
-      <!-- 更多 dropdown -->
       <div class="tb-more">
-        <button type="button" class="tb-more-btn" aria-label="更多格式工具" aria-expanded="false" aria-controls="morePanelFormat">
+        <button type="button" class="tb-more-btn" id="charWrapBtn" onmousedown="event.preventDefault()" aria-label="文字包围" aria-expanded="false" aria-controls="charWrapMenu" title="文字包围：下划线 / 波浪线 / 双下划线 / 上划线 / 下加点 / 着重号 / 删除线 / 边框 / 底纹 / 突显 / 拼音注音">
+          包围 <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
+        <div class="tb-more-panel" id="charWrapMenu" role="menu" aria-label="文字包围选项">
+          <button type="button" class="tb-btn" role="menuitem" data-wrap="underline">下划线</button>
+          <button type="button" class="tb-btn" role="menuitem" data-wrap="wavy">波浪线</button>
+          <button type="button" class="tb-btn" role="menuitem" data-wrap="double">双下划线</button>
+          <button type="button" class="tb-btn" role="menuitem" data-wrap="overline">上划线</button>
+          <button type="button" class="tb-btn" role="menuitem" data-wrap="underdot">下加点</button>
+          <button type="button" class="tb-btn" role="menuitem" data-wrap="emphasis">着重号</button>
+          <!-- 2026-10 修复：删除线原写成 data-wrap="underdot"（下加点）→ 点「删除线」实际加下加点 -->
+          <button type="button" class="tb-btn" role="menuitem" data-wrap="strike">删除线</button>
+          <button type="button" class="tb-btn" role="menuitem" data-wrap="charbox">字符边框</button>
+          <button type="button" class="tb-btn" role="menuitem" data-wrap="shade">底纹</button>
+          <div style="height:1px;margin:3px 8px;background:var(--border);"></div>
+          <button type="button" class="tb-btn" role="menuitem" data-wrap="highlight-green">突显·绿</button>
+          <button type="button" class="tb-btn" role="menuitem" data-wrap="highlight-blue">突显·蓝</button>
+          <button type="button" class="tb-btn" role="menuitem" data-wrap="highlight-pink">突显·粉</button>
+          <button type="button" class="tb-btn" role="menuitem" data-wrap="highlight-orange">突显·橙</button>
+          <button type="button" class="tb-btn" role="menuitem" data-wrap="highlight-purple">突显·紫</button>
+          <div style="height:1px;margin:3px 8px;background:var(--border);"></div>
+          <button type="button" class="tb-btn" role="menuitem" data-wrap="ruby">拼音注音</button>
+        </div>
+      </div>
+      <div class="tb-more">
+        <button type="button" class="tb-more-btn" id="supSubBtn" onmousedown="event.preventDefault()" aria-label="上标下标" aria-expanded="false" aria-controls="supSubMenu" title="上标/下标：把选中文字设为上标或下标的小字符">
+          上下标 <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
+        <div class="tb-more-panel" id="supSubMenu" role="menu" aria-label="上标下标选项">
+          <button type="button" class="tb-btn" role="menuitem" data-sup="sup">上标</button>
+          <button type="button" class="tb-btn" role="menuitem" data-sup="sub">下标</button>
+        </div>
+      </div>
+      <button type="button" class="tb-btn" id="formatRulesBtn" role="menuitem" title="格式规则：对选中文字一键应用自定义规则（可多条叠加；Ctrl+Shift+Q）" aria-label="格式规则">格式规则</button>
+      <!-- 2026-10 修复：Ribbon 重构时这一个下拉只剩了一个 display:none 的空容器，
+           里面的入口（去空/突显/转成表格/表格转文本，以及 app.js 注入的「插入题注」）
+           既不可见也点不到 → 恢复成真正的 .tb-more 下拉。 -->
+      <div class="tb-more">
+        <button type="button" class="tb-more-btn" id="moreFormatBtn" aria-expanded="false" aria-controls="morePanelFormat" title="更多格式工具：去空 / 突显 / 转成表格 / 表格转文本">
           更多 <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
         </button>
-        <div class="tb-more-panel" id="morePanelFormat" role="menu">
-          <button type="button" class="tb-btn" id="charWrapBtn" role="menuitem" title="文字包围下拉菜单：下划线 / 删除线 / 字符边框 / 底纹" aria-label="文字包围">文字包围 <span class="ptoe-caret">▾</span></button>
-          <button type="button" class="tb-btn" id="supSubBtn" role="menuitem" title="上标下标下拉菜单：把选中文字设为上标或下标的小字符" aria-label="上标下标">上标/下标 <span class="ptoe-caret">▾</span></button>
-          <button type="button" class="tb-btn" id="formatRulesBtn" role="menuitem" title="格式规则：对选中文字一键应用自定义规则（可多条叠加 / 条件分支；Ctrl+Shift+Q）" aria-label="格式规则">格式规则</button>
-          <button type="button" class="tb-btn" id="colorBtn" role="menuitem" title="文本颜色" aria-label="文本颜色">文本颜色</button>
-          <button type="button" class="tb-btn" id="latexBtn" role="menuitem" onmousedown="event.preventDefault()" title="插入 LaTeX 公式：输入 LaTeX 源码，KaTeX 渲染成 MathML；导出 EPUB 后照常显示" aria-label="插入公式">公式</button>
-          <select id="imgModeSel" title="插入图片的显示模式：全画幅=占满文字宽度，局部=按原尺寸居中，行内=嵌在文字中间（50% 宽度）" style="width:100%;margin-bottom:4px;padding:4px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text);font:inherit;">
-            <option value="full">全画幅</option>
-            <option value="fit">局部</option>
-            <option value="inline">行内</option>
-          </select>
-          <button type="button" class="tb-btn" id="imgExternalBtn" role="menuitem" onmousedown="event.preventDefault()" title="从本地文件选择图片，插入到文字光标处" aria-label="插入外部图片">插入图片</button>
-          <input type="file" id="imgExternalInput" accept="image/*" style="display:none"/>
-          <button type="button" class="tb-btn" id="dividerBtn" role="menuitem" onmousedown="event.preventDefault()" title="分隔线下拉菜单：在光标处插入一行分隔线（直线 / 线段 / 点线 / 双线）" aria-label="插入分隔线">分隔线 <span class="ptoe-caret">▾</span></button>
-          <button type="button" class="tb-btn" id="tableBtn" role="menuitem" onmousedown="event.preventDefault()" title="插入表格：在光标处插入空表格，行/列数与是否带表头可设（Ctrl+Alt+T）" aria-label="插入表格">插入表格</button>
-          <button type="button" class="tb-btn" id="tableConvertBtn" role="menuitem" data-op="table" onmousedown="event.preventDefault()" title="转成表格：把选中的文字转成原生表格（支持 Markdown 管道表 / 画框表 / 空格对齐列；手动档，不要求分隔行）" aria-label="转成表格">转成表格</button>
-          <button type="button" class="tb-btn" id="tableToTextBtn" role="menuitem" data-op="table2text" onmousedown="event.preventDefault()" title="表格转文本：把光标所在表格还原成 Markdown 管道文字（光标不在表格内则转当前页全部表格；可再用「转成表格」转回）" aria-label="表格转文本">表格转文本</button>
-          <button type="button" class="tb-btn" id="colsBtn" role="menuitem" data-op="columns" onmousedown="event.preventDefault()" title="分栏：选中段落两两转成无边框两列表（第1段→左栏、第2段→右栏，落单段放右栏），无选区时在光标处插入空白分栏行。左栏批注垂直居中；中间分栏宽度可在表格内拖拽或用「设置列宽」调整（表格菜单「表格转段落」可还原）" aria-label="分栏">分栏</button>
+        <div class="tb-more-panel" id="morePanelFormat" role="menu" aria-label="更多格式工具">
+          <button type="button" class="tb-btn" data-op="strip_ws" role="menuitem" onmousedown="event.preventDefault()" title="去空（去除段落内全部空白，保留换行）" aria-label="去空">去空</button>
+          <button type="button" class="tb-btn" data-op="highlight" role="menuitem" onmousedown="event.preventDefault()" title="突显文字：对选中文字设置背景色高亮" aria-label="突显文字">突显</button>
+          <button type="button" class="tb-btn" id="tableConvertBtn" data-op="table" role="menuitem" onmousedown="event.preventDefault()" title="转成表格：把选中的文字转成原生表格（支持 Markdown 管道表 / 画框表 / 空格对齐列；手动档，不要求分隔行）" aria-label="转成表格">转成表格</button>
+          <button type="button" class="tb-btn" id="tableToTextBtn" data-op="table2text" role="menuitem" onmousedown="event.preventDefault()" title="表格转文本：把光标所在表格还原成 Markdown 管道文字（光标不在表格内则转当前页全部表格；可再用「转成表格」转回）" aria-label="表格转文本">表格转文本</button>
         </div>
       </div>
     </div>
-
-    <!-- Zone 2b: 格式刷（外部工具栏独立下拉，非「更多」内） -->
-    <div class="tb-group" role="group" aria-label="格式刷">
-      <div class="tb-more">
-        <button type="button" class="tb-more-btn" id="formatBrushBtn" aria-label="格式刷" aria-expanded="false" aria-controls="brushPanel" title="格式刷：捕获格式 / 功能刷（合并/标题等，可混合）；快捷键默认 Shift+Ctrl+1..0（可在设置中自定义）">
-          格式刷 <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
-        </button>
-        <div class="tb-more-panel" id="brushPanel" role="menu" aria-label="格式刷菜单" style="min-width:150px;">
-          <button type="button" class="tb-btn" id="brushFmtBtn" role="menuitem" title="捕获当前选区格式，持续应用到后续选中的文字（持续格式刷）" aria-label="格式刷（捕获格式）">格式刷（捕获）</button>
-          <div style="height:1px;margin:3px 8px;background:var(--border);"></div>
-          <div id="brushOpsList" style="display:flex;flex-direction:column;gap:1px;"></div>
-          <button type="button" class="tb-btn" id="brushMixBtn" role="menuitem" title="混合刷：勾选多个功能组合成一个刷，点击段落依次生效" aria-label="混合刷">混合…</button>
-        </div>
-        <div class="tb-more-panel" id="brushMixPanel" role="menu" aria-label="混合刷多选" style="min-width:170px;">
-          <div id="brushMixList" style="display:flex;flex-direction:column;gap:2px;padding:2px 0;"></div>
-          <div style="display:flex;gap:4px;margin-top:4px;">
-            <button type="button" class="tb-btn" id="brushMixApply" style="flex:1;" title="按勾选启用混合刷" aria-label="启用混合刷">启用</button>
-            <button type="button" class="tb-btn" id="brushMixCancel" style="flex:1;" title="取消" aria-label="取消">取消</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Zone 3: 文本工具 -->
-    <div class="tb-group" role="group" aria-label="文本工具">
-      <button type="button" class="tb-btn" id="toSimplifiedBtn" title="把全部页面文字转为简体（繁体→简体） (Ctrl+Shift+T)">繁→简</button>
-      <button type="button" class="tb-btn" id="toTraditionBtn" title="把全部页面文字转为繁体（简体→繁体） (Ctrl+Shift+Y)">简→繁</button>
-      <button type="button" class="tb-btn" id="mdToggleBtn" title="切换 Markdown 源码 / 富文本编辑模式（详见帮助） (Ctrl+Shift+D)">Markdown</button>
-      <button type="button" class="tb-btn" id="cleanBtn" title="智能清理：合并被 OCR 拆散的小段落、清除段首 #/* 等符号、归一化中英文标点、移除残留的 HTML 标签 (Ctrl+Shift+C)">清理</button>
-      <button type="button" class="tb-btn" id="proofreadBtn" title="文字纠错下拉菜单：校正当前页 / 应用全部候选 / 清除标注 / 回退原文 (Ctrl+K)" aria-label="文字纠错 (Ctrl+K)">校 <span class="ptoe-caret">▾</span></button>
-      <!-- 字符格式（2026-09-27）：逐字符 字号/字体/颜色 弹窗入口 + 清除。并入「文本工具」
-           组而非另开一组，避免工具栏多出第 9 个分组、第三行 -->
-      <button type="button" class="ic-btn" id="charFormatBtn" onmousedown="event.preventDefault()" title="字符格式：为选中文字设置逐字符的字号（8-72 像素）、字体与颜色" aria-label="字符格式">
-        <svg viewBox="0 0 24 24"><path d="M4 19 9.5 5h1L16 19"/><line x1="6" y1="14" x2="14" y2="14"/><line x1="17" y1="19V9"/><line x1="21" y1="19v-5"/><line x1="20" y1="12h2"/></svg>
-      </button>
-      <button type="button" class="ic-btn" id="charFmtClearBtn" onmousedown="event.preventDefault()" title="清除字符格式：移除选中文字的逐字符字号/字体/颜色（整段选中即为整段）" aria-label="清除字符格式">
-        <svg viewBox="0 0 24 24"><path d="M5 17 12 10l3 3 4-4"/><line x1="4" y1="20" x2="20" y2="20"/><path d="M4 4l16 16"/></svg>
-      </button>
+    <span class="ribbon-sep"></span>
+    <div class="tb-group" role="group" aria-label="对齐">
       <button type="button" class="ic-btn" data-op="align_left" onmousedown="event.preventDefault()" title="居左 (Ctrl+Shift+Left)" aria-label="居左 (Ctrl+Shift+Left)">
         <svg viewBox="0 0 24 24"><line x1="3" y1="6" x2="15" y2="6"/><line x1="3" y1="12" x2="15" y2="12"/><line x1="3" y1="18" x2="15" y2="18"/></svg>
       </button>
@@ -13360,10 +13434,131 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <button type="button" class="ic-btn" data-op="indent" onmousedown="event.preventDefault()" title="缩进" aria-label="缩进">
         <svg viewBox="0 0 24 24"><line x1="3" y1="6" x2="21" y2="6"/><line x1="9" y1="12" x2="21" y2="12"/><line x1="9" y1="18" x2="21" y2="18"/></svg>
       </button>
+    </div>
+    <span class="ribbon-sep"></span>
+    <div class="tb-group" role="group" aria-label="格式刷">
+      <div class="tb-more">
+        <button type="button" class="tb-more-btn" id="formatBrushBtn" aria-label="格式刷" aria-expanded="false" aria-controls="brushPanel" title="格式刷：捕获格式 / 功能刷（合并/标题等，可混合）；快捷键默认 Shift+Ctrl+1..0（可在设置中自定义）">
+          格式刷 <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
+        <div class="tb-more-panel" id="brushPanel" role="menu" aria-label="格式刷菜单" style="min-width:150px;">
+          <button type="button" class="tb-btn" id="brushFmtBtn" role="menuitem" title="捕获当前选区格式，持续应用到后续选中的文字（持续格式刷）" aria-label="格式刷（捕获）">格式刷（捕获）</button>
+          <div style="height:1px;margin:3px 8px;background:var(--border);"></div>
+          <div id="brushOpsList" style="display:flex;flex-direction:column;gap:1px;"></div>
+          <button type="button" class="tb-btn" id="brushMixBtn" role="menuitem" title="混合刷：勾选多个功能组合成一个刷，点击段落依次生效" aria-label="混合刷">混合…</button>
+        </div>
+        <div class="tb-more-panel" id="brushMixPanel" role="menu" aria-label="混合刷多选" style="min-width:170px;">
+          <div id="brushMixList" style="display:flex;flex-direction:column;gap:2px;padding:2px 0;"></div>
+          <div style="display:flex;gap:4px;margin-top:4px;">
+            <button type="button" class="tb-btn" id="brushMixApply" style="flex:1;" title="按勾选启用混合刷" aria-label="启用混合刷">启用</button>
+            <button type="button" class="tb-btn" id="brushMixCancel" style="flex:1;" title="取消" aria-label="取消">取消</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <span class="ribbon-sep"></span>
+    <div class="tb-group" role="group" aria-label="导航与搜索">
+      <button type="button" class="ic-btn" id="searchOpenBtn" onmousedown="event.preventDefault()" title="搜索/替换全部页面 (Ctrl+F)" aria-label="搜索 (Ctrl+F)">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      </button>
+      <label style="display:inline-flex;align-items:center;gap:2px;">
+        <input type="number" id="pageJump" min="1" placeholder="页" aria-label="跳转页码 (Ctrl+G)" title="输入页码后回车跳转 (Ctrl+G)" style="width:52px;height:26px;padding:0 6px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text);font:inherit;">
+      </label>
+      <button type="button" class="tb-btn" id="jumpBtn" onmousedown="event.preventDefault()" title="跳转到指定页码 (Ctrl+G)">跳转</button>
+    </div>
+  </div>
+
+  <!-- 面板：插入 -->
+  <div class="ribbon-panel" id="panelInsert" role="tabpanel" aria-labelledby="tabInsert">
+    <div class="tb-group" role="group" aria-label="插入对象">
+      <button type="button" class="tb-btn" id="imgExternalBtn" onmousedown="event.preventDefault()" title="从本地文件选择图片，插入到文字光标处" aria-label="插入外部图片">
+        <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8" cy="8" r="3"/><line x1="21" y1="15" x2="16" y2="10"/></svg>
+        图片
+      </button>
+      <input type="file" id="imgExternalInput" accept="image/*" style="display:none"/>
+      <!-- 2026-10 修复：原内联 width:100%;margin:4px 0 是纵向表单写法，放进 32px 高的 Ribbon 行里会把
+           行撑高/挤歪其它按钮 → 改为固定高度、按内容宽度 -->
+      <select id="imgModeSel" title="插入图片的显示模式：全画幅=占满文字宽度，局部=按原尺寸居中，行内=嵌在文字中间（50% 宽度）" style="height:26px;padding:0 24px 0 6px;">
+        <option value="full">全画幅</option><option value="fit">局部</option><option value="inline">行内</option>
+      </select>
+      <button type="button" class="tb-btn" id="tableBtn" onmousedown="event.preventDefault()" title="插入表格：在光标处插入空表格，行/列数与是否带表头可设（Ctrl+Alt+T）" aria-label="插入表格">
+        <svg viewBox="0 0 24 24"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/><line x1="6" y1="3" x2="6" y2="21"/><line x1="12" y1="3" x2="12" y2="21"/><line x1="18" y1="3" x2="18" y2="21"/></svg>
+        表格
+      </button>
+      <button type="button" class="tb-btn" id="latexBtn" role="menuitem" onmousedown="event.preventDefault()" title="插入 LaTeX 公式：输入 LaTeX 源码，KaTeX 渲染成 MathML；导出 EPUB 后照常显示" aria-label="插入公式">
+        <svg viewBox="0 0 24 24"><path d="M6 3h12M6 21h12M6 12h12M6 6h12M6 18h12M3 6h2M3 12h2M3 18h2M21 6h-2M21 12h-2M21 18h-2"/></svg>
+        公式
+      </button>
+      <button type="button" class="tb-btn" id="dividerBtn" role="menuitem" onmousedown="event.preventDefault()" title="分隔线：在光标处插入一条分隔线" aria-label="插入分隔线">
+        <svg viewBox="0 0 24 24"><line x1="3" y1="12" x2="21" y2="12"/></svg>
+        分隔线
+      </button>
+      <button type="button" class="tb-btn" id="colsBtn" role="menuitem" data-op="columns" onmousedown="event.preventDefault()" title="分栏：选中段落两两转成无边框两列表" aria-label="分栏">
+        <svg viewBox="0 0 24 24"><rect x="3" y="3" width="8" height="18" rx="1"/><rect x="13" y="3" width="8" height="18" rx="1"/></svg>
+        分栏
+      </button>
+    </div>
+    <span class="ribbon-sep"></span>
+    <div class="tb-group" role="group" aria-label="文本样式">
+      <button type="button" class="tb-btn" id="colorBtn" role="menuitem" title="文本颜色" aria-label="文本颜色">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 8v4M12 16v4"/></svg>
+        颜色
+      </button>
+      <button type="button" class="ic-btn" id="charFormatBtn" onmousedown="event.preventDefault()" title="字符格式：为选中文字设置逐字符的字号（8-72 像素）、字体与颜色" aria-label="字符格式">
+        <svg viewBox="0 0 24 24"><path d="M4 19 9.5 5h1L16 19"/><line x1="6" y1="14" x2="14" y2="14"/><line x1="17" y1="19V9"/><line x1="21" y1="19v-5"/><line x1="20" y1="12h2"/></svg>
+      </button>
+      <button type="button" class="ic-btn" id="charFmtClearBtn" onmousedown="event.preventDefault()" title="清除字符格式：移除选中文字的逐字符字号/字体/颜色" aria-label="清除字符格式">
+        <svg viewBox="0 0 24 24"><path d="M5 17 12 10l3 3 4-4"/><line x1="4" y1="20" x2="20" y2="20"/><path d="M4 4l16 16"/></svg>
+      </button>
+      <button type="button" class="tb-btn" id="mdToggleBtn" title="切换 Markdown 源码 / 富文本编辑模式（详见帮助） (Ctrl+Shift+D)">Markdown</button>
+    </div>
+  </div>
+
+  <!-- 面板：校对 -->
+  <div class="ribbon-panel" id="panelProof" role="tabpanel" aria-labelledby="tabProof">
+    <div class="tb-group" role="group" aria-label="文本转换">
+      <button type="button" class="tb-btn" id="toSimplifiedBtn" title="把全部页面文字转为简体（繁体→简体） (Ctrl+Shift+T)">繁→简</button>
+      <button type="button" class="tb-btn" id="toTraditionBtn" title="把全部页面文字转为繁体（简体→繁体） (Ctrl+Shift+Y)">简→繁</button>
+      <button type="button" class="tb-btn" id="cleanBtn" title="智能清理：合并被 OCR 拆散的小段落、清除段首 #/* 等符号、归一化中英文标点、移除残留的 HTML 标签 (Ctrl+Shift+C)">清理</button>
+    </div>
+    <span class="ribbon-sep"></span>
+    <div class="tb-group" role="group" aria-label="纠错与段落">
+      <!-- 2026-10：校正下拉从页面级浮层（position:fixed）改为本工具栏内的 .tb-more 下拉，
+           开合统一走 .tb-more.open 的 CSS；菜单项仍沿用 prMenu* 这些 id，JS 绑定不变。 -->
+      <div class="tb-more">
+        <button type="button" class="tb-more-btn" id="proofreadBtn" aria-expanded="false" aria-controls="proofreadMenu" title="文字纠错：校正当前页 / 应用全部候选 / 清除标注 / 回退原文 (Ctrl+K)" aria-label="文字纠错 (Ctrl+K)">
+          校正 <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
+        <div class="tb-more-panel" id="proofreadMenu" role="menu" aria-label="文字纠错" style="min-width:280px;left:0;right:auto;">
+          <button type="button" class="tb-btn" id="prMenuCorrect" role="menuitem">校正</button>
+          <button type="button" class="tb-btn" id="prMenuReocr" role="menuitem">重识别</button>
+          <button type="button" class="tb-btn" id="prMenuApply" role="menuitem">应用</button>
+          <button type="button" class="tb-btn" id="prMenuClear" role="menuitem">清除</button>
+          <button type="button" class="tb-btn" id="prMenuRevert" role="menuitem">回退</button>
+          <div style="height:1px;margin:3px 8px;background:var(--border);"></div>
+          <button type="button" class="tb-btn" id="prMenuApplyAll" role="menuitem" title="对所有已挂载页应用纠错提示">全部应用</button>
+          <button type="button" class="tb-btn" id="prMenuClearAll" role="menuitem" title="清除所有页的纠错标注">全部清除</button>
+          <div style="height:1px;margin:3px 8px;background:var(--border);"></div>
+          <div style="padding:2px 4px;">
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;" title="默认只执行三条规则：连续重复文字 / 连续标点 / 中文中的连续字母">原有规则（半角转全角/引号配对/混淆表/词典） <input type="checkbox" id="prLegacyRules" style="margin-left:auto;"></label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-top:6px;">LLM 深度校对 <input type="checkbox" id="prLlmEnable" style="margin-left:auto;"></label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-top:6px;">模型 <select id="prLlmModel" style="flex:1;min-width:0;"></select></label>
+            <small style="color:var(--text-muted);display:block;margin-top:4px;font-size:11px;line-height:1.5;">启用后每次校正会额外调用本地 llama-server 进行深度校对。模型留空则使用当前选中模型。</small>
+            <div style="display:flex;gap:6px;margin-top:8px;">
+              <button type="button" id="prLlmStart" style="flex:1;">启动服务</button>
+              <button type="button" id="prLlmStop" style="flex:1;">停止服务</button>
+              <button type="button" id="prLlmSwitch" style="flex:1;" title="用当前所选模型重启服务：自动停止旧模型并加载新模型（无需先手动停止）">切换模型</button>
+            </div>
+            <small id="prLlmStatus" style="color:var(--text-muted);display:block;margin-top:4px;font-size:11px;"></small>
+          </div>
+        </div>
+      </div>
       <button type="button" class="ic-btn" id="indentDlgBtn" onmousedown="event.preventDefault()" title="段落设置：左/右缩进、首行/悬挂缩进、段前段后与行距（导出 EPUB 生效）" aria-label="段落设置">¶</button>
     </div>
+  </div>
 
-    <!-- Zone 4: 标记 -->
+  <!-- 面板：页面 -->
+  <div class="ribbon-panel" id="panelPage" role="tabpanel" aria-labelledby="tabPage">
     <div class="tb-group" role="group" aria-label="标记">
       <button type="button" class="ic-btn" data-op="marker_full" onmousedown="event.preventDefault()" title="全文标记：当前文章到此结束，后续内容属于新文章（开新页） (Ctrl+Shift+F)" aria-label="全文标记 (Ctrl+Shift+F)">
         <svg viewBox="0 0 24 24"><path d="M4 4h16a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/><line x1="12" y1="8" x2="12" y2="16"/></svg>
@@ -13378,82 +13573,70 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
         <svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><line x1="12" y1="10" x2="12" y2="14"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
       </button>
     </div>
-  </div>
-
-  <!-- CENTER: 进度/状态区 -->
-  <div class="tb-section tb-center" role="region" aria-label="进度">
-    <div class="tb-group" role="group" aria-label="进度" style="flex:1 1 auto; min-width:240px; justify-content:space-between; gap:6px; align-items:center;">
-      <button type="button" class="ic-btn" id="prevPageBtn" onmousedown="event.preventDefault()" title="上一页" aria-label="上一页">
-        <svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>
-      </button>
-      <span id="pagePos" aria-live="off" title="当前所在页码" style="font-size:12px;color:var(--text-muted);white-space:nowrap;">第 1 / 547 页</span>
-      <div id="progressWrap" style="flex:1;min-width:80px;height:6px;background:var(--border);border-radius:3px;cursor:pointer;position:relative;overflow:hidden;" title="点击或拖拽跳转到指定进度">
-        <div id="progressBar" style="width:0%;height:100%;background:var(--accent);border-radius:3px;transition:width 0.15s ease;"></div>
-      </div>
-      <span id="progressPct" style="font-size:11px;color:var(--text-muted);min-width:30px;text-align:right;">0%</span>
-      <span id="errBadge" title="点击跳转到第一个待纠错页面" style="display:inline-flex;align-items:center;gap:3px;font-size:11px;color:#E02020;cursor:pointer;white-space:nowrap;padding:2px 8px;border-radius:12px;background:rgba(224,32,32,.1);border:1px solid rgba(224,32,32,.25);font-weight:600;">
-        待纠错 <b id="errBadgeNum" style="min-width:14px;text-align:center;">0</b> 处
-      </span>
-      <button type="button" class="ic-btn" id="nextPageBtn" onmousedown="event.preventDefault()" title="下一页" aria-label="下一页">
-        <svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg>
-      </button>
-    </div>
-    <span id="prLastPage" class="tb-status" aria-live="off" title="最后一次校正/重识别的页码" style="font-size:11px;color:var(--accent);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:90px;"></span>
-    <span id="status" class="tb-status tb-status-main" style="font-size:11px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px;">加载中 ...</span>
-    <span id="prCount" title="当前页面存在的可纠错文字数量" style="font-size:11px;color:var(--text-muted);white-space:nowrap;">可纠错：<b id="prCountNum" style="color:#E02020;">0</b></span>
-  </div>
-
-  <!-- RIGHT: 操作区 -->
-  <div class="tb-section tb-right" role="region" aria-label="操作">
-    <div class="tb-group tb-main" role="group" aria-label="主要操作">
-      <button type="button" class="tb-btn" id="saveBtn" onmousedown="event.preventDefault()" title="保存 (Ctrl+S)" aria-label="保存 (Ctrl+S)" style="background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600;padding:0 14px;">
+    <span class="ribbon-sep"></span>
+    <div class="tb-group" role="group" aria-label="主要操作">
+      <button type="button" class="tb-btn" id="saveBtn" onmousedown="event.preventDefault()" title="保存 (Ctrl+S)" aria-label="保存 (Ctrl+S)">
         <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;fill:none;stroke-width:2;vertical-align:-2px;margin-right:4px;"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
         保存
       </button>
-      <div style="position:relative;display:inline-flex;vertical-align:middle;">
-        <button type="button" class="tb-btn" id="finishBtn" onmousedown="event.preventDefault()" title="完成并转换 (Ctrl+Enter)" aria-label="完成并转换 (Ctrl+Enter)" style="background:#1a7f37;border-color:#1a7f37;color:#fff;font-weight:600;padding:0 12px;box-shadow:var(--shadow-sm);">
-          <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;fill:none;stroke-width:2;vertical-align:-2px;margin-right:4px;"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 3v18"/></svg>
-          完成并转换
-        </button>
-        <div class="tb-more" id="finishMore" style="position:absolute;top:100%;left:0;z-index:30;">
-          <button type="button" class="tb-more-btn" id="finishMoreBtn" aria-label="导出选项" aria-expanded="false" style="height:26px;padding:0 6px;border:1px solid var(--border);border-top:none;border-radius:0 0 var(--radius-sm) var(--radius-sm);background:var(--bg-elev);color:var(--text);">
-            <svg viewBox="0 0 24 24" width="12" height="12" style="stroke:currentColor;fill:none;stroke-width:2;"><polyline points="6 9 12 15 18 9"/></svg>
-          </button>
-          <div class="tb-more-panel" id="finishMorePanel" role="menu" style="left:0;right:auto;min-width:120px;">
-            <button type="button" class="tb-btn" id="exportTxtBtn" role="menuitem" title="导出为纯文本文件（.txt）">导出 TXT</button>
-            <button type="button" class="tb-btn" id="exportDocxBtn" role="menuitem" title="导出为 Word 文档（.docx）">导出 DOCX</button>
-            <button type="button" class="tb-btn" id="exportMdBtn" role="menuitem" title="导出为 Markdown 文件（.md）">导出 MD</button>
-            <button type="button" class="tb-btn" id="exportEpubBtn" role="menuitem" title="导出为 EPUB 电子书（.epub）">导出 EPUB</button>
-          </div>
-        </div>
-      </div>
-    </div>
-    <div class="tb-group" role="group" aria-label="更多">
+      <button type="button" class="tb-btn" id="finishBtn" onmousedown="event.preventDefault()" title="完成并转换 (Ctrl+Enter)" aria-label="完成并转换 (Ctrl+Enter)">
+        <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;fill:none;stroke-width:2;vertical-align:-2px;margin-right:4px;"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 3v18"/></svg>
+        完成并转换
+      </button>
       <div class="tb-more">
-        <button type="button" class="tb-more-btn" aria-label="更多" aria-expanded="false" aria-controls="morePanelRight" title="更多操作">
-          <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;fill:none;stroke-width:2;"><circle cx="12" cy="6" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="18" r="2"/></svg>
-          更多
+        <button type="button" class="tb-more-btn" id="finishMoreBtn" aria-label="导出选项" aria-expanded="false">
+          <svg viewBox="0 0 24 24" width="12" height="12" style="stroke:currentColor;fill:none;stroke-width:2;"><polyline points="6 9 12 15 18 9"/></svg>
+          导出
         </button>
-        <div class="tb-more-panel" id="morePanelRight" role="menu">
-          <button type="button" class="tb-btn" id="stageBtn" role="menuitem" title="暂存：把当前修改暂时保存到本地历史缓存（不转换，可随时恢复） (Ctrl+Shift+S)" aria-label="暂存 (Ctrl+Shift+S)" style="justify-content:flex-start;">
-            <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;fill:none;stroke-width:2;vertical-align:-2px;margin-right:4px;"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
-            暂存
-          </button>
-          <button type="button" class="tb-btn" id="helpBtn" role="menuitem" title="帮助：Markdown 格式、快捷键与标记说明 (F1)" aria-label="帮助 (F1)" style="justify-content:flex-start;">
-            <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;fill:none;stroke-width:2;vertical-align:-2px;margin-right:4px;"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-            帮助
-          </button>
-          <button type="button" class="tb-btn" id="historyBtn" role="menuitem" title="历史记录：查看/管理本地矫正缓存（文件名与路径分列、多版本） (Ctrl+H)" aria-label="历史记录 (Ctrl+H)" style="justify-content:flex-start;">
-            <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;fill:none;stroke-width:2;vertical-align:-2px;margin-right:4px;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-            历史记录
-          </button>
-          <button type="button" class="tb-btn" id="settingsBtn" role="menuitem" title="设置 (Ctrl+Shift+O)" aria-label="设置 (Ctrl+Shift+O)" style="justify-content:flex-start;">
-            <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;fill:none;stroke-width:2;vertical-align:-2px;margin-right:4px;"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 15 19.4a1.65 1.65 0 0 0 1.82.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 15a1.65 1.65 0 0 0-1.51-1H21a2 2 0 0 1 2-2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-            设置
-          </button>
+        <div class="tb-more-panel" id="finishMorePanel" role="menu" style="left:0;right:auto;min-width:120px;">
+          <button type="button" class="tb-btn" id="exportTxtBtn" role="menuitem" title="导出为纯文本文件（.txt）">导出 TXT</button>
+          <button type="button" class="tb-btn" id="exportDocxBtn" role="menuitem" title="导出为 Word 文档（.docx）">导出 DOCX</button>
+          <button type="button" class="tb-btn" id="exportMdBtn" role="menuitem" title="导出为 Markdown 文件（.md）">导出 MD</button>
+          <button type="button" class="tb-btn" id="exportEpubBtn" role="menuitem" title="导出为 EPUB 电子书（.epub）">导出 EPUB</button>
         </div>
       </div>
     </div>
+    <span class="ribbon-sep"></span>
+    <!-- 2026-10：原「更多」二级下拉里的 暂存/帮助/历史记录/设置 已全部平铺到本面板 -->
+    <div class="tb-group" role="group" aria-label="工具">
+      <button type="button" class="tb-btn" id="stageBtn" title="暂存：把当前修改暂时保存到本地历史缓存（不转换，可随时恢复） (Ctrl+Shift+S)" aria-label="暂存 (Ctrl+Shift+S)" style="justify-content:flex-start;">
+        <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;fill:none;stroke-width:2;vertical-align:-2px;margin-right:4px;"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+        暂存
+      </button>
+      <button type="button" class="tb-btn" id="helpBtn" title="帮助：Markdown 格式、快捷键与标记说明 (F1)" aria-label="帮助 (F1)" style="justify-content:flex-start;">
+        <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;fill:none;stroke-width:2;"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        帮助
+      </button>
+      <button type="button" class="tb-btn" id="historyBtn" title="历史记录：查看/管理本地矫正缓存（文件名与路径分列、多版本） (Ctrl+H)" aria-label="历史记录 (Ctrl+H)" style="justify-content:flex-start;">
+        <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;fill:none;stroke-width:2;vertical-align:-2px;margin-right:4px;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        历史记录
+      </button>
+      <button type="button" class="tb-btn" id="settingsBtn" title="设置 (Ctrl+Shift+O)" aria-label="设置 (Ctrl+Shift+O)" style="justify-content:flex-start;">
+        <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;fill:none;stroke-width:2;"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 15 19.4a1.65 1.65 0 0 0 1.82.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 15a1.65 1.65 0 0 0-1.51-1H21a2 2 0 0 1 2-2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        设置
+      </button>
+    </div>
+  </div>
+
+  <!-- 底部状态行（常驻，不随选项卡切换） -->
+  <div class="tb-statusbar">
+    <button type="button" class="ic-btn" id="prevPageBtn" onmousedown="event.preventDefault()" title="上一页" aria-label="上一页">
+      <svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>
+    </button>
+    <span id="pagePos" aria-live="off" title="当前所在页码" style="font-size:12px;color:var(--text-muted);white-space:nowrap;">第 1 / 547 页</span>
+    <div id="progressWrap" style="flex:1;min-width:120px;height:6px;background:var(--border);border-radius:3px;cursor:pointer;position:relative;overflow:hidden;" title="点击或拖拽跳转到指定进度">
+      <div id="progressBar" style="width:0%;height:100%;background:var(--accent);border-radius:3px;transition:width 0.15s ease;"></div>
+    </div>
+    <span id="progressPct" style="font-size:11px;color:var(--text-muted);min-width:30px;text-align:right;">0%</span>
+    <span id="errBadge" title="点击跳转到第一个待纠错页面" style="display:inline-flex;align-items:center;gap:3px;font-size:11px;color:#E02020;cursor:pointer;white-space:nowrap;padding:2px 8px;border-radius:12px;background:rgba(224,32,32,.1);border:1px solid rgba(224,32,32,.25);font-weight:600;">
+      待纠错 <b id="errBadgeNum" style="min-width:14px;text-align:center;">0</b> 处
+    </span>
+    <button type="button" class="ic-btn" id="nextPageBtn" onmousedown="event.preventDefault()" title="下一页" aria-label="下一页">
+      <svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg>
+    </button>
+    <span id="prLastPage" class="tb-status" aria-live="off" title="最后一次校正/重识别的页码" style="font-size:11px;color:var(--accent);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:90px;"></span>
+    <span id="status" class="tb-status tb-status-main" style="font-size:11px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px;">加载中 ...</span>
+    <span id="prCount" title="当前页面存在的可纠错文字数量" style="font-size:11px;color:var(--text-muted);white-space:nowrap;">可纠错：<b id="prCountNum" style="color:#E02020;">0</b></span>
   </div>
 </div>
 <div id="hintbar">
@@ -13575,51 +13758,11 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
     </div>
   </div>
 </div>
-<div id="proofreadMenu">
-  <button type="button" id="prMenuCorrect" role="menuitem">校正</button>
-  <button type="button" id="prMenuReocr" role="menuitem">重识别</button>
-  <button type="button" id="prMenuApply" role="menuitem">应用</button>
-  <button type="button" id="prMenuClear" role="menuitem">清除</button>
-  <button type="button" id="prMenuRevert" role="menuitem">回退</button>
-  <div style="border-top:1px solid #eee;margin-top:6px;"></div>
-  <button type="button" id="prMenuApplyAll" role="menuitem" title="对所有已挂载页应用纠错提示">全部应用</button>
-  <button type="button" id="prMenuClearAll" role="menuitem" title="清除所有页的纠错标注">全部清除</button>
-  <div style="padding:6px 10px;border-top:1px solid #eee;margin-top:6px;">
-    <label style="display:block;font-size:13px;" title="默认只执行三条规则：连续重复文字 / 连续标点 / 中文中的连续字母">启用原有规则（半角转全角/引号配对/混淆表/词典） <input type="checkbox" id="prLegacyRules"></label>
-    <label style="display:block;font-size:13px;margin-top:6px;">启用 LLM 深度校对 <input type="checkbox" id="prLlmEnable"></label>
-    <label style="display:block;font-size:13px;margin-top:6px;">模型 <select id="prLlmModel" style="width:130px;"></select></label>
-    <small style="color:#666;display:block;margin-top:4px;">启用后每次校正会额外调用本地 llama-server 进行深度校对。模型留空则使用当前选中模型。</small>
-    <div style="display:flex;gap:6px;margin-top:8px;">
-      <button type="button" id="prLlmStart" style="flex:1;">启动服务</button>
-      <button type="button" id="prLlmStop" style="flex:1;">停止服务</button>
-      <button type="button" id="prLlmSwitch" style="flex:1;" title="用当前所选模型重启服务：自动停止旧模型并加载新模型（无需先手动停止）">切换模型</button>
-    </div>
-    <small id="prLlmStatus" style="color:#666;display:block;margin-top:4px;"></small>
-  </div>
-</div>
-<div id="charWrapMenu" class="tb-menu">
-  <button type="button" data-wrap="underline" role="menuitem">下划线</button>
-  <button type="button" data-wrap="wavy" role="menuitem">波浪线</button>
-  <button type="button" data-wrap="double" role="menuitem">双下划线</button>
-  <button type="button" data-wrap="overline" role="menuitem">上划线</button>
-  <button type="button" data-wrap="underdot" role="menuitem">下加点</button>
-  <button type="button" data-wrap="emphasis" role="menuitem">着重号</button>
-  <button type="button" data-wrap="strike" role="menuitem">删除线</button>
-  <button type="button" data-wrap="charbox" role="menuitem">字符边框</button>
-  <button type="button" data-wrap="shade" role="menuitem">底纹</button>
-  <div class="sep"></div>
-  <button type="button" data-wrap="highlight-green" role="menuitem">突显·绿</button>
-  <button type="button" data-wrap="highlight-blue" role="menuitem">突显·蓝</button>
-  <button type="button" data-wrap="highlight-pink" role="menuitem">突显·粉</button>
-  <button type="button" data-wrap="highlight-orange" role="menuitem">突显·橙</button>
-  <button type="button" data-wrap="highlight-purple" role="menuitem">突显·紫</button>
-  <div class="sep"></div>
-  <button type="button" data-wrap="ruby" role="menuitem">拼音注音</button>
-</div>
-<div id="supSubMenu" class="tb-menu">
-  <button type="button" data-sup="sup" role="menuitem">上标</button>
-  <button type="button" data-sup="sub" role="menuitem">下标</button>
-</div>
+<!-- 2026-10：原 #proofreadMenu 页面级浮层已迁入「校对」工具栏面板（见 #panelProof），此处不再保留。 -->
+<!-- 2026-10 修复：此处原有的 #charWrapMenu / #supSubMenu 两个旧浮层菜单与 Ribbon 工具栏内的
+     下拉面板 **id 重复**（getElementById 只取先出现的工具栏面板），导致工具栏下拉被旧 CSS
+     （position:fixed + display:none）劫持、菜单关不掉。Ribbon 已自带同名面板，故删除这两个
+     重复节点；波浪线/突显/注音等其余包围格式仍在右键菜单与选中浮动菜单中提供。 -->
 <!-- 分隔线菜单（2026-09-27）：线条型四种 + 花样型八种（2026-10-21），字形预览即最终写入内容 -->
 <div id="dividerMenu" class="tb-menu">
   <button type="button" data-div="solid" role="menuitem" title="实线分隔线">直线 <span class="div-glyph div-solid">────────</span></button>

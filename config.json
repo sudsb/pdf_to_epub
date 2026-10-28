@@ -1,6 +1,6 @@
 {
   "llama_server": "E:/xox/Tools/llama-c/llama-server.exe",
-  "models_dir": "E:/xox/Tools/llama-c/models",
+  "models_dir": "E:/model",
   "model_choices": {
     "HY": {
       "name": "HunyuanOCR.BF16.gguf",

@@ -3,9 +3,10 @@
 
 覆盖的不变量（括号内是本次修复的缺陷编号，见各注释）：
   A1 viewportPage 判定「当前页」必须与 jumpToPage/scrollToIndex 的落点用同一条线
-     （hostTop + prefixTop(idx) - VIEW_TOP_OFFSET，即吸顶工具栏下沿 60px）——
-     否则跳转后目标页 rect.top=60，判定取到被工具栏盖住的上一页，「当前页」范围
+     （hostTop + prefixTop(idx) - toolbarOffset()，即吸顶工具栏实测高度的下沿）——
+     否则跳转后目标页 rect.top=工具栏高度，判定取到被工具栏盖住的上一页，「当前页」范围
      打错页 → 替换失效，工具栏页码也少一页。
+     （2026-10：工具栏改为 Ribbon 三段结构，高度不再是定值 60px，故判定线由常量改为实测。）
   A2 replaceAll 必须用 _replaceScopeIndexes()（沿用搜索时锁定的 _scopeSearchPage），
      替换时不能重新解析 _searchScopeIndexes()（视口变了就打到别的页）。
   A3 搜索「当前页」= currentPageIndex()：光标/选区所在页优先，取不到再回退视口页
@@ -54,17 +55,23 @@ class SearchReplaceStaticTest(unittest.TestCase):
     # ---------- A1：视口页判定线与跳转落点一致 ----------
     def test_viewport_page_uses_jump_landing_line(self):
         src = self.src
-        self.assertEqual(src.count('const VIEW_TOP_OFFSET = 60;'), 1,
-                         'VIEW_TOP_OFFSET 应只声明一次')
-        self.assertIn('rect.top <= VIEW_TOP_OFFSET', src,
+        # 2026-10：吸顶工具栏改为 Ribbon 三段结构（选项卡行 + 面板行 + 状态行，面板还会换行），
+        # 高度不再是 60px 定值 → 判定线/落点统一改为 toolbarOffset() 实测。
+        # 不变量仍是：判定线与跳转落点必须取同一个高度。
+        self.assertEqual(src.count('function toolbarOffset()'), 1,
+                         'toolbarOffset 应只声明一次')
+        self.assertNotIn('const VIEW_TOP_OFFSET = 60;', src,
+                         '不得回退到写死 60px 的旧实现（Ribbon 工具栏高度会变化）')
+        self.assertIn('const topOff = toolbarOffset();', src)
+        self.assertIn('rect.top <= topOff', src,
                       'viewportPage 应按工具栏下沿线判定（原 rect.top<=0 取到上一页）')
-        self.assertIn('const y = Math.max(0, window.scrollY - hostTop + VIEW_TOP_OFFSET)', src,
+        self.assertIn('const y = Math.max(0, window.scrollY - hostTop + topOff)', src,
                       'viewportPage 兜底二分必须用同一条线')
         self.assertNotIn('const viewportTop = window.scrollY;', src,
                          '旧的「窗口顶 y=0」判定不得回归')
-        # 跳转三处落点必须引用同一常量（而非散落字面量 60）
-        self.assertGreaterEqual(src.count('hostTop + prefixTop(idx) - VIEW_TOP_OFFSET'), 3,
-                                'jumpToPage/jumpToPageIndex/scrollToIndex 落点应引用 VIEW_TOP_OFFSET')
+        # 跳转三处落点必须引用同一来源（而非散落字面量 60）
+        self.assertGreaterEqual(src.count('hostTop + prefixTop(idx) - toolbarOffset()'), 3,
+                                'jumpToPage/jumpToPageIndex/scrollToIndex 落点应引用 toolbarOffset()')
 
     # ---------- A2：替换沿用搜索锁定页 ----------
     def test_replace_uses_locked_scope_page(self):
@@ -163,7 +170,9 @@ class SearchReplaceStaticTest(unittest.TestCase):
         node = shutil.which('node')
         if not node:
             self.skipTest('未安装 node，跳过语法检查')
-        r = subprocess.run([node, '--check', APP_JS], capture_output=True, text=True)
+        # 显式 utf-8：Windows 默认按 GBK 解码 node 输出，含中文报错时测试自己先抛 UnicodeDecodeError
+        r = subprocess.run([node, '--check', APP_JS], capture_output=True, text=True,
+                           encoding='utf-8', errors='replace')
         self.assertEqual(r.returncode, 0, 'node --check 失败：\n%s' % (r.stderr or r.stdout))
 
 
@@ -200,7 +209,6 @@ function ok(cond, msg) { if (!cond) failures.push(msg); }
 function eq(a, b, msg) { ok(JSON.stringify(a) === JSON.stringify(b), msg + '（实际 ' + JSON.stringify(a) + '，期望 ' + JSON.stringify(b) + '）'); }
 
 const decl = [
-  extractDecl(/const VIEW_TOP_OFFSET = \d+;/),
   extractDecl(/const _ENTITY_RE = [^\n]+;/)
 ].join('\n');
 
@@ -220,6 +228,8 @@ const host = {
   getBoundingClientRect: function () { return { top: HOST_TOP }; }
 };
 const window = { get scrollY() { return SCROLL_Y; } };
+// 工具栏遮挡高度桩：行为断言按 60px 这一固定线验证（真实实现读 #toolbar 实测高度）
+function toolbarOffset() { return 60; }
 function prefixTop(i) { return PREFIX[i]; }
 function pageSource(i) { return PAGE_SRC; }
 // 光标/选区所在页桩：CARET_PAGE>=0 时返回带 .page-row[data-i] 的编辑区
@@ -334,7 +344,8 @@ class SearchReplaceBehaviorTest(unittest.TestCase):
             script = os.path.join(td, 'harness.js')
             with open(script, 'w', encoding='utf-8') as f:
                 f.write(textwrap.dedent(HARNESS))
-            r = subprocess.run([self.node, script, APP_JS], capture_output=True, text=True)
+            r = subprocess.run([self.node, script, APP_JS], capture_output=True, text=True,
+                               encoding='utf-8', errors='replace')
         out = (r.stdout or '') + (r.stderr or '')
         self.assertEqual(r.returncode, 0, '行为断言未通过：\n%s' % out)
         self.assertIn('OK', out)
