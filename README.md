@@ -340,6 +340,7 @@ When enabled, a local HTTP server starts and opens the correction UI (a pywebvie
 - **Right**: Editable OCR text (one `<div>` per line)
 - **Toolbar**: Format (bold, italic, headings h1–h6, alignment, notes), markers (article break, paragraph merge), search/replace, proofreading, image insert, export TXT/DOCX/EPUB
 - **Command Line** (`Ctrl+;`): nvim-style line-range commands (`7,10merge`), multi-command scripts (`;` separators, `（…）` scope groups), and `插入 insert [格式 format][文本 text]` that falls back to the **system clipboard** when text is omitted (see USAGE.md 六)
+- **nvim Mode** (2026-10-28, optional): default INSERT; `Esc` → NORMAL (`j`/`k` page, `gg`/`G`, `dd`/`yy`/`cc`, `v` visual), `:` opens the command line with `:w`/`:wq`/`:q`/`:next`/`:prev`/`:g N` and page-scoped `:s/old/new/` (`10,20s/...`, `%s/...`) — see USAGE.md 六
 - **Virtual List**: Handles 1000+ pages smoothly
 - **Undo/Redo**: Ctrl+Z / Ctrl+Y (10 steps)
 - **History**: Versioned cache at `data/correction_history/` (20 versions per PDF)

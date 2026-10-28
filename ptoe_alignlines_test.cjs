@@ -1,17 +1,19 @@
 'use strict';
-// 多行文本对齐（alignLines）real-DOM jsdom harness（2026-10-20）
+// 多行文本对齐（alignLines）real-DOM jsdom harness（2026-10-20，2026-10-28 重写口径）
 // 覆盖：
-//   1) 基准宽度按**显示列宽**（CJK 占 2 列）算——按字符数补齐会让中文行左右错位；
-//   2) 含空格的行：左段靠左、右段靠右（两端对齐），中间以 &nbsp; 填充；
-//   3) 最长行不补齐（只把分隔空白统一成 &nbsp;，列宽不变）；
-//   4) 无空格的行：右侧补齐到基准宽度；
+//   1) 基准宽度 = 选中行里最长的**真实渲染宽度**（像素量测），不是字符数/列数；
+//   2) 含空白行：左段贴左、右段贴右，差额补在**最后一个空白段**（用户 2026-10-28 确认）；
+//   3) 最长行不额外拉伸（只把分隔空白换成等宽 &nbsp;）；
+//   4) 无空白行：行尾补不可见空白到基准宽度；
 //   5) 行内格式（strong/em/span）保留——旧实现整体覆写 innerHTML 会丢；
 //   6) 幂等：重复对齐结果不变；
-//   7) 标记类 ptoe-align-lines 落在块上（导出时豁免空白符清理）。
-// 运行：node ptoe_alignlines_test.cjs
+//   7) 标记类 ptoe-align-lines 落在块上（导出时豁免空白符清理）；
+//   8) 量测不可用（客户区宽度全 0，如 jsdom/隐藏页）→ 回退列宽算法（中文 2 列/其余 1 列）。
+// 运行：
+//   python -c "import correctmanage,os;p=os.path.join(os.environ['TEMP'],'opencode','ui_current.html');os.makedirs(os.path.dirname(p),exist_ok=True);open(p,'w',encoding='utf-8').write(correctmanage._UI_HTML)"
+//   node ptoe_alignlines_test.cjs
 const fs = require('fs');
 const path = require('path');
-const assert = require('assert');
 const { JSDOM } = require('jsdom');
 
 const REPO = __dirname;
@@ -47,15 +49,56 @@ function cols(s) {
   }
   return w;
 }
+// HTML 会把可折叠空白串折成一个空格（&nbsp; 不折叠）——量测模型必须先折叠
+function collapse(s) {
+  return String(s == null ? '' : s).replace(/[ \t\n\r\f\v]+/g, ' ');
+}
+// 模型 A：1 列 = 7px、&nbsp; = 1 列（与列宽算法等价，用来验证两条路径口径一致）
+function pxCols(s) {
+  return cols(collapse(s)) * 7;
+}
+// 模型 B：Windows Microsoft YaHei 14px 实测口径（中文 14px、空格/&nbsp; 4px、数字/字母 8px、'.' 3px）
+// ——旧实现按「列宽」折算就是在这里崩掉的（补 1 列只补到 7px，实际 nbsp 只有 4px）
+function pxYahei(s) {
+  let w = 0;
+  for (const ch of collapse(s)) {
+    const c = ch.codePointAt(0);
+    if (c === 0x20 || c === 0x00a0) w += 4;
+    else if (ch === '.') w += 3;
+    else if (c < 0x80) w += 8;
+    else w += 14;
+  }
+  return w;
+}
+let MEASURE = pxCols;
+// >0 时：量测宽度超过该值视为「已折成两个视觉行」（Range 返回两个不同 top 的矩形）
+let WRAP_OVER = 0;
 
+// 页面：一个编辑区里放四组互不干扰的段落（选区分组，基准只按选中的块算）
 const PAGES = [
   {
     page: 1, w: 800, h: 1200,
-    text: '<p>第一章 总则</p>' +
+    text:
+      // A 组（列宽模型 / 兼容旧断言）
+      '<p>第一章 总则</p>' +
       '<p>第一节 总则的适用范围</p>' +
       '<p>第二节 附则</p>' +
       '<p><strong>第三条 术语</strong></p>' +
-      '<p>无空格行</p>',
+      '<p>无空格行</p>' +
+      // B 组（真实字体口径：视觉等长）
+      '<p>第一章 总则</p>' +
+      '<p>第一节 总则的适用范围</p>' +
+      '<p>第二节 附则</p>' +
+      // C 组（多个空白段 → 只放大最后一段）
+      '<p>1. 第四节    多空白段的末列对齐</p>' +
+      '<p>1. 第五节  短</p>' +
+      // D 组（无量测环境 → 列宽兜底）
+      '<p>第一章 总则</p>' +
+      '<p>第一节 总则的适用范围</p>' +
+      '<p>第二节 附则</p>' +
+      // E 组（已折成多行的块不参与对齐）
+      '<p>很长很长的一行超级长的文字内容用来模拟折行</p>' +
+      '<p>短行 目标</p>',
   },
 ];
 
@@ -89,6 +132,29 @@ const dom = new JSDOM(uiHtml, {
     window.cancelAnimationFrame = (id) => clearTimeout(id);
     window.document.execCommand = () => true;
     window.document.queryCommandState = () => false;
+    // 布局引擎替身：Range 的客户区宽度按 MEASURE 模型算（jsdom 本身没有布局）
+    const rectList = function (text) {
+      const w = MEASURE(text);
+      if (!w) return [];
+      if (WRAP_OVER && w > WRAP_OVER) {
+        return [
+          { width: w / 2, height: 14, left: 0, top: 0, right: w / 2, bottom: 14 },
+          { width: w / 2, height: 14, left: 0, top: 20, right: w / 2, bottom: 34 },
+        ];
+      }
+      return [{ width: w, height: 14, left: 0, top: 0, right: w, bottom: 14 }];
+    };
+    window.Range.prototype.getClientRects = function () {
+      return rectList(this.toString());
+    };
+    window.Range.prototype.getBoundingClientRect = function () {
+      const w = MEASURE(this.toString());
+      return { width: w, height: 14, left: 0, top: 0, right: w, bottom: 14 };
+    };
+    // canvas getContext 替身：量 &nbsp; 宽度用
+    window.HTMLCanvasElement.prototype.getContext = function () {
+      return { font: '', measureText: (s) => ({ width: MEASURE(s) }) };
+    };
     window.__errors = [];
     window.addEventListener('error', (e) => { window.__errors.push(String(e.message)); });
   },
@@ -96,7 +162,8 @@ const dom = new JSDOM(uiHtml, {
 const w = dom.window;
 const doc = w.document;
 
-const EXPORTS = ['alignLines', '_textCols', '_blockTextNodes', '_replaceBlockRange', 'ALIGN_LINES_CLASS'];
+const EXPORTS = ['alignLines', '_textCols', '_blockTextNodes', '_replaceBlockRange', 'ALIGN_LINES_CLASS',
+  '_alignLineInfo', '_lastWsRun', '_alignLineMetrics', '_blockTextSpan', '_nbspPx'];
 try {
   w.eval(appJs + '\n;[' + EXPORTS.map((n) => 'typeof ' + n + ' === "undefined" ? null : ' + n).join(',') +
     '].forEach(function(v, i) { if (v !== null && v !== undefined) window["__x_" + ' + JSON.stringify(EXPORTS) + '[i]] = v; });');
@@ -133,24 +200,33 @@ function selectBlocks(bs) {
   sel.addRange(r);
   return r;
 }
+// 一行按真实字体渲染后的宽度（px，含尾部 &nbsp; 填充）
+function edge(block) {
+  return MEASURE(collapse(visible(block)));
+}
 
 function run() {
   const align = X('alignLines');
   const textCols = X('_textCols');
   A(typeof align === 'function', 'alignLines 可用');
   A(typeof textCols === 'function', '_textCols 可用');
+  A(typeof X('_alignLineMetrics') === 'function', '_alignLineMetrics 可用（像素量测入口）');
   if (!editableOf(0)) { A(false, 'init 挂载了第 1 页'); return; }
   A(w.__errors.length === 0, '加载期无 JS 错误: ' + JSON.stringify(w.__errors));
 
   const ed = editableOf(0);
   const bs = blocksOf(ed);
-  EQ(bs.length, 5, '第 1 页 5 个块');
+  EQ(bs.length, 15, '第 1 页 15 个块（五组用例）');
 
   // ---- 1) 列宽口径：CJK 2 列 ----
   EQ(textCols('第一章'), 6, '中文 2 字 = 6 列');
   EQ(textCols('abc'), 3, 'ASCII 3 字符 = 3 列');
+  // 最后一个空白段解析
+  EQ(X('_lastWsRun')('1. 第一节    总则').index, 6, '分界取最后一个空白段（不是第一个，第一个在 index 2）');
+  EQ(X('_lastWsRun')('无空白'), null, '无空白行没有分界');
 
-  // ---- 2) 三行对齐（含空格的两端对齐 + 最长行不补齐）----
+  // ==== A 组：列宽模型（量测口径与列宽口径一致） ====
+  MEASURE = pxCols;
   selectBlocks(bs.slice(0, 3));
   align(ed);
   const t0 = visible(bs[0]), t1 = visible(bs[1]), t2 = visible(bs[2]);
@@ -161,9 +237,7 @@ function run() {
     '三行列宽一致（' + cols(t0) + '/' + cols(t1) + '/' + cols(t2) + '）');
   A(/^第一章(\u00a0)+总则$/.test(t0), '填充用 &nbsp;（HTML 折叠不掉）');
   A(!/ /.test(t0) && !/ /.test(t1) && !/ /.test(t2), '段内不留半角空格（导出清理不会吃掉对齐）');
-  // 左段靠左（同一列起）+ 右段靠右（右边缘同列）
   A(t0.startsWith('第一章') && t1.startsWith('第一节') && t2.startsWith('第二节'), '左段靠左（同一列起）');
-  A(cols(t0) === cols(t1) && cols(t1) === cols(t2), '右段靠右（右边缘同列）');
 
   // ---- 3) 标记类 ----
   EQ(X('ALIGN_LINES_CLASS'), 'ptoe-align-lines', '标记类名常量');
@@ -187,6 +261,53 @@ function run() {
   selectBlocks(bs.slice(0, 3));
   align(ed);
   EQ(visible(bs[0]), before, '重复对齐结果不变（幂等）');
+
+  // ==== B 组：真实字体口径（Microsoft YaHei 14px）—— 视觉等长 ====
+  MEASURE = pxYahei;
+  const b1 = bs.slice(5, 8);
+  selectBlocks(b1);
+  align(ed);
+  const e1 = b1.map(edge);
+  const nbCount = (visible(b1[0]).match(/\u00a0/g) || []).length;
+  A(nbCount > 11, '补白按真实 &nbsp; 宽度算（' + nbCount + ' 个，旧算法只补 11 个）');
+  A(Math.max.apply(null, e1) - Math.min.apply(null, e1) <= 4.01,
+    '三行右侧对齐到像素级（' + e1.join(' / ') + ' px）');
+  A(Math.abs(e1[1] - pxYahei('第一节 总则的适用范围')) < 0.01, '最长行宽度不变（' + e1[1] + ' px）');
+  A(visible(b1[0]).startsWith('第一章') && visible(b1[2]).startsWith('第二节'), '左段仍贴左');
+  // 导出线索：填充只能是 &nbsp;（半角空格会被折叠/清理）
+  A(!/ /.test(visible(b1[0])) && !/ /.test(visible(b1[2])), '补白不含半角空格');
+
+  // ==== C 组：多个空白段 → 只放大最后一个空白段 ====
+  const c1 = bs.slice(8, 10);
+  selectBlocks(c1);
+  align(ed);
+  const ce = c1.map(edge);
+  A(Math.max.apply(null, ce) - Math.min.apply(null, ce) <= 4.01,
+    '多空白段行也等长（' + ce.join(' / ') + ' px）');
+  A(visible(c1[0]).indexOf('1. 第四节') === 0 && visible(c1[1]).indexOf('1. 第五节') === 0,
+    '前缀空白段保持原样（补白落在最后一段）');
+  A(/^1\. 第五节(\u00a0)+短$/.test(visible(c1[1])), '最后一列右对齐（页码/末列场景）');
+
+  // ==== D 组：量测不可用 → 回退列宽算法 ====
+  MEASURE = () => 0;
+  const d1 = bs.slice(10, 13);
+  selectBlocks(d1);
+  align(ed);
+  EQ(visible(d1[0]), '第一章' + NB.repeat(11) + '总则', '无量测环境回退列宽算法（第 1 行）');
+  EQ(visible(d1[2]), '第二节' + NB.repeat(11) + '附则', '无量测环境回退列宽算法（第 3 行）');
+  MEASURE = pxYahei;
+
+  // ==== E 组：已折成多个视觉行的块不参与（没有单一右边缘可比） ====
+  WRAP_OVER = 200;
+  const e2 = bs.slice(13, 15);
+  const beforeLong = visible(e2[0]);
+  selectBlocks(e2);
+  align(ed);
+  EQ(visible(e2[0]), beforeLong, '折成两行的块不参与对齐（文本不变）');
+  A(!e2[0].classList.contains('ptoe-align-lines'), '折行块不加对齐标记类');
+  A(Math.abs(edge(e2[1]) - pxYahei('短行 目标')) <= 4.01, '同一选区里的单行仍按自身宽度收口');
+  WRAP_OVER = 0;
+  MEASURE = pxCols;
 }
 
 function waitReady(cb) {

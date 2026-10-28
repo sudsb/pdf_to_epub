@@ -7900,3 +7900,81 @@ INFO|2026-10-27 22:58:07|=== ptoe start: ['mian.py', 'gui'] ===
 INFO|2026-10-27 22:58:16|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', 'E:\\MYBooks\\books\\毛泽东思想\\《毛泽东思想万岁》武汉钢二司编 第一卷.pdf', '--engine', 'llama', '--history-id', '761fd3442a46698c_20261013213151_c0d1', '--lang', 'zh-CN'] ===
 INFO|2026-10-28 08:50:38|=== ptoe start: ['test_guimanage.py'] ===
 INFO|2026-10-28 08:50:38|=== ptoe start: ['test_guimanage.py'] ===
+INFO|2026-10-28 11:11:33|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:33|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:33|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:33|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:33|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:33|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:33|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:34|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_resume_0i9jiqb3\sample.pdf, dpi=200, model=HY, workers=None
+INFO|2026-10-28 11:11:34|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-10-28 11:11:34|starting server: model=HY, workers=2
+INFO|2026-10-28 11:11:34|server ready: model=HY, elapsed=0.0s
+INFO|2026-10-28 11:11:34|ocr progress: 3/3 (100.0%) elapsed=0.0s
+INFO|2026-10-28 11:11:34|ocr done: total_pages=3, todo=3, excluded=0, errors=0, elapsed=0.0s
+INFO|2026-10-28 11:11:34|structure done: elapsed=0.0s
+INFO|2026-10-28 11:11:34|history done: elapsed=0.0s
+INFO|2026-10-28 11:11:34|render done: elapsed=0.0s
+INFO|2026-10-28 11:11:34|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_resume_0i9jiqb3\out.epub, total_elapsed=0.0s
+INFO|2026-10-28 11:11:34|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_resume_cy9czusl\sample.pdf, dpi=200, model=HY, workers=None
+INFO|2026-10-28 11:11:34|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-10-28 11:11:35|starting server: model=HY, workers=2
+INFO|2026-10-28 11:11:35|server ready: model=HY, elapsed=0.0s
+INFO|2026-10-28 11:11:35|ocr done: total_pages=3, todo=3, excluded=0, errors=0, elapsed=0.0s
+INFO|2026-10-28 11:11:35|structure done: elapsed=0.0s
+INFO|2026-10-28 11:11:35|history done: elapsed=0.0s
+INFO|2026-10-28 11:11:35|render done: elapsed=0.0s
+INFO|2026-10-28 11:11:35|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_resume_cy9czusl\out.epub, total_elapsed=0.0s
+INFO|2026-10-28 11:11:35|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_resume_4nb445es\sample.pdf, dpi=200, model=HY, workers=None
+INFO|2026-10-28 11:11:35|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-10-28 11:11:35|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_resume_c9e9pz9y\sample.pdf, dpi=200, model=HY, workers=None
+INFO|2026-10-28 11:11:35|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.0s
+INFO|2026-10-28 11:11:35|starting server: model=HY, workers=2
+INFO|2026-10-28 11:11:35|server ready: model=HY, elapsed=0.0s
+INFO|2026-10-28 11:11:35|ocr done: total_pages=3, todo=1, excluded=0, errors=0, elapsed=0.0s
+INFO|2026-10-28 11:11:35|structure done: elapsed=0.0s
+INFO|2026-10-28 11:11:35|history done: elapsed=0.0s
+INFO|2026-10-28 11:11:35|render done: elapsed=0.0s
+INFO|2026-10-28 11:11:35|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_resume_c9e9pz9y\out.epub, total_elapsed=0.0s
+INFO|2026-10-28 11:11:35|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:35|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:35|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:35|pdf_to_epub start: pdf=C:\Users\ADMINI~1\AppData\Local\Temp\test_mian_kxcw59xb\sample.pdf, dpi=200, model=HY, workers=None
+INFO|2026-10-28 11:11:36|split done: pages=3, dir=D:\code-project\python\PToEA\data\sample, elapsed=0.2s
+INFO|2026-10-28 11:11:36|starting server: model=HY, workers=2
+INFO|2026-10-28 11:11:36|server ready: model=HY, elapsed=0.0s
+INFO|2026-10-28 11:11:36|ocr progress: 3/3 (100.0%) elapsed=0.2s
+INFO|2026-10-28 11:11:36|ocr done: total_pages=3, todo=3, excluded=0, errors=0, elapsed=0.0s
+INFO|2026-10-28 11:11:36|structure done: elapsed=0.0s
+INFO|2026-10-28 11:11:36|history done: elapsed=0.0s
+INFO|2026-10-28 11:11:36|render done: elapsed=0.0s
+INFO|2026-10-28 11:11:36|pdf_to_epub success: epub=C:\Users\Administrator\AppData\Local\Temp\test_mian_kxcw59xb\out.epub, total_elapsed=0.2s
+INFO|2026-10-28 11:11:36|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:11:36|=== ptoe start: ['test_mian.py'] ===
+INFO|2026-10-28 11:12:33|=== ptoe start: ['test_guimanage.py'] ===
+INFO|2026-10-28 11:12:33|=== ptoe start: ['test_guimanage.py'] ===
+INFO|2026-10-28 11:18:31|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-10-28 11:18:43|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', 'E:\\MYBooks\\books\\毛泽东思想\\《毛泽东思想万岁》武汉钢二司编 第一卷.pdf', '--engine', 'llama', '--history-id', '761fd3442a46698c_20261013213151_c0d1', '--lang', 'zh-CN'] ===
+INFO|2026-10-28 11:24:31|=== ptoe start: ['mian.py', 'gui'] ===
+INFO|2026-10-28 11:24:40|=== ptoe start: ['D:\\code-project\\python\\PToEA\\mian.py', 'correct', 'E:\\MYBooks\\books\\毛泽东思想\\《毛泽东思想万岁》武汉钢二司编 第二卷.pdf', '--engine', 'llama', '--history-id', 'manual_6d75dd10_20260831211740_3990', '--lang', 'zh-CN'] ===

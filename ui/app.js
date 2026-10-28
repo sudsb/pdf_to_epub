@@ -5550,22 +5550,36 @@ function cycleHeading(ed) {
 }
 // 多行对齐标记类（与后端白名单同名，见 correctmanage/htmlmanage 的 _ALIGN_LINES_CLASS）
 const ALIGN_LINES_CLASS = 'ptoe-align-lines';
-// 多行文本对齐：以选中行中最长行为基准；含空格的行，空格左右内容分别靠两端对齐，
-// 中间以 &nbsp; 填充；最长行不补齐（只把行内空白统一成 &nbsp;，列宽不变）。
-// 2026-10-20 重写（旧实现三处毛病）：
-//  1) 宽度按「字符数」算——中文/全角占 2 列，按字符数补齐会让中文行左右错位
-//     （用户报的现象：多行文本左右两侧对不齐）；
-//  2) 整体覆写 innerHTML——行内加粗/斜体/标记 span 全丢，文本里的 '<' 还会被当标签解析；
-//  3) 半角空格会被 HTML 折叠成一格、被导出时的空白清理吃掉——填充必须用 &nbsp;（U+00A0）。
+// 多行文本对齐：选中行拉到**同一长度**，左右两端分别对齐——
+//   分界点取行内**最后一个空白段**（用户 2026-10-28 确认：目录/页码类
+//   「1. 第一节    总则」场景，前缀贴左缘、最后一列严格右对齐最自然）；
+//   左段贴左、右段贴右，差额全部补在最后一个空白段里（不可断空格 &nbsp;）；
+//   无中间空白的行在行尾补不可见空白，保证整体等长；最长行不额外拉伸。
+// 2026-10-28 重写（用户报「矫正页面里选中行左右两侧对不齐」的根因）：
+//   旧实现按「显示列宽」折算补齐量（中文/全角 2 列、其余 1 列，再补同数量 &nbsp;），
+//   隐含「1 个 &nbsp; ≈ 半个中文宽」的假设。实测 Windows 的 Microsoft YaHei
+//   14px：中文 14px、&nbsp; 仅 4px、数字/字母 ≈8px、'.' ≈3px —— 补贴量只有真实
+//   需要的一小半，选中的行右边仍差几十像素。现在改为**像素量测**：用 DOM Range
+//   量出每行（及左右段）的真实渲染宽度，用 canvas 量出当前字体下单个 &nbsp; 的
+//   宽度，再算该补几个 &nbsp;（误差 ≤ 1 个 &nbsp;，约 2~4px）。
+//   量测不可用（jsdom/隐藏页，宽度全 0）时回退旧的列宽算法。
+// 2026-10-20 的修复继续保留：
+//   1) 行内加粗/斜体/标记 span 保持——只替换空白区间，不整体覆写 innerHTML；
+//   2) 填充用 &nbsp;（U+00A0）：HTML 折叠不掉、导出时的空白清理也吃不掉。
 function alignLines(ed) {
   const row = ed.closest('.page-row');
   const i = row ? Number(row.dataset.i) : -1;
   const sel = window.getSelection();
-  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+  let range = (sel && sel.rangeCount > 0 && !sel.isCollapsed) ? sel.getRangeAt(0) : null;
+  // 点工具栏/菜单时选区可能已塌陷：回退最近一次落在本编辑区内的非折叠选区
+  if (!range && _lastEditableRange && !_lastEditableRange.collapsed &&
+      ed.contains(_lastEditableRange.startContainer) && ed.contains(_lastEditableRange.endContainer)) {
+    range = _lastEditableRange;
+  }
+  if (!range) {
     showToast('请先选中要对齐的多行文本', 'warn');
     return;
   }
-  const range = sel.getRangeAt(0);
   const startBlock = _boundaryBlockInRange(ed, range.startContainer, false);
   const endBlock = _boundaryBlockInRange(ed, range.endContainer, true);
   const blocks = _blocksBetween(ed, startBlock, endBlock);
@@ -5574,42 +5588,46 @@ function alignLines(ed) {
     return;
   }
   const NBSP = '\u00a0';
-  // 逐块解析：块开标签后有补的 \n（块间换行约定，见 _ensureBlockNewlines），
-  // 首尾空白不参与对齐计算，只按「首个空白串」切分左右两段。
-  const infos = blocks.map(function (b) {
-    const raw = b.textContent || '';
-    const lead = (/^\s*/.exec(raw) || [''])[0];
-    const rest = raw.slice(lead.length);
-    const trail = (/\s*$/.exec(rest) || [''])[0];
-    const body = rest.slice(0, rest.length - trail.length);
-    const sep = /\s+/.exec(body);
-    return {
-      el: b,
-      lead: lead.length,
-      body: body,
-      trail: trail.length,
-      sepStart: sep ? sep.index : -1,
-      sepEnd: sep ? sep.index + sep[0].length : -1,
-      cols: _textCols(body)
-    };
-  });
+  const infos = blocks.map(_alignLineInfo);
   const baseCols = Math.max.apply(null, infos.map(function (x) { return x.cols; }));
+  const metrics = _alignLineMetrics(infos);   // 真实像素量测；不可用时 null
   histRun('多行对齐', [i], function () {
-    infos.forEach(function (x) {
+    infos.forEach(function (x, k) {
       const b = x.el;
-      if (!x.body) return;   // 空行不参与（原样保留）
-      const need = baseCols - x.cols;   // 该行比基准短多少列
-      if (x.sepStart >= 0) {
-        // 有空格：左段靠左、右段靠右，中间（分隔空白 + 填充）统一为 &nbsp;
-        // 分隔空白本身的列数原样保留，只把字符换成 &nbsp;（避免 HTML 折叠后错位）
-        const sepCols = _textCols(x.body.slice(x.sepStart, x.sepEnd));
-        const mid = NBSP.repeat(sepCols) + NBSP.repeat(Math.max(0, need));
-        _replaceBlockRange(b, x.lead + x.sepStart, x.lead + x.sepEnd, mid);
-      } else if (need > 0) {
-        // 无空格：整段靠左，右侧补齐到基准宽度。
-        // 连同尾部空白一起替换——否则重复对齐会一次次往后追加（不幂等）
-        const from = x.lead + x.body.length;
-        _replaceBlockRange(b, from, from + x.trail, NBSP.repeat(need));
+      if (!x.body || x.hardBreak) return;   // 空行 / 一块多行（含 <br>）不参与，原样保留
+      const px = metrics ? metrics.lines[k] : null;
+      if (metrics && !px) return;           // 量测判定该行已折成多行 → 不参与
+      if (px) {
+        // 左右段宽度不因对齐改变 → 差额全部由最后一个空白段吸收
+        const a = px.leftPx + px.rightPx;
+        const need = Math.max(0, metrics.base - a);
+        let count = Math.round(need / metrics.nbsp);
+        // 不允许越过基准宽度：越过的行会变成下一次对齐的新基准，
+        // 反复点「多行对齐」就会一路变长（不幂等）
+        if (a + count * metrics.nbsp > metrics.base + 0.01) count -= 1;
+        if (x.sepStart >= 0) {
+          const mid = NBSP.repeat(Math.max(1, count));   // 至少留一格，避免左右粘连
+          _replaceBlockRange(b, x.lead + x.sepStart, x.lead + x.sepEnd, mid);
+        } else if (count > 0) {
+          // 无空白：行尾补不可见空白至等长（连旧尾部空白一起换掉，保证幂等）
+          const from = x.lead + x.body.length;
+          _replaceBlockRange(b, from, from + x.trail, NBSP.repeat(count));
+        }
+      } else {
+        // 无量测环境（jsdom/隐藏页）：回退列宽算法
+        const need = baseCols - x.cols;   // 该行比基准短多少列
+        if (x.sepStart >= 0) {
+          // 有空格：左段靠左、右段靠右，中间（分隔空白 + 填充）统一为 &nbsp;
+          // 分隔空白本身的列数原样保留，只把字符换成 &nbsp;（避免 HTML 折叠后错位）
+          const sepCols = _textCols(x.body.slice(x.sepStart, x.sepEnd));
+          const mid = NBSP.repeat(sepCols) + NBSP.repeat(Math.max(0, need));
+          _replaceBlockRange(b, x.lead + x.sepStart, x.lead + x.sepEnd, mid);
+        } else if (need > 0) {
+          // 无空格：整段靠左，右侧补齐到基准宽度。
+          // 连同尾部空白一起替换——否则重复对齐会一次次往后追加（不幂等）
+          const from = x.lead + x.body.length;
+          _replaceBlockRange(b, from, from + x.trail, NBSP.repeat(need));
+        }
       }
       // 标记类：导出时该段豁免空白符清理（对齐用的空白是版式的一部分）。
       // 单元格裸文本先包 <p>：ptoe-align-lines 不在单元格类白名单内，落 td 上会丢。
@@ -5618,6 +5636,123 @@ function alignLines(ed) {
     syncContent(ed);
     if (row) { markDirty(i); scheduleRemeasure(i); }
   });
+}
+// 逐块解析对齐信息：块开标签后有补的 \n（块间换行约定，见 _ensureBlockNewlines），
+// 首尾空白不参与对齐计算；左右分界取**最后一个空白段**。
+function _alignLineInfo(b) {
+  const raw = b.textContent || '';
+  const lead = (/^\s*/.exec(raw) || [''])[0];
+  const rest = raw.slice(lead.length);
+  const trail = (/\s*$/.exec(rest) || [''])[0];
+  const body = rest.slice(0, rest.length - trail.length);
+  const gap = _lastWsRun(body);
+  return {
+    el: b,
+    lead: lead.length,
+    body: body,
+    trail: trail.length,
+    sepStart: gap ? gap.index : -1,
+    sepEnd: gap ? gap.index + gap[0].length : -1,
+    cols: _textCols(body),
+    // 含 <br> 的块是「一块多行」，整块没有单一左右分界 → 不参与对齐（原样保留）
+    hardBreak: !!b.querySelector('br')
+  };
+}
+// 行内最后一个空白段（\s 含 &nbsp;：上一轮插入的填充也认得出）
+function _lastWsRun(str) {
+  const re = /\s+/g;
+  let m, last = null;
+  while ((m = re.exec(str)) !== null) last = m;
+  return last;
+}
+// 真实像素量测：{ base: 基准宽度, nbsp: 单个 &nbsp; 宽度, lines: [{leftPx,rightPx}] }。
+// lines[k] 为 null 表示该块不参与对齐（空行 / 含 <br> / 已经折成多行）。
+// 量测不可用（jsdom/隐藏页：Range 的 client rect 全 0）→ 返回 null，调用方回退列宽算法。
+function _alignLineMetrics(infos) {
+  const lines = [];
+  let base = 0, measurable = false;
+  for (const x of infos) {
+    if (!x.body || x.hardBreak) { lines.push(null); continue; }
+    const from = x.lead, to = x.lead + x.body.length;
+    const body = _blockTextSpan(x.el, from, to);
+    // 该行已经折成多个视觉行：没有单一右边缘可比 → 跳过（也不让它抬高标准）
+    if (body.wraps) { lines.push(null); continue; }
+    const leftPx = x.sepStart >= 0 ? _blockTextSpan(x.el, from, x.lead + x.sepStart).px : body.px;
+    const rightPx = x.sepStart >= 0 ? _blockTextSpan(x.el, x.lead + x.sepEnd, to).px : 0;
+    if (body.px > 0) {
+      measurable = true;
+      if (body.px > base) base = body.px;   // 基准 = 选中行里最长的真实宽度（含原有分隔空白）
+    }
+    lines.push({ leftPx: leftPx, rightPx: rightPx });
+  }
+  if (!measurable) return null;
+  const nbsp = _nbspPx(infos[0].el);
+  if (!(nbsp > 0)) return null;
+  return { base: base, nbsp: nbsp, lines: lines };
+}
+// 块内 [start,end) 文本的渲染跨度：{ px: 宽度(px), wraps: 是否跨了多个视觉行 }。
+// 真实 DOM Range 量测，字体/字号/逐字行内格式都算进去（不靠字符数量估算）。
+// 量测不可用（jsdom/隐藏页）→ { px: 0, wraps: false }，调用方回退列宽算法。
+function _blockTextSpan(block, start, end) {
+  const none = { px: 0, wraps: false };
+  if (!(end > start)) return none;
+  const nodes = _blockTextNodes(block);
+  let pos = 0, range = null;
+  for (const n of nodes) {
+    const len = n.data.length;
+    const s = Math.max(start, pos), e = Math.min(end, pos + len);
+    if (e > s) {
+      if (!range) {
+        range = document.createRange();
+        range.setStart(n, s - pos);
+      }
+      range.setEnd(n, e - pos);
+    }
+    pos += len;
+  }
+  if (!range) return none;
+  try {
+    if (typeof range.getClientRects === 'function') {
+      const rects = range.getClientRects();
+      let w = 0, tops = [];
+      for (let k = 0; k < rects.length; k++) {
+        w += rects[k].width;
+        const t = Math.round(rects[k].top || 0);
+        if (tops.indexOf(t) < 0) tops.push(t);
+      }
+      if (w > 0) return { px: w, wraps: tops.length > 1 };
+    }
+    if (typeof range.getBoundingClientRect === 'function') {
+      const rc = range.getBoundingClientRect();
+      if (rc && rc.width > 0) return { px: rc.width, wraps: false };
+    }
+  } catch (e) { /* 无量测能力 → 回退列宽算法 */ }
+  return none;
+}
+// 当前字体下单个 &nbsp; 的宽度（px）。canvas 量测；无 canvas 时按 1/4 em 兜底。
+let _alignMeasureCtx;
+function _nbspPx(el) {
+  let cs = null;
+  try { cs = window.getComputedStyle(el); } catch (e) { cs = null; }
+  const size = (cs && cs.fontSize) || '14px';
+  const family = (cs && cs.fontFamily) || 'sans-serif';
+  if (_alignMeasureCtx === undefined) {
+    _alignMeasureCtx = null;
+    try {
+      const cv = document.createElement('canvas');
+      if (cv && typeof cv.getContext === 'function') _alignMeasureCtx = cv.getContext('2d');
+    } catch (e) { _alignMeasureCtx = null; }
+  }
+  if (_alignMeasureCtx) {
+    try {
+      _alignMeasureCtx.font = ((cs && cs.fontStyle) || 'normal') + ' ' +
+        ((cs && cs.fontWeight) || '400') + ' ' + size + ' ' + family;
+      const w = _alignMeasureCtx.measureText('\u00a0').width;
+      if (w > 0) return w;
+    } catch (e) { /* 落到下面的兜底 */ }
+  }
+  const px = parseFloat(size);
+  return px > 0 ? px * 0.25 : 0;
 }
 // 文本显示列宽：CJK/全角字符占 2 列，其余占 1 列。
 // 多行对齐按列宽（不是字符数）算基准宽度——中文行按字符数补齐会左右错位。
@@ -17930,4 +18065,571 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
   bindAutoSaveSettingsEvents(); // 自动备份设置事件（一次性，防重复绑定）
   loadAutoSaveFromServer();      // 服务端自动备份设置（异步覆盖默认值）
   _autoSaveSchedule();           // 启动定时检查
+})();
+
+// ============================================================================
+// nvim 风格键位 + 命令模型（2026-10-28，仅矫正 GUI / ui/app.js）
+//
+// 设计要点：
+//  1) 默认 INSERT（编辑）模式，与既有行为完全一致；Esc 进入 NORMAL（导航/命令）。
+//  2) `:` 进入 CMDLINE（复用既有命令行），Ctrl+; 快捷键路径保持不变。
+//  3) 纯增量：用捕获阶段单路由接管 NORMAL/VISUAL 键；INSERT/CMDLINE 不拦截。
+//  4) 复用既有事实源：jumpToPageIndex/_cmdSwitchPage/undoHistory/_CMD_BUILTINS/
+//     _parseCmdLine/pageSource/histRun/_multiSel*，不另造一套。
+//  5) IME：compositionstart 起合成期间一律放行，中文输入不被吞。
+//  6) 模式指示条与样式从 JS 注入（同 injectCmdLineStyles），不改 _UI_HTML/ui_full.html。
+// ============================================================================
+(function initPtoeVimMode() {
+  if (window.__ptoeVimInstalled) return;
+  window.__ptoeVimInstalled = true;
+
+  var LEADER_DEFAULT = '\\';
+  var CHORD_TIMEOUT = 1000;                 // 待定前缀（g/d/y/c/leader）超时
+  var LEADER_DEFAULT_MAPS = { w: 'w', q: 'q', s: 'settings', e: 'export', h: 'help' };
+  var VIM = { mode: 'INSERT', count: 0, pending: '', pendingAt: 0, composing: false, hintShown: false, cmdReturn: 'NORMAL' };
+
+  // ---- 样式 + 模式指示条（视觉层，只注入）----
+  (function injectVimStyles() {
+    if (document.getElementById('vimModeStyles')) return;
+    var st = document.createElement('style');
+    st.id = 'vimModeStyles';
+    st.textContent = [
+      '#vimModeBar{position:fixed;left:12px;bottom:8px;z-index:96;display:none;align-items:center;gap:6px;',
+      '  padding:2px 9px;border-radius:6px;background:rgba(28,39,51,.88);color:#fff;',
+      '  font:600 11px/1.7 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;',
+      '  letter-spacing:.04em;box-shadow:0 2px 8px rgba(0,0,0,.18);user-select:none;pointer-events:none;}',
+      '#vimModeBar.on{display:inline-flex;}',
+      '#vimModeBar .vm-normal{color:#9ad1ff;}',
+      '#vimModeBar .vm-insert{color:#9fe6a0;}',
+      '#vimModeBar .vm-visual{color:#ffd479;}',
+      '#vimModeBar .vm-cmdline{color:#ffb3c8;}',
+      '#vimModeBar .vm-count{color:#ffd479;}',
+      '#vimModeBar .vm-pending{color:#c9b5ff;}',
+      'body.vim-nav .editable{caret-color:transparent;}'
+    ].join('');
+    document.head.appendChild(st);
+  })();
+
+  function bar() {
+    var el = document.getElementById('vimModeBar');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'vimModeBar';
+      el.setAttribute('aria-live', 'polite');
+      (document.body || document.documentElement).appendChild(el);
+    }
+    return el;
+  }
+
+  function renderMode() {
+    var el = bar();
+    var labels = { NORMAL: 'NORMAL', INSERT: 'INSERT', VISUAL: 'VISUAL', CMDLINE: 'COMMAND' };
+    var label = labels[VIM.mode] || VIM.mode;
+    var cls = 'vm-' + String(VIM.mode).toLowerCase();
+    var html = '<span class="' + cls + '">-- ' + label + ' --</span>';
+    if (VIM.count) html += '<span class="vm-count">' + VIM.count + '</span>';
+    if (VIM.pending) html += '<span class="vm-pending">' + (VIM.pending === 'leader' ? LEADER_DEFAULT : VIM.pending) + '</span>';
+    el.innerHTML = html;
+    el.classList.toggle('on', VIM.mode !== 'INSERT');
+    el.style.bottom = (VIM.mode === 'CMDLINE') ? '44px' : '8px';
+    if (document.body) document.body.classList.toggle('vim-nav', VIM.mode === 'NORMAL' || VIM.mode === 'VISUAL');
+  }
+
+  function setMode(m) {
+    VIM.mode = m;
+    if (m !== 'NORMAL') { VIM.count = 0; VIM.pending = ''; }
+    renderMode();
+  }
+  function resetCount() { VIM.count = 0; }
+  function consume(e) { e.preventDefault(); e.stopPropagation(); }
+
+  // ---- 当前位置 / 翻页 ----
+  function curPageIndex() {
+    var ed = currentEditable();
+    if (ed) { var row = ed.closest('.page-row'); if (row) return Number(row.dataset.i); }
+    return viewportPage();
+  }
+  function pageMove(delta) {
+    var n = VIM.count || 1;
+    resetCount();
+    if (!pages.length) return;
+    var idx = viewportPage();
+    var t = idx + delta * n;
+    if (t < 0) t = 0;
+    if (t > pages.length - 1) t = pages.length - 1;
+    if (t === idx) { showToast(delta > 0 ? '已经是最后一页' : '已经是第一页', 'warn'); return; }
+    jumpToPageIndex(t);
+  }
+  function firstPage() { resetCount(); if (pages.length) jumpToPageIndex(0); }
+  function lastPage() { resetCount(); if (pages.length) jumpToPageIndex(pages.length - 1); }
+  function gotoPageNumber(n) { resetCount(); _cmdPageJump(n); }
+
+  // ---- 块定位 / 行操作（dd / yy / cc / x）----
+  function blockAtCaret(fallbackFirst) {
+    var ed = currentEditable();
+    if (!ed) return null;
+    var node = null;
+    var sel = window.getSelection();
+    if (sel && sel.rangeCount) node = sel.getRangeAt(0).startContainer;
+    if (!node && _lastEditableRange) node = _lastEditableRange.startContainer;
+    if (node && node.nodeType !== 1) node = node.parentElement;
+    var el = node;
+    while (el && el.parentNode) {
+      if (el.parentNode.classList && el.parentNode.classList.contains('editable')) {
+        var tag = el.tagName;
+        if (tag === 'P' || tag === 'DIV' || /^H[1-6]$/.test(tag)) return el;
+        break;
+      }
+      el = el.parentNode;
+    }
+    return fallbackFirst ? (ed.firstElementChild || null) : null;
+  }
+
+  function deleteBlock() {
+    var ed = currentEditable(); if (!ed) { showToast('请先点击某一页文字', 'warn'); return; }
+    var block = blockAtCaret(true); if (!block) return;
+    var row = ed.closest('.page-row');
+    var i = row ? Number(row.dataset.i) : -1;
+    histRun('删除行', i >= 0 ? [i] : [], function () {
+      if (block.parentNode) block.parentNode.removeChild(block);
+      syncContent(ed);
+      if (i >= 0) { markDirty(i); scheduleRemeasure(i); }
+    });
+  }
+
+  function yankBlock() {
+    var ed = currentEditable(); if (!ed) { showToast('请先点击某一页文字', 'warn'); return; }
+    var block = blockAtCaret(true); if (!block) return;
+    ed.focus();
+    var r = document.createRange(); r.selectNodeContents(block);
+    var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+    Promise.resolve(_cmdCopy(ed, false)).catch(function () {});
+  }
+
+  function clearBlockInsert() {
+    var ed = currentEditable(); if (!ed) { showToast('请先点击某一页文字', 'warn'); return; }
+    var block = blockAtCaret(true); if (!block) return;
+    var row = ed.closest('.page-row');
+    var i = row ? Number(row.dataset.i) : -1;
+    histRun('清空行', i >= 0 ? [i] : [], function () {
+      block.innerHTML = '';
+      syncContent(ed);
+      if (i >= 0) { markDirty(i); scheduleRemeasure(i); }
+    });
+    enterInsert();
+  }
+
+  function deleteChar() {
+    var ed = currentEditable(); if (!ed) return;
+    var sel = window.getSelection(); if (!sel || !sel.rangeCount) return;
+    var row = ed.closest('.page-row');
+    var i = row ? Number(row.dataset.i) : -1;
+    histRun('删除字符', i >= 0 ? [i] : [], function () {
+      if (!sel.isCollapsed) {
+        var sr = sel.getRangeAt(0);
+        sr.deleteContents();
+      } else {
+        var rr = sel.getRangeAt(0).cloneRange();
+        rr.collapse(false);
+        var node = rr.startContainer, off = rr.startOffset;
+        if (node && node.nodeType === 3 && off < node.length) {
+          var del = document.createRange();
+          del.setStart(node, off);
+          del.setEnd(node, off + 1);
+          del.deleteContents();
+        }
+      }
+      syncContent(ed);
+      if (i >= 0) { markDirty(i); scheduleRemeasure(i); }
+    });
+  }
+
+  function yankSelection() {
+    var blocks = Array.from(_multiSelBlocks).filter(function (b) { return b.isConnected; });
+    if (!blocks.length) { yankBlock(); return; }
+    var ed = blocks[0].parentNode;
+    var r = document.createRange();
+    r.setStart(blocks[0], 0);
+    r.setEnd(blocks[blocks.length - 1], blocks[blocks.length - 1].childNodes.length);
+    var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+    Promise.resolve(_cmdCopy(ed, false)).catch(function () {});
+  }
+
+  function deleteSelection() {
+    var blocks = Array.from(_multiSelBlocks).filter(function (b) { return b.isConnected; });
+    if (!blocks.length) { deleteBlock(); return; }
+    var ed = blocks[0].parentNode;
+    var row = ed && ed.closest ? ed.closest('.page-row') : null;
+    var i = row ? Number(row.dataset.i) : -1;
+    histRun('删除行', i >= 0 ? [i] : [], function () {
+      for (var k = 0; k < blocks.length; k++) if (blocks[k].parentNode) blocks[k].parentNode.removeChild(blocks[k]);
+      _multiSelClear();
+      if (ed) syncContent(ed);
+      if (i >= 0) { markDirty(i); scheduleRemeasure(i); }
+    });
+    setMode('NORMAL');
+  }
+
+  function toggleVisual() {
+    resetCount();
+    var block = blockAtCaret(true);
+    if (block) _multiSelToggle(block);
+    VIM.mode = 'VISUAL';
+    renderMode();
+  }
+
+  function enterInsert() {
+    setMode('INSERT');
+    var ed = currentEditable() || _lastFocusedEd;
+    if (ed && ed.isConnected && ed.focus) { try { ed.focus(); } catch (e) {} }
+  }
+
+  // ---- 浮层 / 弹窗守卫：这些情况下不接管按键，交既有逻辑 ----
+  function overlayActive() {
+    if (_multiSelAnyModalOpen()) return true;
+    var pop = document.getElementById('popup');
+    if (pop && pop.style.display === 'flex') return true;
+    if (errKey) return true;
+    var cm = document.getElementById('contextMenu');
+    if (cm && !cm.hidden && cm.style.display !== 'none') return true;
+    if (typeof _formatBrush !== 'undefined' && _formatBrush) return true;
+    if (typeof _brushArmed !== 'undefined' && _brushArmed) return true;
+    if (typeof paintActive !== 'undefined' && paintActive) return true;
+    var panels = document.querySelectorAll('#brushPanel, #brushMixPanel, #charWrapMenu, #supSubMenu, #proofreadMenu, #dividerMenu');
+    for (var k = 0; k < panels.length; k++) {
+      var el = panels[k];
+      if (el && getComputedStyle(el).display !== 'none') return true;
+    }
+    if (document.querySelector('.tb-more.open')) return true;
+    return false;
+  }
+
+  // ---- 待定前缀分派：g / d / y / c / leader ----
+  function dispatchPending(e) {
+    var p = VIM.pending, k = e.key;
+    consume(e);
+    if (p === 'g') {
+      VIM.pending = '';
+      if (k === 'g') { firstPage(); } else { resetCount(); }
+      renderMode(); return;
+    }
+    if (p === 'leader') {
+      VIM.pending = '';
+      runLeader(k);
+      renderMode(); return;
+    }
+    if (p === 'd' || p === 'y' || p === 'c') {
+      VIM.pending = '';
+      resetCount();
+      if (k === p) {
+        if (p === 'd') deleteBlock();
+        else if (p === 'y') yankBlock();
+        else clearBlockInsert();
+      }
+      renderMode(); return;
+    }
+    VIM.pending = '';
+    renderMode();
+  }
+
+  // ---- NORMAL / VISUAL 键处理 ----
+  function handleNav(e) {
+    var k = e.key;
+    var mod = e.ctrlKey || e.altKey || e.metaKey;
+
+    if (VIM.pending && Date.now() - VIM.pendingAt > CHORD_TIMEOUT) {
+      VIM.pending = ''; VIM.count = 0; renderMode();
+    }
+
+    // 计数前缀：3j / 5G
+    if (!mod && /^[0-9]$/.test(k)) {
+      if (k === '0' && !VIM.count) { consume(e); return; }
+      VIM.count = VIM.count * 10 + parseInt(k, 10);
+      consume(e); renderMode(); return;
+    }
+
+    if (VIM.pending) { dispatchPending(e); return; }
+
+    if (e.ctrlKey && !e.altKey && !e.metaKey) {
+      if (k === 'r') { consume(e); resetCount(); redoHistory(); return; }
+      // Ctrl+f / Ctrl+b 不拦截：沿用应用既有的 Ctrl+F 搜索，避免与 NORMAL 翻页冲突
+      if (k === 'd') { consume(e); pageMove(1); return; }
+      if (k === 'u') { consume(e); pageMove(-1); return; }
+      if (k === 'v') { consume(e); toggleVisual(); return; }
+      return;
+    }
+    if (mod) return;
+
+    if (VIM.mode === 'VISUAL') {
+      if (k === 'Escape' || k === 'v' || k === 'V') { consume(e); _multiSelClear(); setMode('NORMAL'); return; }
+      if (k === 'y') { consume(e); yankSelection(); return; }
+      if (k === 'd') { consume(e); deleteSelection(); return; }
+      if (k === 'i' || k === 'a') { consume(e); _multiSelClear(); enterInsert(); return; }
+    }
+
+    switch (k) {
+      case 'Escape': consume(e); resetCount(); setMode('NORMAL'); return;
+      case 'i': case 'a': case 'o': consume(e); enterInsert(); return;
+      case 'v': case 'V': consume(e); toggleVisual(); return;
+      case 'j': consume(e); pageMove(1); return;
+      case 'k': consume(e); pageMove(-1); return;
+      case 'g': consume(e); VIM.pending = 'g'; VIM.pendingAt = Date.now(); renderMode(); return;
+      case 'G': {
+        var n = VIM.count; resetCount();
+        if (n) gotoPageNumber(n); else lastPage();
+        consume(e); return;
+      }
+      case 'd': case 'y': case 'c':
+        consume(e); VIM.pending = k; VIM.pendingAt = Date.now(); renderMode(); return;
+      case 'x': consume(e); resetCount(); deleteChar(); return;
+      case 'u': consume(e); resetCount(); undoHistory(); return;
+      case ':': consume(e); VIM.cmdReturn = 'NORMAL'; setMode('CMDLINE'); openCmdLine(); return;
+      case '/': case '?': consume(e); openSearchModal(); return;
+      default:
+        if (k === LEADER_DEFAULT) { consume(e); VIM.pending = 'leader'; VIM.pendingAt = Date.now(); renderMode(); return; }
+        // NORMAL 下不得编辑正文：退格/删除/回车也必须拦下
+        if (k === 'Backspace' || k === 'Delete' || k === 'Enter') { consume(e); return; }
+        // 可打印键一律吞掉，避免误写入正文
+        if (k.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) consume(e);
+        return;
+    }
+  }
+
+  function onKeydown(e) {
+    // CMDLINE 关闭后复位到进入前的模式
+    if (VIM.mode === 'CMDLINE' && !_cmdLineActive) setMode(VIM.cmdReturn || 'NORMAL');
+    if (e.isComposing || VIM.composing) return;                       // IME 合成：放行
+    var t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
+    if (_cmdLineActive) return;
+    if (capturingOp || mouseCapturingOp) return;
+
+    if (VIM.mode === 'INSERT') {
+      // Esc 进 NORMAL：仅在没有任何浮层/弹窗/选区/纠错焦点时抢占，避免破坏既有 Esc 语义
+      if (e.key === 'Escape' && !overlayActive() && !_multiSelBlocks.size) {
+        consume(e);
+        setMode('NORMAL');
+        if (!VIM.hintShown) {
+          VIM.hintShown = true;
+          showToast('NORMAL：j/k 翻页 · gg/G 首末页 · i 编辑 · : 命令 · v 选区', 'ok');
+        }
+      }
+      return;
+    }
+    if (overlayActive()) return;
+    handleNav(e);
+  }
+
+  // ---- leader 映射（默认 + localStorage 用户覆盖；:map 定义）----
+  function loadMaps() {
+    try {
+      var o = JSON.parse(localStorage.getItem('ptoe_vim_maps') || '{}');
+      return (o && typeof o === 'object') ? o : {};
+    } catch (e) { return {}; }
+  }
+  function saveMaps(m) { try { localStorage.setItem('ptoe_vim_maps', JSON.stringify(m || {})); } catch (e) {} }
+  function runLeader(k) {
+    var maps = {}, base = LEADER_DEFAULT_MAPS, user = loadMaps();
+    for (var a in base) maps[a] = base[a];
+    for (var b in user) maps[b] = user[b];
+    var cmd = maps[k];
+    if (!cmd) { showToast('未定义的 leader 映射：<leader>' + k + '（:map 查看/定义）', 'warn'); return; }
+    try { Promise.resolve(_cmdRunScript(cmd)).catch(function (err) { showToast('命令失败：' + err, 'fail'); }); }
+    catch (err) { showToast('命令失败：' + err, 'fail'); }
+  }
+  function mapCommand(args) {
+    var a = String(args == null ? '' : args).trim();
+    var m = loadMaps();
+    if (!a) {
+      var all = {}, base = LEADER_DEFAULT_MAPS, user = loadMaps();
+      for (var x in base) all[x] = base[x];
+      for (var y in user) all[y] = user[y];
+      var lines = [];
+      for (var key in all) lines.push('<leader>' + key + '→' + all[key]);
+      showToast('leader 映射：' + (lines.join('  ') || '(空)'), 'ok');
+      return;
+    }
+    var sp = a.indexOf(' ');
+    if (sp < 0) { showToast('用法：:map <键> <命令>，如 :map w wq', 'warn'); return; }
+    var k = a.slice(0, sp).trim().replace(/^<leader>/i, '');
+    var cmd = a.slice(sp + 1).trim().replace(/^:/, '');
+    if (k.length !== 1) { showToast('leader 键必须是单个字符', 'warn'); return; }
+    if (!cmd) { showToast('命令不能为空', 'warn'); return; }
+    m[k] = cmd; saveMaps(m);
+    showToast('已映射 <leader>' + k + ' → ' + cmd, 'ok');
+  }
+
+  // ---- :s 页范围替换（当前页 / N,M 页号范围 / % 或 all 全局）----
+  function pageNumberRange(a, b) {
+    var lo = parseInt(a, 10);
+    var hi = (b == null ? lo : parseInt(b, 10));
+    if (!isFinite(lo)) return [];
+    if (b === -1 || b === '$') hi = Infinity;
+    var out = [];
+    for (var i = 0; i < pages.length; i++) {
+      var pn = pages[i].page;
+      if (pn >= lo && pn <= hi) out.push(i);
+    }
+    return out;
+  }
+
+  function parseSub(args) {
+    var a = String(args == null ? '' : args).trim();
+    var forceAll = false;
+    if (/^all(?![a-z0-9])/i.test(a)) { forceAll = true; a = a.slice(3).trim(); }
+    if (!a) return null;
+    var sub = _cmdParseSubstitute(a);
+    if (!sub) {
+      // 容忍 nvim 的省略写法：s/旧/新（无结尾分隔符）
+      var d0 = a.charAt(0);
+      if (d0 && !/[a-zA-Z0-9\s]/.test(d0)) sub = _cmdParseSubstitute(a + d0);
+    }
+    if (!sub) return null;
+    return { re: sub.re, repl: sub.repl, forceAll: forceAll };
+  }
+
+  // 替换只作用于普通文本节点：MathML/ SVG 内部（公式、矢量图）一律跳过，
+  // 避免像「劈开实体」一样把公式拆坏（与搜索/替换的既有口径一致）。
+  function inMathOrSvg(node) {
+    var p = node && node.parentNode;
+    while (p && p.tagName) {
+      var tn = p.tagName.toLowerCase();
+      if (tn === 'math' || tn === 'svg') return true;
+      p = p.parentNode;
+    }
+    return false;
+  }
+
+  function runSubstitute(ctx) {
+    var sub = parseSub(ctx && ctx.args);
+    if (!sub) { showToast('替换语法：s/旧/新/ ｜ 10,20s/旧/新/ ｜ %s/旧/新/ ｜ s all/旧/新/', 'warn'); return; }
+    var loc = ctx && ctx.spec ? ctx.spec.loc : null;
+    var idxs;
+    if (sub.forceAll || (loc && loc.all)) idxs = pages.map(function (p, i) { return i; });
+    else if (loc && loc.line != null && loc.line2 != null) idxs = pageNumberRange(loc.line, loc.line2);
+    else if (loc && loc.line != null) idxs = pageNumberRange(loc.line, loc.line);
+    else idxs = [curPageIndex()];
+    if (!idxs.length) { showToast('页范围无有效页', 'warn'); return; }
+
+    var before = histBegin('替换', idxs);
+    var total = 0, changed = 0;
+    for (var n = 0; n < idxs.length; n++) {
+      var i = idxs[n];
+      var src = pageSource(i);
+      if (src == null) continue;
+      var out = null, cnt = 0;
+      if (mdMode) {
+        out = String(src).replace(sub.re, function () { cnt++; return sub.repl; });
+      } else {
+        var d = document.createElement('div');
+        d.innerHTML = src;
+        var walker = document.createTreeWalker(d, NodeFilter.SHOW_TEXT, null, false);
+        var nodes = [], t;
+        while ((t = walker.nextNode())) nodes.push(t);
+        for (var q = 0; q < nodes.length; q++) {
+          if (inMathOrSvg(nodes[q])) continue;
+          var old = nodes[q].data;
+          sub.re.lastIndex = 0;
+          var next = old.replace(sub.re, function () { cnt++; return sub.repl; });
+          if (next !== old) nodes[q].data = next;
+        }
+        if (cnt) out = d.innerHTML;
+      }
+      if (!out || out === src) continue;
+      if (mdMode) mdSourceMap.set(i, out); else contentMap.set(i, out);
+      total += cnt; changed++;
+      editedSet.add(i);
+      var row = host.querySelector('.page-row[data-i="' + i + '"]');
+      var ed = row && row.querySelector('.editable');
+      if (ed) { ed.innerHTML = displayHtml(i); try { _reapplyProofread(i); } catch (e) {} scheduleRemeasure(i); }
+    }
+    if (total) { dirty = true; updateStatus(); histEnd(before, '替换'); showToast('已替换 ' + total + ' 处（' + changed + ' 页）', 'ok'); }
+    else { histEnd(before, '替换'); showToast('未找到匹配内容', 'warn'); }
+  }
+
+  function quitGui(force) {
+    if (!force && dirty && !window.confirm('有未保存的修改，确定关闭界面？')) return;
+    try { window.close(); } catch (e) {}
+    setTimeout(function () {
+      if (!document.hidden) showToast('浏览器可能不允许脚本关闭此页，请手动关闭', 'warn');
+    }, 350);
+  }
+
+  // ---- 注册 ex 命令（追加进既有 _CMD_BUILTINS，自动进候选/补全）----
+  function registerCommands() {
+    var B = _CMD_BUILTINS;
+    function has(keys) {
+      for (var i = 0; i < B.length; i++) {
+        for (var j = 0; j < keys.length; j++) if (B[i].keys.indexOf(keys[j]) >= 0) return true;
+      }
+      return false;
+    }
+    function add(entry) { if (!has(entry.keys)) B.push(entry); }
+
+    add({
+      keys: ['s'], desc: '正则替换：默认当前页；N,M 为页号范围；% 或 all 全局',
+      example: 's/旧/新/', usage: 's/旧/新/ ｜ 10,20s/旧/新/ ｜ %s/旧/新/ ｜ s all/旧/新/',
+      global: true, run: function (ctx) { runSubstitute(ctx); }
+    });
+
+    add({
+      keys: ['w', 'write'], desc: '保存（nvim :w）', example: 'w', usage: 'w',
+      global: true, run: async function () { try { await save(); } catch (e) { showToast('保存失败：' + e, 'fail'); } }
+    });
+    add({
+      keys: ['w!'], desc: '强制保存（同 :w）', example: 'w!', usage: 'w!',
+      global: true, run: async function () { try { await save(); } catch (e) { showToast('保存失败：' + e, 'fail'); } }
+    });
+    add({
+      keys: ['q', 'quit'], desc: '关闭界面（有未保存修改会确认）', example: 'q', usage: 'q',
+      global: true, run: function () { quitGui(false); }
+    });
+    add({
+      keys: ['q!'], desc: '强制关闭界面', example: 'q!', usage: 'q!',
+      global: true, run: function () { quitGui(true); }
+    });
+    add({
+      keys: ['wq'], desc: '保存并完成转换（带确认弹窗）', example: 'wq', usage: 'wq',
+      global: true, run: async function () {
+        try { await save(); } catch (e) { showToast('保存失败：' + e, 'fail'); return; }
+        confirmFinish();
+      }
+    });
+    add({
+      keys: ['qa', 'qa!'], desc: '关闭界面（同 :q）', example: 'qa', usage: 'qa',
+      global: true, run: function () { quitGui(false); }
+    });
+
+    add({
+      keys: ['next', 'n'], desc: '下一页', example: 'next', usage: 'next ｜ n',
+      global: true, run: function () { _cmdSwitchPage(1); }
+    });
+    add({
+      keys: ['prev', 'previous'], desc: '上一页', example: 'prev', usage: 'prev ｜ previous',
+      global: true, run: function () { _cmdSwitchPage(-1); }
+    });
+    add({
+      keys: ['g'], desc: '跳转到原书页号（同 :页）', example: 'g 12', usage: 'g N',
+      global: true, run: function (ctx) { _cmdPageJump(ctx && ctx.args); }
+    });
+
+    add({
+      keys: ['map', 'nmap', 'leader'], desc: '查看/定义 leader 映射', example: 'map w wq', usage: 'map ｜ map <键> <命令>',
+      global: true, keepOpen: true, run: function (ctx) { mapCommand(ctx && ctx.args); }
+    });
+  }
+  registerCommands();
+
+  // ---- 事件接线 ----
+  document.addEventListener('keydown', onKeydown, true);
+  document.addEventListener('compositionstart', function () { VIM.composing = true; }, true);
+  document.addEventListener('compositionend', function () { VIM.composing = false; }, true);
+  // 用户主动点进编辑区 → 回 INSERT；程序性 focus 不触发（避免翻页后被弹回编辑态）
+  document.addEventListener('mousedown', function (e) {
+    var t = e.target;
+    if (!t || !t.closest) return;
+    if (t.closest('.editable') && VIM.mode === 'NORMAL') setMode('INSERT');
+  }, true);
+
+  renderMode();
 })();
