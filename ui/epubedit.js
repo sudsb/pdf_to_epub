@@ -1012,10 +1012,15 @@ const clone = range.cloneRange();
   // 块撑出真实滚动高度；行距固定（见 .sr-item height），滚动位置可精确换算。
   const SR_ROW_H = 46;      // = .sr-item height（epubedit.html，无外边距）
   const SR_OVERSCAN = 8;
+  // 浏览器单元素可滚动高度上限（Chrome≈33.5M px）。结果极多时 n*SR_ROW_H 超过此值会被浏览器
+  // 钳制 scrollHeight，导致滚动条位置错位——轻微拖动就跳到头/尾（双向都会发生）。超限时按比例
+  // 把每行滚动占位缩放到 _srUnit，使 scrollHeight 恒有界、不跳变（行高同步缩放保持 1:1）。
+  const SR_SCROLL_MAX_PX = 33000000;
   const _srRAF = (typeof requestAnimationFrame === 'function')
     ? requestAnimationFrame
     : function (cb) { return setTimeout(cb, 16); };
   let _srFrom = -1, _srTo = -1;
+  let _srUnit = SR_ROW_H;   // 每行滚动占位高度；默认=SR_ROW_H，超限时缩放
 
   function _srScaffold(list) {
     const first = list.firstElementChild;
@@ -1032,6 +1037,9 @@ const clone = range.cloneRange();
     const item = document.createElement('div');
     item.className = 'sr-item' + (k === searchCurrent ? ' current' : '');
     item.dataset.srIndex = String(k);
+    // 行高与边距同步为 _srUnit，保证「占位高度」与「实际渲染高度」1:1，缩放时也不重叠/错位
+    item.style.height = _srUnit + 'px';
+    item.style.margin = '0';
     item.innerHTML = '<div class="sr-page">第 ' + r.page + ' 章</div><div class="sr-ctx">' + r.ctx + '</div>';
     item.addEventListener('click', function () {
       searchCurrent = k;
@@ -1048,12 +1056,12 @@ const clone = range.cloneRange();
     const top = list.firstElementChild, bot = list.lastElementChild;
     const n = searchResults.length;
     const vh = list.clientHeight || 260;
-    const first = Math.max(0, Math.floor(list.scrollTop / SR_ROW_H) - SR_OVERSCAN);
-    const last = Math.min(n, Math.ceil((list.scrollTop + vh) / SR_ROW_H) + SR_OVERSCAN);
+    const first = Math.max(0, Math.floor(list.scrollTop / _srUnit) - SR_OVERSCAN);
+    const last = Math.min(n, Math.ceil((list.scrollTop + vh) / _srUnit) + SR_OVERSCAN);
     if (!force && first === _srFrom && last === _srTo) return;
     _srFrom = first; _srTo = last;
-    top.style.height = (first * SR_ROW_H) + 'px';
-    bot.style.height = ((n - last) * SR_ROW_H) + 'px';
+    top.style.height = (first * _srUnit) + 'px';
+    bot.style.height = ((n - last) * _srUnit) + 'px';
     const frag = document.createDocumentFragment();
     for (let k = first; k < last; k++) frag.appendChild(_srBuildItem(searchResults[k], k));
     win.innerHTML = '';
@@ -1072,9 +1080,9 @@ const clone = range.cloneRange();
     if (!list || searchCurrent < 0 || !searchResults.length) return;
     if (!list.querySelector('.sr-window')) return;
     const vh = list.clientHeight || 260;
-    const top = searchCurrent * SR_ROW_H;
+    const top = searchCurrent * _srUnit;
     if (top < list.scrollTop) list.scrollTop = top;
-    else if (top + SR_ROW_H > list.scrollTop + vh) list.scrollTop = top + SR_ROW_H - vh;
+    else if (top + _srUnit > list.scrollTop + vh) list.scrollTop = top + _srUnit - vh;
     _srRenderWindow(true);
   }
   (function () {
@@ -1098,6 +1106,9 @@ const clone = range.cloneRange();
     const list = document.getElementById('searchList');
     const count = document.getElementById('srCount');
     if (count) count.textContent = '共 ' + total + ' 处匹配' + (total > MAX ? '，仅显示前 ' + MAX + ' 条' : '');
+    // 结果极多时把每行滚动占位缩放到 _srUnit，使 scrollHeight 不超过浏览器上限（否则滚动条乱跳）
+    const fullH = results.length * SR_ROW_H;
+    _srUnit = fullH > SR_SCROLL_MAX_PX ? SR_SCROLL_MAX_PX / Math.max(1, results.length) : SR_ROW_H;
     if (!list) return;
     if (!results.length) {
       list.innerHTML = '<div class="sr-empty">未找到匹配内容</div>';

@@ -6806,10 +6806,15 @@ function updateKeepChips() {
 // 逐行测量。结果数组仍完整保留（供上一个/下一个、替换当前使用），计数显示真实总数。
 const SR_ROW_H = 50;      // 单行占位高度 = .sr-item height(44) + margin-bottom(6)
 const SR_OVERSCAN = 8;    // 视口上下各多渲染的行数（滚动时不留空白）
+// 浏览器单元素可滚动高度上限（Chrome≈33.5M px）。结果极多时 n*SR_ROW_H 会超过此值，
+// 浏览器会钳制 scrollHeight，导致滚动条位置与内容错位——轻微拖动就跳到头/尾（双向都会发生）。
+// 因此当总高超限时按比例把每行滚动占位缩放到 _srUnit，使 scrollHeight 恒有界、不跳变。
+const SR_SCROLL_MAX_PX = 33000000;
 const _srRAF = (typeof requestAnimationFrame === 'function')
   ? requestAnimationFrame
   : function (cb) { return setTimeout(cb, 16); };
 let _srFrom = -1, _srTo = -1;   // 当前已渲染窗口 [from, to)
+let _srUnit = SR_ROW_H;         // 每行滚动占位高度；默认=SR_ROW_H，超限时缩放（行高同步缩放保持 1:1）
 
 // 首次或结果清空后重建「上占位 + 内容层 + 下占位」三层结构
 function _srScaffold(list) {
@@ -6828,6 +6833,9 @@ function _srBuildItem(r, k) {
   const item = document.createElement('div');
   item.className = 'sr-item' + (k === searchCurrent ? ' current' : '');
   item.dataset.srIndex = String(k);
+  // 行高与边距同步为 _srUnit，保证「占位高度」与「实际渲染高度」1:1，缩放时也不重叠/错位
+  item.style.height = _srUnit + 'px';
+  item.style.margin = '0';
   item.innerHTML = '<div class="sr-page">' + (r.scopePage ? '本页' : '第 ' + r.page + ' 页') + '</div><div class="sr-ctx">' + r.ctx + '</div>';
   item.addEventListener('click', function () {
     searchCurrent = k;
@@ -6845,12 +6853,12 @@ function _srRenderWindow(force) {
   const top = list.firstElementChild, bot = list.lastElementChild;
   const n = searchResults.length;
   const vh = list.clientHeight || 320;
-  const first = Math.max(0, Math.floor(list.scrollTop / SR_ROW_H) - SR_OVERSCAN);
-  const last = Math.min(n, Math.ceil((list.scrollTop + vh) / SR_ROW_H) + SR_OVERSCAN);
+  const first = Math.max(0, Math.floor(list.scrollTop / _srUnit) - SR_OVERSCAN);
+  const last = Math.min(n, Math.ceil((list.scrollTop + vh) / _srUnit) + SR_OVERSCAN);
   if (!force && first === _srFrom && last === _srTo) return; // 窗口未变：省掉重建
   _srFrom = first; _srTo = last;
-  top.style.height = (first * SR_ROW_H) + 'px';
-  bot.style.height = ((n - last) * SR_ROW_H) + 'px';
+  top.style.height = (first * _srUnit) + 'px';
+  bot.style.height = ((n - last) * _srUnit) + 'px';
   const frag = document.createDocumentFragment();
   for (let k = first; k < last; k++) frag.appendChild(_srBuildItem(searchResults[k], k));
   win.innerHTML = '';
@@ -6872,9 +6880,9 @@ function _srScrollCurrentIntoView() {
   if (!list || searchCurrent < 0 || !searchResults.length) return;
   if (!list.querySelector('.sr-window')) return;
   const vh = list.clientHeight || 320;
-  const top = searchCurrent * SR_ROW_H;
+  const top = searchCurrent * _srUnit;
   if (top < list.scrollTop) list.scrollTop = top;
-  else if (top + SR_ROW_H > list.scrollTop + vh) list.scrollTop = top + SR_ROW_H - vh;
+  else if (top + _srUnit > list.scrollTop + vh) list.scrollTop = top + _srUnit - vh;
   _srRenderWindow(true);
 }
 
@@ -6901,6 +6909,9 @@ function renderSearchResults(results, total, MAX) {
   const list = document.getElementById('searchList');
   const count = document.getElementById('srCount');
   count.textContent = '共 ' + total + ' 处匹配' + (total > MAX ? '，仅显示前 ' + MAX + ' 条' : '');
+  // 结果极多时把每行滚动占位缩放到 _srUnit，使 scrollHeight 不超过浏览器上限（否则滚动条乱跳）
+  const fullH = results.length * SR_ROW_H;
+  _srUnit = fullH > SR_SCROLL_MAX_PX ? SR_SCROLL_MAX_PX / Math.max(1, results.length) : SR_ROW_H;
   if (!results.length) {
     list.innerHTML = '<div class="sr-empty">未找到匹配内容</div>';
     _srFrom = _srTo = -1;

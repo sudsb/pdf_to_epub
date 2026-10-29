@@ -284,7 +284,9 @@ mark.ptoe-search{background:#ffe9a8;color:inherit;border-radius:2px;padding:0 1p
 }
 .search-row label{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--text-muted);white-space:nowrap;}
 .sr-count{padding:2px 14px;font-size:11px;color:var(--text-dim);}
-.sr-list{flex:1;overflow-y:auto;min-height:90px;max-height:260px;padding:4px 14px 10px;}
+/* 虚拟滚动的结果列表：关掉滚动锚定，否则窗口滑动改写上占位块高度会被锚定补进
+   scrollTop，与窗口位移正反馈 → 滚过十来行就一路冲到列表头/尾（同矫正界面 #searchList） */
+.sr-list{flex:1;overflow-y:auto;min-height:90px;max-height:260px;padding:4px 14px 10px;overflow-anchor:none;}
 .sr-empty{padding:18px 0;text-align:center;color:var(--text-dim);font-size:13px;}
 .sr-item{height:46px;box-sizing:border-box;overflow:hidden;padding:6px 8px;border-radius:6px;cursor:pointer;}
 .sr-item:hover{background:var(--bg-hover);}

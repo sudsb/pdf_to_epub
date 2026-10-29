@@ -13158,7 +13158,11 @@ body.paint-mode{cursor:copy;}
 .search-nav button{width:32px;height:28px;padding:0;border:1px solid var(--border);background:#fff;border-radius:5px;cursor:pointer;font-size:14px;}
 .search-nav button:hover{background:#eef3fb;border-color:var(--accent);}
 #searchPos{font-size:12px;color:#5a6b7c;min-width:70px;text-align:center;}
-#searchList{max-height:45vh;overflow:auto;border:1px solid var(--border);border-radius:6px;padding:6px;background:#fafbfc;font-size:12px;}
+/* 结果列表是虚拟滚动（ui/app.js 的 _srRenderWindow）：窗口滑动时会改写「上占位块」高度。
+   浏览器滚动锚定（scroll anchoring）会把这段高度增量补进 scrollTop，再驱动下一帧的窗口
+   滑动 → 正反馈：滚过第十行左右就一路加速冲到列表末尾，从末尾向上滚同样会冲到开头。
+   overflow-anchor:none 关掉锚定后，scrollTop 只跟随用户滚动。 */
+#searchList{max-height:45vh;overflow:auto;border:1px solid var(--border);border-radius:6px;padding:6px;background:#fafbfc;font-size:12px;overflow-anchor:none;}
 .sr-head{display:flex;align-items:center;gap:8px;padding:2px 0 6px;color:#5a6b7c;font-weight:600;}
 .sr-item{height:44px;box-sizing:border-box;overflow:hidden;padding:4px 8px;border:1px solid var(--border);border-radius:6px;margin:0 0 6px;cursor:pointer;background:#fff;}
 .sr-item:hover{border-color:var(--accent);background:#f2f7ff;}
