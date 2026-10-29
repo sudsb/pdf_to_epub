@@ -8837,6 +8837,10 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "undo_depth": UNDO_DEPTH_DEFAULT,
                     "search_max_results": SEARCH_MAX_RESULTS_DEFAULT,
                     "show_line_numbers": False,
+                    # 纠错序号角标显示（2026-10-29）：序号用于 N Enter / N Delete
+                    # 按序应用或取消，显示只是视觉开关，默认开。与 configmanage
+                    # DEFAULT_CONFIG["ui_settings"] 同名同默认。
+                    "show_err_number": True,
                     "line_num_size": LINE_NUM_SIZE_DEFAULT,
                     "text_justify": True,
                     "clean_punctuation": True,
@@ -8870,6 +8874,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "undo_depth": stored.get("undo_depth", defaults.get("undo_depth", UNDO_DEPTH_DEFAULT)),
                     "search_max_results": stored.get("search_max_results", defaults.get("search_max_results", SEARCH_MAX_RESULTS_DEFAULT)),
                     "show_line_numbers": bool(stored.get("show_line_numbers", defaults.get("show_line_numbers", False))),
+                    "show_err_number": bool(stored.get("show_err_number", defaults.get("show_err_number", True))),
                     "line_num_size": stored.get("line_num_size", defaults.get("line_num_size", LINE_NUM_SIZE_DEFAULT)),
                     "text_justify": bool(stored.get("text_justify", defaults.get("text_justify", True))),
                     "clean_punctuation": bool(stored.get("clean_punctuation", defaults.get("clean_punctuation", True))),
@@ -9041,6 +9046,12 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     self._send(400, self._json({"ok": False, "error": "show_line_numbers 必须是布尔值"}), "application/json; charset=utf-8")
                     return
                 clean["show_line_numbers"] = v
+            if "show_err_number" in ui:
+                v = ui["show_err_number"]
+                if not isinstance(v, bool):
+                    self._send(400, self._json({"ok": False, "error": "show_err_number 必须是布尔值"}), "application/json; charset=utf-8")
+                    return
+                clean["show_err_number"] = v
             if "line_num_size" in ui:
                 v = ui["line_num_size"]
                 if v not in LINE_NUM_SIZE_CHOICES:
@@ -9829,6 +9840,28 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     else None
                 )
                 probe = _probe_server(model_name) if model_name else "none"
+                # 实际运行模型反查（2026-10-29）：probe 只回答「端口上跑的是不是配置
+                # 里的那个模型」。多开矫正界面时，早先打开的窗口内存/下拉框里仍是旧
+                # 模型键，重识别按旧键探测 → 报「当前服务加载的模型与所选模型不符」。
+                # mismatch 时把服务端真实加载的 id 反查成 model_choices 键返回，前端
+                # 据此把下拉框与持久化值对齐到正在运行的模型（match 时无需额外请求，
+                # 保证 5s 轮询不增加开销）。
+                running_model = model_key if probe == "match" else None
+                if probe == "mismatch" and isinstance(model_choices, dict):
+                    try:
+                        ids = llamamanage._loaded_model_ids()
+                    except Exception:  # noqa: BLE001  探测失败按未知处理
+                        ids = []
+                    if ids:
+                        for k in sorted(model_choices):
+                            nm = str((model_choices.get(k) or {}).get("name") or k)
+                            try:
+                                hit = llamamanage._model_id_matches(nm, ids)
+                            except Exception:  # noqa: BLE001
+                                hit = False
+                            if hit:
+                                running_model = k
+                                break
                 # 大模型加载耗时可达数分钟，此期间进程存活但 /health 仍 503：
                 # 报「启动中」而非「未运行」，避免用户误判启动失败（2026-08-09）
                 proc = getattr(llamamanage, "_server_process", None)
@@ -9844,6 +9877,9 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                             "mismatch": probe == "mismatch",
                             "loading": loading,
                             "model": model_key or None,
+                            # 服务端实际运行的模型键（未知为 None）：前端据此记忆
+                            # 「最近使用的模型」并对齐下拉框/持久化值（2026-10-29）
+                            "running_model": running_model or None,
                         }
                     ),
                     "application/json; charset=utf-8",
@@ -14098,6 +14134,12 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
           <option value="medium">中</option>
           <option value="large">大</option>
         </select>
+      </label>
+      <h4 style="margin:16px 0 4px;">纠错序号</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">每页待处理纠错按文档顺序从 1 编号。序号的用途是<b>按序号操作纠错</b>：普通模式下 <b>N Enter</b> 应用第 N 处、<b>N Delete</b> 取消（忽略）第 N 处，命令行也可用 :err N / :errd N。角标只是可选的可视提示（CSS 伪元素，绝对定位），不写入正文/保存内容；关闭后只是不显示角标，按序号操作的编号口径完全不变。</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
+        <input type="checkbox" id="errNumShow" style="width:16px;height:16px;">
+        显示纠错序号角标
       </label>
       <h4 style="margin:16px 0 4px;">正文对齐</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">矫正页正文默认两端对齐（分散对齐），段落左右边缘整齐更美观。关闭后按浏览器默认（左对齐）。纯视图层，不影响保存与导出；手动设置的逐块对齐仍然生效。</p>

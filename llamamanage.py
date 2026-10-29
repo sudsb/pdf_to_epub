@@ -494,6 +494,34 @@ def _probe_server(model_name: str) -> str:
     return "mismatch"
 
 
+def _loaded_model_ids() -> list[str]:
+    """读取 127.0.0.1:8080 上 llama-server 已加载的模型 id 列表（不可达返回 []）。
+
+    与 _probe_server 的差异：_probe_server 只判断「是不是某个模型」，这里把服务端
+    实际加载的 id 原样取回，供矫正界面把「当前真正在跑的模型」反查成配置里的
+    model_choices 键（2026-10-29：多开矫正界面时下拉框停在旧模型 → 重识别报
+    「模型不匹配」）。探测失败一律返回 []，调用方按「未知」处理，不抛异常。
+    """
+    if _active_engine() == "vllm":
+        fn = getattr(_vllm_module(), "_loaded_model_ids", None)
+        if fn is None:
+            return []
+        try:
+            return list(fn() or [])
+        except Exception:  # noqa: BLE001  探测失败不影响主流程
+            return []
+    try:
+        r = _SESSION.get("http://127.0.0.1:8080/v1/models", timeout=2)
+        if r.status_code != 200:
+            return []
+        data = r.json().get("data")
+        if not isinstance(data, list):
+            return []
+        return [str(m.get("id")) for m in data if isinstance(m, dict) and m.get("id")]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _probe_mmproj() -> bool | None:
     """探测 127.0.0.1:8080 上 llama-server 是否为多模态（已加载 --mmproj 视觉投影）。
 

@@ -23,6 +23,48 @@ class _FakeResp:
         return {"choices": [{"message": {"content": "识别结果"}}]}
 
 
+class TestLoadedModelIds(unittest.TestCase):
+    """_loaded_model_ids（2026-10-29 模型记忆）：取回服务端实际加载的模型 id。
+
+    矫正界面多开时靠它把「端口上真正在跑的模型」反查回配置键，从而修掉
+    「另一个窗口切了模型 → 本窗口重识别报模型不匹配」。探测失败必须返回空
+    列表而不是抛异常（状态轮询每 5s 一次，不能因探测失败打断界面）。
+    """
+
+    def _resp(self, payload, code=200):
+        r = mock.Mock()
+        r.status_code = code
+        r.json.return_value = payload
+        return r
+
+    def test_parses_model_ids(self):
+        resp = self._resp({"data": [{"id": "E:/model/x.gguf"}, {"id": "y.gguf"}, {"oops": 1}]})
+        with mock.patch.object(llm, "_active_engine", return_value="llama"), \
+             mock.patch.object(llm._SESSION, "get", return_value=resp):
+            self.assertEqual(llm._loaded_model_ids(), ["E:/model/x.gguf", "y.gguf"])
+
+    def test_unreachable_returns_empty(self):
+        with mock.patch.object(llm, "_active_engine", return_value="llama"), \
+             mock.patch.object(llm._SESSION, "get", side_effect=RuntimeError("boom")):
+            self.assertEqual(llm._loaded_model_ids(), [])
+
+    def test_non_200_or_bad_payload_returns_empty(self):
+        with mock.patch.object(llm, "_active_engine", return_value="llama"), \
+             mock.patch.object(llm._SESSION, "get", return_value=self._resp({}, code=503)):
+            self.assertEqual(llm._loaded_model_ids(), [])
+        with mock.patch.object(llm, "_active_engine", return_value="llama"), \
+             mock.patch.object(llm._SESSION, "get", return_value=self._resp({"data": "nope"})):
+            self.assertEqual(llm._loaded_model_ids(), [])
+
+    def test_resolvable_against_model_id_matches(self):
+        # 与 _probe_server 同一比对口径：服务端回完整路径，配置里是相对路径也能命中
+        resp = self._resp({"data": [{"id": "E:/model/qwen3.5/Qwen3.5-0.8B-Q8_0.gguf"}]})
+        with mock.patch.object(llm, "_active_engine", return_value="llama"), \
+             mock.patch.object(llm._SESSION, "get", return_value=resp):
+            ids = llm._loaded_model_ids()
+        self.assertTrue(llm._model_id_matches("qwen3.5/Qwen3.5-0.8B-Q8_0.gguf", ids))
+
+
 class TestBatchInfer(unittest.TestCase):
     def test_config_resolved_once_per_batch(self):
         # 配置（模型名）在批次开始前解析一次；每页请求不再触发 get_config()

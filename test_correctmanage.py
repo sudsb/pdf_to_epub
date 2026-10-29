@@ -9893,6 +9893,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "undo_depth": 100,
                     "search_max_results": 200,
                     "show_line_numbers": False,
+                    "show_err_number": True,
                     "line_num_size": "large",
                     "text_justify": True,
                     "clean_punctuation": True,
@@ -9944,6 +9945,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "undo_depth": 100,
                     "search_max_results": 200,
                     "show_line_numbers": False,
+                    "show_err_number": True,
                     "line_num_size": "large",
                     "text_justify": True,
                     "clean_punctuation": True,
@@ -10299,6 +10301,45 @@ class TestUiSettingsEndpoint(unittest.TestCase):
             res = requests.post(
                 base + "/api/ui_settings",
                 data=_json.dumps({"ui_settings": {"show_line_numbers": "yes"}}),
+            ).json()
+            self.assertFalse(res["ok"])
+            self.assertIn("布尔", res["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self._stop(server)
+
+    def test_post_show_err_number_persists(self):
+        # 纠错序号角标显示开关（2026-10-29）：bool 键，与 show_line_numbers 同构；
+        # 关掉只影响视觉，按序号应用/取消的编号口径不受影响（纯前端状态口径）。
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"show_err_number": False}}),
+            ).json()
+            self.assertTrue(res["ok"])
+            self.assertEqual(calls, [{"show_err_number": False}])
+        finally:
+            self._stop(server)
+
+    def test_post_show_err_number_bad_type_400(self):
+        import json as _json
+
+        import requests
+
+        self._patch_cfg({})
+        calls = self._patch_setter()
+        server, base = self._start()
+        try:
+            res = requests.post(
+                base + "/api/ui_settings",
+                data=_json.dumps({"ui_settings": {"show_err_number": 1}}),
             ).json()
             self.assertFalse(res["ok"])
             self.assertIn("布尔", res["error"])
@@ -11587,6 +11628,7 @@ class TestSetUiSettingsConfig(unittest.TestCase):
                 "undo_depth": 100,
                 "search_max_results": 200,
                 "show_line_numbers": False,
+                "show_err_number": True,
                 "line_num_size": "large",
                 "text_justify": True,
                 "clean_punctuation": True,

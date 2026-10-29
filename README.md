@@ -340,7 +340,9 @@ When enabled, a local HTTP server starts and opens the correction UI (a pywebvie
 - **Right**: Editable OCR text (one `<div>` per line)
 - **Toolbar**: Format (bold, italic, headings h1–h6, alignment, notes), markers (article break, paragraph merge), search/replace, proofreading, image insert, export TXT/DOCX/EPUB
 - **Command Line** (`Ctrl+;`): nvim-style line-range commands (`7,10merge`), multi-command scripts (`;` separators, `（…）` scope groups), and `插入 insert [格式 format][文本 text]` that falls back to the **system clipboard** when text is omitted (see USAGE.md 六)
-- **nvim Mode** (2026-10-28, optional): default INSERT; `Esc` → NORMAL (`j`/`k` page, `gg`/`G`, `dd`/`yy`/`cc`, `v` visual), `:` opens the command line with `:w`/`:wq`/`:q`/`:next`/`:prev`/`:g N` and page-scoped `:s/old/new/` (`10,20s/...`, `%s/...`) — see USAGE.md 六
+- **nvim Mode** (2026-10-28, optional): default INSERT; `Esc` or `Ctrl+[` → NORMAL (`j`/`k` page, `5g`/`5G` jump to original page N, `gg`/`G`, `dd`/`yy`/`cc`, `v` visual, `h`/`l` previous/next proofreading error, `Enter`/`Delete` accept/ignore the focused error, `N Enter`/`N Delete` accept/ignore error **number N** on the page, `X` clear this page's annotations, `st` open settings), `:` opens the command line with `:w`/`:wq`/`:q`/`:next`/`:prev`/`:g N`/`:st`/`:err N`/`:errd N`/`:cls` and page-scoped `:s/old/new/` (`10,20s/...`, `%s/...`) — see USAGE.md 六
+- **Proofreading error numbers**: per-page 1-based ordinals in document order, usable to apply/cancel by number (`N Enter` / `N Delete`, `:err N` / `:errd N`). The badge is view-only (`data-err-no` + CSS pseudo-element, never written into the text) and can be hidden via settings (`ui_settings.show_err_number`, default on) without changing the numbering
+- **Model auto-alignment**: `/api/llm_status` reports the model actually loaded by llama-server; the UI aligns its proofread/reOCR model to it (and persists it) so multiple correction windows never send requests with a stale model
 - **Virtual List**: Handles 1000+ pages smoothly
 - **Undo/Redo**: Ctrl+Z / Ctrl+Y (10 steps)
 - **History**: Versioned cache at `data/correction_history/` (20 versions per PDF)

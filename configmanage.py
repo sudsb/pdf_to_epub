@@ -499,6 +499,10 @@ DEFAULT_CONFIG = {
         # 文字页面行号显示（2026-10）：虚拟列表各页文字块左侧显示行号（每页从 1 起），
         # 供命令行按行号寻址（如 :7,10merge）。纯视图层，不写入保存内容/导出。默认关。
         "show_line_numbers": False,
+        # 纠错序号角标显示（2026-10-29）：bool，默认 true。序号本身只用于
+        # 「N Enter / N Delete / :err N / :errd N」按序应用或取消纠错；显示与否
+        # 只是视觉开关（纯 CSS 类，关掉不影响按序号操作的编号口径）。
+        "show_err_number": True,
         # 行号栏尺寸（2026-10）：small/medium/large，控制行号字号与左侧留白。默认 large（大）。
         "line_num_size": LINE_NUM_SIZE_DEFAULT,
         # 正文两端对齐/分散对齐（2026-10）：bool，默认 true，矫正页正文段落左右边缘对齐更美观。
@@ -1136,6 +1140,10 @@ def set_ui_settings(ui: dict) -> dict:
         # 行号显示开关（bool）：非 bool 输入回退 False，与 rule_all_pages_confirm 同构
         v = ui["show_line_numbers"]
         clean["show_line_numbers"] = True if v is True else False
+    if "show_err_number" in ui:
+        # 纠错序号角标显示开关（bool，2026-10-29）：非 bool 回退默认 True
+        v = ui["show_err_number"]
+        clean["show_err_number"] = True if v is True else False
     if "line_num_size" in ui:
         # 行号栏尺寸：仅接受 small/medium/large，非法值回退默认 large
         v = str(ui["line_num_size"])

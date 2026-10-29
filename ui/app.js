@@ -274,6 +274,9 @@ const UI_SETTINGS_DEFAULTS = { tip_delay: 600, err_hover_delay: 1500, brush_merg
   popup_row1: ['bold','italic','underline','underdot','wavy','double','overline','emphasis','strike','charbox','shade','highlight_green','highlight_blue','highlight_pink','highlight_orange','highlight_purple','ruby','paint','remove'],
   popup_row2: ['heading','p','note','citation','align_left','align_center','align_right','align_lines','centerbold','merge','sup','sub','table','table2text'],
   popup_rule_count: 5, proofread_batch_pages: 0, proofread_auto_jump: true, undo_depth: 100, show_line_numbers: false,
+  // 纠错序号角标显示（2026-10-29）：只影响角标可视与否，编号口径（N Enter/N Delete/
+  // :err N）始终按文档顺序，与后端 configmanage DEFAULT_CONFIG["ui_settings"] 同名同默认。
+  show_err_number: true,
   search_max_results: 200,
   line_num_size: 'large', text_justify: true,
   clean_punctuation: true, clean_symbols: true, clean_md_tags: true, clean_html_tags: true, clean_paragraphs: false,
@@ -348,6 +351,8 @@ async function loadUiSettingsFromServer() {
       if (smr) smr.value = String(searchMaxResults());
       const ln = document.getElementById('lineNumShow');
       if (ln) ln.checked = !!uiBool('show_line_numbers', false);
+      const en = document.getElementById('errNumShow');
+      if (en) en.checked = !!uiBool('show_err_number', true);
       const lns = document.getElementById('lineNumSizeSel');
       if (lns) lns.value = uis('line_num_size', 'large');
       const tj = document.getElementById('textJustifyToggle');
@@ -482,6 +487,9 @@ function applyUiPrefs() {
   // 行号显示（2026-10）：host 切换 .ptoe-line-num 类即可整页重算（纯 CSS 计数器），
   // 无需重建 DOM / 走 setMdMode 的重挂路径。启动时也会走到这里（loadUiSettingsFromServer）。
   if (host) host.classList.toggle('ptoe-line-num', !!uiBool('show_line_numbers', false));
+  // 纠错序号角标（2026-10-29）：同样只切一个 class（CSS 伪元素显隐，无需重建标注 DOM）。
+  // 关掉只影响「看得见」，N Enter / N Delete / :err N 的编号口径仍按文档顺序不变。
+  if (host) host.classList.toggle('ptoe-err-num', !!uiBool('show_err_number', true));
   // 行号栏尺寸（2026-10）：host 切换 .ptoe-ln-sm/.ptoe-ln-md 类（大 = large 无附加类）。
   // 只改 CSS 变量（--ln-pad/--ln-numw/--ln-gap/--ln-font），整页重排交给浏览器。
   if (host) {
@@ -1602,6 +1610,18 @@ function jumpToPageIndex(idx) {
   updateViewport();
   const row = host.querySelector('.page-row[data-i="' + idx + '"]');
   if (row) { const ed = row.querySelector('.editable'); if (ed) ed.scrollTop = 0; }
+  // 落点二次校正（2026-10-29）：未挂载/未实测行的 prefixTop 是按图片宽高比估算的，
+  // 正文列比图片高时实际行高更大 → 目标行停在工具栏线下方若干百 px，viewportPage()
+  // 仍判定在上一页，NORMAL 下连按 j 表现为「到了某一页就翻不动」。行已挂载后按实测
+  // 位置补一次平移（阈值 2px，最多一次，避免与滚动锚定互相拉扯）。
+  if (row) {
+    const d = row.getBoundingClientRect().top - toolbarOffset();
+    if (Math.abs(d) > 2) {
+      _progJumpTs = Date.now();
+      window.scrollTo({ top: Math.max(0, window.scrollY + d), behavior: 'auto' });
+      updateViewport();
+    }
+  }
   hidePopup();
   setStatus('已跳转到第 ' + pages[idx].page + ' 页');
 }
@@ -11010,6 +11030,55 @@ let proofreadLlmEnabled = false; // LLM 深度校对开关（服务端持久化 
 let proofreadLlmModel = '';      // 深度校对模型 key（'' = 跟随 selected_model）
 let proofreadLegacyRules = false; // 原有规则开关（默认关：校正只跑三条新规则；服务端持久化）
 
+// ---------- 模型记忆 / 对齐（2026-10-29） ----------
+// 问题：矫正界面多开时，A 窗口把服务切成模型 X，早先打开的 B 窗口内存/下拉框仍是
+// 旧模型 C；点「重识别」时后端按 C 探测端口 → 报「当前服务加载的模型与所选模型不符」。
+// 方案：/api/llm_status 返回服务端实际运行的模型键（running_model），前端把它对齐到
+// 本地状态 + 下拉框并写回 config.json —— B 窗口自动收敛，新开窗口读到持久化值即是
+// 「最近使用的模型」。探测/写入失败一律静默降级，绝不影响编辑与翻页。
+let _prModelAdoptBusy = false;
+// 校对设置（enabled/model/legacy）已从服务端载入：未载入前绝不做「对齐 + 回写」，
+// 否则会把尚未读取的默认值（enabled=false, model='')覆盖掉用户真实配置。
+let _prSettingsLoaded = false;
+async function ptoeAdoptRunningModel(res) {
+  const key = res && res.running && res.running_model;
+  if (!key || key === proofreadLlmModel) return false;
+  if (_prModelAdoptBusy || !_prSettingsLoaded) return false;
+  const sel = document.getElementById('prLlmModel');
+  // 用户正在下拉框里挑选时不抢值（避免刚选中就被改回去）
+  if (sel && document.activeElement === sel) return false;
+  const opts = sel ? Array.prototype.map.call(sel.options, function (o) { return o.value; }) : [];
+  // 下拉框尚未填充（设置面板从未打开）或配置里无此键（服务由外部启动）→ 不动
+  if (!opts.length || opts.indexOf(key) < 0) return false;
+  _prModelAdoptBusy = true;
+  try {
+    proofreadLlmModel = key;
+    if (sel) sel.value = key;
+    try {
+      await fetchJSON('/api/proofread_settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          enabled: proofreadLlmEnabled,
+          model: key,
+          enable_legacy_rules: proofreadLegacyRules,
+        }),
+      });
+    } catch (e) { /* 持久化失败不影响本次会话（内存值已对齐） */ }
+    showToast('已对齐当前运行模型：' + key, 'ok');
+    return true;
+  } finally {
+    _prModelAdoptBusy = false;
+  }
+}
+// 主动对齐一次（重识别前调用：另一个窗口刚切换模型时不必等 5s 轮询）
+async function ptoeSyncProofreadModel() {
+  try {
+    const res = await fetchJSON('/api/llm_status');
+    if (res && res.ok) await ptoeAdoptRunningModel(res);
+  } catch (e) { /* 服务不可达：沿用本地值，由请求自身报错 */ }
+}
+
 // 批量范围：n>0 时从 start 起连续 n 页；n<=0（0 = 全部）时返回整本书全部页索引数组
 function _batchRange(start, n) {
   if (n <= 0) { // 0 = 校正/重识别整本书：从首页到末页
@@ -11135,6 +11204,18 @@ function renderProofread(i) {
   // 已包裹的 .ptoe-err 会被 walker 拒绝，导致左侧条目被截断，Σ标注段长度
   // 与 err.wrong 不等，应用纠错时其后标注会按错误长度平移——2026-10-10 修复
   errors.sort(function (a, b) { return (a.start || 0) - (b.start || 0); });
+  // 页内序号（2026-10-29）：只为「未消失」的条目按 start 升序 1 基编号。序号只写进
+  // data-err-no 属性、由 CSS ::before 绝对定位展示 —— 不产生文本节点，故不影响正文、
+  // 保存内容与纯文本偏移（_plainNoAnno / contentMap 完全无感）。
+  const _errNo = {};
+  {
+    let _no = 0;
+    for (let _x = 0; _x < errors.length; _x++) {
+      if (!errors[_x] || errors[_x]._gone) continue;
+      _no++;
+      _errNo[_x] = _no;
+    }
+  }
   // P2: 保存光标（相对 ed 文本偏移，排除 .ptoe-fix/.ptoe-marker 的展示文本）——重建后恢复，防 IME 光标跳段首
   let savedSelOffset = -1;
   try {
@@ -11174,6 +11255,7 @@ function renderProofread(i) {
       sEl.className = 'ptoe-err';
       sEl.setAttribute('data-err-i', k);
       sEl.setAttribute('data-err-empty', '1');
+      if (_errNo[k]) sEl.setAttribute('data-err-no', String(_errNo[k]));
       sEl.textContent = _candText(err.candidates[0]); // 2026-09-21：候选为 dict {text,score} 时取 text
       frag.appendChild(sEl);
       const fixEl = document.createElement('span');
@@ -11216,6 +11298,8 @@ function renderProofread(i) {
       const sEl = document.createElement('s');
       sEl.className = 'ptoe-err';
       sEl.setAttribute('data-err-i', k);
+      // 序号只挂在首段（跨段错误仍是一个序号），避免同一处重复显示
+      if (firstSeg && _errNo[k]) sEl.setAttribute('data-err-no', String(_errNo[k]));
       sEl.textContent = segText;
       frag.appendChild(sEl);
       // fixEl 只在首段插一次（candidates 必须是数组，否则安全跳过）
@@ -11647,6 +11731,130 @@ function advanceToNextError(i, k) {
   showErrPopup(rect);
 }
 
+// ---------- 页内纠错序号导航 / 精确应用（2026-10-29，NORMAL 键位用） ----------
+// 序号口径与 renderProofread 写入的 data-err-no 完全一致：本页「未消失」条目按
+// errors 数组顺序（renderProofread 已按 start 升序）1 基编号。序号只存在于属性 +
+// CSS ::before 伪元素里，不产生文本节点，故不进正文/保存/纯文本偏移。
+function _prLiveIdxList(i) {
+  const errors = proofreadErrors[i];
+  if (!errors || !errors.length) return [];
+  const out = [];
+  for (let k = 0; k < errors.length; k++) if (errors[k] && !errors[k]._gone) out.push(k);
+  return out;
+}
+// 本页序号（1 基）→ errors 下标；越界返回 -1
+function _prIdxFromNo(i, no) {
+  const list = _prLiveIdxList(i);
+  const n = parseInt(no, 10);
+  if (!(n >= 1) || n > list.length) return -1;
+  return list[n - 1];
+}
+// 纠错操作的作用页：以视口页为准（用户眼前这一页），取不到再退回光标页
+function _prErrPage() {
+  const vp = viewportPage();
+  if (vp >= 0 && vp < pages.length) return vp;
+  const ci = currentPageIndex();
+  return (ci >= 0 && ci < pages.length) ? ci : 0;
+}
+// 从 from 之后/之前找第一处仍有待处理纠错的页（不含自身）；无则 -1
+function _prFindErrorPage(from, dir) {
+  for (let i = from + dir; i >= 0 && i < pages.length; i += dir) {
+    if (_prLiveIdxList(i).length) return i;
+  }
+  return -1;
+}
+// 定位到某页某条纠错并弹出采纳/忽略窗（必要时先跳页挂载该行）
+function _prFocusError(i, k) {
+  let row = host.querySelector('.page-row[data-i="' + i + '"]');
+  if (!row) { jumpToPageIndex(i); row = host.querySelector('.page-row[data-i="' + i + '"]'); }
+  const ed = row ? row.querySelector('.editable') : null;
+  const el = ed ? ed.querySelector('.ptoe-err[data-err-i="' + k + '"]') : null;
+  if (!el) return false;
+  el.scrollIntoView({ block: 'center', behavior: 'auto' });
+  const rect = _errAnchorRect(i, k) || el.getBoundingClientRect();
+  errKey = { i: i, k: k };
+  _errHideBlockUntil = performance.now() + 600; // 屏蔽紧随其后的 selectionchange 隐藏
+  showErrPopup(rect);
+  return true;
+}
+// 上/下一处纠错（dir<0 向前，dir>0 向后；count = 步数，跨页继续）。返回是否移动。
+function ptoeErrStep(dir, count) {
+  const n = Math.max(1, parseInt(count, 10) || 1);
+  let page = (errKey && typeof errKey.i === 'number' && errKey.i >= 0 && errKey.i < pages.length)
+    ? errKey.i : _prErrPage();
+  let list = _prLiveIdxList(page);
+  if (!list.length) {
+    const np = _prFindErrorPage(page, dir);
+    if (np < 0) { showToast('全书没有待处理纠错', 'warn'); return false; }
+    page = np; list = _prLiveIdxList(page);
+  }
+  let pos = (errKey && errKey.i === page) ? list.indexOf(errKey.k) : -1;
+  if (pos < 0) pos = dir > 0 ? -1 : list.length;
+  let moved = false;
+  for (let step = 0; step < n; step++) {
+    let next = pos + dir;
+    if (next < 0 || next >= list.length) {
+      const np = _prFindErrorPage(page, dir);
+      if (np < 0) break; // 到全书首/尾：停在原处，不循环
+      page = np; list = _prLiveIdxList(page);
+      next = dir > 0 ? 0 : list.length - 1;
+    }
+    pos = next; moved = true;
+  }
+  if (!moved) {
+    showToast(dir > 0 ? '已经是最后一处纠错' : '已经是第一处纠错', 'warn');
+    return false;
+  }
+  const ok = _prFocusError(page, list[pos]);
+  if (ok) {
+    setStatus('第 ' + pages[page].page + ' 页：第 ' + (pos + 1) + '/' + list.length + ' 处待处理纠错');
+  } else {
+    showToast('未能定位到该处标注（可能已随编辑失效）', 'warn');
+  }
+  return ok;
+}
+// 应用（accept）或取消/忽略（ignore）指定序号的纠错；no 缺省 = 当前定位/本页第一处。
+// 复用既有「采纳/忽略」按钮（errOk/errNo）的完整逻辑：撤销栈、反馈、标注重建一致。
+function ptoeErrApplyNo(no, ignore) {
+  let i, k;
+  const hasNo = !(no == null || no === '');
+  const page = _prErrPage();
+  if (hasNo) {
+    i = page;
+    k = _prIdxFromNo(i, no);
+    if (k < 0) {
+      const total = _prLiveIdxList(i).length;
+      showToast(total ? ('本页没有序号 ' + no + '（共 ' + total + ' 处）') : '本页没有待处理纠错', 'warn');
+      return false;
+    }
+  } else if (errKey && proofreadErrors[errKey.i] &&
+             proofreadErrors[errKey.i][errKey.k] && !proofreadErrors[errKey.i][errKey.k]._gone) {
+    // 无序号：优先作用于悬浮窗当前定位的那一处（用户眼前看到的）
+    i = errKey.i; k = errKey.k;
+  } else {
+    i = page;
+    const list = _prLiveIdxList(i);
+    if (!list.length) {
+      const np = _prFindErrorPage(i, 1); // 本页无待处理 → 顺延到后面第一处
+      if (np < 0) { showToast('本页没有待处理纠错', 'warn'); return false; }
+      i = np;
+      k = _prLiveIdxList(i)[0];
+    } else {
+      k = list[0];
+    }
+  }
+  // 目标页未挂载时先跳过去（未挂载页没有标注 DOM，点击采纳会静默失败）
+  if (!host.querySelector('.page-row[data-i="' + i + '"]')) jumpToPageIndex(i);
+  // 序号（1 基，按文档顺序）——状态改动前取，供操作后的提示
+  const noShown = _prLiveIdxList(i).indexOf(k) + 1;
+  errKey = { i: i, k: k };
+  const btn = document.getElementById(ignore ? 'errNo' : 'errOk');
+  if (!btn) return false;
+  btn.click(); // 与鼠标点击同一路径（含撤销栈、反馈、自动跳到下一处）
+  showToast((ignore ? '已取消' : '已应用') + '第 ' + noShown + ' 处纠错（原书第 ' + pages[i].page + ' 页）', 'ok');
+  return true;
+}
+
 // 跨页错误导航（2026-10）：Ctrl+PageDown / Ctrl+PageUp 从当前位置向后/向前查找
 // 第一处仍有待处理错误的页面，跳转并定位该页第一个错误（弹出采纳/忽略窗）。
 // 不再只停留在当前页；到文档首/尾时只提示，不循环，避免误以为还有错误。
@@ -11809,6 +12017,9 @@ async function _reocrIndices(indices) {
   const errBefore = new Map();
   for (const k of indices) errBefore.set(k, _copyErrors(k));
   const before = histBegin('重识别', indices);
+  // 重识别前主动对齐一次「服务端实际运行的模型」（模型记忆，2026-10-29）：
+  // 另一个窗口刚切换过模型时不必等 5s 轮询，否则按过期模型键探测会报「模型不匹配」
+  await ptoeSyncProofreadModel();
   const model = proofreadLlmModel || '';
   const btn = document.getElementById('prMenuReocr');
   if (btn) btn.disabled = true;
@@ -14210,6 +14421,8 @@ function openSettings() {
   if (rac) rac.checked = !!uiBool('rule_all_pages_confirm', true);
   const lnc = document.getElementById('lineNumShow');
   if (lnc) lnc.checked = !!uiBool('show_line_numbers', false);
+  const enc = document.getElementById('errNumShow');
+  if (enc) enc.checked = !!uiBool('show_err_number', true);
   const lnsIn = document.getElementById('lineNumSizeSel');
   if (lnsIn) lnsIn.value = uis('line_num_size', 'large');
   const tjIn = document.getElementById('textJustifyToggle');
@@ -14903,7 +15116,8 @@ const _CMD_SHORT_ALIASES = {
   'tb': '表格', 'im': '插图', 'imf': '图格式', 'cy': '复制', 'ct': '复制文本',
   'pt': '粘贴', 'px': '粘贴文本', 'nt': '注释', 'qt': '引用', 'ins': '插入', 'ru': '规则',
   // 工具操作简写
-  'sv': 'save', 'ex': 'export', 'st': 'stage', 'u': 'undo', 'rd': 'redo',
+  // 'st' 2026-10-29 改指「设置」（用户要求 st 快速打开设置），暂存改由 'sg'
+  'sv': 'save', 'ex': 'export', 'sg': 'stage', 'st': 'settings', 'u': 'undo', 'rd': 'redo',
   'hs': 'history', 'cl': 'clean', 't2': 't2s', 's2': 's2t', 'set': 'settings',
   'ok': '采纳', 'ap': '应用校正', 'ig': '忽略', 'cm': '清除标注',
   'rv': '回退', 'fn': '完成', 'cap': '题注',
@@ -17195,7 +17409,11 @@ document.addEventListener('keydown', (e) => {
         o.value = ''; o.textContent = '（无可用模型）';
         prLlmModelEl.appendChild(o);
       }
+      // 读取成功后才允许「对齐运行模型 + 回写配置」：否则会把未载入的默认值写回去
+      _prSettingsLoaded = true;
     } catch (e) { console.warn('loadProofreadLlm failed: ' + e.message); }
+    // 下拉框填充完成后立即对齐一次服务端实际运行的模型（模型记忆，2026-10-29）
+    if (_prSettingsLoaded) { try { await ptoeSyncProofreadModel(); } catch (e) {} }
   }
   // legacyToast=true 时提示语针对「原有规则」开关（由该勾选框的 change 触发）
   async function saveProofreadLlm(legacyToast) {
@@ -17227,6 +17445,8 @@ document.addEventListener('keydown', (e) => {
   prLlmEnableEl.addEventListener('change', function () { saveProofreadLlm(false); });
   prLlmModelEl.addEventListener('change', function () { saveProofreadLlm(false); });
   if (prLegacyRulesEl) prLegacyRulesEl.addEventListener('change', function () { saveProofreadLlm(true); });
+  // 模型记忆（2026-10-29）：每次状态轮询把本地模型值收敛到服务端实际运行的那个
+  // （ptoeAdoptRunningModel，定义在 proofread 状态区，重识别前也会主动调一次）。
   // llama-server 启停（句子校正：以纯文本模式启动，不附加图像投影）
   async function refreshLlmStatus() {
     const el = document.getElementById('prLlmStatus');
@@ -17234,12 +17454,14 @@ document.addEventListener('keydown', (e) => {
     try {
       const res = await fetchJSON('/api/llm_status');
       if (!res.ok) { el.textContent = '服务状态: 未知（' + (res.error || '') + '）'; return; }
+      await ptoeAdoptRunningModel(res);
       // loading：进程存活但模型仍在加载（health 503），两个按钮都禁用避免重复启动/误停
       const loading = !res.running && !!res.loading;
+      const shownModel = res.running_model || res.model;
       el.textContent = res.running
         ? ('服务状态: 运行中' + (res.mismatch
             ? '（其他模型，可停止后切换）'
-            : (res.model ? '（' + res.model + '）' : '')))
+            : (shownModel ? '（' + shownModel + '）' : '')))
         : (loading ? '服务状态: 启动中…' : '服务状态: 未运行');
       const startBtn = document.getElementById('prLlmStart');
       const stopBtn = document.getElementById('prLlmStop');
@@ -17847,6 +18069,8 @@ document.getElementById('resetUiSettingsBtn').addEventListener('click', () => {
   if (rac) rac.checked = true;
   const lnr = document.getElementById('lineNumShow');
   if (lnr) lnr.checked = false;
+  const enr = document.getElementById('errNumShow');
+  if (enr) enr.checked = UI_SETTINGS_DEFAULTS.show_err_number;
   const lnsr = document.getElementById('lineNumSizeSel');
   if (lnsr) lnsr.value = UI_SETTINGS_DEFAULTS.line_num_size;
   const tjr = document.getElementById('textJustifyToggle');
@@ -17987,6 +18211,13 @@ document.getElementById('lineNumShow').addEventListener('change', (e) => {
   // 保存前先把开关落到 host 类上：即使服务端写入失败（离线/磁盘满），
   // 本次会话内仍按用户所见生效（applyUiPrefs 的即时切换与保存解耦）。
   if (uiSettings) { uiSettings.show_line_numbers = e.target.checked; saveUiSettings(); }
+  applyUiPrefs();
+});
+// 纠错序号角标显示开关（2026-10-29）：只切 host 的 .ptoe-err-num 类（纯 CSS 显隐，
+// 不重建标注 DOM）；序号本身的编号口径不受影响，关掉后 N Enter / N Delete 照常可用。
+const _errNumShowChk = document.getElementById('errNumShow');
+if (_errNumShowChk) _errNumShowChk.addEventListener('change', (e) => {
+  if (uiSettings) { uiSettings.show_err_number = !!e.target.checked; saveUiSettings(); }
   applyUiPrefs();
 });
 // 行号栏尺寸（大/中/小；2026-10：服务端持久化 config.json ui_settings）
@@ -18476,7 +18707,13 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
   var LEADER_DEFAULT = '\\';
   var CHORD_TIMEOUT = 1000;                 // 待定前缀（g/d/y/c/leader）超时
   var LEADER_DEFAULT_MAPS = { w: 'w', q: 'q', s: 'settings', e: 'export', h: 'help' };
-  var VIM = { mode: 'INSERT', count: 0, pending: '', pendingAt: 0, composing: false, hintShown: false, cmdReturn: 'NORMAL' };
+  var VIM = {
+    mode: 'INSERT', count: 0, pending: '', pendingAt: 0, composing: false,
+    hintShown: false, cmdReturn: 'NORMAL',
+    // 翻页锚点（见 pageBase）：anchor = 上次翻页目标页索引，anchorAt = 设定时间，
+    // jumpAt = 最近一次程序性跳转时间（自身滚动不失效锚点）
+    anchor: -1, anchorAt: 0, jumpAt: 0
+  };
 
   // ---- 样式 + 模式指示条（视觉层，只注入）----
   (function injectVimStyles() {
@@ -18495,7 +18732,16 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
       '#vimModeBar .vm-cmdline{color:#ffb3c8;}',
       '#vimModeBar .vm-count{color:#ffd479;}',
       '#vimModeBar .vm-pending{color:#c9b5ff;}',
-      'body.vim-nav .editable{caret-color:transparent;}'
+      'body.vim-nav .editable{caret-color:transparent;}',
+      // 页内纠错序号角标（2026-10-29）：序号的用途是「按序号应用/取消纠错」
+      // （N Enter / N Delete / :err N / :errd N），角标只是可选可视提示 ——
+      // 由 host 上的 .ptoe-err-num 类控制显隐（设置里可关，关掉编号口径不变）。
+      // 绝对定位伪元素不占行内空间 → 不改正文布局、不进 DOM 文本/保存内容。
+      '.ptoe-err-num .ptoe-err[data-err-no]{position:relative;}',
+      '.ptoe-err-num .ptoe-err[data-err-no]::before{content:attr(data-err-no);position:absolute;left:-1px;top:-0.95em;',
+      '  z-index:3;font:600 9px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#fff;',
+      '  background:#d33;border-radius:6px;padding:0 3px;text-decoration:none;pointer-events:none;',
+      '  -webkit-user-select:none;user-select:none;}'
     ].join('');
     document.head.appendChild(st);
   })();
@@ -18534,6 +18780,16 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
   function consume(e) { e.preventDefault(); e.stopPropagation(); }
 
   // ---- 当前位置 / 翻页 ----
+  // 翻页锚点（2026-10-29）：视口页由「工具栏线落在哪一行」判定，而未实测行的高度只是
+  // 按图片宽高比估算的——正文列比图片高时，跳转落点会低于目标行，viewportPage() 仍判定
+  // 在上一页，连按 j 就表现为「翻到某一页后再也翻不动」。这里记住上一次翻页的目标页：
+  // 短时间内的连续翻页以它为基准；用户自己滚动/点击/触摸后立即失效，不干扰手动浏览。
+  var ANCHOR_TTL = 4000;
+  function setAnchor(idx) { VIM.anchor = idx; VIM.anchorAt = Date.now(); VIM.jumpAt = Date.now(); }
+  function pageBase() {
+    if (VIM.anchor >= 0 && VIM.anchor < pages.length && (Date.now() - VIM.anchorAt) < ANCHOR_TTL) return VIM.anchor;
+    return viewportPage();
+  }
   function curPageIndex() {
     var ed = currentEditable();
     if (ed) { var row = ed.closest('.page-row'); if (row) return Number(row.dataset.i); }
@@ -18543,16 +18799,23 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
     var n = VIM.count || 1;
     resetCount();
     if (!pages.length) return;
-    var idx = viewportPage();
-    var t = idx + delta * n;
+    var base = pageBase();
+    var t = base + delta * n;
     if (t < 0) t = 0;
     if (t > pages.length - 1) t = pages.length - 1;
-    if (t === idx) { showToast(delta > 0 ? '已经是最后一页' : '已经是第一页', 'warn'); return; }
+    if (t === base) { showToast(delta > 0 ? '已经是最后一页' : '已经是第一页', 'warn'); return; }
     jumpToPageIndex(t);
+    setAnchor(t);
   }
-  function firstPage() { resetCount(); if (pages.length) jumpToPageIndex(0); }
-  function lastPage() { resetCount(); if (pages.length) jumpToPageIndex(pages.length - 1); }
-  function gotoPageNumber(n) { resetCount(); _cmdPageJump(n); }
+  function firstPage() { resetCount(); if (pages.length) { jumpToPageIndex(0); setAnchor(0); } }
+  function lastPage() { resetCount(); if (pages.length) { var t = pages.length - 1; jumpToPageIndex(t); setAnchor(t); } }
+  function gotoPageNumber(n) {
+    resetCount();
+    var pn = parseInt(n, 10);
+    if (!(pn >= 1)) { showToast('页号无效（用法：5G / 5g）', 'warn'); return; }
+    _cmdPageJump(pn);
+    setAnchor(viewportPage()); // 以实际落点为锚，之后的 j/k 从这里继续
+  }
 
   // ---- 块定位 / 行操作（dd / yy / cc / x）----
   function blockAtCaret(fallbackFirst) {
@@ -18674,12 +18937,29 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
     if (ed && ed.isConnected && ed.focus) { try { ed.focus(); } catch (e) {} }
   }
 
+  // 清除当前页纠错标注（NORMAL X / :cls）：复用既有 clearProofread + 撤销栈，
+  // 作用页取视口页（NORMAL 下 currentEditable 可能是翻页前那一页）。
+  function clearErrPage() {
+    var i = _prErrPage();
+    var row = host.querySelector('.page-row[data-i="' + i + '"]');
+    var ed = row ? row.querySelector('.editable') : null;
+    if (!ed) { showToast('请先滚动到要清除的页', 'warn'); return; }
+    if (!ed.querySelector('.ptoe-err, .ptoe-fix')) { showToast('本页没有纠错标注', 'warn'); return; }
+    histRun('清除纠错标注', [i], function () { clearProofread(i); });
+    hideErrPopup();
+    scheduleRemeasure(i);
+    showToast('已清除本页纠错标注', 'ok');
+    setStatus('已清除第 ' + pages[i].page + ' 页纠错标注');
+  }
+
   // ---- 浮层 / 弹窗守卫：这些情况下不接管按键，交既有逻辑 ----
   function overlayActive() {
     if (_multiSelAnyModalOpen()) return true;
     var pop = document.getElementById('popup');
     if (pop && pop.style.display === 'flex') return true;
-    if (errKey) return true;
+    // 纠错采纳/忽略窗：INSERT/VISUAL 下仍让既有逻辑接管（Esc = 忽略），
+    // NORMAL 下由键位层接管（h/l 换处、Enter 采纳、Delete 忽略、Esc 关闭）。
+    if (errKey && VIM.mode !== 'NORMAL') return true;
     var cm = document.getElementById('contextMenu');
     if (cm && !cm.hidden && cm.style.display !== 'none') return true;
     if (typeof _formatBrush !== 'undefined' && _formatBrush) return true;
@@ -18701,6 +18981,12 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
     if (p === 'g') {
       VIM.pending = '';
       if (k === 'g') { firstPage(); } else { resetCount(); }
+      renderMode(); return;
+    }
+    if (p === 's') {
+      VIM.pending = '';
+      if (k === 't') { resetCount(); openSettings(); }
+      else { showToast('未定义的 s 和弦：s' + k + '（st = 打开设置面板）', 'warn'); }
       renderMode(); return;
     }
     if (p === 'leader') {
@@ -18741,6 +19027,8 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
     if (VIM.pending) { dispatchPending(e); return; }
 
     if (e.ctrlKey && !e.altKey && !e.metaKey) {
+      // Ctrl+[ = Esc（vim 里两者等价）：已在 NORMAL 时只清掉计数/前缀
+      if (k === '[') { consume(e); resetCount(); VIM.pending = ''; setMode('NORMAL'); return; }
       if (k === 'r') { consume(e); resetCount(); redoHistory(); return; }
       // Ctrl+f / Ctrl+b 不拦截：沿用应用既有的 Ctrl+F 搜索，避免与 NORMAL 翻页冲突
       if (k === 'd') { consume(e); pageMove(1); return; }
@@ -18758,17 +19046,44 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
     }
 
     switch (k) {
-      case 'Escape': consume(e); resetCount(); setMode('NORMAL'); return;
+      case 'Escape': consume(e); resetCount(); hideErrPopup(); setMode('NORMAL'); return;
       case 'i': case 'a': case 'o': consume(e); enterInsert(); return;
       case 'v': case 'V': consume(e); toggleVisual(); return;
       case 'j': consume(e); pageMove(1); return;
       case 'k': consume(e); pageMove(-1); return;
-      case 'g': consume(e); VIM.pending = 'g'; VIM.pendingAt = Date.now(); renderMode(); return;
+      // h / l：上一处 / 下一处纠错（跨页；带计数即跳过 N 处）
+      case 'h': case 'l': {
+        var hc = VIM.count || 1; resetCount();
+        consume(e);
+        ptoeErrStep(k === 'l' ? 1 : -1, hc);
+        return;
+      }
+      // Enter / Delete：应用 / 取消（忽略）纠错 —— 带计数 N 时精确到本页第 N 处编号
+      case 'Enter': {
+        var ac = VIM.count; resetCount();
+        consume(e);
+        ptoeErrApplyNo(ac || null, false);
+        return;
+      }
+      case 'Delete': {
+        var dc = VIM.count; resetCount();
+        consume(e);
+        ptoeErrApplyNo(dc || null, true);
+        return;
+      }
+      case 'g':
+        // 5g = 跳到原书第 5 页（与 5G 同义）；无计数时 gg 仍为首屏
+        if (VIM.count) { var gn = VIM.count; resetCount(); consume(e); gotoPageNumber(gn); return; }
+        consume(e); VIM.pending = 'g'; VIM.pendingAt = Date.now(); renderMode(); return;
       case 'G': {
         var n = VIM.count; resetCount();
         if (n) gotoPageNumber(n); else lastPage();
         consume(e); return;
       }
+      case 's':
+        // s 前缀：st = 打开设置（st 也可作 ex 命令）
+        consume(e); VIM.pending = 's'; VIM.pendingAt = Date.now(); renderMode(); return;
+      case 'X': consume(e); resetCount(); clearErrPage(); return;
       case 'd': case 'y': case 'c':
         consume(e); VIM.pending = k; VIM.pendingAt = Date.now(); renderMode(); return;
       case 'x': consume(e); resetCount(); deleteChar(); return;
@@ -18777,8 +19092,8 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
       case '/': case '?': consume(e); openSearchModal(); return;
       default:
         if (k === LEADER_DEFAULT) { consume(e); VIM.pending = 'leader'; VIM.pendingAt = Date.now(); renderMode(); return; }
-        // NORMAL 下不得编辑正文：退格/删除/回车也必须拦下
-        if (k === 'Backspace' || k === 'Delete' || k === 'Enter') { consume(e); return; }
+        // NORMAL 下不得编辑正文：退格等也必须拦下
+        if (k === 'Backspace') { consume(e); return; }
         // 可打印键一律吞掉，避免误写入正文
         if (k.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) consume(e);
         return;
@@ -18795,13 +19110,16 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
     if (capturingOp || mouseCapturingOp) return;
 
     if (VIM.mode === 'INSERT') {
-      // Esc 进 NORMAL：仅在没有任何浮层/弹窗/选区/纠错焦点时抢占，避免破坏既有 Esc 语义
-      if (e.key === 'Escape' && !overlayActive() && !_multiSelBlocks.size) {
+      // Esc / Ctrl+[ 进 NORMAL：仅在没有任何浮层/弹窗/选区/纠错焦点时抢占，
+      // 避免破坏既有 Esc 语义（浮层打开时 Esc 仍有原用途）。
+      var toNormal = (e.key === 'Escape') ||
+        (e.key === '[' && e.ctrlKey && !e.altKey && !e.metaKey);
+      if (toNormal && !overlayActive() && !_multiSelBlocks.size) {
         consume(e);
         setMode('NORMAL');
         if (!VIM.hintShown) {
           VIM.hintShown = true;
-          showToast('NORMAL：j/k 翻页 · gg/G 首末页 · i 编辑 · : 命令 · v 选区', 'ok');
+          showToast('NORMAL：j/k 翻页 · h/l 上/下一处纠错 · N Enter/Delete 应用/取消第 N 处 · st 设置 · : 命令', 'ok');
         }
       }
       return;
@@ -19003,6 +19321,42 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
       global: true, run: function (ctx) { _cmdPageJump(ctx && ctx.args); }
     });
 
+    // ---- 设置 / 纠错序号（2026-10-29）----
+    add({
+      keys: ['settings', 'st', '设置', 'pref'], desc: '打开设置面板（NORMAL 下也可直接 st）',
+      example: 'st', usage: 'st',
+      global: true, run: function () { openSettings(); }
+    });
+    add({
+      keys: ['cls', 'clearerr', '清除纠错'], desc: '清除当前页纠错标注（删除线+候选字，正文不动）',
+      example: 'cls', usage: 'cls',
+      global: true, run: function () { clearErrPage(); }
+    });
+    add({
+      keys: ['err', '应用纠错'], desc: '应用本页第 N 处纠错（无参数 = 当前/第一处）',
+      example: 'err 3', usage: 'err [N]',
+      global: true, run: function (ctx) {
+        var a = String((ctx && ctx.args) || '').trim();
+        ptoeErrApplyNo(a || null, false);
+      }
+    });
+    add({
+      keys: ['errd', '忽略纠错', '取消纠错'], desc: '取消（忽略）本页第 N 处纠错',
+      example: 'errd 3', usage: 'errd [N]',
+      global: true, run: function (ctx) {
+        var a = String((ctx && ctx.args) || '').trim();
+        ptoeErrApplyNo(a || null, true);
+      }
+    });
+    add({
+      keys: ['errm', '下一处纠错'], desc: '跳到下一处纠错（跨页）', example: 'errm', usage: 'errm',
+      global: true, run: function () { ptoeErrStep(1, 1); }
+    });
+    add({
+      keys: ['errp', '上一处纠错'], desc: '跳到上一处纠错（跨页）', example: 'errp', usage: 'errp',
+      global: true, run: function () { ptoeErrStep(-1, 1); }
+    });
+
     add({
       keys: ['map', 'nmap', 'leader'], desc: '查看/定义 leader 映射', example: 'map w wq', usage: 'map ｜ map <键> <命令>',
       global: true, keepOpen: true, run: function (ctx) { mapCommand(ctx && ctx.args); }
@@ -19014,6 +19368,16 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
   document.addEventListener('keydown', onKeydown, true);
   document.addEventListener('compositionstart', function () { VIM.composing = true; }, true);
   document.addEventListener('compositionend', function () { VIM.composing = false; }, true);
+  // 翻页锚点失效：用户自己滚动/触摸/点击后不再沿用上一次翻页目标（防误判）。
+  // 自身跳转（jumpToPageIndex）在同一任务内触发 scroll，250ms 内不失效。
+  window.addEventListener('scroll', function () {
+    if (VIM.anchor < 0) return;
+    if (Date.now() - VIM.jumpAt < 250) return;
+    VIM.anchor = -1;
+  }, { passive: true });
+  ['wheel', 'touchstart', 'mousedown'].forEach(function (ev) {
+    document.addEventListener(ev, function () { VIM.anchor = -1; }, { passive: true, capture: true });
+  });
   // 用户主动点进编辑区 → 回 INSERT；程序性 focus 不触发（避免翻页后被弹回编辑态）
   document.addEventListener('mousedown', function (e) {
     var t = e.target;

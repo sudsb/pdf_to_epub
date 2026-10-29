@@ -124,6 +124,25 @@ def _probe_server(model_name: str) -> str:
     return "mismatch"
 
 
+def _loaded_model_ids() -> list[str]:
+    """读取 vLLM 服务 /v1/models 的已加载模型 id 列表（不可达返回 []）。
+
+    与 llamamanage._loaded_model_ids 同签名：供矫正界面把「当前真正在跑的模型」
+    反查成配置键；探测失败返回 []，调用方按未知处理。
+    """
+    _, sargs, _, _ = _vll_args()
+    try:
+        r = _SESSION.get(f"{_base_url(sargs)}/v1/models", timeout=2)
+        if r.status_code != 200:
+            return []
+        data = r.json().get("data")
+        if not isinstance(data, list):
+            return []
+        return [str(m.get("id")) for m in data if isinstance(m, dict) and m.get("id")]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _probe_mmproj() -> bool | None:
     """vLLM 侧多模态探测占位：当前按文本服务处理，返回 None（未知）。"""
     return None

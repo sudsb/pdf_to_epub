@@ -27,6 +27,7 @@ PToEA is a Windows-first CLI tool (plus optional local GUI) for converting PDF f
 - **Browser/GUI**: `uv run python mian.py gui`
 - **Package to exe**: `powershell -ExecutionPolicy Bypass -File .\0pack.ps1 [-NoPaddle][-OneFile]`
 - **Lint UI JS**: `node --check ui/app.js`; also `python check_js.py` for embedded/extracted JS
+- **Command-line aliases**: `node ptoe_cmdshort_test.cjs` — enforces that `_CMD_SHORT_ALIASES` (ui/app.js) has no duplicate/colliding short names and every target exists. Run it after touching the alias table or `_CMD_BUILTINS`
 
 ## Code Conventions & Common Patterns
 
@@ -69,10 +70,18 @@ PToEA is a Windows-first CLI tool (plus optional local GUI) for converting PDF f
     - `python test_stringmanage.py`
     - `python test_pdfmanage.py`
     - `python test_llamamanage.py`
-  - UI/JS: `node --check ui/app.js`, `python check_js.py`
+  - UI/JS: `node --check ui/app.js`, `python check_js.py`, `node ptoe_cmdshort_test.cjs`
+  - NORMAL-mode key bindings / proofreading ordinals: `python test_vim_ui.py`
 - **Quality**: No type/lint/coverage gate—manual smoke tests are required
 - **Patterns**: Use atomic write helpers, lock ordering, and guarded lazy imports for all tests
-- **Pitfalls**: Be watchful of 8.3/long-path mismatches (especially in frozen exe), session/config race bugs, global state, and missed dependency mocks in test runs
+- **Pitfalls**: Be watchful of 8.3/long-path mismatches (especially in frozen exe), session/config race bugs, global state, and missed dependency mocks in test runs. Never call `configmanage.set_ui_settings` from an ad-hoc script to "test" it: it writes `config.json`, and its exception fallback overwrites the whole file with `DEFAULT_CONFIG` (patch `get_config` + `_atomic_write_json` first, or prefer `validate_and_patch_config`, which is pure)
+
+## Correction GUI Key Layer (`ui/app.js` → `initPtoeVimMode`)
+
+- Default mode is `INSERT` (no behavior change for existing users); `Esc` / `Ctrl+[` enter `NORMAL`.
+- NORMAL keys are routed by one capture-phase `keydown` listener. The proofreading accept/ignore popup blocks keys in `INSERT`/`VISUAL` but is **released to the key layer in `NORMAL`** (see `overlayActive()`).
+- Page navigation uses a «翻页锚点» (`pageBase()` / `setAnchor()`): row heights of unmounted pages are estimated from image aspect ratio, so `viewportPage()` alone can report the previous page and make `j` stick. Keep the anchor when touching paging code.
+- Proofreading ordinals (`_prLiveIdxList` / `_prIdxFromNo`) are computed from state only, never from the DOM, so they keep working when the `data-err-no` badge is hidden (`ui_settings.show_err_number`). Badges must stay layout-neutral (absolute `::before`, no text nodes) — they must never enter saved content or plain-text offsets.
 
 ---
 _See [README.md](README.md), [USAGE.md](USAGE.md), and comments in `0pack.ps1` for deeper specifics. Update this guideline if major architecture or conventions change._

@@ -31,6 +31,8 @@ class VimStaticTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.src = read(APP_JS)
+        cls.cm_html = read(os.path.join(ROOT, 'correctmanage.py'))
+        cls.cfg = read(os.path.join(ROOT, 'configmanage.py'))
         # 只取新增模块，避免把既有 17k 行里的同名片段误判为通过
         marker = 'function initPtoeVimMode()'
         i = cls.src.index(marker)
@@ -94,6 +96,112 @@ class VimStaticTest(unittest.TestCase):
         self.assertIn("st.id = 'vimModeStyles'", self.mod)
         self.assertIn("el.id = 'vimModeBar'", self.mod,
                       '模式指示条应由 JS 注入，避免 _UI_HTML/ui_full.html 双份同步')
+
+    # ---- 2026-10-29 增量：翻页卡死 / 设置命令 / 纠错序号键位 ----
+
+    def test_v7_page_move_anchor(self):
+        """j/k 连按不得卡在同一页：翻页目标用锚点推进，不只依赖视口判定。"""
+        self.assertIn('function pageBase()', self.mod)
+        self.assertIn('ANCHOR_TTL', self.mod)
+        self.assertIn('var base = pageBase();', self.mod,
+                      'pageMove 必须以翻页锚点为基准，避免视口判定误差导致「翻不动」')
+        self.assertIn('setAnchor(t)', self.mod)
+        # 用户自己滚动/触摸/点击 → 锚点失效，不干扰手动浏览
+        self.assertIn("'wheel', 'touchstart', 'mousedown'", self.mod)
+        self.assertIn("window.addEventListener('scroll'", self.mod)
+        # 跳转落点二次校正（前缀估算与实测行高不一致的根因修复）
+        self.assertIn('row.getBoundingClientRect().top - toolbarOffset()', self.src,
+                      'jumpToPageIndex 必须按实测位置校正落点')
+
+    def test_v8_ctrl_bracket_to_normal(self):
+        self.assertIn("e.key === '[' && e.ctrlKey", self.mod,
+                      'Ctrl+[ 必须等价 Esc 进入 NORMAL（INSERT 与 NORMAL 两侧）')
+        self.assertIn("if (k === '[')", self.mod)
+
+    def test_v9_settings_command(self):
+        self.assertIn('function openSettings()', self.src)
+        self.assertIn('run: function () { openSettings(); }', self.mod,
+                      'ex 命令 :st / :settings 必须真正打开设置面板')
+        self.assertIn("keys: ['settings', 'st', '设置'", self.mod)
+        self.assertIn("'st': 'settings'", self.src,
+                      ':st 必须是设置（暂存改由 :sg）')
+        self.assertIn("'sg': 'stage'", self.src)
+        # NORMAL 和弦 st
+        self.assertIn("case 's':", self.mod)
+        self.assertIn("if (k === 't') { resetCount(); openSettings(); }", self.mod)
+
+    def test_v10_count_g_jumps_original_page(self):
+        # 5g = 5G = 跳到原书第 5 页；gg 仍是首屏
+        self.assertIn('if (VIM.count) { var gn = VIM.count; resetCount(); consume(e); gotoPageNumber(gn); return; }',
+                      self.mod)
+        self.assertIn('if (n) gotoPageNumber(n); else lastPage();', self.mod)
+        self.assertIn('function gotoPageNumber(', self.mod)
+
+    def test_v11_error_navigation_keys(self):
+        self.assertIn("case 'h': case 'l':", self.mod)
+        self.assertIn('ptoeErrStep(k === \'l\' ? 1 : -1, hc)', self.mod)
+        self.assertIn("case 'Enter':", self.mod)
+        self.assertIn("case 'Delete':", self.mod)
+        self.assertIn('ptoeErrApplyNo(ac || null, false)', self.mod)
+        self.assertIn('ptoeErrApplyNo(dc || null, true)', self.mod)
+        self.assertIn("case 'X': consume(e); resetCount(); clearErrPage(); return;", self.mod)
+        self.assertIn('function clearErrPage()', self.mod)
+        # 复用既有采纳/忽略按钮，撤销栈/反馈/标注重建口径一致
+        self.assertIn("btn.click()", self.src)
+        self.assertIn('ptoeErrApplyNo(a || null, false);', self.mod, 'ex :err 必须走同一套应用逻辑')
+        self.assertIn('ptoeErrApplyNo(a || null, true);', self.mod, 'ex :errd 必须走同一套取消逻辑')
+
+    def test_v12_error_numbering_does_not_touch_text(self):
+        # 序号只写 data-err-no 属性 + CSS ::before 绝对定位 → 不产生文本节点
+        self.assertIn("sEl.setAttribute('data-err-no'", self.src)
+        self.assertIn('const _errNo = {};', self.src)
+        self.assertIn('content:attr(data-err-no)', self.src)
+        self.assertIn('position:absolute', self.mod,
+                      '序号必须绝对定位，避免改变正文行高/排版')
+        self.assertIn('function _prIdxFromNo(', self.src)
+        self.assertIn('function _prLiveIdxList(', self.src)
+        # 序号的用途是按序号应用/取消（不是显示）：编号口径只看状态，不看 DOM
+        idx_from_no = self.src[self.src.index('function _prIdxFromNo('):]
+        self.assertIn('_prLiveIdxList(i)', idx_from_no[:400],
+                      '序号→条目必须按状态列表换算，关闭角标后仍可用')
+
+    def test_v13_error_number_badge_toggle(self):
+        """角标显示可在设置里开关；关掉只影响视觉，不影响按序号操作。"""
+        self.assertIn('show_err_number', self.src)
+        self.assertIn("host.classList.toggle('ptoe-err-num'", self.src)
+        self.assertIn('.ptoe-err-num .ptoe-err[data-err-no]::before', self.src,
+                      '角标必须由 .ptoe-err-num 类控制显隐（纯 CSS，不重建标注）')
+        self.assertIn("id=\"errNumShow\"", self.cm_html)
+        self.assertIn('"show_err_number": True', self.cm_html,
+                      'GET 默认值与 configmanage 必须同名同默认')
+        self.assertIn('"show_err_number": True', self.cfg)
+        self.assertIn('if "show_err_number" in ui:', self.cfg)
+        self.assertIn('if "show_err_number" in ui:', self.cm_html)
+        # 勾选框接线：改完即时生效（切 CSS 类）+ 持久化到 ui_settings
+        self.assertIn("const _errNumShowChk = document.getElementById('errNumShow');", self.src)
+        self.assertIn('uiSettings.show_err_number = !!e.target.checked', self.src)
+
+
+class ModelMemoryStaticTest(unittest.TestCase):
+    """模型记忆（2026-10-29）：多开矫正界面时模型不得停在过期值。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = read(APP_JS)
+        cls.cm = read(os.path.join(ROOT, 'correctmanage.py'))
+
+    def test_llm_status_reports_running_model(self):
+        self.assertIn('"running_model": running_model or None', self.cm)
+        self.assertIn('llamamanage._loaded_model_ids()', self.cm)
+
+    def test_frontend_adopts_running_model(self):
+        self.assertIn('async function ptoeAdoptRunningModel(res)', self.js)
+        self.assertIn('async function ptoeSyncProofreadModel()', self.js)
+        self.assertIn('await ptoeAdoptRunningModel(res)', self.js,
+                      '状态轮询必须把本地模型收敛到服务端实际运行的模型')
+        # 重识别前主动对齐一次，避免等到下一轮 5s 轮询
+        reocr = self.js[self.js.index('async function _reocrIndices'):]
+        self.assertIn('await ptoeSyncProofreadModel();', reocr[:4000])
 
 
 class VimSyntaxTest(unittest.TestCase):
