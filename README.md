@@ -11,6 +11,7 @@ A Windows-oriented CLI tool that converts PDFs to EPUB via local OCR and local m
 - **Text Processing**: Clean, structure, and normalize OCR text (bbox conversion, page-number stripping, heading detection, zh-CN/zh-TW conversion)
 - **EPUB Generation**: Convert structured text to XHTML and package as standard EPUB3
 - **Optional Manual Correction**: Browser-based UI for page-by-page correction with formatting, markers, search/replace, proofreading, and history
+- **Vim-style Normal Mode**: `Esc` / `Ctrl+[` enters NORMAL; the local server also switches the active IME from Chinese to English conversion mode (Sogou / Baidu / Microsoft Pinyin) so `j`/`k`/`h`/`l` are not eaten as pinyin — the keyboard layout is never changed
 - **Batch Conversion**: Queue multiple PDFs in the GUI (or pass several PDFs to `mian.py epub`) and convert them sequentially, continuing after individual failures
 - **Resume Support**: Resume interrupted OCR jobs from checkpoint
 - **Packaging**: Single-file Windows executable via PyInstaller
@@ -479,6 +480,9 @@ data/<pdf_stem>/
 ```powershell
 # Unit tests (stdlib unittest)
 uv run python -m unittest test_pdfmanage test_mian test_correctmanage test_llamamanage test_stringmanage test_vllmmanage
+
+# IME switch guard (Esc → English conversion mode, no keyboard-layout switch)
+uv run python test_imemanage.py
 
 # Queue + request script test
 uv run python test_image_queue_request.py

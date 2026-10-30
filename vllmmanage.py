@@ -207,15 +207,15 @@ def runserver(
         return True
     if probe == "mismatch":
         port = sargs.get("port") or "8000"
-        print(f"Port {port} is occupied by a vLLM server with a different model (need '{probe_name}')")
-        if _server_process is not None and _server_process.poll() is None:
-            stopserver()
-            time.sleep(0.5)
-            if _probe_server(probe_name) != "none":
-                print("Port still occupied by an external process — abort to avoid silent model mismatch; close it manually and retry")
-                return False
-        else:
-            print("Port is held by an external process that ptoe cannot verify — abort to avoid silent model mismatch; close it manually and retry")
+        print(f"Port {port} is occupied by a vLLM server with a different model (need '{probe_name}'); stopping stale instance ...")
+        # 热切换（2026-10-30 修复「切换模型失败」）：旧实例可能由本程序上一次运行/
+        # 另一个矫正界面启动（_server_process 管不到），此时仍要先停掉再启动，
+        # 否则「切换模型」永远报「端口被外部进程占用」而拒绝切换。
+        # stopserver 内含端口兜底（_kill_port_owner），停完再探测确认端口释放。
+        stopserver()
+        time.sleep(0.5)
+        if _probe_server(probe_name) != "none":
+            print("Port still occupied after stopping — abort to avoid silent model mismatch; close it manually and retry")
             return False
 
     if not vllm_server:

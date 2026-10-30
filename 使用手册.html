@@ -5,13 +5,27 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>使用手册 - PToEA</title>
 <style>
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial; padding: 24px; max-width: 980px; margin: auto; color: #24292e; background: #fff; }
-pre { background: #f6f8fa; padding: 12px; overflow: auto; }
-code { background: #f6f8fa; padding: 2px 4px; border-radius: 3px; }
-h1,h2,h3,h4,h5,h6 { color: #0366d6; }
-ul, ol { margin-left: 1.2em; }
-blockquote { color: #6a737d; padding-left: 12px; border-left: 4px solid #eee; }
-hr { border: none; border-top: 1px solid #e1e4e8; margin: 24px 0; }
+:root { color-scheme: light; --accent:#3568b8; --text:#202b38; --muted:#526475; --border:#d9e0e8; }
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { font-family: "PingFang SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 40px 24px; max-width: 960px; margin: auto; color: var(--text); background: #f3f5f8; line-height: 1.85; letter-spacing: .015em; -webkit-font-smoothing: antialiased; }
+article { max-width: 860px; margin: auto; padding: 42px 52px; background: #fff; border: 1px solid var(--border); border-radius: 14px; box-shadow: 0 8px 30px rgba(28,43,61,.06); }
+h1,h2,h3,h4,h5,h6 { color: var(--text); line-height: 1.45; letter-spacing: .01em; }
+h1 { margin-top: 0; color: var(--accent); font-size: 2em; }
+h2 { margin-top: 2em; padding-bottom: .35em; border-bottom: 1px solid var(--border); }
+p { margin: .8em 0; }
+pre { background: #f6f8fa; border: 1px solid #e5eaf0; border-radius: 8px; padding: 16px; overflow: auto; line-height: 1.65; }
+code { background: #eef2f6; padding: 2px 5px; border-radius: 4px; font-family: "Cascadia Code", Consolas, monospace; font-size: .92em; }
+pre code { padding: 0; background: transparent; }
+ul, ol { margin-left: 1.2em; padding-left: .8em; }
+li { margin: .25em 0; }
+blockquote { color: var(--muted); margin-left: 0; padding: 4px 16px; border-left: 3px solid #a9bed8; background: #f7f9fc; }
+hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+::selection { background: rgba(53,104,184,.18); }
+@media (max-width: 640px) { body { padding: 0; background: #fff; } article { padding: 26px 20px; border: none; border-radius: 0; box-shadow: none; } h1 { font-size: 1.65em; } }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+@media print { body { padding: 0; background: #fff; } article { max-width: none; padding: 0; border: none; box-shadow: none; } pre { white-space: pre-wrap; } }
 </style>
 
 </head>

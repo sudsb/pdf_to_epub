@@ -503,6 +503,12 @@ DEFAULT_CONFIG = {
         # 「N Enter / N Delete / :err N / :errd N」按序应用或取消纠错；显示与否
         # 只是视觉开关（纯 CSS 类，关掉不影响按序号操作的编号口径）。
         "show_err_number": True,
+        # Esc / Ctrl+[ 进 NORMAL 时自动把输入法切英文（2026-10-30）：bool，默认 true。
+        # 只把当前输入法内部的「中文模式 → 英文模式」（搜狗/百度/微软拼音通用），
+        # 不切换键盘布局/输入语言，所以不会变成「美式键盘」。开启后前端调
+        # /api/ime_english，由本地服务端（imemanage）用 Win32 IMM32 接口切换；
+        # 输入法已是英文 / 非 Windows / 失败都静默跳过，不影响按键本身。
+        "ime_switch_on_esc": True,
         # 行号栏尺寸（2026-10）：small/medium/large，控制行号字号与左侧留白。默认 large（大）。
         "line_num_size": LINE_NUM_SIZE_DEFAULT,
         # 正文两端对齐/分散对齐（2026-10）：bool，默认 true，矫正页正文段落左右边缘对齐更美观。
@@ -1144,6 +1150,10 @@ def set_ui_settings(ui: dict) -> dict:
         # 纠错序号角标显示开关（bool，2026-10-29）：非 bool 回退默认 True
         v = ui["show_err_number"]
         clean["show_err_number"] = True if v is True else False
+    if "ime_switch_on_esc" in ui:
+        # Esc 后自动切英文输入法（bool）：非 bool 输入回退默认 True
+        v = ui["ime_switch_on_esc"]
+        clean["ime_switch_on_esc"] = True if v is True else False
     if "line_num_size" in ui:
         # 行号栏尺寸：仅接受 small/medium/large，非法值回退默认 large
         v = str(ui["line_num_size"])
@@ -1372,11 +1382,26 @@ def set_auto_save(cfg: dict) -> dict:
             return cfg
 
 
-# flags 支持集：g=全局、i=忽略大小写、m=多行、u=unicode（'s' 不支持，直接拒绝）
-_REPLACE_RULE_FLAGS = frozenset("gimu")
+# flags 支持集：g=全局、i=忽略大小写、m=多行、s=点号跨行（2026-10-30 起支持，
+# 与前端 rrApplyRegex / 执行侧 re.DOTALL 对齐）、u=unicode
+_REPLACE_RULE_FLAGS = frozenset("gimsu")
 _REPLACE_RULE_MAX = 100
 _REPLACE_RULE_NAME_MAX = 40
 _REPLACE_RULE_REPLACEMENT_MAX = 200
+
+
+def _compile_rule_pattern(pattern: str, flags: str = ""):
+    """按「执行口径」编译替换规则正则：方言归一（\\z/\\h/\\R/(?<name>…)+ 标志映射）。
+
+    与前端 ptoeRegexDialect / 后端 rulemanage.normalize_pattern 同一口径，保证
+    保存校验能通过的规则，两端执行时也能通过（2026-10-30 正则引擎增强）。
+    供 _validate_replace_rule 与调试复用；非法时抛 re.error。
+    """
+    import re
+
+    import rulemanage
+
+    return re.compile(rulemanage.normalize_pattern(pattern), rulemanage.compile_flags(flags))
 
 
 def _validate_replace_rule(item) -> dict:
@@ -1399,21 +1424,24 @@ def _validate_replace_rule(item) -> dict:
         raise ValueError("正则表达式（pattern）不能为空")
     import re
 
-    try:
-        re.compile(pattern)
-    except re.error as e:
-        raise ValueError(f"正则表达式无效：{e}") from e
     flags = item.get("flags")
     if flags is None:
         flags = ""
     if not isinstance(flags, str):
-        raise ValueError("flags 必须是字符串（g/i/m/u 组合）")
+        raise ValueError("flags 必须是字符串（g/i/m/s/u 组合）")
     flags_norm = ""
     for ch in flags.strip().lower():
         if ch not in _REPLACE_RULE_FLAGS:
-            raise ValueError("flags 含不支持的修饰符（仅支持 g/i/m/u）")
+            raise ValueError("flags 含不支持的修饰符（仅支持 g/i/m/s/u）")
         if ch not in flags_norm:
             flags_norm += ch
+    # 校验口径与执行口径一致（2026-10-30）：按 flags 编译（原来裸 re.compile，
+    # 与前端「补 u/方言翻译」的执行口径不一致），并统一走方言归一（\z、\h、\R、
+    # JS 的 (?<name>) 写法等），让同一份规则在前后端都能成立。
+    try:
+        _compile_rule_pattern(pattern, flags_norm)
+    except re.error as e:
+        raise ValueError(f"正则表达式无效：{e}") from e
     keep_groups = item.get("keep_groups")
     if keep_groups is None:
         keep_groups = []

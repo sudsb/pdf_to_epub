@@ -154,7 +154,6 @@ class VimStaticTest(unittest.TestCase):
     def test_v12_error_numbering_does_not_touch_text(self):
         # 序号只写 data-err-no 属性 + CSS ::before 绝对定位 → 不产生文本节点
         self.assertIn("sEl.setAttribute('data-err-no'", self.src)
-        self.assertIn('const _errNo = {};', self.src)
         self.assertIn('content:attr(data-err-no)', self.src)
         self.assertIn('position:absolute', self.mod,
                       '序号必须绝对定位，避免改变正文行高/排版')
@@ -164,6 +163,13 @@ class VimStaticTest(unittest.TestCase):
         idx_from_no = self.src[self.src.index('function _prIdxFromNo('):]
         self.assertIn('_prLiveIdxList(i)', idx_from_no[:400],
                       '序号→条目必须按状态列表换算，关闭角标后仍可用')
+        # 2026-10-30：序号是稳定编号（存进条目 err.no），采纳/忽略某处后其余序号不前移
+        self.assertIn('function _prAssignStableNos(', self.src)
+        self.assertIn('e.no = maxNo;', self.src, '新条目只能追加编号，绝不重排已有编号')
+        self.assertIn('_prAssignStableNos(k);', self.src,
+                      '每轮校正结果落盘时一次性分配编号（之后不再改）')
+        self.assertIn("parseInt(errors[k].no, 10) === n", self.src,
+                      '序号→条目必须按稳定编号查找，不再按序位')
 
     def test_v13_error_number_badge_toggle(self):
         """角标显示可在设置里开关；关掉只影响视觉，不影响按序号操作。"""
@@ -180,6 +186,48 @@ class VimStaticTest(unittest.TestCase):
         # 勾选框接线：改完即时生效（切 CSS 类）+ 持久化到 ui_settings
         self.assertIn("const _errNumShowChk = document.getElementById('errNumShow');", self.src)
         self.assertIn('uiSettings.show_err_number = !!e.target.checked', self.src)
+
+    def test_v14_error_nav_robust_and_ime_switch(self):
+        """h/l 不会因标注缺失而卡死；Esc 后可自动切英文输入法（2026-10-30）。"""
+        # 定位不到标注 → 先按状态补渲染一次（大模型校正/翻页挂载后 DOM 可能缺标注）
+        self.assertIn('try { renderProofread(i); }', self.src)
+        # 找不到可聚焦项时继续向后找，命中过至少一处即算移动成功
+        self.assertIn('if (steps > 0) {', self.src)
+        # NORMAL/VISUAL 下没有正文输入：IME 合成期间也要认 j/k/h/l，否则输入法把字母吞成拼音
+        self.assertIn("if (VIM.mode !== 'NORMAL' && VIM.mode !== 'VISUAL') return;", self.mod)
+        # Esc 后自动切英文输入法：设置项（前后端同默认，默认开）+ 触发点 + 服务端能力。
+        # 2026-10-30 需求变更：只切「输入法内部中/英模式」，不切键盘布局（不能变成美式键盘）。
+        self.assertIn('id="imeSwitchChk"', self.cm_html)
+        self.assertIn('"ime_switch_on_esc": True', self.cm_html)
+        self.assertIn('"ime_switch_on_esc": True', self.cfg)
+        self.assertIn('if "ime_switch_on_esc" in ui:', self.cfg)
+        self.assertIn('ime_switch_on_esc: true,', self.src)
+        self.assertIn("uiBool('ime_switch_on_esc', true)", self.src)
+        self.assertIn('function ptoeImeToEnglish()', self.src)
+        self.assertIn('ptoeImeToEnglish();', self.mod, 'INSERT→NORMAL 时必须按设置尝试切英文')
+        self.assertIn("'/api/ime_english'", self.src)
+        self.assertIn('def ime_to_english(', self.cm_html)
+        # 实现落在 imemanage：WM_IME_CONTROL 转换模式消息；绝不允许再切键盘布局
+        self.ime_src = read(os.path.join(ROOT, 'imemanage.py'))
+        self.assertIn('def ime_to_english(', self.ime_src)
+        self.assertIn('_IMC_GETCONVERSIONMODE', self.ime_src)
+        self.assertIn('_IMC_SETCONVERSIONMODE', self.ime_src)
+        self.assertIn('IME_CMODE_ALPHANUMERIC', self.ime_src)
+        self.assertIn('IME_CMODE_NATIVE', self.ime_src)
+        self.assertNotIn('WM_INPUTLANGCHANGEREQUEST', self.ime_src)
+        self.assertNotIn('LoadKeyboardLayout', self.ime_src)
+        self.assertNotIn('WM_INPUTLANGCHANGEREQUEST', self.cm_html)
+        self.assertNotIn('LoadKeyboardLayout', self.cm_html)
+
+    def test_v15_page_jump_moves_focus(self):
+        """命令/快捷键翻页后焦点必须搬到目标页：否则还得鼠标点一下，按页操作会落到旧页。"""
+        self.assertIn('function focusPageIndex(', self.src)
+        jump = self.src[self.src.index('function jumpToPageIndex('):]
+        self.assertIn('focusPageIndex(idx);', jump[:2500],
+                      'jumpToPageIndex 落点后必须聚焦目标页文字区（含光标复位）')
+        self.assertIn('_lastFocusedEd = ed;', self.src)
+        # 程序性 focus 不得触发 NORMAL→INSERT 自动切换（只有用户 mousedown 才切编辑态）
+        self.assertIn("if (t.closest('.editable') && VIM.mode === 'NORMAL') setMode('INSERT');", self.mod)
 
 
 class ModelMemoryStaticTest(unittest.TestCase):

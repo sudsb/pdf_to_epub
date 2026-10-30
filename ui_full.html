@@ -954,6 +954,85 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   .img-panel img{width:100%;}
   .editable{font-size:calc(var(--editor-font-size) + 2px);height:auto;min-height:160px;overflow-y:visible;}
 }
+
+/* 统一视觉与轻量交互：只装饰视图层，不改变虚拟列表尺寸模型与正文导出契约。 */
+:root{
+  --accent:#3568B8;--accent-hover:#2A5596;--accent-soft:#E9F0FA;
+  --border:#D9E0E8;--border-strong:#BEC9D6;
+  --bg:#F3F5F8;--bg-hover:#F0F4F8;--bg-active:#E4EBF3;
+  --text:#202B38;--text-muted:#526475;--text-dim:#748292;
+  --radius:8px;--radius-sm:6px;
+  --shadow-sm:0 1px 2px rgba(28,43,61,.05),0 2px 8px rgba(28,43,61,.035);
+  --shadow-md:0 8px 24px rgba(28,43,61,.10),0 2px 6px rgba(28,43,61,.05);
+  --shadow-lg:0 18px 48px rgba(20,35,55,.16),0 4px 12px rgba(20,35,55,.07);
+  --glass-bg:rgba(255,255,255,.88);--glass-border:rgba(217,224,232,.85);
+  --focus-ring:0 0 0 3px rgba(53,104,184,.18);
+  --motion-fast:140ms;--motion-base:200ms;
+}
+.dark{
+  --accent:#82A9E8;--accent-hover:#A2C1F1;--accent-soft:#263854;
+  --bg:#141A23;--bg-elev:#1D2531;--bg-hover:#273242;--bg-active:#303E52;
+  --text:#E6EBF2;--text-muted:#A9B5C4;--text-dim:#8492A5;
+  --glass-bg:rgba(29,37,49,.88);--glass-border:rgba(74,86,105,.7);
+  --shadow-lg:0 18px 48px rgba(0,0,0,.38),0 4px 12px rgba(0,0,0,.24);
+}
+::selection{background:rgba(53,104,184,.20);}
+body{letter-spacing:.01em;}
+button,select,input,textarea{transition-duration:var(--motion-fast);}
+button:focus-visible,select:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
+*::-webkit-scrollbar{width:9px;height:9px;}
+*::-webkit-scrollbar-track{background:transparent;}
+*::-webkit-scrollbar-thumb{background:rgba(116,130,146,.34);border:2px solid transparent;border-radius:8px;background-clip:padding-box;}
+*::-webkit-scrollbar-thumb:hover{background:rgba(82,100,117,.55);border:2px solid transparent;background-clip:padding-box;}
+#toolbar{box-shadow:0 1px 0 rgba(28,43,61,.02),0 5px 18px rgba(28,43,61,.045);}
+.ribbon-tabs{height:30px;padding:0 10px;background:var(--glass-bg);}
+.ribbon-tab{height:30px;padding:0 14px;letter-spacing:.03em;}
+.ribbon-tab.active{font-weight:650;}
+.ribbon-panel{padding:4px 8px;background:var(--glass-bg);}
+#toolbar .tb-group{border-color:transparent;background:rgba(255,255,255,.58);box-shadow:inset 0 0 0 1px var(--border);}
+.dark #toolbar .tb-group{background:rgba(255,255,255,.025);}
+#toolbar .tb-group:hover{background:var(--bg-elev);border-color:transparent;}
+#toolbar .ic-btn,#toolbar .tb-btn,#toolbar .tb-more-btn{transition:background var(--motion-fast),border-color var(--motion-fast),color var(--motion-fast),box-shadow var(--motion-fast),transform 80ms ease;}
+#toolbar .tb-statusbar{background:var(--glass-bg);color:var(--text-muted);}
+#status,#pagePos,#pos{font-variant-numeric:tabular-nums;}
+#hintbar{color:var(--text-muted);background:var(--accent-soft);border-bottom-color:transparent;}
+.page-row{background:var(--bg-elev);border-color:var(--border);border-radius:10px;box-shadow:var(--shadow-sm);transition:border-color var(--motion-base),box-shadow var(--motion-base);}
+.page-row:hover{transform:none;border-color:var(--border-strong);box-shadow:var(--shadow-md);}
+.page-head{color:var(--text-muted);font-weight:600;letter-spacing:.04em;border-bottom-style:solid;}
+.page-err-badge{box-shadow:0 2px 6px rgba(192,57,43,.18);}
+.img-panel{border-color:var(--border);border-radius:7px;background:var(--bg);}
+.img-panel img{border-radius:3px;}
+.editable{padding:14px 18px;border-color:var(--border);border-radius:7px;background:var(--bg-elev);line-height:1.85;color:var(--text);caret-color:var(--accent);transition:border-color var(--motion-fast),box-shadow var(--motion-fast);}
+#pages.ptoe-line-num .editable>p::after,#pages.ptoe-line-num .editable>div::after,
+#pages.ptoe-line-num .editable>h1::after,#pages.ptoe-line-num .editable>h2::after,
+#pages.ptoe-line-num .editable>h3::after,#pages.ptoe-line-num .editable>h4::after,
+#pages.ptoe-line-num .editable>h5::after,#pages.ptoe-line-num .editable>h6::after,
+#pages.ptoe-line-num .editable>table tr>td:first-child::after,#pages.ptoe-line-num .editable>table tr>th:first-child::after{line-height:1.85;}
+.editable:focus{border-color:var(--accent);box-shadow:var(--focus-ring);}
+.editable h1,.editable h2,.editable h3,.editable h4,.editable h5,.editable h6{line-height:1.5;letter-spacing:.01em;}
+.modal{background:var(--bg-elev);color:var(--text);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow-lg);padding:22px 24px;line-height:1.65;}
+.modal h3{font-size:18px;letter-spacing:.01em;}
+.modal h4{color:var(--text);}
+.settings-tab,.scope-btn,.tb-btn,.pop-btn,.ctx-item{transition:background var(--motion-fast),border-color var(--motion-fast),color var(--motion-fast),box-shadow var(--motion-fast);}
+#popup,#contextMenu,.ctx-submenu,#errPopup,#imgPopup,#dividerMenu,#tblMenu,#tblAlignGrid,.color-pop{background:var(--bg-elev);border-color:var(--border);box-shadow:var(--shadow-lg);}
+#popup,.ctx-submenu,#errPopup,#imgPopup,#dividerMenu,#tblMenu,#tblAlignGrid,.color-pop{border-radius:10px;}
+.ctx-item,.pop-btn,#tblMenu button{color:var(--text);}
+.ctx-item:hover,#tblMenu button:hover{background:var(--accent-soft);color:var(--accent);}
+#tip{border:1px solid rgba(255,255,255,.12);border-radius:7px;box-shadow:var(--shadow-md);}
+.toast{border:1px solid rgba(255,255,255,.12);box-shadow:var(--shadow-lg);}
+#toast .toast{transform:translateY(8px);}
+#toast .toast.show{transform:translateY(0);}
+@media (prefers-reduced-motion:no-preference){
+  @keyframes ptoeUiModalIn{from{opacity:0;transform:translateY(8px) scale(.985);}to{opacity:1;transform:none;}}
+  @keyframes ptoeUiMenuIn{from{opacity:0;transform:translateY(-4px);}to{opacity:1;transform:none;}}
+  @keyframes ptoeUiFade{from{opacity:0;}to{opacity:1;}}
+  .modal{animation:ptoeUiModalIn var(--motion-base) cubic-bezier(.2,.8,.2,1);}
+  .ribbon-panel.active{animation:ptoeUiFade var(--motion-fast) ease-out;}
+  #toolbar .tb-more.open .tb-more-panel,#contextMenu,#popup,#errPopup,#imgPopup,#dividerMenu,#tblMenu,#tblAlignGrid,.color-pop{animation:ptoeUiMenuIn var(--motion-fast) ease-out;}
+}
+@media (prefers-reduced-motion:reduce){
+  .modal,.ribbon-panel.active,#toolbar .tb-more.open .tb-more-panel,#errPopup,#imgPopup,#dividerMenu,#tblMenu,#tblAlignGrid,.color-pop{animation:none !important;}
+}
 </style>
 </head>
 <body>
@@ -1736,6 +1815,19 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
           <option value="large">大</option>
         </select>
       </label>
+      <h4 style="margin:16px 0 4px;">纠错序号</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">每页待处理纠错按文档顺序从 1 编号。序号的用途是<b>按序号操作纠错</b>：普通模式下 <b>N Enter</b> 应用第 N 处、<b>N Delete</b> 取消（忽略）第 N 处，命令行也可用 :err N / :errd N。角标只是可选的可视提示（CSS 伪元素，绝对定位），不写入正文/保存内容；关闭后只是不显示角标，按序号操作的编号口径完全不变。</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
+        <input type="checkbox" id="errNumShow" style="width:16px;height:16px;">
+        显示纠错序号角标
+      </label>
+      <p style="font-size:11px;color:#8a9bab;margin:4px 0 0 24px;">序号是<b>稳定编号</b>：采纳/忽略某一处后，其余各处的序号不会前移（被处理掉的序号消失）。</p>
+      <h4 style="margin:16px 0 4px;">输入法</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">默认开启：按 <b>Esc</b> / <b>Ctrl+[</b> 进入普通（NORMAL）模式时，如果输入法正在<b>中文模式</b>，自动切到<b>英文模式</b>，避免接着敲 j/k/h/l 打出拼音候选。只切输入法内部的中/英状态（搜狗、百度、微软拼音等通用），<b>不会</b>把输入法换成美式键盘或切换输入语言；输入法已经是英文时不做任何操作。由本地服务端调用 Windows 输入法接口实现（浏览器无法自行切换），非 Windows 或调用失败时静默跳过，不影响按键。取消勾选可关闭。</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
+        <input type="checkbox" id="imeSwitchChk" style="width:16px;height:16px;">
+        Esc 后自动切英文输入法
+      </label>
       <h4 style="margin:16px 0 4px;">正文对齐</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">矫正页正文默认两端对齐（分散对齐），段落左右边缘整齐更美观。关闭后按浏览器默认（左对齐）。纯视图层，不影响保存与导出；手动设置的逐块对齐仍然生效。</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
@@ -1880,7 +1972,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <div class="rr-edit-grid" style="margin-top:8px;">
         <label>规则名称 <input type="text" id="cfRuleName" placeholder="如：去行首圈码"></label>
         <label>正则表达式 <input type="text" id="cfRulePattern" placeholder="如：^[①-⑳]\s*"></label>
-        <label>标志 <input type="text" id="cfRuleFlags" placeholder="i m u（忽略留空）" title="可选：i 忽略大小写 / m 多行 / u Unicode"></label>
+        <label>标志 <input type="text" id="cfRuleFlags" placeholder="i m s u（忽略留空）" title="可选：i 忽略大小写 / m 多行 / s 点号跨行 / u Unicode"></label>
         <label>替换为 <input type="text" id="cfRuleReplacement" placeholder="留空 = 删除匹配内容"></label>
       </div>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center;">

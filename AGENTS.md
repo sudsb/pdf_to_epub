@@ -46,6 +46,7 @@ PToEA is a Windows-first CLI tool (plus optional local GUI) for converting PDF f
 
 - **Entrypoint**: `mian.py` (CLI), `guimanage.py` (server/GUI)
 - **Key modules**: `configmanage.py`, `pdfmanage.py`, `llamamanage.py`, `correctmanage.py`, `epubmanage.py`, `stringmanage.py`, `vllmmanage.py`, `paddleocrmanage.py`
+- **IME switch**: `imemanage.py` (Esc → 英文转换模式; IMM32 only, never keyboard layout)
 - **Frontend**: `ui/app.js`, `ui/epubedit.html`, `ui/tabhost.html`, `ui/epubedit.js`
 - **Config**: `config.json` (auto-managed but can be edited for advanced setup)
 - **Pack, build scripts**: `0pack.ps1`, `0pack.bat`, `0_copy_ptoe_to_pte.ps1`
@@ -72,6 +73,7 @@ PToEA is a Windows-first CLI tool (plus optional local GUI) for converting PDF f
     - `python test_llamamanage.py`
   - UI/JS: `node --check ui/app.js`, `python check_js.py`, `node ptoe_cmdshort_test.cjs`
   - NORMAL-mode key bindings / proofreading ordinals: `python test_vim_ui.py`
+  - IME switch (Esc → English conversion mode): `python test_imemanage.py`
 - **Quality**: No type/lint/coverage gate—manual smoke tests are required
 - **Patterns**: Use atomic write helpers, lock ordering, and guarded lazy imports for all tests
 - **Pitfalls**: Be watchful of 8.3/long-path mismatches (especially in frozen exe), session/config race bugs, global state, and missed dependency mocks in test runs. Never call `configmanage.set_ui_settings` from an ad-hoc script to "test" it: it writes `config.json`, and its exception fallback overwrites the whole file with `DEFAULT_CONFIG` (patch `get_config` + `_atomic_write_json` first, or prefer `validate_and_patch_config`, which is pure)
@@ -82,6 +84,7 @@ PToEA is a Windows-first CLI tool (plus optional local GUI) for converting PDF f
 - NORMAL keys are routed by one capture-phase `keydown` listener. The proofreading accept/ignore popup blocks keys in `INSERT`/`VISUAL` but is **released to the key layer in `NORMAL`** (see `overlayActive()`).
 - Page navigation uses a «翻页锚点» (`pageBase()` / `setAnchor()`): row heights of unmounted pages are estimated from image aspect ratio, so `viewportPage()` alone can report the previous page and make `j` stick. Keep the anchor when touching paging code.
 - Proofreading ordinals (`_prLiveIdxList` / `_prIdxFromNo`) are computed from state only, never from the DOM, so they keep working when the `data-err-no` badge is hidden (`ui_settings.show_err_number`). Badges must stay layout-neutral (absolute `::before`, no text nodes) — they must never enter saved content or plain-text offsets.
+- `Esc` / `Ctrl+[` → `NORMAL` also calls `POST /api/ime_english` when `ui_settings.ime_switch_on_esc` is on (default **on**, 2026-10-30): `imemanage.ime_to_english()` switches the *active IME's own* 中文→英文 conversion mode (Sogou / Baidu / Microsoft Pinyin) so the following `j/k/h/l` are not swallowed as pinyin. Only the conversion mode may change: resolve the IME window with `ImmGetDefaultIMEWnd` and talk to it with `WM_IME_CONTROL` + `IMC_GET/SETCONVERSIONMODE` (browsers use TSF, so `ImmGetContext` returns NULL cross-process). **Never switch keyboard layout / input language** (`LoadKeyboardLayout`, `WM_INPUTLANGCHANGEREQUEST` → becomes the US keyboard; `test_imemanage.py` guards this). Write then re-read to verify, fall back to the IME's own `Shift` toggle hotkey only after that, do nothing when already English, and never blind-toggle when the mode cannot be read.
 
 ---
 _See [README.md](README.md), [USAGE.md](USAGE.md), and comments in `0pack.ps1` for deeper specifics. Update this guideline if major architecture or conventions change._

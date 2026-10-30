@@ -277,6 +277,10 @@ const UI_SETTINGS_DEFAULTS = { tip_delay: 600, err_hover_delay: 1500, brush_merg
   // 纠错序号角标显示（2026-10-29）：只影响角标可视与否，编号口径（N Enter/N Delete/
   // :err N）始终按文档顺序，与后端 configmanage DEFAULT_CONFIG["ui_settings"] 同名同默认。
   show_err_number: true,
+  // Esc / Ctrl+[ 进 NORMAL 时自动切英文输入法（2026-10-30）：默认开。只切输入法内部
+  // 的中/英模式（搜狗/百度/微软拼音），不换键盘布局；由本地服务端 /api/ime_english
+  // （imemanage）调 Win32 接口实现，失败静默。
+  ime_switch_on_esc: true,
   search_max_results: 200,
   line_num_size: 'large', text_justify: true,
   clean_punctuation: true, clean_symbols: true, clean_md_tags: true, clean_html_tags: true, clean_paragraphs: false,
@@ -353,6 +357,8 @@ async function loadUiSettingsFromServer() {
       if (ln) ln.checked = !!uiBool('show_line_numbers', false);
       const en = document.getElementById('errNumShow');
       if (en) en.checked = !!uiBool('show_err_number', true);
+      const ime = document.getElementById('imeSwitchChk');
+      if (ime) ime.checked = !!uiBool('ime_switch_on_esc', true);
       const lns = document.getElementById('lineNumSizeSel');
       if (lns) lns.value = uis('line_num_size', 'large');
       const tj = document.getElementById('textJustifyToggle');
@@ -408,6 +414,8 @@ function saveUIMirror() {
     localStorage.setItem('ptoe_search_max_results', String(uiSettings.search_max_results != null ? uiSettings.search_max_results : UI_SETTINGS_DEFAULTS.search_max_results));
     // 行号显示（2026-10）：'1'/'0'（与其它布尔型 UI 偏好同一口径，uiBool 读 'ptoe_'+key）
     localStorage.setItem('ptoe_show_line_numbers', uiSettings.show_line_numbers ? '1' : '0');
+    // Esc 后自动切英文输入法（2026-10-30）：'1'/'0'（uiBool 读 'ptoe_'+key）
+    localStorage.setItem('ptoe_ime_switch_on_esc', uiSettings.ime_switch_on_esc ? '1' : '0');
     // 行号栏尺寸（2026-10）：字符串键 small/medium/large（uis 读 'ptoe_'+key）
     localStorage.setItem('ptoe_line_num_size', String(uiSettings.line_num_size || UI_SETTINGS_DEFAULTS.line_num_size));
     // 正文两端对齐（2026-10）：'1'/'0'（uiBool 读 'ptoe_'+key）
@@ -1602,6 +1610,27 @@ function updatePrBadge() {
   numEl.textContent = String(total);
   _updateAllPageErrBadges();
 }
+// 翻页落点聚焦（2026-10-30）：只滚视口不搬焦点时，currentEditable()/_lastFocusedEd
+// 仍指向上一页，命令/快捷键翻页后还得用鼠标再点一下新页；其间 N Enter、x、dd、
+// 插入图片等按页操作都会落到旧页。程序性 focus 不触发 initPtoeVimMode 的
+// mousedown→INSERT 自动切换，NORMAL 下翻页不会被弹回编辑态。
+function focusPageIndex(idx) {
+  const row = host.querySelector('.page-row[data-i="' + idx + '"]');
+  const ed = row ? row.querySelector('.editable') : null;
+  if (!ed) return null;
+  try { ed.focus({ preventScroll: true }); } catch (e) { try { ed.focus(); } catch (e2) {} }
+  // 光标落到本页开头（首个子节点行首），保证后续键入/命令的落点也是这一页
+  try {
+    const sel = window.getSelection();
+    const r = document.createRange();
+    r.setStart(ed.firstChild || ed, 0);
+    r.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(r);
+  } catch (e) { /* 选区设置失败不影响焦点 */ }
+  _lastFocusedEd = ed;
+  return ed;
+}
 function jumpToPageIndex(idx) {
   if (idx < 0 || idx >= pages.length) return;
   const hostTop = host.getBoundingClientRect().top + window.scrollY;
@@ -1622,6 +1651,7 @@ function jumpToPageIndex(idx) {
       updateViewport();
     }
   }
+  focusPageIndex(idx);
   hidePopup();
   setStatus('已跳转到第 ' + pages[idx].page + ' 页');
 }
@@ -6627,9 +6657,12 @@ function _replaceOffset(args) {
 }
 
 function searchRegexFor(query) {
-  const regexMode = document.getElementById('searchRegex').checked;
-  const q = regexMode ? query : query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(q, regexMode ? 'gimu' : 'giu');
+  const box = document.getElementById('searchRegex');
+  const regexMode = !!(box && box.checked);
+  // 统一走方言层：\Z / \z / \A / \h / \R / (?P<name>) 等 PCRE/Python 写法不再抛
+  // 「Invalid escape」（2026-10-30）
+  const q = regexMode ? query : String(query == null ? '' : query).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return ptoeRegexCompile(q, regexMode ? 'gim' : 'gi');
 }
 
 // ---------- 搜索范围 + 保留组（2026-09） ----------
@@ -6764,6 +6797,174 @@ function _partialReplaceTokens(toks, re, kg, replacement, target) {
     seen += r.seen;
   }
   return { text: out, replaced: replaced, count: ord, seen: seen };
+}
+
+// ---------- 正则方言层（2026-10-30）：让同一份规则在浏览器与 Python 两侧都成立 ----------
+// 用户按 PCRE/Python 习惯写的规则（例如匹配段末裸数字
+//   ([0-9]+)(?=[^\S\n]*(?:\n[^\S\n]*\n|\Z))
+// ）在 Python re 里合法，在浏览器里却有三种死法：
+//   1) \Z / \z / \A / \R 在 u 模式下是非法转义 → new RegExp 直接 SyntaxError；
+//   2) 不带 u 时 \Z 退化成字面量 "Z"，静默错配；
+//   3) 富文本页按标签切成 token 后，正则永远看不到跨段的 \n，前瞻恒不成立。
+// 这里统一做两件事：把外来方言翻译成 JS 等价写法（ptoeRegexDialect），以及需要
+// 跨段/跨行语义时改在「虚拟文本」上匹配并把命中映射回源码（_rrApplyVirtual）。
+// 所有用户正则入口（搜索、替换规则、格式规则）都经过 ptoeRegexCompile。
+function ptoeRegexDialect(src) {
+  const s = String(src == null ? '' : src);
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '\\' && i + 1 < s.length) {
+      const n = s[i + 1];
+      if (n === 'Z' || n === 'z') { out += '(?![\\s\\S])'; i++; continue; }        // Python/PCRE 串尾
+      if (n === 'A') { out += '(?<![\\s\\S])'; i++; continue; }                     // PCRE 串首
+      if (n === 'h') { out += '[^\\S\\n\\r]'; i++; continue; }                      // 横向空白
+      if (n === 'R') { out += '(?:\\r\\n|[\\n\\r\\u2028\\u2029])'; i++; continue; }  // 任意换行
+      out += c + n; i++; continue;
+    }
+    // Python 命名组 (?P<name>...) → JS (?<name>...)
+    if (c === '(' && s.slice(i, i + 4) === '(?P<') { out += '(?<'; i += 3; continue; }
+    out += c;
+  }
+  // Python 命名反向引用 (?P=name) → JS \k<name>
+  return out.replace(/\(\?P=([A-Za-z_][A-Za-z0-9_]*)\)/g, '\\k<$1>');
+}
+
+// 统一的正则构造：方言翻译 + 缺 u 补 u（需 indices/Unicode 属性时更准），
+// u 模式编译失败再退回去掉 u 的写法（兼容历史规则里多写的反斜杠等）。
+function ptoeRegexCompile(source, flags) {
+  const f = String(flags || '');
+  const src = ptoeRegexDialect(source);
+  const withU = f.indexOf('u') >= 0 ? f : (f + 'u');
+  const tries = [withU, f];
+  if (withU.indexOf('u') >= 0) tries.splice(1, 0, withU.replace(/u/g, ''));
+  let lastErr = null;
+  for (let i = 0; i < tries.length; i++) {
+    try { return new RegExp(src, tries[i]); } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('正则表达式无效');
+}
+
+// 块级标签集合：虚拟文本里用它决定「哪里该算一个换行」（段/行边界）。
+const _RR_BLOCK_TAGS = new Set([
+  'p', 'div', 'br', 'hr', 'li', 'ul', 'ol', 'dl', 'dt', 'dd', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  'table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th', 'caption', 'blockquote', 'pre',
+  'figure', 'figcaption', 'section', 'article', 'header', 'footer', 'aside', 'nav', 'details', 'summary',
+]);
+// 富文本页 → 虚拟文本：标签丢弃、块级边界记一个 '\n'，同时保留「虚拟下标 → 源码下标」
+// 映射（合成换行的映射是 -1）。末尾多余换行裁掉，让 \Z 落在最后一个块的段末。
+function _rrVirtualView(src) {
+  const s = String(src == null ? '' : src);
+  const chars = [], map = [];
+  let i = 0;
+  while (i < s.length) {
+    if (s[i] === '<') {
+      const j = s.indexOf('>', i);
+      const tag = s.slice(i + 1, j < 0 ? s.length : j);
+      const nm = (tag.match(/^\s*\/?\s*([A-Za-z][\w:-]*)/) || [null, ''])[1];
+      if (nm && _RR_BLOCK_TAGS.has(nm.toLowerCase())) { chars.push('\n'); map.push(-1); }
+      i = j < 0 ? s.length : j + 1;
+      continue;
+    }
+    chars.push(s[i]); map.push(i); i++;
+  }
+  let end = chars.length;
+  while (end > 0 && chars[end - 1] === '\n') end--;
+  return { text: chars.slice(0, end).join(''), map: map.slice(0, end) };
+}
+// 规则是否必须「跨段/跨行」匹配（含显式换行/串首尾/换行断言）。这类规则在按标签
+// 切 token 的老路径里恒不成立，改走虚拟文本；其余规则仍走老路径，行为不变。
+function _rrNeedsVirtual(pattern) {
+  const p = String(pattern == null ? '' : pattern);
+  return /\\[nrzZAR]/.test(p) || p.indexOf('\n') >= 0 || p.indexOf('\r') >= 0;
+}
+// 公式（MathML）区间（源码坐标）：与 _tokenMathFlags 同一口径。跨段规则在整页
+// 虚拟文本上匹配时会看到 <mi>/<mtext> 里的文字，必须整段避开——公式内容不是正文，
+// 改坏它等于把排版公式写坏（2026-10-30，与 token 路径的公式跳过对齐）。
+function _rrMathSpans(src) {
+  const s = String(src == null ? '' : src);
+  const spans = [];
+  let depth = 0, start = 0, i = 0;
+  while (i < s.length) {
+    if (s[i] !== '<') { i++; continue; }
+    const j = s.indexOf('>', i);
+    const end = j < 0 ? s.length : j + 1;
+    const t = s.slice(i, end);
+    if (_MATH_TAG_RE.test(t)) {
+      if (t.charAt(1) === '/') {
+        depth = Math.max(0, depth - 1);
+        if (depth === 0) spans.push([start, end]);
+      } else if (!/\/>\s*$/.test(t)) {
+        if (depth === 0) start = i;
+        depth += 1;
+      }
+    }
+    i = end;
+  }
+  if (depth > 0) spans.push([start, s.length]);
+  return spans;
+}
+// [s,e) 是否与任一区间相交（区间为升序半开区间）
+function _rrOverlaps(s, e, spans) {
+  for (let k = 0; k < spans.length; k++) {
+    if (s < spans[k][1] && e > spans[k][0]) return true;
+  }
+  return false;
+}
+// 在整页虚拟文本上执行替换（跨段规则专用）。命中必须「在源码里连续」（不跨越标签，
+// 避免把标签切坏），否则跳过该命中只计数；保留组语义与 _partialApply 完全一致。
+// 实体（&nbsp; 等）与公式（MathML）的安全口径同样照抄 _partialApply：
+// 命中不得劈开实体，区域边界不得把实体切开，公式内部整段不改（2026-10-30 修复：
+// 此前跨段规则会把 &#12288; 劈成 &#; 写坏页面）。
+function _rrApplyVirtual(src, baseRe, kg, replacement) {
+  const view = _rrVirtualView(src);
+  const spans = _entitySpans(view.text);
+  const mathSpans = _rrMathSpans(src);
+  const flags = (baseRe.flags.indexOf('d') >= 0) ? baseRe.flags : (baseRe.flags + 'd');
+  let re;
+  try { re = new RegExp(baseRe.source, flags); } catch (e) { re = baseRe; }
+  const groupCount = _countCaptureGroups(re.source);
+  let out = '', last = 0, replaced = 0, seen = 0;
+  re.lastIndex = 0;
+  let m;
+  while ((m = re.exec(view.text)) !== null) {
+    const vs = m.index, ve = vs + m[0].length;
+    if (m[0].length === 0) { // 零宽命中：只推进锚点，不产生替换
+      if (re.lastIndex === m.index) re.lastIndex++;
+      continue;
+    }
+    seen++;
+    const sStart = view.map[vs], sEnd = view.map[ve - 1];
+    // 命中跨了标签/块边界（虚拟文本里夹着合成换行）→ 原样跳过，绝不切坏标签结构
+    if (sStart < 0 || sEnd < 0 || (sEnd - sStart) !== (ve - vs - 1)) continue;
+    const absStart = sStart, absEnd = sEnd + 1;
+    // 公式内部：与 token 路径一致，整段不参与替换
+    if (_rrOverlaps(absStart, absEnd, mathSpans)) continue;
+    // 实体保护（虚拟下标与源码下标在该连续命中内一一对应）：劈开实体直接跳过
+    if (!_matchEntitySafe(vs, ve, spans)) continue;
+    out += src.slice(last, absStart);
+    if (kg.has(0)) {
+      out += src.slice(absStart, absEnd); // 整段保留：只数不改
+    } else {
+      const regions = _matchFlatRegions(m, groupCount);
+      const mSpans = [];
+      for (let k = 0; k < spans.length; k++) {
+        if (spans[k][0] < ve && spans[k][1] > vs) mSpans.push(spans[k]);
+      }
+      if (!_regionsEntitySafe(regions, mSpans)) {
+        out += src.slice(absStart, absEnd); // 区域边界会劈开实体 → 原样保留，不计 replaced
+      } else {
+        for (const r of regions) {
+          if (r.keep !== null && kg.has(r.keep)) out += view.text.slice(r.s, r.e);
+          else out += _expandKeepRegex(replacement, m, kg);
+        }
+        replaced++;
+      }
+    }
+    last = absEnd;
+  }
+  out += src.slice(last);
+  return { text: out, replaced: replaced, seen: seen };
 }
 
 // 按当前范围（全部页/当前页）返回要处理的页索引数组
@@ -7170,9 +7371,9 @@ function updateRrKeepChips() {
   const pattern = raw.replace(/^\/(.+)\/[a-z]*$/, '$1'); // 兼容 /pattern/flags 写法
   const n = pattern ? _countCaptureGroups(pattern) : 0;
   row.style.display = n >= 1 ? 'flex' : 'none';
-  if (n >= 1 && n > rrLastGroupCount) {
-    for (let k = rrLastGroupCount + 1; k <= n; k++) rrKeepGroups.add(k);
-  }
+  // 2026-10-30：不再「新建规则时把捕获组全部默认勾成保留组」。旧行为让单组规则
+  // （如 ([0-9]+)(?=…) 匹配段末裸数字）匹配到却零改动，提示「匹配内容均为保留组，
+  // 未实际替换」——看起来就是规则不生效。现在默认全替换，需要保留时手动点组按钮。
   for (const k of [...rrKeepGroups]) if (k < 1 || k > n) rrKeepGroups.delete(k);
   rrLastGroupCount = n;
   const chips = document.getElementById('rrKeepChips');
@@ -7216,7 +7417,7 @@ function saveRrEdit() {
   const flags = document.getElementById('rrFlags').value.trim().replace(/[^imsu]/g, '');
   const replacement = document.getElementById('rrReplacement').value;
   if (!pattern) { showToast('请输入正则表达式', 'warn'); return; }
-  try { new RegExp(pattern, flags); } catch (e) { showToast('正则表达式无效：' + e.message, 'fail'); return; }
+  try { ptoeRegexCompile(pattern, flags); } catch (e) { showToast('正则表达式无效：' + e.message, 'fail'); return; }
   const kgArr = [...rrKeepGroups].sort(function (a, b) { return a - b; });
   if (rrEditingId) {
     const rule = replaceRules.find(function (r) { return r.id === rrEditingId; });
@@ -7235,10 +7436,11 @@ function saveRrEdit() {
   showToast('已保存替换规则「' + (name || '未命名') + '」', 'ok');
 }
 
-// 规则应用正则：g + 用户标志去重，缺 u 补 u（indices 所需），apply 时再加 d
+// 规则应用正则：g + 用户标志去重，缺 u 补 u（indices 所需），apply 时再加 d。
+// 走 ptoeRegexDialect：Python/PCRE 风格写法（\Z、\A、\h、\R、(?P<name>)）在此翻译。
 function rrApplyRegex(rule) {
   const base = ('g' + String(rule.flags || '').replace(/[^imsu]/g, '')).split('').filter(function (f, i, a) { return a.indexOf(f) === i; }).join('');
-  return new RegExp(rule.pattern, base.indexOf('u') >= 0 ? base : (base + 'u'));
+  return ptoeRegexCompile(rule.pattern, base);
 }
 
 // 用保存的规则执行替换：allPages=false 只作用当前页。保留组语义与搜索框内相同。
@@ -7252,10 +7454,18 @@ function applyReplaceRule(rule, allPages) {
   let count = 0;
   let replacedTotal = 0, noopTotal = 0, seenTotal = 0; // 2026-09：规则的诚实统计（同 replaceAll）
   const before = histBegin('替换规则「' + (rule.name || '未命名') + '」', allPages ? null : scopeIdx);
+  // 跨段/跨行规则（\n、\Z、\A、\R 等）：按标签切 token 的老路径永远看不到段落边界，
+  // 改在整页「虚拟文本」上匹配再映射回源码（2026-10-30）。其余规则行为完全不变。
+  const useVirtual = !mdMode && _rrNeedsVirtual(rule.pattern);
   for (const i of scopeIdx) {
     const src = pageSource(i);
-    const toks = mdMode ? [src] : src.split(/(<[^>]+>)/);
-    const rr = _partialReplaceTokens(toks, re, kg, rule.replacement, -1);
+    let rr;
+    if (useVirtual) {
+      rr = _rrApplyVirtual(src, re, kg, rule.replacement);
+    } else {
+      const toks = mdMode ? [src] : src.split(/(<[^>]+>)/);
+      rr = _partialReplaceTokens(toks, re, kg, rule.replacement, -1);
+    }
     seenTotal += rr.seen;
     if (rr.replaced > 0) {
       if (rr.text !== src) { changed.push({ i: i, out: rr.text }); replacedTotal += rr.replaced; }
@@ -11037,6 +11247,10 @@ let proofreadLegacyRules = false; // 原有规则开关（默认关：校正只�
 // 本地状态 + 下拉框并写回 config.json —— B 窗口自动收敛，新开窗口读到持久化值即是
 // 「最近使用的模型」。探测/写入失败一律静默降级，绝不影响编辑与翻页。
 let _prModelAdoptBusy = false;
+// 用户刚在下拉框里手选了别的模型（尚未点「切换模型」）：这期间绝不做「对齐运行模型」。
+// 否则 5s 轮询会把下拉框与持久化值改回旧模型 → 用户点「切换模型」时切换的还是旧模型，
+// 表现为「切换模型失败」（2026-10-30 修复）。切换成功后由 refreshLlmStatus 收敛清位。
+let _prModelUserPick = false;
 // 校对设置（enabled/model/legacy）已从服务端载入：未载入前绝不做「对齐 + 回写」，
 // 否则会把尚未读取的默认值（enabled=false, model='')覆盖掉用户真实配置。
 let _prSettingsLoaded = false;
@@ -11044,6 +11258,8 @@ async function ptoeAdoptRunningModel(res) {
   const key = res && res.running && res.running_model;
   if (!key || key === proofreadLlmModel) return false;
   if (_prModelAdoptBusy || !_prSettingsLoaded) return false;
+  // 用户手选未生效的模型：保留其选择，不抢值（等「切换模型」或下次收敛）
+  if (_prModelUserPick) return false;
   const sel = document.getElementById('prLlmModel');
   // 用户正在下拉框里挑选时不抢值（避免刚选中就被改回去）
   if (sel && document.activeElement === sel) return false;
@@ -11119,6 +11335,9 @@ function _applyProofreadResult(k, errors) {
     errs = errs.filter(function (e) { return !proofreadDismissed[k].has(e.start + ':' + e.wrong); });
   }
   proofreadErrors[k] = errs;
+  // 本轮结果的稳定编号只在这里分配一次：之后采纳/忽略都不会让其它序号前移
+  // （2026-10-30 用户要求「每处序号不变」）。
+  _prAssignStableNos(k);
   const row = host.children ? [...host.children].find(function (r) { return Number(r.dataset.i) === k; }) : null;
   if (row && row.querySelector('.editable')) { renderProofread(k); scheduleRemeasure(k); }
   return errs.length;
@@ -11204,18 +11423,11 @@ function renderProofread(i) {
   // 已包裹的 .ptoe-err 会被 walker 拒绝，导致左侧条目被截断，Σ标注段长度
   // 与 err.wrong 不等，应用纠错时其后标注会按错误长度平移——2026-10-10 修复
   errors.sort(function (a, b) { return (a.start || 0) - (b.start || 0); });
-  // 页内序号（2026-10-29）：只为「未消失」的条目按 start 升序 1 基编号。序号只写进
+  // 页内序号（2026-10-29 / 2026-10-30 稳定化）：序号在「本轮校正结果」里一次性分配，
+  // 之后哪些条目被采纳/忽略都不重排（被处理掉的序号消失，其余保持不变）。序号只写进
   // data-err-no 属性、由 CSS ::before 绝对定位展示 —— 不产生文本节点，故不影响正文、
   // 保存内容与纯文本偏移（_plainNoAnno / contentMap 完全无感）。
-  const _errNo = {};
-  {
-    let _no = 0;
-    for (let _x = 0; _x < errors.length; _x++) {
-      if (!errors[_x] || errors[_x]._gone) continue;
-      _no++;
-      _errNo[_x] = _no;
-    }
-  }
+  _prAssignStableNos(i);
   // P2: 保存光标（相对 ed 文本偏移，排除 .ptoe-fix/.ptoe-marker 的展示文本）——重建后恢复，防 IME 光标跳段首
   let savedSelOffset = -1;
   try {
@@ -11255,7 +11467,7 @@ function renderProofread(i) {
       sEl.className = 'ptoe-err';
       sEl.setAttribute('data-err-i', k);
       sEl.setAttribute('data-err-empty', '1');
-      if (_errNo[k]) sEl.setAttribute('data-err-no', String(_errNo[k]));
+      if (err.no) sEl.setAttribute('data-err-no', String(err.no));
       sEl.textContent = _candText(err.candidates[0]); // 2026-09-21：候选为 dict {text,score} 时取 text
       frag.appendChild(sEl);
       const fixEl = document.createElement('span');
@@ -11299,7 +11511,7 @@ function renderProofread(i) {
       sEl.className = 'ptoe-err';
       sEl.setAttribute('data-err-i', k);
       // 序号只挂在首段（跨段错误仍是一个序号），避免同一处重复显示
-      if (firstSeg && _errNo[k]) sEl.setAttribute('data-err-no', String(_errNo[k]));
+      if (firstSeg && err.no) sEl.setAttribute('data-err-no', String(err.no));
       sEl.textContent = segText;
       frag.appendChild(sEl);
       // fixEl 只在首段插一次（candidates 必须是数组，否则安全跳过）
@@ -11732,9 +11944,26 @@ function advanceToNextError(i, k) {
 }
 
 // ---------- 页内纠错序号导航 / 精确应用（2026-10-29，NORMAL 键位用） ----------
-// 序号口径与 renderProofread 写入的 data-err-no 完全一致：本页「未消失」条目按
-// errors 数组顺序（renderProofread 已按 start 升序）1 基编号。序号只存在于属性 +
-// CSS ::before 伪元素里，不产生文本节点，故不进正文/保存/纯文本偏移。
+// 序号是**稳定编号**（2026-10-30 用户要求）：每处纠错在本轮校正结果里一次性编号 1..N，
+// 存进条目本身的 err.no；之后无论采纳/忽略掉哪几处，剩余条目的序号都不重排
+// （被处理掉的那个序号直接消失）。因此「3 Enter」永远指用户编号时看到的那一处，
+// 不会因为前面少了一处而全部前移。编号只存在于属性 + CSS ::before 伪元素里，
+// 不产生文本节点，故不进正文/保存/纯文本偏移。
+function _prAssignStableNos(i) {
+  const errors = proofreadErrors[i];
+  if (!errors || !errors.length) return;
+  let maxNo = 0;
+  for (const e of errors) {
+    if (!e) continue;
+    const n = parseInt(e.no, 10);
+    if (isFinite(n) && n > maxNo) maxNo = n;
+  }
+  for (const e of errors) {
+    if (!e) continue;
+    const n = parseInt(e.no, 10);
+    if (!isFinite(n) || n < 1) { maxNo += 1; e.no = maxNo; }
+  }
+}
 function _prLiveIdxList(i) {
   const errors = proofreadErrors[i];
   if (!errors || !errors.length) return [];
@@ -11742,12 +11971,18 @@ function _prLiveIdxList(i) {
   for (let k = 0; k < errors.length; k++) if (errors[k] && !errors[k]._gone) out.push(k);
   return out;
 }
-// 本页序号（1 基）→ errors 下标；越界返回 -1
+// 序号 → errors 下标（按稳定编号 err.no 查；老数据/未编号条目回退为「按序位」）；
+// 找不到返回 -1
 function _prIdxFromNo(i, no) {
   const list = _prLiveIdxList(i);
   const n = parseInt(no, 10);
-  if (!(n >= 1) || n > list.length) return -1;
-  return list[n - 1];
+  if (!(n >= 1)) return -1;
+  const errors = proofreadErrors[i] || [];
+  const byNo = list.findIndex(function (k) { return parseInt(errors[k].no, 10) === n; });
+  if (byNo >= 0) return list[byNo];
+  // 兼容旧历史条目（无 err.no）：按序位解释，保持既有行为
+  if (list.some(function (k) { return parseInt(errors[k].no, 10) > 0; })) return -1;
+  return (n <= list.length) ? list[n - 1] : -1;
 }
 // 纠错操作的作用页：以视口页为准（用户眼前这一页），取不到再退回光标页
 function _prErrPage() {
@@ -11764,11 +11999,24 @@ function _prFindErrorPage(from, dir) {
   return -1;
 }
 // 定位到某页某条纠错并弹出采纳/忽略窗（必要时先跳页挂载该行）
+// 2026-10-30 修复（大模型校正后 h/l 跳不动）：状态里有该处纠错、DOM 里却没有对应
+// 标注时（分页挂载时标注尚未重建 / 行被重渲染后没回注 / 偏移重锚定把它跳过了），
+// 以前直接 return false，键位层把它当「跳转失败」停住不动。现在先补渲染一次再找。
 function _prFocusError(i, k) {
-  let row = host.querySelector('.page-row[data-i="' + i + '"]');
-  if (!row) { jumpToPageIndex(i); row = host.querySelector('.page-row[data-i="' + i + '"]'); }
-  const ed = row ? row.querySelector('.editable') : null;
-  const el = ed ? ed.querySelector('.ptoe-err[data-err-i="' + k + '"]') : null;
+  function findEl() {
+    const row = host.querySelector('.page-row[data-i="' + i + '"]');
+    const ed = row ? row.querySelector('.editable') : null;
+    return ed ? ed.querySelector('.ptoe-err[data-err-i="' + k + '"]') : null;
+  }
+  let el = findEl();
+  if (!el) {
+    // 页未挂载 → 先跳过去挂载；已挂载但标注缺失 → 按状态重建一次标注
+    if (!host.querySelector('.page-row[data-i="' + i + '"]')) jumpToPageIndex(i);
+    if (!findEl() && proofreadErrors[i] && proofreadErrors[i][k]) {
+      try { renderProofread(i); } catch (e) { console.warn('renderProofread failed: ' + e.message); }
+    }
+    el = findEl();
+  }
   if (!el) return false;
   el.scrollIntoView({ block: 'center', behavior: 'auto' });
   const rect = _errAnchorRect(i, k) || el.getBoundingClientRect();
@@ -11778,10 +12026,16 @@ function _prFocusError(i, k) {
   return true;
 }
 // 上/下一处纠错（dir<0 向前，dir>0 向后；count = 步数，跨页继续）。返回是否移动。
+// 起点页优先取「浮窗当前定位页」，但该页没有待处理项时退回视口页——否则浮窗停在
+// 一张已经没有待处理项的旧页时，向后永远找不到东西（大模型校正后常见）。
 function ptoeErrStep(dir, count) {
   const n = Math.max(1, parseInt(count, 10) || 1);
-  let page = (errKey && typeof errKey.i === 'number' && errKey.i >= 0 && errKey.i < pages.length)
-    ? errKey.i : _prErrPage();
+  const vp = _prErrPage();
+  let page = vp;
+  if (errKey && typeof errKey.i === 'number' && errKey.i >= 0 && errKey.i < pages.length &&
+      _prLiveIdxList(errKey.i).length) {
+    page = errKey.i;
+  }
   let list = _prLiveIdxList(page);
   if (!list.length) {
     const np = _prFindErrorPage(page, dir);
@@ -11790,28 +12044,32 @@ function ptoeErrStep(dir, count) {
   }
   let pos = (errKey && errKey.i === page) ? list.indexOf(errKey.k) : -1;
   if (pos < 0) pos = dir > 0 ? -1 : list.length;
-  let moved = false;
-  for (let step = 0; step < n; step++) {
+  // 逐个候选推进：跳过「有状态但 DOM 里定位不到」的条目（它们可能已随编辑失效），
+  // 直到找到能真正聚焦的一处；全程找不到才提示，不再卡在第一步。
+  let steps = 0, guard = 0, lastPage = -1, lastK = -1;
+  while (steps < n) {
+    if (++guard > 100000) break; // 防御：状态异常时不至于死循环
     let next = pos + dir;
     if (next < 0 || next >= list.length) {
       const np = _prFindErrorPage(page, dir);
       if (np < 0) break; // 到全书首/尾：停在原处，不循环
       page = np; list = _prLiveIdxList(page);
+      if (!list.length) break;
       next = dir > 0 ? 0 : list.length - 1;
     }
-    pos = next; moved = true;
+    pos = next;
+    if (_prFocusError(page, list[pos])) { steps++; lastPage = page; lastK = list[pos]; }
   }
-  if (!moved) {
-    showToast(dir > 0 ? '已经是最后一处纠错' : '已经是第一处纠错', 'warn');
-    return false;
+  if (steps > 0) {
+    const errors = proofreadErrors[lastPage] || [];
+    const live = _prLiveIdxList(lastPage).length;
+    const no = parseInt((errors[lastK] || {}).no, 10);
+    setStatus('第 ' + pages[lastPage].page + ' 页：第 ' + (isFinite(no) && no > 0 ? no : (lastK + 1)) +
+      ' 处待处理纠错（本页共 ' + live + ' 处）');
+    return true;
   }
-  const ok = _prFocusError(page, list[pos]);
-  if (ok) {
-    setStatus('第 ' + pages[page].page + ' 页：第 ' + (pos + 1) + '/' + list.length + ' 处待处理纠错');
-  } else {
-    showToast('未能定位到该处标注（可能已随编辑失效）', 'warn');
-  }
-  return ok;
+  showToast(dir > 0 ? '已经是最后一处纠错' : '已经是第一处纠错', 'warn');
+  return false;
 }
 // 应用（accept）或取消/忽略（ignore）指定序号的纠错；no 缺省 = 当前定位/本页第一处。
 // 复用既有「采纳/忽略」按钮（errOk/errNo）的完整逻辑：撤销栈、反馈、标注重建一致。
@@ -11823,8 +12081,14 @@ function ptoeErrApplyNo(no, ignore) {
     i = page;
     k = _prIdxFromNo(i, no);
     if (k < 0) {
-      const total = _prLiveIdxList(i).length;
-      showToast(total ? ('本页没有序号 ' + no + '（共 ' + total + ' 处）') : '本页没有待处理纠错', 'warn');
+      // 序号稳定（不重排）：被采纳/忽略掉的序号会整号消失，这里如实说明剩余编号
+      const errors = proofreadErrors[i] || [];
+      const nos = _prLiveIdxList(i)
+        .map(function (x) { return parseInt((errors[x] || {}).no, 10); })
+        .filter(function (x) { return isFinite(x) && x > 0; });
+      showToast(nos.length
+        ? ('本页没有序号 ' + no + '（剩余序号 ' + nos.join('/') + '）')
+        : '本页没有待处理纠错', 'warn');
       return false;
     }
   } else if (errKey && proofreadErrors[errKey.i] &&
@@ -11845,8 +12109,10 @@ function ptoeErrApplyNo(no, ignore) {
   }
   // 目标页未挂载时先跳过去（未挂载页没有标注 DOM，点击采纳会静默失败）
   if (!host.querySelector('.page-row[data-i="' + i + '"]')) jumpToPageIndex(i);
-  // 序号（1 基，按文档顺序）——状态改动前取，供操作后的提示
-  const noShown = _prLiveIdxList(i).indexOf(k) + 1;
+  // 序号（稳定编号）——状态改动前取，供操作后的提示
+  const _noIdx = _prLiveIdxList(i).indexOf(k);
+  const _noStable = parseInt(((proofreadErrors[i] || [])[k] || {}).no, 10);
+  const noShown = (isFinite(_noStable) && _noStable > 0) ? _noStable : (_noIdx + 1);
   errKey = { i: i, k: k };
   const btn = document.getElementById(ignore ? 'errNo' : 'errOk');
   if (!btn) return false;
@@ -13553,7 +13819,7 @@ async function saveFormatRule() {
   // 校验每个条件的正则表达式
   for (const c of _frConds) {
     if (c.type === 'regex' && c.pattern) {
-      try { new RegExp(c.pattern); } catch (e) { showToast('正则表达式无效: ' + e.message, 'fail'); return; }
+      try { ptoeRegexCompile(c.pattern, ''); } catch (e) { showToast('正则表达式无效: ' + e.message, 'fail'); return; }
     }
   }
 const rule = {
@@ -14423,6 +14689,8 @@ function openSettings() {
   if (lnc) lnc.checked = !!uiBool('show_line_numbers', false);
   const enc = document.getElementById('errNumShow');
   if (enc) enc.checked = !!uiBool('show_err_number', true);
+  const imeIn = document.getElementById('imeSwitchChk');
+  if (imeIn) imeIn.checked = !!uiBool('ime_switch_on_esc', true);
   const lnsIn = document.getElementById('lineNumSizeSel');
   if (lnsIn) lnsIn.value = uis('line_num_size', 'large');
   const tjIn = document.getElementById('textJustifyToggle');
@@ -15475,7 +15743,7 @@ function _cmdParseSubstitute(expr) {
   if (seps < 2) return null; // 必须有成对分隔符，避免把普通文本误判为替换
   let flags = parts[2] || 'g';
   if (flags.indexOf('g') < 0) flags += 'g';
-  try { return { re: new RegExp(parts[0], flags), repl: parts[1] }; }
+  try { return { re: ptoeRegexCompile(parts[0], flags), repl: parts[1] }; }
   catch (e) { showToast('正则无效：' + e.message, 'fail'); return null; }
 }
 
@@ -15560,7 +15828,7 @@ function _cmdRunSearch(q) {
   searchPages();
 }
 
-// 全局跳转到原书页号 N（非列表序号）；跳转后同步聚焦该页文字区
+// 全局跳转到原书页号 N（非列表序号）；落点聚焦由 jumpToPageIndex 统一负责
 function _cmdPageJump(n) {
   n = parseInt(n, 10);
   if (!(n >= 1)) { showToast('请输入有效页号（如 页 12）', 'warn'); return; }
@@ -15568,11 +15836,6 @@ function _cmdPageJump(n) {
   for (let i = 0; i < pages.length; i++) { if (pages[i].page === n) { idx = i; break; } }
   if (idx < 0) { showToast('未找到第 ' + n + ' 页', 'warn'); return; }
   jumpToPageIndex(idx);
-  try {
-    const row = host.querySelector('.page-row[data-i="' + idx + '"]');
-    const e2 = row ? row.querySelector('.editable') : null;
-    if (e2) e2.focus();
-  } catch (e) {}
 }
 
 // 选中连续整行
@@ -17443,7 +17706,9 @@ document.addEventListener('keydown', (e) => {
   // init
   loadProofreadLlm();
   prLlmEnableEl.addEventListener('change', function () { saveProofreadLlm(false); });
-  prLlmModelEl.addEventListener('change', function () { saveProofreadLlm(false); });
+  // 手选模型只写配置、不立刻重启服务（切换由「切换模型」按钮完成）；期间禁止
+  // 「对齐运行模型」把选择改回旧值（否则切换的仍是旧模型 → 看起来切换失败）
+  prLlmModelEl.addEventListener('change', function () { _prModelUserPick = true; saveProofreadLlm(false); });
   if (prLegacyRulesEl) prLegacyRulesEl.addEventListener('change', function () { saveProofreadLlm(true); });
   // 模型记忆（2026-10-29）：每次状态轮询把本地模型值收敛到服务端实际运行的那个
   // （ptoeAdoptRunningModel，定义在 proofread 状态区，重识别前也会主动调一次）。
@@ -17454,6 +17719,9 @@ document.addEventListener('keydown', (e) => {
     try {
       const res = await fetchJSON('/api/llm_status');
       if (!res.ok) { el.textContent = '服务状态: 未知（' + (res.error || '') + '）'; return; }
+      // 服务端跑的正是用户手选的那个模型 → 手选已生效，恢复正常「对齐运行模型」
+      if (res.running && !res.mismatch && res.running_model &&
+          res.running_model === proofreadLlmModel) _prModelUserPick = false;
       await ptoeAdoptRunningModel(res);
       // loading：进程存活但模型仍在加载（health 503），两个按钮都禁用避免重复启动/误停
       const loading = !res.running && !!res.loading;
@@ -17475,6 +17743,7 @@ document.addEventListener('keydown', (e) => {
     const startBtnNow = document.getElementById('prLlmStart');
     if (statusEl) statusEl.textContent = '服务状态: 启动中…';
     if (startBtnNow) startBtnNow.disabled = true;
+    _prModelUserPick = true;
     try {
       const modelEl = document.getElementById('prLlmModel');
       const res = await fetchJSON('/api/llm_start', {
@@ -17483,7 +17752,9 @@ document.addEventListener('keydown', (e) => {
         body: JSON.stringify({ model: (modelEl && modelEl.value) || proofreadLlmModel || '' }),
       });
       if (!res.ok) { showToast('启动服务失败: ' + (res.error || ''), 'fail'); refreshLlmStatus(); return; }
-      showToast(res.message || '服务已启动', res.running ? 'ok' : 'fail');
+      if (!res.running) { showToast(res.message || '服务启动失败', 'fail'); return; }
+      showToast(res.message || '服务已启动', 'ok');
+      _prModelUserPick = false;
     } catch (e) { showToast('启动服务失败: ' + e.message, 'fail'); }
     refreshLlmStatus();
   }
@@ -17503,6 +17774,8 @@ document.addEventListener('keydown', (e) => {
     const modelEl = document.getElementById('prLlmModel');
     const model = (modelEl && modelEl.value) || proofreadLlmModel || '';
     if (!model) { showToast('请先在下拉框选择要切换到的模型', 'warn'); return; }
+    // 切换期间（大模型加载可达数分钟）禁止 5s 轮询把下拉框改回旧模型
+    _prModelUserPick = true;
     if (btn) { btn.disabled = true; btn.textContent = '切换中…'; }
     if (statusEl) statusEl.textContent = '服务状态: 切换模型中（' + model + '）…';
     try {
@@ -17512,13 +17785,17 @@ document.addEventListener('keydown', (e) => {
         body: JSON.stringify({ model: model }),
       });
       if (!res.ok) { showToast('切换模型失败: ' + (res.error || ''), 'fail'); return; }
-      showToast(res.message || ('正在切换到 ' + model), res.running ? 'ok' : 'fail');
+      // ok:true 但 running:false = 后端报告启动失败（端口被占/超时），必须按失败提示
+      if (!res.running) { showToast(res.message || ('切换模型失败：' + model + ' 未启动'), 'fail'); return; }
+      proofreadLlmModel = model;
+      showToast(res.message || ('已切换到 ' + model), 'ok');
+      _prModelUserPick = false;
     } catch (e) { showToast('切换模型失败: ' + e.message, 'fail'); }
     finally {
-      // 无论成功/失败/提前 return 都恢复按钮，避免卡在「切换中…」不可点击
+      // 无论成功/失败/提前 return 都恢复按钮并刷新状态，避免卡在「切换中…」不可点击
       if (btn) { btn.disabled = false; btn.textContent = '切换模型'; }
+      refreshLlmStatus();
     }
-    refreshLlmStatus();
   }
   refreshLlmStatus();
   // 动态监控（2026-08-23）：外部清理 llama 进程/模型变化时，定时刷新启动/停止按钮与状态文本，
@@ -17926,7 +18203,7 @@ async function saveCfRule() {
   const replacement = val('cfRuleReplacement');
   if (!name) { showToast('请填写规则名称', 'err'); return; }
   if (!pattern) { showToast('请填写正则表达式', 'err'); return; }
-  try { new RegExp(pattern, flags); }
+  try { ptoeRegexCompile(pattern, flags); }
   catch (e) { showToast('正则表达式无效：' + e.message, 'err'); return; }
   if (cfEditingId) {
     const r = cfRules.find(x => x.id === cfEditingId);
@@ -18071,6 +18348,8 @@ document.getElementById('resetUiSettingsBtn').addEventListener('click', () => {
   if (lnr) lnr.checked = false;
   const enr = document.getElementById('errNumShow');
   if (enr) enr.checked = UI_SETTINGS_DEFAULTS.show_err_number;
+  const imer = document.getElementById('imeSwitchChk');
+  if (imer) imer.checked = !!UI_SETTINGS_DEFAULTS.ime_switch_on_esc;
   const lnsr = document.getElementById('lineNumSizeSel');
   if (lnsr) lnsr.value = UI_SETTINGS_DEFAULTS.line_num_size;
   const tjr = document.getElementById('textJustifyToggle');
@@ -18220,6 +18499,32 @@ if (_errNumShowChk) _errNumShowChk.addEventListener('change', (e) => {
   if (uiSettings) { uiSettings.show_err_number = !!e.target.checked; saveUiSettings(); }
   applyUiPrefs();
 });
+// Esc 后自动切英文输入法（2026-10-30）：服务端持久化 config.json ui_settings；
+// 触发点在 ptoeImeToEnglish（INSERT→NORMAL 时按当前值判断），无需额外 apply。
+const _imeSwitchChk = document.getElementById('imeSwitchChk');
+if (_imeSwitchChk) _imeSwitchChk.addEventListener('change', (e) => {
+  const on = !!e.target.checked;
+  if (uiSettings) { uiSettings.ime_switch_on_esc = on; saveUiSettings(); }
+  else { try { localStorage.setItem('ptoe_ime_switch_on_esc', on ? '1' : '0'); } catch (err) {} }
+});
+// Esc / Ctrl+[ 进 NORMAL 时把输入法切英文（2026-10-30）：浏览器 JS 无法切换输入法，
+// 只能请本地服务端用 Win32 输入法 API 切（/api/ime_english）。默认关（设置-界面可开）；
+// 请求失败 / 非 Windows / 无服务端一律静默——按键本身绝不因为切输入法失败而卡住。
+let _imeSwitchBusy = false;
+function ptoeImeToEnglish() {
+  // 默认开（2026-10-30）：进 NORMAL 后接着敲 j/k/h/l，若输入法还在中文模式会被拼音
+  // 吞掉。服务端 imemanage 只切「输入法内部的中/英模式」（搜狗/百度/微软拼音通用），
+  // 不切换键盘布局/输入语言；已是英文 / 非 Windows / 失败都静默，不影响按键。
+  if (!uiBool('ime_switch_on_esc', true)) return;
+  if (_imeSwitchBusy) return;
+  _imeSwitchBusy = true;
+  var done = function () { _imeSwitchBusy = false; };
+  try {
+    Promise.resolve(fetchJSON('/api/ime_english', { method: 'POST' }))
+      .catch(function () { /* 静默：切换失败不影响按键 */ })
+      .then(done, done);
+  } catch (e) { done(); }
+}
 // 行号栏尺寸（大/中/小；2026-10：服务端持久化 config.json ui_settings）
 const _lineNumSizeSel = document.getElementById('lineNumSizeSel');
 if (_lineNumSizeSel) _lineNumSizeSel.addEventListener('change', (e) => {
@@ -19103,7 +19408,12 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
   function onKeydown(e) {
     // CMDLINE 关闭后复位到进入前的模式
     if (VIM.mode === 'CMDLINE' && !_cmdLineActive) setMode(VIM.cmdReturn || 'NORMAL');
-    if (e.isComposing || VIM.composing) return;                       // IME 合成：放行
+    if (e.isComposing || VIM.composing) {
+      // INSERT 下必须放行（中文输入不能被吞）；NORMAL/VISUAL 没有正文输入
+      // （点进编辑区会自动回 INSERT），导航键仍要认——否则输入法把 h/l 当拼音
+      // 上报 isComposing，表现就是「普通模式下 h/l 按了没反应」（2026-10-30 修复）。
+      if (VIM.mode !== 'NORMAL' && VIM.mode !== 'VISUAL') return;
+    }
     var t = e.target;
     if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
     if (_cmdLineActive) return;
@@ -19117,6 +19427,9 @@ window.addEventListener('resize', () => { applyAspectHeights(); scheduleViewport
       if (toNormal && !overlayActive() && !_multiSelBlocks.size) {
         consume(e);
         setMode('NORMAL');
+        // 进 NORMAL 后接着敲的是 j/k/h/l 这类英文键：按设置自动把输入法切英文
+        // （2026-10-30；异步、失败静默，不阻塞按键）
+        ptoeImeToEnglish();
         if (!VIM.hintShown) {
           VIM.hintShown = true;
           showToast('NORMAL：j/k 翻页 · h/l 上/下一处纠错 · N Enter/Delete 应用/取消第 N 处 · st 设置 · : 命令', 'ok');

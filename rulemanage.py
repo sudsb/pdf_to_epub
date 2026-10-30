@@ -481,6 +481,79 @@ def parse_regex_pattern(pattern: str) -> tuple[str, str]:
     return pattern, ""
 
 
+# 支持 flags（2026-10-30）：i/m/s/x 映射 Python re；u/g 对 Python 无意义（恒 Unicode、
+# 恒全量匹配），接受但不产生效果——这样同一份规则（含前端写的 g/u）能原样落盘不报错。
+_PATTERN_FLAG_MAP = {
+    "i": re.IGNORECASE,
+    "m": re.MULTILINE,
+    "s": re.DOTALL,
+    "x": re.VERBOSE,
+}
+
+
+def normalize_pattern(pattern: str) -> str:
+    """正则方言归一：把 JS / PCRE 写法翻译成 Python re 能跑的等价写法。
+
+    前端（浏览器 RegExp）与后端（Python re）语法有交集也有差集，用户写规则时不该
+    关心自己处在哪一侧。这里统一处理（2026-10-30 增强正则引擎）：
+
+    - ``\\z``（Python 3.12+ / PCRE 串尾）→ ``\\Z``（Python re 的串尾）
+    - ``\\h``（JS 横向空白）→ ``[^\\S\\n\\r]``
+    - ``\\R``（任意换行序列）→ ``(?:\\r\\n|[\\n\\r\\u2028\\u2029])``
+    - JS 命名组 ``(?<name>…)`` → ``(?P<name>…)``（``(?<=`` / ``(?<!`` 前瞻/后顾不动）
+    - JS/Python 命名反向引用 ``\\k<name>`` → ``(?P=name)``
+
+    ``\\A`` / ``\\Z`` / 前瞻后顾 / ``[^\\S\\n]`` 等本就走 Python 原生语义，原样保留。
+    """
+    s = "" if pattern is None else str(pattern)
+    if not s:
+        return s
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\" and i + 1 < n:
+            nx = s[i + 1]
+            if nx == "z":
+                out.append("\\Z")
+                i += 2
+                continue
+            if nx == "h":
+                out.append("[^\\S\\n\\r]")
+                i += 2
+                continue
+            if nx == "R":
+                out.append("(?:\\r\\n|[\\n\\r\\u2028\\u2029])")
+                i += 2
+                continue
+            if nx == "k" and i + 2 < n and s[i + 2] == "<":
+                j = s.find(">", i + 3)
+                if j > 0:
+                    out.append("(?P=" + s[i + 3:j] + ")")
+                    i = j + 1
+                    continue
+            out.append(s[i:i + 2])
+            i += 2
+            continue
+        # JS 命名组 (?<name>…)：排除 (?<= 与 (?<!
+        if c == "(" and s.startswith("(?<", i) and i + 3 < n and s[i + 3] not in "=!":
+            out.append("(?P<")
+            i += 3
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def compile_flags(flags: str) -> int:
+    """把 g/i/m/s/u/x 标志串翻译成 Python re 标志（未知字符忽略）。"""
+    fl = 0
+    for ch in str(flags or "").strip().lower():
+        fl |= _PATTERN_FLAG_MAP.get(ch, 0)
+    return fl
+
+
 # 编译正则缓存（同一规则的正则在 eval_condition 与 find_matches 中各编译一次）。
 # 有界 LRU（OrderedDict + 锁）：频繁使用场景下不再反复整体 clear 后重新编译，
 # 也不会无限增长；多线程 serve（ThreadingHTTPServer）下读写经锁保护。
@@ -598,16 +671,15 @@ def _compile_cached(raw: str) -> re.Pattern:
             _REGEX_CACHE.move_to_end(raw)
             return pat
         pattern, flags = parse_regex_pattern(raw)
+        # 方言归一 + flags 全量映射（i/m/s/x；g/u 无效果）。归一后再做危险模式检查，
+        # 保证检查的就是真正要执行的那份表达式（2026-10-30 正则引擎增强）。
+        pattern = normalize_pattern(pattern)
         if _is_dangerous(pattern):
             raise re.error(f"表达式 {raw!r} 含嵌套量词（灾难性回溯风险），已拒绝执行")
-        fl = 0
-        if "i" in flags:
-            fl |= re.IGNORECASE
-        if "m" in flags:
-            fl |= re.MULTILINE
-        if "s" in flags:
-            fl |= re.DOTALL
-        pat = re.compile(pattern, fl)
+        try:
+            pat = re.compile(pattern, compile_flags(flags))
+        except re.error as e:
+            raise re.error(f"表达式 {raw!r} 无效：{e}") from e
         if len(_REGEX_CACHE) >= _REGEX_CACHE_MAX:
             _REGEX_CACHE.popitem(last=False)
         _REGEX_CACHE[raw] = pat
@@ -2214,6 +2286,8 @@ __all__ = [
     "apply_rules",
     "VALID_FORMAT_OPS",
     "parse_regex_pattern",
+    "normalize_pattern",
+    "compile_flags",
     "parse_html",
     "serialize_html",
     "collect_text_nodes",

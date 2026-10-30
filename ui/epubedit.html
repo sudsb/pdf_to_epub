@@ -310,6 +310,69 @@ mark.ptoe-search{background:#ffe9a8;color:inherit;border-radius:2px;padding:0 1p
 @media (prefers-reduced-motion: reduce){
   button,.toc-item,.art-row,.toast{transition:none !important;transform:none !important;}
 }
+
+/* 统一视觉与轻量交互：不改变虚拟章节列表的定位和测量。 */
+:root{
+  --accent:#3568B8;--accent-hover:#2A5596;--accent-soft:#E9F0FA;
+  --border:#D9E0E8;--border-strong:#BEC9D6;
+  --bg:#F3F5F8;--bg-hover:#F0F4F8;--bg-active:#E4EBF3;
+  --text:#202B38;--text-muted:#526475;--text-dim:#748292;
+  --editor-font-size:15px;--radius:8px;--radius-sm:6px;
+  --shadow-sm:0 1px 2px rgba(28,43,61,.05),0 2px 8px rgba(28,43,61,.035);
+  --shadow-md:0 8px 24px rgba(28,43,61,.10),0 2px 6px rgba(28,43,61,.05);
+  --shadow-lg:0 18px 48px rgba(20,35,55,.16),0 4px 12px rgba(20,35,55,.07);
+  --glass-bg:rgba(255,255,255,.90);--glass-border:rgba(217,224,232,.85);
+  --focus-ring:0 0 0 3px rgba(53,104,184,.18);
+  --motion-fast:140ms;--motion-base:200ms;
+}
+::selection{background:rgba(53,104,184,.20);}
+body{letter-spacing:.01em;}
+button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
+*::-webkit-scrollbar{width:9px;height:9px;}
+*::-webkit-scrollbar-track{background:transparent;}
+*::-webkit-scrollbar-thumb{background:rgba(116,130,146,.34);border:2px solid transparent;border-radius:8px;background-clip:padding-box;}
+#toolbar{min-height:50px;padding:3px 12px;box-shadow:0 5px 18px rgba(28,43,61,.045);}
+#bookTitle{font-size:16px;letter-spacing:.01em;}
+#toolbar .tb-group{background:rgba(255,255,255,.62);box-shadow:inset 0 0 0 1px var(--border);border-color:transparent;}
+#toolbar .tb-group:hover{background:var(--bg-elev);border-color:transparent;}
+#toolbar .ic-btn,#toolbar .tb-btn,.search-nav .tb-btn{transition:background var(--motion-fast),border-color var(--motion-fast),color var(--motion-fast),box-shadow var(--motion-fast),transform 80ms ease;}
+#statusBar{min-height:26px;padding:4px 16px;background:rgba(255,255,255,.72);}
+#tocPanel{width:248px;min-width:248px;background:#F8FAFC;}
+#tocHead{padding:13px 16px 11px;font-size:12px;letter-spacing:.10em;color:var(--text-muted);text-transform:uppercase;}
+#tocList{padding:8px;}
+.toc-item{padding:8px 10px;line-height:1.55;transition:background var(--motion-fast),color var(--motion-fast),box-shadow var(--motion-fast);}
+.toc-item:hover{transform:none;color:var(--accent);}
+.toc-item.active{box-shadow:inset 3px 0 0 var(--accent);}
+.toc-index{font-variant-numeric:tabular-nums;}
+#list{background:var(--bg);}
+.art-row{border-radius:11px;padding:14px 18px;border-color:var(--border);box-shadow:var(--shadow-sm);transition:border-color var(--motion-base),box-shadow var(--motion-base);}
+.art-row:hover{transform:none;border-color:var(--border-strong);box-shadow:var(--shadow-md);}
+.art-row.active{border-color:var(--accent);box-shadow:0 0 0 1px rgba(53,104,184,.28),var(--shadow-md);}
+.art-head{padding-bottom:9px;margin-bottom:10px;border-bottom-style:solid;}
+.art-num{color:var(--accent);font-variant-numeric:tabular-nums;letter-spacing:.03em;}
+.art-title{font-size:16px;line-height:1.55;padding:3px 6px;}
+.art-body{padding:4px 6px;line-height:1.85;caret-color:var(--accent);}
+.art-body p{margin:.65em 0;}
+.art-body h2,.art-body h3,.art-body h4,.art-body h5,.art-body h6{line-height:1.5;}
+.art-title:focus,.art-body:focus{box-shadow:var(--focus-ring);}
+#emptyState{border-radius:12px;box-shadow:var(--shadow-sm);line-height:1.7;}
+#popup,#contextMenu,.ctx-submenu,.modal{background:var(--bg-elev);border:1px solid var(--border);box-shadow:var(--shadow-lg);}
+#popup,#contextMenu,.ctx-submenu{border-radius:10px;}
+.modal{border-radius:14px;}
+.modal-head{padding:13px 16px;font-size:15px;}
+.search-row{padding:10px 16px;}
+.search-row input[type=text],.search-row input[type=search]{height:32px;transition:border-color var(--motion-fast),box-shadow var(--motion-fast);}
+.sr-item{transition:background var(--motion-fast),box-shadow var(--motion-fast);}
+.sr-item.current{box-shadow:inset 3px 0 0 var(--accent);}
+.toast{border:1px solid rgba(255,255,255,.12);box-shadow:var(--shadow-lg);}
+@media (prefers-reduced-motion:no-preference){
+  @keyframes ptoeEpubModalIn{from{opacity:0;transform:translateY(8px) scale(.985);}to{opacity:1;transform:none;}}
+  @keyframes ptoeEpubMenuIn{from{opacity:0;transform:translateY(-4px);}to{opacity:1;transform:none;}}
+  #searchModalBg .modal{animation:ptoeEpubModalIn var(--motion-base) cubic-bezier(.2,.8,.2,1);}
+  #popup,#contextMenu{animation:ptoeEpubMenuIn var(--motion-fast) ease-out;}
+}
+@media (prefers-reduced-motion:reduce){#searchModalBg .modal,#popup,#contextMenu{animation:none !important;}}
+@media(max-width:800px){#tocPanel{width:200px;min-width:200px;}#bookAuthor{display:none;}.art-row{padding:12px;}}
 </style>
 </head>
 <body>

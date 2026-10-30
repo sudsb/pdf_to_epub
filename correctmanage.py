@@ -982,6 +982,27 @@ def _proofread_engine_ctx():
         llamamanage.set_engine(None)
 
 
+def ime_to_english() -> tuple[bool, str]:
+    """把前台窗口的输入法从「中文模式」切到「英文模式」（Windows only）。
+
+    浏览器 JS 无法切换输入法，只能由本地服务端调 Win32 接口：矫正界面在
+    INSERT→NORMAL（Esc / Ctrl+[）时按设置 ui_settings.ime_switch_on_esc 调
+    /api/ime_english（2026-10-30 新增）。真正的实现与兼容性说明见 imemanage：
+
+      * 只用 IMM32「转换模式」消息（WM_IME_CONTROL + IMC_SETCONVERSIONMODE），
+        把当前输入法内部的中/英状态切到英文；
+      * **不切换键盘布局/输入语言**（不再请求把输入语言切到 en-US 键盘布局），
+        所以搜狗/百度/微软拼音不会被换成「美式键盘」；
+      * 已经是英文 → 什么也不做；读不到状态 → 不盲切。
+
+    返回 (现在是否处于英文模式, 说明)；非 Windows / 任何失败都返回 (False, 原因)，
+    调用方静默忽略，不影响按键本身。
+    """
+    import imemanage  # 惰性导入：IME 只在 Windows 下有实际动作
+
+    return imemanage.ime_to_english()
+
+
 def _proofread_llm_enhance(text: str, errors: list, model_key: str = "qwen2b"):
     """Call llama-server via llamamanage.request to get additional sentence-level suggestions.
     Returns (suggestions, error_str|None): suggestions is a list of error dicts matching
@@ -2995,7 +3016,15 @@ def _cf_strip_markdown(text: str) -> str:
 
 
 def _cf_apply_custom_rules(text: str, rules) -> str:
-    """按顺序应用自定义清理规则（正则替换；仅使用 i/m/u 标志）。"""
+    """按顺序应用自定义清理规则（正则替换）。
+
+    flags（2026-10-30 增强）：i/m/s/x 全部映射到 Python re 对应标志（原来只认
+    i/m，写 s 会被静默忽略）；g/u 接受但无效果。正则先过方言归一
+    （rulemanage.normalize_pattern：\\z、\\h、\\R、JS (?<name>…) 等），与替换规则、
+    格式规则引擎同一口径。
+    """
+    import rulemanage
+
     for rule in rules or ():
         if not isinstance(rule, dict):
             continue
@@ -3007,14 +3036,13 @@ def _cf_apply_custom_rules(text: str, rules) -> str:
         repl = rule.get("replacement")
         if not isinstance(repl, str):
             repl = ""
-        flags = 0
-        f = str(rule.get("flags") or "")
-        if "i" in f:
-            flags |= re.IGNORECASE
-        if "m" in f:
-            flags |= re.MULTILINE
         try:
-            text = re.sub(pat, repl, text, flags=flags)
+            text = re.sub(
+                rulemanage.normalize_pattern(pat),
+                repl,
+                text,
+                flags=rulemanage.compile_flags(str(rule.get("flags") or "")),
+            )
         except re.error:
             continue  # 非法规则已在设置端校验，这里宽容跳过不阻断主链路
     return text
@@ -8841,6 +8869,10 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     # 按序应用或取消，显示只是视觉开关，默认开。与 configmanage
                     # DEFAULT_CONFIG["ui_settings"] 同名同默认。
                     "show_err_number": True,
+                    # Esc 后自动切英文输入法（2026-10-30）：默认开（只切输入法内部的
+                    # 中/英模式，不换键盘布局）。与 configmanage
+                    # DEFAULT_CONFIG["ui_settings"] 同名同默认。
+                    "ime_switch_on_esc": True,
                     "line_num_size": LINE_NUM_SIZE_DEFAULT,
                     "text_justify": True,
                     "clean_punctuation": True,
@@ -8875,6 +8907,7 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     "search_max_results": stored.get("search_max_results", defaults.get("search_max_results", SEARCH_MAX_RESULTS_DEFAULT)),
                     "show_line_numbers": bool(stored.get("show_line_numbers", defaults.get("show_line_numbers", False))),
                     "show_err_number": bool(stored.get("show_err_number", defaults.get("show_err_number", True))),
+                    "ime_switch_on_esc": bool(stored.get("ime_switch_on_esc", defaults.get("ime_switch_on_esc", True))),
                     "line_num_size": stored.get("line_num_size", defaults.get("line_num_size", LINE_NUM_SIZE_DEFAULT)),
                     "text_justify": bool(stored.get("text_justify", defaults.get("text_justify", True))),
                     "clean_punctuation": bool(stored.get("clean_punctuation", defaults.get("clean_punctuation", True))),
@@ -9052,6 +9085,12 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     self._send(400, self._json({"ok": False, "error": "show_err_number 必须是布尔值"}), "application/json; charset=utf-8")
                     return
                 clean["show_err_number"] = v
+            if "ime_switch_on_esc" in ui:
+                v = ui["ime_switch_on_esc"]
+                if not isinstance(v, bool):
+                    self._send(400, self._json({"ok": False, "error": "ime_switch_on_esc 必须是布尔值"}), "application/json; charset=utf-8")
+                    return
+                clean["ime_switch_on_esc"] = v
             if "line_num_size" in ui:
                 v = ui["line_num_size"]
                 if v not in LINE_NUM_SIZE_CHOICES:
@@ -9839,29 +9878,34 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     if model_info
                     else None
                 )
-                probe = _probe_server(model_name) if model_name else "none"
-                # 实际运行模型反查（2026-10-29）：probe 只回答「端口上跑的是不是配置
-                # 里的那个模型」。多开矫正界面时，早先打开的窗口内存/下拉框里仍是旧
-                # 模型键，重识别按旧键探测 → 报「当前服务加载的模型与所选模型不符」。
-                # mismatch 时把服务端真实加载的 id 反查成 model_choices 键返回，前端
-                # 据此把下拉框与持久化值对齐到正在运行的模型（match 时无需额外请求，
-                # 保证 5s 轮询不增加开销）。
-                running_model = model_key if probe == "match" else None
-                if probe == "mismatch" and isinstance(model_choices, dict):
-                    try:
-                        ids = llamamanage._loaded_model_ids()
-                    except Exception:  # noqa: BLE001  探测失败按未知处理
-                        ids = []
-                    if ids:
-                        for k in sorted(model_choices):
-                            nm = str((model_choices.get(k) or {}).get("name") or k)
-                            try:
-                                hit = llamamanage._model_id_matches(nm, ids)
-                            except Exception:  # noqa: BLE001
-                                hit = False
-                            if hit:
-                                running_model = k
-                                break
+                # 探测必须与「启动服务」用同一个引擎（proofread_engine）：矫正界面把
+                # 服务起在校正引擎上，这里若按识别引擎（engine）探测，端口/引擎口径
+                # 不一致 → 状态永远 running:false / mismatch，下拉框与运行模型对不上
+                # （2026-10-30 修复「切换模型失败」）。
+                with _proofread_engine_ctx():
+                    probe = _probe_server(model_name) if model_name else "none"
+                    # 实际运行模型反查（2026-10-29）：probe 只回答「端口上跑的是不是配置
+                    # 里的那个模型」。多开矫正界面时，早先打开的窗口内存/下拉框里仍是旧
+                    # 模型键，重识别按旧键探测 → 报「当前服务加载的模型与所选模型不符」。
+                    # mismatch 时把服务端真实加载的 id 反查成 model_choices 键返回，前端
+                    # 据此把下拉框与持久化值对齐到正在运行的模型（match 时无需额外请求，
+                    # 保证 5s 轮询不增加开销）。
+                    running_model = model_key if probe == "match" else None
+                    if probe == "mismatch" and isinstance(model_choices, dict):
+                        try:
+                            ids = llamamanage._loaded_model_ids()
+                        except Exception:  # noqa: BLE001  探测失败按未知处理
+                            ids = []
+                        if ids:
+                            for k in sorted(model_choices):
+                                nm = str((model_choices.get(k) or {}).get("name") or k)
+                                try:
+                                    hit = llamamanage._model_id_matches(nm, ids)
+                                except Exception:  # noqa: BLE001
+                                    hit = False
+                                if hit:
+                                    running_model = k
+                                    break
                 # 大模型加载耗时可达数分钟，此期间进程存活但 /health 仍 503：
                 # 报「启动中」而非「未运行」，避免用户误判启动失败（2026-08-09）
                 proc = getattr(llamamanage, "_server_process", None)
@@ -10886,6 +10930,23 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
         if path == "/api/replace_rules":
             self._replace_rules()
             return
+        if path == "/api/ime_english":
+            # Esc 进 NORMAL 后把输入法切英文（设置-界面「Esc 后自动切英文输入法」）。
+            # 浏览器不能切输入法，只能由本地服务端调 Win32 API；失败一律静默降级。
+            try:
+                switched, msg = ime_to_english()
+                self._send(
+                    200,
+                    self._json({"ok": True, "switched": switched, "message": msg}),
+                    "application/json; charset=utf-8",
+                )
+            except Exception as e:  # noqa: BLE001
+                self._send(
+                    500,
+                    self._json({"ok": False, "error": str(e)}),
+                    "application/json; charset=utf-8",
+                )
+            return
         if path == "/api/correction_format":
             self._correction_format()
             return
@@ -10947,24 +11008,35 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     return
                 model_info = model_choices.get(model_key) or {}
                 has_mmproj = bool(model_info.get("mmproj"))
-                from llamamanage import _active_engine
-
-                eng = _active_engine()
-                eng_label = "vLLM-Omni" if eng == "vllm" else "llama-server"
-                eng_port = (
-                    (cfg.get("vllm_server_args") or {}).get("port") or "8000"
-                    if eng == "vllm"
-                    else (cfg.get("llama_server_args") or {}).get("port") or "8080"
-                )
                 # 快速切换支持（2026-08 修复）：若端口上运行的是其他模型，先停掉
                 # 本进程管理的旧实例再启动新模型；仍被占用（外部进程）则给出明确提示，
                 # 避免直接调 runserver 撞端口报出难懂的占用错误。
-                from llamamanage import _probe_server as _probe_pre, stopserver
+                #
+                # 引擎口径（2026-10-30 修复）：eng / 端口 / 探测 / 停止 / 启动全部在
+                # 校正引擎上下文内完成。此前只有 runserver 在 ctx 内，前面按识别引擎
+                # （engine）探测+停止——engine=vllm、proofread_engine=llama 时切换会去
+                # 探测/杀掉 vLLM 的 8000 端口，报「端口 8000 被外部 vLLM-Omni 占用」，
+                # 真正的模型切换则从未发生。
+                # 矫正/重识别为单请求顺序处理（用户逐页点击，一次一个请求），并发
+                # 槽位取 1 即可——llama-server 的 KV cache ≈ n_ctx × parallel，默认
+                # 取 config 的 parallel(6)×max_tokens(8192) 会把 KV 预分配撑到数 GB，
+                # 显著超过直接启动（--parallel 1）的显存占用（2026-09-01 修复）。
+                with _proofread_engine_ctx():
+                    from llamamanage import _active_engine
 
-                pre_name = str(model_info.get("name") or model_key)
-                if _probe_pre(pre_name) == "mismatch":
-                    stopserver()  # 仅能停掉本进程启动的实例
-                    time.sleep(1.0)
+                    eng = _active_engine()
+                    eng_label = "vLLM-Omni" if eng == "vllm" else "llama-server"
+                    eng_port = (
+                        (cfg.get("vllm_server_args") or {}).get("port") or "8000"
+                        if eng == "vllm"
+                        else (cfg.get("llama_server_args") or {}).get("port") or "8080"
+                    )
+                    from llamamanage import _probe_server as _probe_pre, stopserver
+
+                    pre_name = str(model_info.get("name") or model_key)
+                    if _probe_pre(pre_name) == "mismatch":
+                        stopserver()  # 仅能停掉本进程启动的实例（含端口兜底）
+                        time.sleep(1.0)
                     if _probe_pre(pre_name) == "mismatch":
                         self._send(
                             200,
@@ -10975,17 +11047,13 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                                         f"端口 {eng_port} 被外部 {eng_label} 占用"
                                         "（非本程序启动），请手动关闭后重试"
                                     ),
+                                    "engine": eng,
+                                    "port": str(eng_port),
                                 }
                             ),
                             "application/json; charset=utf-8",
                         )
                         return
-                # 矫正/重识别为单请求顺序处理（用户逐页点击，一次一个请求），并发
-                # 槽位取 1 即可——llama-server 的 KV cache ≈ n_ctx × parallel，默认
-                # 取 config 的 parallel(6)×max_tokens(8192) 会把 KV 预分配撑到数 GB，
-                # 显著超过直接启动（--parallel 1）的显存占用（2026-09-01 修复）。
-                # 矫正引擎与识别引擎分离：启动服务按校正引擎（proofread_engine）钉扎
-                with _proofread_engine_ctx():
                     running = bool(runserver(model_key, with_mmproj=has_mmproj, parallel=1, ctx_size=8192))
                 if running:
                     # Issue 1 fix: persist model choice so it survives UI restart
@@ -11000,7 +11068,10 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
                     from llamamanage import _probe_server
 
                     model_name = str(model_info.get("name") or model_key)
-                    if _probe_server(model_name) == "mismatch":
+                    # 与启动同一引擎口径探测（否则 vLLM/llama 混用时误报「端口被其他占用」）
+                    with _proofread_engine_ctx():
+                        _probe_after = _probe_server(model_name)
+                    if _probe_after == "mismatch":
                         message = (
                             f"端口 {eng_port} 已被其他 {eng_label} 占用（模型不符），"
                             f"请先停止旧服务（或手动关闭任务管理器中的 {eng_label}）后重试"
@@ -11030,13 +11101,16 @@ class _CorrectionHandler(BaseHTTPRequestHandler):
             try:
                 from llamamanage import _active_engine, _probe_server, stopserver
 
-                eng_label = (
-                    "vLLM-Omni" if _active_engine() == "vllm" else "llama-server"
-                )
-                stopserver()
-                # stopserver 已兜底杀端口上的遗留实例；再探测确认端口真正释放
-                # （杀不掉时提示手动关闭，避免界面误报已停止）
-                if _probe_server(None) != "none":
+                # 停止/探测同样按校正引擎（proofread_engine）口径，与启动保持一致
+                with _proofread_engine_ctx():
+                    eng_label = (
+                        "vLLM-Omni" if _active_engine() == "vllm" else "llama-server"
+                    )
+                    stopserver()
+                    # stopserver 已兜底杀端口上的遗留实例；再探测确认端口真正释放
+                    # （杀不掉时提示手动关闭，避免界面误报已停止）
+                    still_busy = _probe_server(None) != "none"
+                if still_busy:
                     self._send(
                         200,
                         self._json(
@@ -13353,6 +13427,85 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
   .img-panel img{width:100%;}
   .editable{font-size:calc(var(--editor-font-size) + 2px);height:auto;min-height:160px;overflow-y:visible;}
 }
+
+/* 统一视觉与轻量交互：只装饰视图层，不改变虚拟列表尺寸模型与正文导出契约。 */
+:root{
+  --accent:#3568B8;--accent-hover:#2A5596;--accent-soft:#E9F0FA;
+  --border:#D9E0E8;--border-strong:#BEC9D6;
+  --bg:#F3F5F8;--bg-hover:#F0F4F8;--bg-active:#E4EBF3;
+  --text:#202B38;--text-muted:#526475;--text-dim:#748292;
+  --radius:8px;--radius-sm:6px;
+  --shadow-sm:0 1px 2px rgba(28,43,61,.05),0 2px 8px rgba(28,43,61,.035);
+  --shadow-md:0 8px 24px rgba(28,43,61,.10),0 2px 6px rgba(28,43,61,.05);
+  --shadow-lg:0 18px 48px rgba(20,35,55,.16),0 4px 12px rgba(20,35,55,.07);
+  --glass-bg:rgba(255,255,255,.88);--glass-border:rgba(217,224,232,.85);
+  --focus-ring:0 0 0 3px rgba(53,104,184,.18);
+  --motion-fast:140ms;--motion-base:200ms;
+}
+.dark{
+  --accent:#82A9E8;--accent-hover:#A2C1F1;--accent-soft:#263854;
+  --bg:#141A23;--bg-elev:#1D2531;--bg-hover:#273242;--bg-active:#303E52;
+  --text:#E6EBF2;--text-muted:#A9B5C4;--text-dim:#8492A5;
+  --glass-bg:rgba(29,37,49,.88);--glass-border:rgba(74,86,105,.7);
+  --shadow-lg:0 18px 48px rgba(0,0,0,.38),0 4px 12px rgba(0,0,0,.24);
+}
+::selection{background:rgba(53,104,184,.20);}
+body{letter-spacing:.01em;}
+button,select,input,textarea{transition-duration:var(--motion-fast);}
+button:focus-visible,select:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
+*::-webkit-scrollbar{width:9px;height:9px;}
+*::-webkit-scrollbar-track{background:transparent;}
+*::-webkit-scrollbar-thumb{background:rgba(116,130,146,.34);border:2px solid transparent;border-radius:8px;background-clip:padding-box;}
+*::-webkit-scrollbar-thumb:hover{background:rgba(82,100,117,.55);border:2px solid transparent;background-clip:padding-box;}
+#toolbar{box-shadow:0 1px 0 rgba(28,43,61,.02),0 5px 18px rgba(28,43,61,.045);}
+.ribbon-tabs{height:30px;padding:0 10px;background:var(--glass-bg);}
+.ribbon-tab{height:30px;padding:0 14px;letter-spacing:.03em;}
+.ribbon-tab.active{font-weight:650;}
+.ribbon-panel{padding:4px 8px;background:var(--glass-bg);}
+#toolbar .tb-group{border-color:transparent;background:rgba(255,255,255,.58);box-shadow:inset 0 0 0 1px var(--border);}
+.dark #toolbar .tb-group{background:rgba(255,255,255,.025);}
+#toolbar .tb-group:hover{background:var(--bg-elev);border-color:transparent;}
+#toolbar .ic-btn,#toolbar .tb-btn,#toolbar .tb-more-btn{transition:background var(--motion-fast),border-color var(--motion-fast),color var(--motion-fast),box-shadow var(--motion-fast),transform 80ms ease;}
+#toolbar .tb-statusbar{background:var(--glass-bg);color:var(--text-muted);}
+#status,#pagePos,#pos{font-variant-numeric:tabular-nums;}
+#hintbar{color:var(--text-muted);background:var(--accent-soft);border-bottom-color:transparent;}
+.page-row{background:var(--bg-elev);border-color:var(--border);border-radius:10px;box-shadow:var(--shadow-sm);transition:border-color var(--motion-base),box-shadow var(--motion-base);}
+.page-row:hover{transform:none;border-color:var(--border-strong);box-shadow:var(--shadow-md);}
+.page-head{color:var(--text-muted);font-weight:600;letter-spacing:.04em;border-bottom-style:solid;}
+.page-err-badge{box-shadow:0 2px 6px rgba(192,57,43,.18);}
+.img-panel{border-color:var(--border);border-radius:7px;background:var(--bg);}
+.img-panel img{border-radius:3px;}
+.editable{padding:14px 18px;border-color:var(--border);border-radius:7px;background:var(--bg-elev);line-height:1.85;color:var(--text);caret-color:var(--accent);transition:border-color var(--motion-fast),box-shadow var(--motion-fast);}
+#pages.ptoe-line-num .editable>p::after,#pages.ptoe-line-num .editable>div::after,
+#pages.ptoe-line-num .editable>h1::after,#pages.ptoe-line-num .editable>h2::after,
+#pages.ptoe-line-num .editable>h3::after,#pages.ptoe-line-num .editable>h4::after,
+#pages.ptoe-line-num .editable>h5::after,#pages.ptoe-line-num .editable>h6::after,
+#pages.ptoe-line-num .editable>table tr>td:first-child::after,#pages.ptoe-line-num .editable>table tr>th:first-child::after{line-height:1.85;}
+.editable:focus{border-color:var(--accent);box-shadow:var(--focus-ring);}
+.editable h1,.editable h2,.editable h3,.editable h4,.editable h5,.editable h6{line-height:1.5;letter-spacing:.01em;}
+.modal{background:var(--bg-elev);color:var(--text);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow-lg);padding:22px 24px;line-height:1.65;}
+.modal h3{font-size:18px;letter-spacing:.01em;}
+.modal h4{color:var(--text);}
+.settings-tab,.scope-btn,.tb-btn,.pop-btn,.ctx-item{transition:background var(--motion-fast),border-color var(--motion-fast),color var(--motion-fast),box-shadow var(--motion-fast);}
+#popup,#contextMenu,.ctx-submenu,#errPopup,#imgPopup,#dividerMenu,#tblMenu,#tblAlignGrid,.color-pop{background:var(--bg-elev);border-color:var(--border);box-shadow:var(--shadow-lg);}
+#popup,.ctx-submenu,#errPopup,#imgPopup,#dividerMenu,#tblMenu,#tblAlignGrid,.color-pop{border-radius:10px;}
+.ctx-item,.pop-btn,#tblMenu button{color:var(--text);}
+.ctx-item:hover,#tblMenu button:hover{background:var(--accent-soft);color:var(--accent);}
+#tip{border:1px solid rgba(255,255,255,.12);border-radius:7px;box-shadow:var(--shadow-md);}
+.toast{border:1px solid rgba(255,255,255,.12);box-shadow:var(--shadow-lg);}
+#toast .toast{transform:translateY(8px);}
+#toast .toast.show{transform:translateY(0);}
+@media (prefers-reduced-motion:no-preference){
+  @keyframes ptoeUiModalIn{from{opacity:0;transform:translateY(8px) scale(.985);}to{opacity:1;transform:none;}}
+  @keyframes ptoeUiMenuIn{from{opacity:0;transform:translateY(-4px);}to{opacity:1;transform:none;}}
+  @keyframes ptoeUiFade{from{opacity:0;}to{opacity:1;}}
+  .modal{animation:ptoeUiModalIn var(--motion-base) cubic-bezier(.2,.8,.2,1);}
+  .ribbon-panel.active{animation:ptoeUiFade var(--motion-fast) ease-out;}
+  #toolbar .tb-more.open .tb-more-panel,#contextMenu,#popup,#errPopup,#imgPopup,#dividerMenu,#tblMenu,#tblAlignGrid,.color-pop{animation:ptoeUiMenuIn var(--motion-fast) ease-out;}
+}
+@media (prefers-reduced-motion:reduce){
+  .modal,.ribbon-panel.active,#toolbar .tb-more.open .tb-more-panel,#errPopup,#imgPopup,#dividerMenu,#tblMenu,#tblAlignGrid,.color-pop{animation:none !important;}
+}
 </style>
 </head>
 <body>
@@ -14141,6 +14294,13 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
         <input type="checkbox" id="errNumShow" style="width:16px;height:16px;">
         显示纠错序号角标
       </label>
+      <p style="font-size:11px;color:#8a9bab;margin:4px 0 0 24px;">序号是<b>稳定编号</b>：采纳/忽略某一处后，其余各处的序号不会前移（被处理掉的序号消失）。</p>
+      <h4 style="margin:16px 0 4px;">输入法</h4>
+      <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">默认开启：按 <b>Esc</b> / <b>Ctrl+[</b> 进入普通（NORMAL）模式时，如果输入法正在<b>中文模式</b>，自动切到<b>英文模式</b>，避免接着敲 j/k/h/l 打出拼音候选。只切输入法内部的中/英状态（搜狗、百度、微软拼音等通用），<b>不会</b>把输入法换成美式键盘或切换输入语言；输入法已经是英文时不做任何操作。由本地服务端调用 Windows 输入法接口实现（浏览器无法自行切换），非 Windows 或调用失败时静默跳过，不影响按键。取消勾选可关闭。</p>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
+        <input type="checkbox" id="imeSwitchChk" style="width:16px;height:16px;">
+        Esc 后自动切英文输入法
+      </label>
       <h4 style="margin:16px 0 4px;">正文对齐</h4>
       <p style="font-size:12px;color:#5a6b7c;margin:0 0 6px;">矫正页正文默认两端对齐（分散对齐），段落左右边缘整齐更美观。关闭后按浏览器默认（左对齐）。纯视图层，不影响保存与导出；手动设置的逐块对齐仍然生效。</p>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
@@ -14285,7 +14445,7 @@ kbd{background:#eef1f5;border:1px solid #c9d1da;border-radius:3px;padding:1px 6p
       <div class="rr-edit-grid" style="margin-top:8px;">
         <label>规则名称 <input type="text" id="cfRuleName" placeholder="如：去行首圈码"></label>
         <label>正则表达式 <input type="text" id="cfRulePattern" placeholder="如：^[①-⑳]\s*"></label>
-        <label>标志 <input type="text" id="cfRuleFlags" placeholder="i m u（忽略留空）" title="可选：i 忽略大小写 / m 多行 / u Unicode"></label>
+        <label>标志 <input type="text" id="cfRuleFlags" placeholder="i m s u（忽略留空）" title="可选：i 忽略大小写 / m 多行 / s 点号跨行 / u Unicode"></label>
         <label>替换为 <input type="text" id="cfRuleReplacement" placeholder="留空 = 删除匹配内容"></label>
       </div>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center;">

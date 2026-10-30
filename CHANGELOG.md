@@ -1,6 +1,16 @@
 # 更新日志（Changelog）
 
 
+## [Unreleased] - 2026-10-30
+
+### 新增
+
+- **输入法自动切英文（矫正界面，默认开）**：按 `Esc` / `Ctrl+[` 进 NORMAL 时，若输入法当前处于**中文模式**，自动切到**英文模式**（搜狗输入法、百度输入法、微软拼音等通用），避免紧接着的 `j`/`k`/`h`/`l`、`dd`、`:` 被拼音吞掉。
+  - **只切输入法内部的中/英状态**，不是切换到美式键盘：实现只用 IMM32 的转换模式通道 —— 用 `ImmGetDefaultIMEWnd` 拿到输入法窗口后发 `WM_IME_CONTROL` + `IMC_GETCONVERSIONMODE` / `IMC_SETCONVERSIONMODE`（`IME_CMODE_NATIVE` ↔ `IME_CMODE_ALPHANUMERIC`），**绝不做** `LoadKeyboardLayout` / `WM_INPUTLANGCHANGEREQUEST` 一类的键盘布局或输入语言切换。浏览器窗口用 TSF，`ImmGetContext` 跨进程恒为 NULL，故走消息通道（已在本机 Chrome + 中文输入法上实测：模式 `0x1/0x401` → `0x0`，`GetKeyboardLayout` 不变）。
+  - 写入后**回读校验**；个别输入法版本不认该消息时，退化为模拟输入法自带的 `Shift` 中英文切换热键，再回读校验；输入法本来就是英文时**不做任何操作**（绝不反向切回中文）；读不到输入法状态时**不盲切**。
+  - 新增模块 `imemanage.py` 承载全部 Win32 调用与决策逻辑（`correctmanage.ime_to_english()` 保留同名薄封装），非 Windows / 调用失败一律静默跳过，不影响按键；新增回归护栏 `test_imemanage.py`。
+  - 设置项 `ui_settings.ime_switch_on_esc`（默认 **true**，此前默认 false）：设置 → 界面 → 输入法 → 「Esc 后自动切英文输入法」可关闭。
+
 ## [Unreleased] - 2026-10-29
 
 ### 新增

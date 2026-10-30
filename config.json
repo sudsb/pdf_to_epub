@@ -264,7 +264,9 @@
     ],
     "tbl_popup_menu": false,
     "tbl_ctx_menu": false,
-    "tbl_tbl_menu": false
+    "tbl_tbl_menu": false,
+    "show_err_number": true,
+    "ime_switch_on_esc": true
   },
   "image_preprocess": {
     "enabled": false,

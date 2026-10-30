@@ -9894,6 +9894,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "search_max_results": 200,
                     "show_line_numbers": False,
                     "show_err_number": True,
+                    "ime_switch_on_esc": True,
                     "line_num_size": "large",
                     "text_justify": True,
                     "clean_punctuation": True,
@@ -9946,6 +9947,7 @@ class TestUiSettingsEndpoint(unittest.TestCase):
                     "search_max_results": 200,
                     "show_line_numbers": False,
                     "show_err_number": True,
+                    "ime_switch_on_esc": True,
                     "line_num_size": "large",
                     "text_justify": True,
                     "clean_punctuation": True,
@@ -11350,7 +11352,8 @@ class TestReplaceRulesEndpoint(unittest.TestCase):
         server, base = _start_handler_server(_basic_server_state())
         try:
             cases = [
-                {"name": "x", "pattern": "x", "flags": "s"},  # s 不支持
+                # 2026-10-30：s（点号跨行）已支持，改用真正不支持的修饰符 q 验证 400
+                {"name": "x", "pattern": "x", "flags": "q"},
                 {"name": "x", "pattern": "x", "flags": "g", "keep_groups": [-1]},
                 {"name": "x", "pattern": "x", "flags": "g", "keep_groups": "1,2"},
             ]
@@ -11361,6 +11364,53 @@ class TestReplaceRulesEndpoint(unittest.TestCase):
                         data=_json.dumps({"rules": [rule]}),
                     ).json()
                     self.assertFalse(res["ok"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_post_regex_dialect_and_s_flag_accepted(self):
+        """2026-10-30：跨段规则（\\Z 前瞻 / \\h / (?<name>)）与 s 标志必须能保存。
+
+        这类规则在浏览器侧由 ptoeRegexDialect 翻译、服务端由 rulemanage.normalize_pattern
+        归一；保存校验必须同样通过，否则「同一条规则前端能跑、保存却 400」。
+        """
+        import json as _json
+
+        import configmanage
+        import requests
+
+        tmp = tempfile.mkdtemp(prefix="ptoe_rules_")
+        path = str(Path(tmp) / "config.json")
+        orig_path = configmanage._CONFIG_PATH
+        configmanage._CONFIG_PATH = path
+        self.addCleanup(lambda: setattr(configmanage, "_CONFIG_PATH", orig_path))
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump({"model_choices": {}, "selected_model": None}, f)
+
+        server, base = _start_handler_server(_basic_server_state())
+        try:
+            rules = [
+                {
+                    "name": "去段末裸数字",
+                    "pattern": "([0-9]+)(?=[^\\S\\n]*(?:\\n[^\\S\\n]*\\n|\\Z))",
+                    "flags": "gsu",
+                    "replacement": "",
+                },
+                {
+                    "name": "点号跨行 + JS 命名组",
+                    "pattern": "(?<body>a(?<=\\d)\\h+b).*(?=c\\z)",
+                    "flags": "ims",
+                    "replacement": "$1",
+                },
+            ]
+            res = requests.post(
+                base + "/api/replace_rules",
+                data=_json.dumps({"rules": rules}),
+            ).json()
+            self.assertTrue(res["ok"], msg=res)
+            self.assertEqual(len(res["rules"]), 2)
+            self.assertEqual(res["rules"][0]["flags"], "gsu")
         finally:
             server.shutdown()
             server.server_close()
@@ -11629,6 +11679,7 @@ class TestSetUiSettingsConfig(unittest.TestCase):
                 "search_max_results": 200,
                 "show_line_numbers": False,
                 "show_err_number": True,
+                "ime_switch_on_esc": True,
                 "line_num_size": "large",
                 "text_justify": True,
                 "clean_punctuation": True,

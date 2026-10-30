@@ -465,17 +465,22 @@ def _model_id_matches(model_name: str, ids) -> bool:
 
 
 def _probe_server(model_name: str) -> str:
-    """探测 127.0.0.1:8080 上是否已有 llama-server，并比对模型。
+    """探测本机 llama-server（端口取 llama_server_args.port，默认 8080）上是否已有
+    服务，并比对模型。
 
     返回 'none'（无模型/端口不可达）| 'match'（已在运行且模型一致）|
     'mismatch'（端口被占用但模型不符或无法匹配）。
     防止启动时端口被旧实例占用导致新 Popen 绑定失败、health 却打到旧服务返回 ok，
     用错模型静默 OCR（S1）。
+
+    2026-10-30 修复：此前端口硬编码 8080，配置改成其他端口后探测恒 'none'
+    → 切换模型时既不停旧实例也不认「已运行」，表现为切换失败。
     """
     if _active_engine() == "vllm":
         return _vllm_module()._probe_server(model_name)
+    base = f"http://127.0.0.1:{_server_port()}"
     try:
-        resp = _SESSION.get("http://127.0.0.1:8080/health", timeout=2)
+        resp = _SESSION.get(base + "/health", timeout=2)
         if resp.status_code != 200:
             return "none"
     except requests.ConnectionError:
@@ -484,7 +489,7 @@ def _probe_server(model_name: str) -> str:
         return "none"
     # 端口上有服务：通过 OpenAI 兼容 /v1/models 比对已加载模型
     try:
-        r2 = _SESSION.get("http://127.0.0.1:8080/v1/models", timeout=2)
+        r2 = _SESSION.get(base + "/v1/models", timeout=2)
         if r2.status_code == 200:
             ids = [m.get("id") for m in r2.json().get("data", [])]
             if _model_id_matches(model_name, ids):
@@ -511,7 +516,7 @@ def _loaded_model_ids() -> list[str]:
         except Exception:  # noqa: BLE001  探测失败不影响主流程
             return []
     try:
-        r = _SESSION.get("http://127.0.0.1:8080/v1/models", timeout=2)
+        r = _SESSION.get(f"http://127.0.0.1:{_server_port()}/v1/models", timeout=2)
         if r.status_code != 200:
             return []
         data = r.json().get("data")
@@ -533,7 +538,7 @@ def _probe_mmproj() -> bool | None:
     if _active_engine() == "vllm":
         return _vllm_module()._probe_mmproj()  # vllmmanage 同签名，见文件2
     try:
-        resp = _SESSION.get("http://127.0.0.1:8080/props", timeout=2)
+        resp = _SESSION.get(f"http://127.0.0.1:{_server_port()}/props", timeout=2)
         if resp.status_code != 200:
             return None
         j = resp.json()
@@ -1061,7 +1066,9 @@ def runserver(
             stopserver()
             return False
         try:
-            response = _SESSION.get("http://127.0.0.1:8080/health", timeout=5)
+            response = _SESSION.get(
+                f"http://127.0.0.1:{_server_port()}/health", timeout=5
+            )
             if response.status_code == 200:
                 print("Server loaded successfully")
                 _record_server_ctx()  # 记录真实 n_ctx，供截断警告正确分流
@@ -1580,7 +1587,7 @@ def request(
             if isinstance(model_cfg, dict)
             else model_key
         )
-        url = "http://127.0.0.1:8080/v1/chat/completions"
+        url = f"http://127.0.0.1:{_server_port()}/v1/chat/completions"
         data = {
             "model": model_name,
             "messages": [{"role": "user", "content": prompt}],
@@ -1835,7 +1842,7 @@ def _record_server_ctx() -> int | None:
     """
     global _SERVER_CTX
     try:
-        slots = _SESSION.get("http://127.0.0.1:8080/slots", timeout=3).json()
+        slots = _SESSION.get(f"http://127.0.0.1:{_server_port()}/slots", timeout=3).json()
         if isinstance(slots, list) and slots:
             v = slots[0].get("n_ctx")
             if isinstance(v, int) and v > 0:
@@ -1988,7 +1995,7 @@ def _request_image_new(
                 if isinstance(model_cfg, dict)
                 else model_key
             )
-        url = "http://127.0.0.1:8080/v1/chat/completions"
+        url = f"http://127.0.0.1:{_server_port()}/v1/chat/completions"
         data = {
             "model": model_name,
             "messages": [
